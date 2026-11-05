@@ -1,0 +1,151 @@
+{
+  "version": 1,
+  "run": {
+    "id": "contour",
+    "revision": "contour-1"
+  },
+  "stock": {
+    "version": 1,
+    "units": "mm",
+    "min_mm": [
+      0,
+      0,
+      0
+    ],
+    "max_mm": [
+      40,
+      40,
+      10
+    ],
+    "cell_size_mm": 0.25,
+    "max_cells": 1048576
+  },
+  "tools": [
+    {
+      "id": "t1",
+      "cutter": {
+        "id": "em4",
+        "name": "em4",
+        "shape": {
+          "kind": "flat"
+        },
+        "diameter_mm": 4,
+        "cutting_length_mm": 30,
+        "overall_length_mm": 50,
+        "shank_diameter_mm": 4,
+        "flutes": 3,
+        "center_cutting": true,
+        "material": "carbide",
+        "neck": null
+      },
+      "stickout_mm": 35,
+      "gauge_length_mm": 60,
+      "holders": [
+        {
+          "z_min_mm": 35,
+          "z_max_mm": 60,
+          "radius_min_mm": 4,
+          "radius_max_mm": 4
+        }
+      ]
+    }
+  ],
+  "initial_position_mm": [
+    0,
+    0,
+    12
+  ],
+  "sweep": {
+    "tolerance_mm": 1e-05,
+    "chord_error_mm": 0.002,
+    "max_tip_step_mm": 0.1,
+    "max_segments": 100000,
+    "max_scratch_cells": 1048576,
+    "max_changed_cells": 1048576,
+    "max_cell_visits": 100000000
+  },
+  "operations": [
+    {
+      "id": "profile",
+      "tool": "t1",
+      "region": {
+        "version": 1,
+        "units": "mm",
+        "name": "retained-annulus",
+        "boundary_error_mm": 1.000000035527137e-07,
+        "components": [
+          {
+            "outer": {
+              "vertices": [
+                [
+                  28.0,
+                  20.0,
+                  0.9999999999999999
+                ],
+                [
+                  12.0,
+                  20.0,
+                  0.9999999999999999
+                ]
+              ]
+            },
+            "holes": [
+              {
+                "vertices": [
+                  [
+                    24.00000000000004,
+                    20.0,
+                    -0.9999999999999999
+                  ],
+                  [
+                    16.00000000000004,
+                    20.0,
+                    -0.9999999999999999
+                  ]
+                ]
+              }
+            ]
+          }
+        ],
+        "source": {
+          "revision": "contour-1",
+          "model": "CadQuery annulus",
+          "cadquery_version": "2.9.0.dev0",
+          "ocp_version": "8.0.1.1",
+          "python_version": "3.12.13",
+          "floor_z_mm": 10.0,
+          "adapter": "analytic_horizontal_lines_circles_v1",
+          "curve_counts": {
+            "circle": 2
+          },
+          "adapter_sha256": "7ef3f6f85b83e1ad0ef98371b1099adf5a5d10dd386bab989526723c68d9c4e7",
+          "error_components_mm": {
+            "chord": 0.0,
+            "joining": 3.552713678800501e-15,
+            "cad_topology": 1.0000000000000002e-07
+          },
+          "extraction_ms": 4.593932011630386
+        }
+      },
+      "floor_z_mm": 2,
+      "stepdown_mm": 2,
+      "clearance_z_mm": 12,
+      "boundaries": "all",
+      "radial_allowance_mm": 0,
+      "bottom_allowance_mm": 0,
+      "feed_mm_min": 600,
+      "plunge_mm_min": 150,
+      "boundary_tolerance_mm": 0.01,
+      "tolerance_mm": 1e-05,
+      "reverse": false,
+      "lead_in_mm": 0,
+      "lead_out_mm": 0,
+      "spindle_rpm": 12000,
+      "work_offset": 1,
+      "tool_number": 1,
+      "length_register": 1,
+      "coolant": "flood",
+      "kind": "contour"
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "units": "mm",
+  "name": "cadquery_round_island",
+  "boundary_error_mm": 1e-07,
+  "components": [
+    {
+      "outer": {
+        "vertices": [
+          [
+            20.0,
+            45.0,
+            0.0
+          ],
+          [
+            20.0,
+            15.0,
+            0.0
+          ],
+          [
+            60.0,
+            15.0,
+            0.0
+          ],
+          [
+            60.0,
+            45.0,
+            0.0
+          ]
+        ]
+      },
+      "holes": [
+        {
+          "vertices": [
+            [
+              45.0,
+              30.0,
+              -0.9999999999999999
+            ],
+            [
+              35.0,
+              30.0,
+              -0.9999999999999999
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "source": {
+    "kind": "cadquery",
+    "revision": "285607770198f10653c5e2386c6bbd3758d834f0",
+    "runtime_sha256": "819a8d66e304c42135342999f1fb3bf23b872fc0a123637817b5d0036e4beff3",
+    "generator_sha256": "a24fda0f16b343101a8bc24c0af91359164c687bf89281c74fca970a064f7e9a",
+    "face_reference": "pocket.bottom",
+    "body": "stock",
+    "parameters": {
+      "pocket_width_mm": 40.0,
+      "round_island": true
+    },
+    "build_ms": 29.311024001799524,
+    "cadquery_version": "2.9.0.dev0",
+    "ocp_version": "8.0.1.1",
+    "python_version": "3.12.13",
+    "floor_z_mm": 12.0,
+    "adapter": "analytic_horizontal_lines_circles_v1",
+    "curve_counts": {
+      "line": 4,
+      "circle": 1
+    },
+    "adapter_sha256": "9a2a381db656f310d692bd6a1d763db00949346f64a162156764b85c5ddecf28",
+    "error_components_mm": {
+      "chord": 0.0,
+      "joining": 0.0,
+      "cad_topology": 1e-07
+    },
+    "extraction_ms": 2.639374986756593,
+    "total_import_build_extract_ms": 2192.453472991474
+  }
+}

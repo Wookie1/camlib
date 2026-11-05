@@ -1,0 +1,79 @@
+{
+  "scope": "Independent SHA256 expected digests generated with Python hashlib/OpenSSL before enabling RustCrypto assembly backend; empty and abc standard vectors additionally checked in native test. Canonical identifiers/cache integrity must remain byte-for-byte unchanged.",
+  "oracle": {
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "ssl": "OpenSSL 3.0.13 30 Jan 2024"
+  },
+  "cases": [
+    {
+      "length": 0,
+      "pattern": "index_mod_251",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "length": 1,
+      "pattern": "index_mod_251",
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    },
+    {
+      "length": 55,
+      "pattern": "index_mod_251",
+      "sha256": "463eb28e72f82e0a96c0a4cc53690c571281131f672aa229e0d45ae59b598b59"
+    },
+    {
+      "length": 56,
+      "pattern": "index_mod_251",
+      "sha256": "da2ae4d6b36748f2a318f23e7ab1dfdf45acdc9d049bd80e59de82a60895f562"
+    },
+    {
+      "length": 63,
+      "pattern": "index_mod_251",
+      "sha256": "29af2686fd53374a36b0846694cc342177e428d1647515f078784d69cdb9e488"
+    },
+    {
+      "length": 64,
+      "pattern": "index_mod_251",
+      "sha256": "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
+    },
+    {
+      "length": 65,
+      "pattern": "index_mod_251",
+      "sha256": "4bfd2c8b6f1eec7a2afeb48b934ee4b2694182027e6d0fc075074f2fabb31781"
+    },
+    {
+      "length": 111,
+      "pattern": "index_mod_251",
+      "sha256": "60780e9451bdc43cf4530ffc95cbb0c4eb24dae2c39f55f334d679e076c08065"
+    },
+    {
+      "length": 112,
+      "pattern": "index_mod_251",
+      "sha256": "09373f127d34e61dbbaa8bc4499c87074f2ddb10e1b465f506d7d70a15011979"
+    },
+    {
+      "length": 127,
+      "pattern": "index_mod_251",
+      "sha256": "92ca0fa6651ee2f97b884b7246a562fa71250fedefe5ebf270d31c546bfea976"
+    },
+    {
+      "length": 128,
+      "pattern": "index_mod_251",
+      "sha256": "471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5"
+    },
+    {
+      "length": 129,
+      "pattern": "index_mod_251",
+      "sha256": "5099c6a56203f9687f7d33f4bfdf576d31dc91f6b695ecea38b2770c87631135"
+    },
+    {
+      "length": 1024,
+      "pattern": "index_mod_251",
+      "sha256": "2bce1ba628720664be4b9fdd77aae0678e5f0f3f02fc6ff641ec879094f6a404"
+    },
+    {
+      "length": 4194337,
+      "pattern": "index_mod_251",
+      "sha256": "a975eb68e045f4134831ab72cd9b2e27268ccabce5122f0338ba04682ab8128e"
+    }
+  ]
+}

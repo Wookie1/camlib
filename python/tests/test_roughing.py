@@ -1,0 +1,300 @@
+"""Real retained CAD roughing through normal Python, stock, replay and posts."""
+
+from camlib.postprocessor import GCodeDialect
+
+from dataclasses import replace
+from functools import lru_cache
+import importlib.util
+import math
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest import mock
+
+from camlib import Engine
+from camlib.jobs import Job, Setup, RegenerationCache
+from camlib.motion import Program
+from camlib.operations import Roughing, StockEdgeEntry
+from camlib.playback import Cursor, Player, RecordedRun
+from camlib.post import LoweringOptions, Machine, ToolSetting, post_events
+from camlib.simulation import OperationUpdate, Simulation, SimulationError
+
+
+@lru_cache(None)
+def example():
+    path = Path(__file__).resolve().parents[2] / 'python' / 'tests' / 'support' / 'roughing.py'
+    spec = importlib.util.spec_from_file_location('retained_roughing_example', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@lru_cache(None)
+def config(adaptive=False):
+    return example().roughing_job(adaptive)
+
+
+@lru_cache(None)
+def stream(adaptive=False):
+    c = config(adaptive)
+    events, report, helix, first = [], None, None, False
+    motions = 0
+    with Simulation(**c) as sim:
+        for update in sim.run_operations():
+            if isinstance(update, OperationUpdate):
+                if not adaptive:
+                    events.extend(update.events)
+                if update.stage == 'end':
+                    report = update.report
+            else:
+                m = update.motion
+                if not adaptive:
+                    events.append(dict(kind='motion', motion=m))
+                if m['curve']['kind'] == 'helix' and helix is None:
+                    # Only enclosed-opening helices contain fresh stock; outside
+                    # components descend through the independently proved air disk.
+                    # The motion's own index (the stock state may already hold
+                    # the rest of its decoded batch).
+                    helix = motions
+                motions += 1
+                if not first and sim.state.volume()['removed_lower_mm3'] > 0.001:
+                    first = True
+                    assert not sim.state.finished
+        assert first and sim.state.finished
+        return dict(
+            events=events,
+            report=report,
+            helix=helix,
+            count=sim.state.completed,
+            heights=sim.state.heights.tobytes(),
+            volume=sim.state.volume(),
+        )
+
+
+class RoughingTest(unittest.TestCase):
+    def test_stock_front_four_layer_cad_rough_streams_bulk_removal_and_completes(self):
+        c = example().roughing_job(stock_front=True, omit_empty_cuts=True)
+        self.assertEqual(c['operations'][0].clearing.path_strategy, 'stock_front')
+        first_removal = False
+        report = None
+        with Simulation(**c) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, OperationUpdate):
+                    if update.stage == 'end':
+                        report = update.report
+                elif not first_removal and sim.state.volume()['removed_lower_mm3'] > 1:
+                    self.assertFalse(sim.state.finished)
+                    first_removal = True
+            self.assertTrue(first_removal and sim.state.finished)
+            self.assertIsNotNone(report)
+            self.assertEqual(report['completed_layers'], 4)
+            self.assertEqual(report['motions'], sim.state.completed)
+            self.assertLessEqual(sim.state.completed, 10000)
+            self.assertGreater(sim.state.volume()['removed_lower_mm3'], 5500)
+            self.assertLess(sim.state.volume()['removed_upper_mm3'], 32 * 28 * 10 - 1888)
+            for layer in report['layers']:
+                front = layer['clearing']['front']
+                self.assertTrue(front['coverage_complete'])
+                self.assertEqual(front['completed_components'], 2)
+                self.assertGreater(front['bulk_contours'], 0)
+                self.assertLessEqual(front['max_bounded_engagement_deg'], report['max_engagement_deg'])
+
+    def test_empty_cut_policy_is_an_explicit_strict_python_boolean(self):
+        operation = config()['operations'][0]
+        self.assertNotIn('omit_empty_cuts', operation.to_dict())
+        self.assertIs(replace(operation, omit_empty_cuts=True).to_dict()['omit_empty_cuts'], True)
+        for value in (1, 'yes', None):
+            with self.assertRaisesRegex(ValueError, 'omit_empty_cuts'):
+                replace(operation, omit_empty_cuts=value).to_dict()
+
+    def test_real_cad_both_clearing_strategies_stream_actual_stock_and_typed_program(self):
+        solid = example().part().val()
+        self.assertTrue(solid.isValid())
+        self.assertAlmostEqual(solid.Volume(), 1888)
+        self.assertTrue(all(f.geomType() == 'PLANE' for f in solid.Faces()))
+        for adaptive in (False, True):
+            result = stream(adaptive)
+            report = result['report']
+            self.assertEqual(report['strategy'], 'roughing')
+            self.assertEqual(report['completed_layers'], 4)
+            self.assertGreaterEqual(report['stock_edge_entries'], 4)
+            self.assertGreaterEqual(report['helical_entries'], 4)
+            self.assertEqual(report['motions'], result['count'])
+            self.assertGreater(result['volume']['removed_lower_mm3'], 5500)
+            self.assertLess(result['volume']['removed_upper_mm3'], 32 * 28 * 10 - 1888)
+            self.assertAlmostEqual(report['target_z_mm'], 2.2 + report['floor_geometry_guard_mm'])
+            self.assertLess(report['floor_geometry_guard_mm'], 0.001)
+            self.assertEqual([item['tip_z_mm'] for item in report['layers'][:3]], [8, 6, 4])
+            if adaptive:
+                self.assertAlmostEqual(report['max_engagement_deg'], math.degrees(2 * math.acos(0.75)))
+                self.assertEqual(report['max_radial_engagement_mm'], 0.25)
+        c = config()
+        program = dict(
+            version=1,
+            id='roughing-program',
+            revision='1',
+            units='mm',
+            tolerance_mm=1e-5,
+            frame=dict(origin_mm=(0, 0, 0), x=(1, 0, 0), y=(0, 1, 0), z=(0, 0, 1)),
+            initial_position_mm=c['initial_position_mm'],
+            tools=[t.to_dict() for t in c['tools']],
+            events=stream()['events'],
+        )
+        with Engine() as engine:
+            summary = engine._request('validate_program', program=program, capabilities=None)['summary']
+            self.assertEqual(summary['motions'], stream()['count'])
+
+    def test_partial_enclosed_helix_replay_and_preflight_refusal(self):
+        for adaptive in (False, True):
+            c = config(adaptive)
+            with RecordedRun(**{'rapid_mm_min': 6000, **c}, checkpoint_every=256) as run:
+                run.wait(timeout=180)
+                player = Player(run)
+                index = stream(adaptive)['helix']
+                self.assertIsNotNone(index)
+                player.seek(Cursor(index))
+                before = player.state.volume()['removed_lower_mm3']
+                cursor = Cursor(index, 0.371)
+                player.seek(cursor)
+                self.assertEqual(player.motion['curve']['kind'], 'helix')
+                saved, position = player.state.heights.tobytes(), player.state.position
+                self.assertGreater(player.state.volume()['removed_lower_mm3'], before + 0.001)
+                player.seek(Cursor(run.status()['available']))
+                self.assertEqual(player.state.heights.tobytes(), stream(adaptive)['heights'])
+                player.seek(Cursor())
+                player.seek(cursor)
+                self.assertEqual(player.state.heights.tobytes(), saved)
+                self.assertEqual(player.state.position, position)
+                self.assertLessEqual(run.status()['largest_frame_bytes'], 8 * 1024 * 1024)
+        c = config()
+        # 40,000 layers (stepdown .0002) is refused by the engine's memory
+        # guard under an explicit budget, not by a fixed layer cap.
+        for op, budget in (
+            (replace(c['operations'][0], entry=StockEdgeEntry(helix=None)), None),
+            (replace(c['operations'][0], stepdown_mm=0.0002), 1 << 20),
+            (replace(c['operations'][0], radial_allowance_mm=-1), None),
+        ):
+            env = {"CAMLIB_MEMORY_BUDGET_BYTES": str(budget)} if budget else {}
+            with mock.patch.dict(os.environ, env), Simulation(**dict(c, operations=(op,))) as sim:
+                with self.assertRaises(SimulationError):
+                    list(sim.run_operations())
+                self.assertEqual(sim.state.completed, 0)
+        import cadquery as cq
+
+        parameters = dict(
+            top_z_mm=10, floor_z_mm=2, stepdown_mm=2, clearance_z_mm=12, clearing=c['operations'][0].clearing
+        )
+        supported = Roughing.from_solid(
+            'cylinder',
+            c['tools'][0],
+            cq.Workplane('XY').circle(3).extrude(4),
+            **{
+                'feed_mm_min': 600,
+                'plunge_mm_min': 150,
+                'spindle_rpm': 12000,
+                'tool_number': 1,
+                'length_register': 1,
+                'coolant': "flood",
+                **parameters,
+            },
+        )
+        self.assertLessEqual(supported.target.surface_error_mm, 0.005)
+        self.assertTrue(any(f['kind'] == 'CYLINDER' for f in supported.target.source['face_bounds']))
+        # General B-spline patches still lack an interpolation bound. A real
+        # nonuniformly scaled sphere exercises unsupported-surface preflight,
+        # while cylinders now use the bounded curved importer.
+        ellipsoid = (
+            cq.Workplane('XY')
+            .sphere(3)
+            .val()
+            .transformGeometry(cq.Matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1.5, 0], [0, 0, 0, 1]]))
+        )
+        self.assertTrue(ellipsoid.isValid())
+        with self.assertRaisesRegex(ValueError, 'no parametric interpolation bound'):
+            Roughing.from_solid(
+                'unsupported',
+                c['tools'][0],
+                ellipsoid,
+                **{
+                    'feed_mm_min': 600,
+                    'plunge_mm_min': 150,
+                    'spindle_rpm': 12000,
+                    'tool_number': 1,
+                    'length_register': 1,
+                    'coolant': "flood",
+                    **parameters,
+                },
+            )
+
+    def test_generic_python_checked_post_and_independent_setup_reuse(self):
+        c = config()
+        header = Program('posted-roughing', '1', c['tools'], c['initial_position_mm'], (), tolerance_mm=1e-5)
+        setting = ToolSetting.for_tool(
+            c['tools'][0], number=1, length_register=1, position_after_mm=c['initial_position_mm']
+        )
+        machine = Machine(
+            'Python roughing machine',
+            (setting,),
+            dialect=GCodeDialect.linuxcnc(),
+            output_units='mm',
+            decimals=3,
+            max_feed_mm_min=10000,
+            max_spindle_rpm=30000,
+            planes=('xy', 'xz', 'yz'),
+            arcs=True,
+            helices=True,
+            max_sweep_rad=6.283185307179586,
+            max_tool_number=99999,
+            max_length_register=99999,
+            tool_changes=True,
+            flood=True,
+            mist=True,
+            tool_change_position_mode='table',
+            rapid_mm_min=6000,
+        )
+        chunks = list(post_events(header, stream()['events'], machine=machine, lowering=LoweringOptions()))
+        self.assertTrue(chunks[-1].text.endswith('M2\n'))
+        self.assertTrue(all(m.curve.to_dict()['kind'] == 'line' for chunk in chunks for m in chunk.motions))
+        mappings = [m for chunk in chunks for m in chunk.data.get('mappings', ())]
+        helices = [
+            e['motion']['id']
+            for e in stream()['events']
+            if e['kind'] == 'motion' and e['motion']['curve']['kind'] == 'helix'
+        ]
+        for id in helices:
+            intervals = [m['source_fraction_interval'] for m in mappings if m['source_motion_id'] == id]
+            self.assertEqual(intervals[0][0], 0)
+            self.assertEqual(intervals[-1][1], 1)
+            self.assertTrue(all(a[1] == b[0] for a, b in zip(intervals, intervals[1:])))
+
+        def job(feed):
+            main = replace(c['operations'][0], feed_mm_min=feed)
+            other = replace(c['operations'][0], id='other-rough')
+            return Job(
+                'roughing-job',
+                str(feed),
+                tuple(
+                    Setup(id, c['stock'], c['tools'], (op,), c['initial_position_mm'])
+                    for id, op in [('main', main), ('other', other)]
+                ),
+            )
+
+        def collect(j, cache):
+            with j.regenerate(cache) as run:
+                for _ in run:
+                    pass
+                self.assertTrue(run.finished)
+                return dict(run.statistics), {k: s.heights.tobytes() for k, s in run.states.items()}
+
+        with TemporaryDirectory() as directory:
+            cache = RegenerationCache(directory)
+            cold, heights = collect(job(600), cache)
+            self.assertTrue(all(not v['cache_hit'] for v in cold.values()))
+            warm, same = collect(job(600), cache)
+            self.assertTrue(all(v['cache_hit'] for v in warm.values()))
+            self.assertEqual(heights, same)
+            changed, same = collect(job(700), cache)
+            self.assertFalse(changed[('main', 'rough')]['cache_hit'])
+            self.assertTrue(changed[('other', 'other-rough')]['cache_hit'])
+            self.assertEqual(heights, same)

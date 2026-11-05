@@ -1,0 +1,1195 @@
+//! Thermal profile cutting (plasma, laser) of sheet parts.
+//!
+//! Each part (a component of `parts`: an outer boundary with holes) is cut
+//! out along its kerf-compensated profile: the beam center runs half a kerf
+//! (plus the boundary margin) outside the part. A loop is entered from a
+//! pierce point in the scrap over an optional straight lead and a tangent arc
+//! lead, cut once around (plus an optional overcut), and left over a tangent
+//! arc and straight lead into the scrap again.
+//!
+//! Order: holes of a part before its outline, and parts that lie inside a
+//! hole of another part before that hole, so nothing is cut free before its
+//! inner features. Every lead and cut is proven not to touch any part, and
+//! every pierce point to keep `pierce_clearance_mm` from every part.
+use crate::{
+    contour::{Boundaries, Compensation},
+    motion::{CompensationSide, Curve, Event, Motion, MoveKind, Plane, Vec3},
+    planar::{Component, ConstructionOptions, PlanarRegion},
+    pocket::{ResidualStatus, Stroke},
+    stock::{CancelSignal, Stock, StockSpec},
+    tool::{Cutter, CutterShape, ToolAssembly, valid_id},
+    verification,
+};
+use serde::{Deserialize, Serialize};
+use std::f64::consts::{FRAC_PI_2, PI};
+
+/// How the torch or head height is controlled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeightMode {
+    /// The program holds one Z (the cut height); the controller or a fixed
+    /// focus handles pierce height and height control (QtPlasmaC, lasers).
+    #[default]
+    Fixed,
+    /// The program moves Z: travel height, down to the pierce height, beam
+    /// on, pierce delay, down to the cut height at the plunge feed.
+    Program,
+}
+
+/// A lead: a straight part of `length_mm` and a tangent arc of `radius_mm`
+/// (either may be zero), always on the scrap side.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lead {
+    #[serde(default)]
+    pub length_mm: f64,
+    #[serde(default)]
+    pub radius_mm: f64,
+}
+
+/// Small holes: a reduced feed and, by default, height control off
+/// (Hypertherm hole-quality guidance: slower speed, THC locked out).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmallHoles {
+    /// Holes up to this diameter (by their perimeter) count as small.
+    /// Default: 1.5 x the sheet thickness (Hypertherm's definition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_diameter_mm: Option<f64>,
+    /// Feed in small holes, percent of `feed_mm_min`.
+    pub feed_percent: f64,
+    #[serde(default = "yes")]
+    pub height_control_off: bool,
+}
+fn yes() -> bool {
+    true
+}
+fn full_power() -> f64 {
+    100.
+}
+fn boundary_tolerance() -> f64 {
+    0.01
+}
+
+/// Micro-joints: short uncut bridges that keep a part in the sheet. The
+/// beam turns off over each joint and fires again after it (no pierce
+/// clearance there: suited to lasers and thin plasma work).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MicroJoints {
+    /// Uncut width along the part edge.
+    pub width_mm: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacing_mm: Option<f64>,
+    /// Also on holes (default: outlines only).
+    #[serde(default)]
+    pub holes: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThermalCutOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::limits::Limits>,
+    pub id: String,
+    /// A beam tool: its cutter diameter is the kerf width.
+    pub tool: String,
+    /// The parts to keep, each an outer boundary with holes.
+    pub parts: PlanarRegion,
+    pub feed_mm_min: f64,
+    /// Nozzle (or focus) height above the sheet top while cutting.
+    pub cut_height_mm: f64,
+    #[serde(default)]
+    pub height_mode: HeightMode,
+    /// Program height mode: pierce and travel heights above the sheet top,
+    /// and the feed from the pierce height down to the cut height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pierce_height_mm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub travel_height_mm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plunge_mm_min: Option<f64>,
+    /// Dwell after the beam turns on, before moving.
+    #[serde(default)]
+    pub pierce_delay_s: f64,
+    /// Beam power while cutting (laser power, percent).
+    #[serde(default = "full_power")]
+    pub power_percent: f64,
+    pub lead_in: Lead,
+    pub lead_out: Lead,
+    /// Keep cutting this far past the loop start before the lead-out; a
+    /// negative value starts the lead-out that far before the loop closes
+    /// (negative overburn, recommended for holes with an arc lead-in).
+    #[serde(default)]
+    pub overcut_mm: f64,
+    /// Smallest distance from a pierce point to any part, beyond half the
+    /// kerf (the pierce crater). Default: the kerf width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pierce_clearance_mm: Option<f64>,
+    /// Torch height control on while cutting each loop (off over leads).
+    #[serde(default)]
+    pub height_control: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small_holes: Option<SmallHoles>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_joints: Option<MicroJoints>,
+    /// Default: outlines clockwise and holes counter-clockwise (the part on
+    /// the right of travel, the good side of a plasma arc with clockwise
+    /// swirl). True reverses both.
+    #[serde(default)]
+    pub reverse: bool,
+    /// "wear": the same beam-center path posted with G41/G42 so the operator
+    /// can trim the kerf at the controller (turned on over the straight
+    /// lead-in, off over the straight lead-out).
+    #[serde(default)]
+    pub compensation: Compensation,
+    #[serde(default = "boundary_tolerance")]
+    pub boundary_tolerance_mm: f64,
+    pub tolerance_mm: f64,
+    pub work_offset: u8,
+    pub tool_number: u32,
+    pub length_register: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThermalCutReport {
+    pub strategy: &'static str,
+    pub geometric_residual_status: ResidualStatus,
+    pub kerf_mm: f64,
+    pub applied_offset_mm: f64,
+    pub parts: usize,
+    pub loops: usize,
+    pub small_holes: usize,
+    pub pierces: usize,
+    pub micro_joints: usize,
+    pub cut_length_mm: f64,
+    /// Loop order: (part index, hole index or None for the outline).
+    pub order: Vec<(usize, Option<usize>)>,
+    pub loops_completed: usize,
+    pub diagnostics: Vec<String>,
+}
+
+enum Step {
+    Move(Curve, MoveKind, Option<f64>),
+    Event(Event),
+    /// A loop is complete (for the report).
+    Done,
+}
+
+pub struct ThermalCutPlan {
+    id: String,
+    tool: String,
+    work_offset: u8,
+    tool_number: u32,
+    length_register: u32,
+    initial: Vec3,
+    spec: StockSpec,
+    steps: std::collections::VecDeque<Step>,
+    events: Vec<Event>,
+    next_id: u64,
+    expected_generation: Option<u64>,
+    drained: bool,
+    tolerance: f64,
+    report: ThermalCutReport,
+}
+
+/// The point at length fraction t of an XY line or arc.
+fn point_at(c: &Curve, t: f64) -> Vec3 {
+    if t <= 0. {
+        return c.start();
+    }
+    if t >= 1. {
+        return c.end();
+    }
+    match *c {
+        Curve::Line { start, end } => std::array::from_fn(|i| start[i] + t * (end[i] - start[i])),
+        Curve::Arc {
+            start,
+            center,
+            sweep_rad,
+            ..
+        }
+        | Curve::Helix {
+            start,
+            center,
+            sweep_rad,
+            ..
+        } => {
+            let r = (start[0] - center[0]).hypot(start[1] - center[1]);
+            let a = (start[1] - center[1]).atan2(start[0] - center[0]) + t * sweep_rad;
+            [center[0] + r * a.cos(), center[1] + r * a.sin(), start[2]]
+        }
+    }
+}
+/// The part of an XY line or arc between length fractions t0 and t1.
+fn part_of(c: &Curve, t0: f64, t1: f64) -> Curve {
+    let (start, end) = (point_at(c, t0), point_at(c, t1));
+    match *c {
+        Curve::Line { .. } => Curve::Line { start, end },
+        Curve::Arc {
+            center,
+            plane,
+            sweep_rad,
+            ..
+        }
+        | Curve::Helix {
+            center,
+            plane,
+            sweep_rad,
+            ..
+        } => Curve::Arc {
+            start,
+            end,
+            center,
+            plane,
+            sweep_rad: sweep_rad * (t1 - t0),
+        },
+    }
+}
+
+fn rot_left(v: [f64; 2]) -> [f64; 2] {
+    [-v[1], v[0]]
+}
+fn add(p: [f64; 2], v: [f64; 2], k: f64) -> [f64; 2] {
+    [p[0] + k * v[0], p[1] + k * v[1]]
+}
+
+/// A flat cylinder tool used only to prove clearance from the parts.
+fn probe_tool(diameter: f64, reach: f64) -> ToolAssembly {
+    ToolAssembly {
+        id: "kerf-probe".into(),
+        cutter: Cutter {
+            id: "kerf-probe".into(),
+            name: String::new(),
+            shape: CutterShape::Flat,
+            diameter_mm: diameter,
+            cutting_length_mm: reach,
+            overall_length_mm: reach + 4.,
+            shank_diameter_mm: diameter,
+            flutes: 1,
+            center_cutting: true,
+            material: String::new(),
+            neck: None,
+        },
+        stickout_mm: reach + 1.,
+        gauge_length_mm: reach + 3.,
+        // The probe's holder is the same cylinder: anything above the
+        // cutting length is still the kerf (no wider body is claimed).
+        holders: vec![crate::tool::HolderSection {
+            z_min_mm: reach + 1.,
+            z_max_mm: reach + 3.,
+            radius_min_mm: diameter / 2.,
+            radius_max_mm: diameter / 2.,
+        }],
+    }
+}
+
+impl ThermalCutPlan {
+    pub fn prepare(
+        op: ThermalCutOperation,
+        assembly: &ToolAssembly,
+        spec: &StockSpec,
+        initial: Vec3,
+        first_id: u64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Self, String> {
+        if cancel.is_cancelled() {
+            return Err("thermal cut planning cancelled".into());
+        }
+        spec.grid()?;
+        let tool = assembly.prepare()?;
+        let cutter = tool.cutter().definition();
+        let kerf = cutter.diameter_mm;
+        let top = spec.max_mm[2];
+        let guard = 16. * op.tolerance_mm;
+        let program = op.height_mode == HeightMode::Program;
+        let pierce_h = op.pierce_height_mm.unwrap_or(op.cut_height_mm);
+        let travel_h = op.travel_height_mm.unwrap_or(pierce_h);
+        let lead_ok = |l: &Lead| {
+            l.length_mm.is_finite()
+                && l.radius_mm.is_finite()
+                && l.length_mm >= 0.
+                && l.radius_mm >= 0.
+        };
+        crate::heights::require(
+            "thermal cut",
+            [
+                (valid_id(&op.id), format!("id {:?} is not a valid identifier", op.id)),
+                (
+                    op.tool == assembly.id,
+                    format!("tool {:?} does not match the assembly {:?}", op.tool, assembly.id),
+                ),
+                (
+                    matches!(cutter.shape, CutterShape::Beam),
+                    "thermal cutting needs a beam tool (camlib.tools.Torch or LaserHead): its diameter is the kerf".into(),
+                ),
+                (
+                    (1e-7..=0.01).contains(&op.tolerance_mm)
+                        && (0.0001..=0.1).contains(&op.boundary_tolerance_mm)
+                        && op.tolerance_mm <= op.boundary_tolerance_mm / 64.,
+                    "tolerance_mm must be within 1e-7..0.01 and at most boundary_tolerance_mm (0.0001..0.1) / 64".into(),
+                ),
+                (
+                    op.feed_mm_min.is_finite() && op.feed_mm_min > 0.,
+                    format!("feed_mm_min {} must be positive", op.feed_mm_min),
+                ),
+                (
+                    op.cut_height_mm.is_finite() && op.cut_height_mm > guard && op.cut_height_mm <= 1000.,
+                    format!("cut_height_mm {} must be positive (the nozzle stays above the sheet)", op.cut_height_mm),
+                ),
+                (
+                    program || (op.pierce_height_mm.is_none() && op.travel_height_mm.is_none() && op.plunge_mm_min.is_none()),
+                    "pierce_height_mm, travel_height_mm and plunge_mm_min need height_mode=\"program\" (the controller sets them in fixed mode)".into(),
+                ),
+                (
+                    !program
+                        || (pierce_h.is_finite()
+                            && travel_h.is_finite()
+                            && op.cut_height_mm <= pierce_h
+                            && pierce_h <= travel_h
+                            && travel_h <= 1000.
+                            && op.plunge_mm_min.is_some_and(|f| f.is_finite() && f > 0.)),
+                    "program heights need cut_height_mm <= pierce_height_mm <= travel_height_mm and a positive plunge_mm_min".into(),
+                ),
+                (
+                    op.pierce_delay_s.is_finite() && (0. ..=1e3).contains(&op.pierce_delay_s),
+                    format!("pierce_delay_s {} must be 0..1000", op.pierce_delay_s),
+                ),
+                (
+                    op.power_percent.is_finite() && op.power_percent > 0. && op.power_percent <= 100.,
+                    format!("power_percent {} must be in (0, 100]", op.power_percent),
+                ),
+                (
+                    lead_ok(&op.lead_in) && lead_ok(&op.lead_out) && op.overcut_mm.is_finite(),
+                    "lead lengths and radii must not be negative".into(),
+                ),
+                (
+                    op.compensation == Compensation::Computer
+                        || (op.lead_in.length_mm > guard && op.lead_out.length_mm > guard),
+                    "wear compensation turns G41/G42 on over the straight lead-in and off over the straight lead-out: set both lead length_mm".into(),
+                ),
+                (
+                    op.pierce_clearance_mm.is_none_or(|c| c.is_finite() && c >= 0.),
+                    "pierce_clearance_mm must not be negative".into(),
+                ),
+                (
+                    op.small_holes.is_none_or(|s| {
+                        s.max_diameter_mm.is_none_or(|d| d.is_finite() && d > 0.)
+                            && s.feed_percent.is_finite()
+                            && s.feed_percent > 0.
+                            && s.feed_percent <= 100.
+                    }),
+                    "small_holes needs a positive max_diameter_mm and feed_percent in (0, 100]".into(),
+                ),
+                (
+                    op.micro_joints.is_none_or(|j| {
+                        j.width_mm.is_finite()
+                            && j.width_mm > 0.
+                            && j.count.is_some() != j.spacing_mm.is_some()
+                            && j.count.is_none_or(|n| (1..=1000).contains(&n))
+                            && j.spacing_mm.is_none_or(|s| s.is_finite() && s > 0.)
+                    }),
+                    "micro_joints need a positive width_mm and either a count (1..1000) or a spacing_mm".into(),
+                ),
+                (
+                    op.micro_joints.is_none() || op.compensation == Compensation::Computer,
+                    "micro-joints turn the beam off and on inside the loop, which cutter compensation does not allow".into(),
+                ),
+                ((1..=9).contains(&op.work_offset), format!("work_offset {} must be 1..9", op.work_offset)),
+                (
+                    op.tool_number > 0 && op.length_register > 0,
+                    "tool_number and length_register must be positive".into(),
+                ),
+                (
+                    initial.iter().all(|n| n.is_finite() && n.abs() <= 1e6) && first_id > 0,
+                    "start position must be finite".into(),
+                ),
+            ],
+        )?;
+        let z_cut = top + op.cut_height_mm;
+        let (z_pierce, z_travel) = if program {
+            (top + pierce_h, top + travel_h)
+        } else {
+            (z_cut, z_cut)
+        };
+        let options = ConstructionOptions {
+            tolerance_mm: op.tolerance_mm,
+        };
+        let source = op.parts.prepare(options)?;
+        let error = source.summary().boundary_error_mm;
+        let margin = op.boundary_tolerance_mm / 2.;
+        if 2. * error + margin + guard > op.boundary_tolerance_mm {
+            return Err(
+                "thermal cut CAD/source uncertainty exceeds boundary tolerance budget".into(),
+            );
+        }
+        let offset = kerf / 2. + error + margin;
+        let prepared = crate::profiles::offset_profiles(
+            &source,
+            offset,
+            Boundaries::All,
+            false,
+            options,
+            cancel,
+        )?;
+        let definition = source.definition().clone();
+        // Nesting depth: how many holes of other parts contain each part.
+        let holes: Vec<(usize, crate::planar::PreparedRegion)> = definition
+            .components
+            .iter()
+            .enumerate()
+            .flat_map(|(i, c)| c.holes.iter().map(move |h| (i, h)))
+            .map(|(i, h)| {
+                PlanarRegion {
+                    version: 1,
+                    units: "mm".into(),
+                    source: serde_json::Value::Null,
+                    name: "hole".into(),
+                    components: vec![Component {
+                        outer: h.clone(),
+                        holes: vec![],
+                    }],
+                    boundary_error_mm: definition.boundary_error_mm,
+                }
+                .prepare(options)
+                .map(|r| (i, r))
+            })
+            .collect::<Result<_, _>>()?;
+        let depth = definition
+            .components
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let v = c.outer.vertices[0];
+                let mut d = 0;
+                for (owner, hole) in &holes {
+                    if *owner != i
+                        && hole.query([v[0], v[1]])?.signed_clearance_mm.unwrap_or(-1.) > 0.
+                    {
+                        d += 1;
+                    }
+                }
+                Ok(d)
+            })
+            .collect::<Result<Vec<usize>, String>>()?;
+        // Loops: the part on the right of travel unless reversed.
+        struct Loop {
+            strokes: Vec<Stroke>,
+            part: usize,
+            hole: Option<usize>,
+            length: f64,
+        }
+        let mut loops = vec![];
+        for p in prepared.loops {
+            let mut strokes = p.strokes;
+            let mut area = 0.;
+            for s in &strokes {
+                let c = s.curve(0.);
+                let mid = c.prepare(op.tolerance_mm)?.position(0.5)?;
+                for (a, b) in [(c.start(), mid), (mid, c.end())] {
+                    area += a[0] * b[1] - b[0] * a[1];
+                }
+            }
+            // Counter-clockwise (area > 0) puts the inside on the left: the
+            // part is inside an outline, outside a hole loop.
+            let part_left = (area > 0.) == p.hole.is_none();
+            if part_left != op.reverse {
+                strokes = strokes.into_iter().rev().map(Stroke::reversed).collect();
+            }
+            let length = strokes.iter().map(crate::profiles::stroke_length).sum();
+            loops.push(Loop {
+                strokes,
+                part: p.component,
+                hole: p.hole,
+                length,
+            });
+        }
+        if loops.is_empty() {
+            return Err("thermal cut has no part loops".into());
+        }
+        // Order: deepest parts first; within a part its holes, then its
+        // outline; parts of equal depth nearest first.
+        let mut order = vec![];
+        let mut remaining: Vec<usize> = (0..definition.components.len()).collect();
+        let mut at = [initial[0], initial[1]];
+        while !remaining.is_empty() {
+            let deepest = remaining.iter().map(|&i| depth[i]).max().unwrap();
+            let (k, _) = remaining
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| depth[**i] == deepest)
+                .map(|(k, &i)| {
+                    let v = definition.components[i].outer.vertices[0];
+                    (k, (v[0] - at[0]).hypot(v[1] - at[1]))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            let part = remaining.remove(k);
+            let mut own: Vec<usize> = (0..loops.len())
+                .filter(|&l| loops[l].part == part)
+                .collect();
+            // Holes nearest first, the outline last.
+            let mut ordered = vec![];
+            while let Some((k, _)) = own
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| loops[**l].hole.is_some())
+                .map(|(k, &l)| {
+                    let s = loops[l].strokes[0].a;
+                    (k, (s[0] - at[0]).hypot(s[1] - at[1]))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+            {
+                let l = own.remove(k);
+                at = loops[l].strokes[0].a;
+                ordered.push(l);
+            }
+            ordered.extend(own);
+            if let Some(&l) = ordered.last() {
+                at = loops[l].strokes[0].a;
+            }
+            order.extend(ordered);
+        }
+        // Proofs: the kerf (with the boundary margin) never touches a part,
+        // and each pierce crater stays clear of every part.
+        let thickness = top - spec.min_mm[2];
+        let z_check = spec.min_mm[2];
+        // Checked part by part (only the parts a probe can reach).
+        let scenes = verification::ComponentScenes::new(
+            "thermal-parts",
+            &op.id,
+            "parts",
+            &definition,
+            [spec.min_mm[2], top],
+            verification::Options {
+                tolerance_mm: op.tolerance_mm,
+                spatial_resolution_mm: (op.boundary_tolerance_mm / 16.).max(op.tolerance_mm),
+                ..Default::default()
+            },
+        )?;
+        let kerf_probe = probe_tool(kerf, thickness + 1.).prepare()?;
+        let pierce_clearance = op.pierce_clearance_mm.unwrap_or(kerf);
+        let crater_probe = probe_tool(kerf + 2. * pierce_clearance, thickness + 1.).prepare()?;
+        let probe = |tool: &crate::tool::PreparedAssembly,
+                     curve: Curve,
+                     what: &str|
+         -> Result<(), String> {
+            let motion = Motion {
+                id: first_id,
+                operation: op.id.clone(),
+                tool: "kerf-probe".into(),
+                curve,
+                kind: MoveKind::Cut,
+                feed_mm_min: Some(op.feed_mm_min),
+            };
+            if let Some(check) = scenes.verify_motion(tool, &motion, cancel)?.unclear {
+                return Err(format!(
+                    "thermal cut {what} is not proven clear of the parts ({:?}); move the lead or shorten it: {:?}",
+                    check.status,
+                    check.findings.first()
+                ));
+            }
+            Ok(())
+        };
+        let at_z = |p: [f64; 2], z: f64| [p[0], p[1], z];
+        let mut steps = std::collections::VecDeque::new();
+        let mut pos = initial;
+        let mut report_order = vec![];
+        let mut small = 0;
+        let mut micro_joints = 0;
+        let mut cut_length = 0.;
+        let mut diagnostics = prepared.diagnostics;
+        let power = op.power_percent;
+        let line = |a: Vec3, b: Vec3| Curve::Line { start: a, end: b };
+        let push_move = |steps: &mut std::collections::VecDeque<Step>,
+                         end: Vec3,
+                         pos: &mut Vec3,
+                         kind,
+                         feed| {
+            if *pos != end {
+                steps.push_back(Step::Move(line(*pos, end), kind, feed));
+                *pos = end;
+            }
+        };
+        if !program && pos[2] != z_cut {
+            push_move(
+                &mut steps,
+                [pos[0], pos[1], z_cut],
+                &mut pos,
+                MoveKind::Rapid,
+                None,
+            );
+        }
+        for &l in &order {
+            let lp = &loops[l];
+            report_order.push((lp.part, lp.hole));
+            let is_small = lp.hole.is_some()
+                && op.small_holes.is_some_and(|s| {
+                    lp.length / PI + kerf <= s.max_diameter_mm.unwrap_or(1.5 * thickness)
+                });
+            small += usize::from(is_small);
+            let feed = if is_small {
+                op.feed_mm_min * op.small_holes.unwrap().feed_percent / 100.
+            } else {
+                op.feed_mm_min
+            };
+            let thc =
+                op.height_control && !(is_small && op.small_holes.unwrap().height_control_off);
+            // Leads inside a hole stay well inside it.
+            let limit = if lp.hole.is_some() {
+                0.45 * lp.length / (2. * PI)
+            } else {
+                f64::INFINITY
+            };
+            let lead = |l: Lead| Lead {
+                length_mm: l.length_mm.min(limit),
+                radius_mm: l.radius_mm.min(limit),
+            };
+            let (mut lin, lout) = (lead(op.lead_in), lead(op.lead_out));
+            if lin.length_mm < op.lead_in.length_mm || lin.radius_mm < op.lead_in.radius_mm {
+                diagnostics.push(format!(
+                    "part {} hole {:?}: leads shortened to fit the hole",
+                    lp.part, lp.hole
+                ));
+            }
+            let side = if op.reverse { -1. } else { 1. };
+            // Scrap side: left of travel unless reversed.
+            let scrap = |t: [f64; 2]| {
+                let n = rot_left(t);
+                [side * n[0], side * n[1]]
+            };
+            let s0 = lp.strokes[0];
+            let start = s0.a;
+            let t = s0.tangent(false);
+            let n = scrap(t);
+            let geometry = |l: Lead| {
+                let center = add(start, n, l.radius_mm);
+                let a = add(center, t, -l.radius_mm);
+                (center, a, add(a, n, l.length_mm))
+            };
+            let crater = |p: [f64; 2]| line(at_z(p, top + 1.), at_z(p, z_check));
+            let (mut center, mut a, mut pierce) = geometry(lin);
+            let first = probe(&crater_probe, crater(pierce), "pierce point");
+            if let Err(error) = first {
+                // In a hole: pierce at its center instead (Hypertherm's
+                // small-hole practice), with a smaller arc if needed.
+                let reach = lp.length / (2. * PI);
+                let fallback = lp.hole.and_then(|_| {
+                    [0.45, 0.25, 0.1, 0.]
+                        .into_iter()
+                        .map(|k| {
+                            let r = lin.radius_mm.min(k * reach);
+                            Lead {
+                                radius_mm: r,
+                                length_mm: (reach - r).max(0.),
+                            }
+                        })
+                        .find(|l| {
+                            probe(&crater_probe, crater(geometry(*l).2), "pierce point").is_ok()
+                        })
+                });
+                let Some(l) = fallback else {
+                    return Err(error);
+                };
+                diagnostics.push(format!(
+                    "part {} hole {:?}: pierced at the hole center (lead {:.3} mm, arc radius {:.3} mm)",
+                    lp.part, lp.hole, l.length_mm, l.radius_mm
+                ));
+                lin = l;
+                (center, a, pierce) = geometry(l);
+            }
+            // Travel to the pierce point and pierce.
+            if program {
+                push_move(
+                    &mut steps,
+                    [pos[0], pos[1], z_travel.max(pos[2])],
+                    &mut pos,
+                    MoveKind::Rapid,
+                    None,
+                );
+                push_move(
+                    &mut steps,
+                    at_z(pierce, pos[2]),
+                    &mut pos,
+                    MoveKind::Rapid,
+                    None,
+                );
+                push_move(
+                    &mut steps,
+                    at_z(pierce, z_pierce),
+                    &mut pos,
+                    MoveKind::Rapid,
+                    None,
+                );
+            } else {
+                push_move(
+                    &mut steps,
+                    at_z(pierce, z_cut),
+                    &mut pos,
+                    MoveKind::Rapid,
+                    None,
+                );
+            }
+            steps.push_back(Step::Event(Event::Beam {
+                power_percent: power,
+            }));
+            if op.pierce_delay_s > 0. {
+                steps.push_back(Step::Event(Event::Dwell {
+                    seconds: op.pierce_delay_s,
+                }));
+            }
+            push_move(
+                &mut steps,
+                at_z(pierce, z_cut),
+                &mut pos,
+                MoveKind::Plunge,
+                op.plunge_mm_min,
+            );
+            let wear = op.compensation == Compensation::Wear;
+            let comp_side = if op.reverse {
+                CompensationSide::Left
+            } else {
+                CompensationSide::Right
+            };
+            // Lead-in: straight, then the tangent arc onto the loop.
+            let mut cuts: Vec<(Curve, MoveKind)> = vec![];
+            if lin.length_mm > 0. {
+                cuts.push((line(at_z(pierce, z_cut), at_z(a, z_cut)), MoveKind::Lead));
+            }
+            if lin.radius_mm > 0. {
+                cuts.push((
+                    Curve::Arc {
+                        start: at_z(a, z_cut),
+                        end: at_z(start, z_cut),
+                        center: at_z(center, z_cut),
+                        plane: Plane::Xy,
+                        sweep_rad: side * FRAC_PI_2,
+                    },
+                    MoveKind::Lead,
+                ));
+            }
+            let lead_in_moves = cuts.len();
+            // A negative overcut stops that far before the loop closes.
+            let mut short = (-op.overcut_mm).clamp(0., 0.5 * lp.length);
+            let mut end = (start, t);
+            let mut kept = lp.strokes.len();
+            while short > guard && kept > 0 {
+                let s = &lp.strokes[kept - 1];
+                let length = crate::profiles::stroke_length(s);
+                if length > short + guard {
+                    break;
+                }
+                short -= length;
+                kept -= 1;
+            }
+            for (k, s) in lp.strokes[..kept].iter().enumerate() {
+                if k + 1 == kept && short > guard {
+                    let length = crate::profiles::stroke_length(s);
+                    let f = 1. - short / length;
+                    cuts.push((
+                        crate::profiles::sub_curve(s, 0., f, z_cut, z_cut),
+                        MoveKind::Cut,
+                    ));
+                    let e = crate::profiles::stroke_point(s, f);
+                    end = (
+                        e,
+                        Stroke {
+                            a: e,
+                            b: s.b,
+                            arc: s.arc,
+                        }
+                        .tangent(false),
+                    );
+                } else {
+                    cuts.push((s.curve(z_cut), MoveKind::Cut));
+                    end = (s.b, s.tangent(true));
+                }
+            }
+            // Overcut: on around the loop from its start.
+            let mut left = op.overcut_mm.clamp(0., lp.length);
+            for s in &lp.strokes {
+                if left <= guard {
+                    break;
+                }
+                let length = crate::profiles::stroke_length(s);
+                let f = (left / length).min(1.);
+                cuts.push((
+                    crate::profiles::sub_curve(s, 0., f, z_cut, z_cut),
+                    MoveKind::Cut,
+                ));
+                let e = crate::profiles::stroke_point(s, f);
+                let tangent = if f >= 1. {
+                    s.tangent(true)
+                } else {
+                    let probe_s = Stroke {
+                        a: e,
+                        b: s.b,
+                        arc: s.arc,
+                    };
+                    probe_s.tangent(false)
+                };
+                end = (e, tangent);
+                left -= length * f;
+            }
+            let mut cut_moves = cuts.len();
+            // Lead-out: the tangent arc, then straight into the scrap.
+            let (e, te) = end;
+            let ne = scrap(te);
+            let c_out = add(e, ne, lout.radius_mm);
+            let b = add(c_out, te, lout.radius_mm);
+            let q = add(b, ne, lout.length_mm);
+            if lout.radius_mm > 0. {
+                cuts.push((
+                    Curve::Arc {
+                        start: at_z(e, z_cut),
+                        end: at_z(b, z_cut),
+                        center: at_z(c_out, z_cut),
+                        plane: Plane::Xy,
+                        sweep_rad: side * FRAC_PI_2,
+                    },
+                    MoveKind::Lead,
+                ));
+            }
+            if lout.length_mm > 0. {
+                cuts.push((line(at_z(b, z_cut), at_z(q, z_cut)), MoveKind::Lead));
+            }
+            // Micro-joints: gaps along the loop, the beam off over each.
+            let mut joints = 0;
+            if let Some(j) = op.micro_joints.filter(|j| lp.hole.is_none() || j.holes) {
+                let n = j.count.map_or_else(
+                    || (lp.length / j.spacing_mm.unwrap()).round().max(1.) as usize,
+                    |n| n as usize,
+                );
+                let half = (j.width_mm + kerf) / 2.;
+                if lp.length / (2. * n as f64) <= half + guard {
+                    return Err(format!(
+                        "{n} micro-joints of width {} do not fit a loop {:.3} mm long",
+                        j.width_mm, lp.length
+                    ));
+                }
+                let gaps: Vec<(f64, f64)> = (0..n)
+                    .map(|k| {
+                        let c = (k as f64 + 0.5) * lp.length / n as f64;
+                        (c - half, c + half)
+                    })
+                    .collect();
+                let mut split = vec![];
+                let mut along = 0.;
+                let mut touched = vec![false; gaps.len()];
+                for (k, (curve, kind)) in cuts.into_iter().enumerate() {
+                    if kind != MoveKind::Cut || k >= cut_moves {
+                        split.push((curve, kind));
+                        continue;
+                    }
+                    let length = curve.prepare(op.tolerance_mm)?.length_mm();
+                    let (s0, s1) = (along, along + length);
+                    along = s1;
+                    let mut t = 0.;
+                    for (gi, &(g0, g1)) in gaps.iter().enumerate() {
+                        if g1 <= s0 || g0 >= s1 {
+                            continue;
+                        }
+                        touched[gi] = true;
+                        let a = ((g0 - s0) / length).clamp(0., 1.);
+                        let b = ((g1 - s0) / length).clamp(0., 1.);
+                        if a > t {
+                            split.push((part_of(&curve, t, a), MoveKind::Cut));
+                        }
+                        let from = point_at(&curve, a.max(t));
+                        let to = point_at(&curve, b);
+                        split.push((line(from, to), MoveKind::Rapid));
+                        t = b;
+                    }
+                    if t < 1. {
+                        split.push((
+                            if t == 0. {
+                                curve
+                            } else {
+                                part_of(&curve, t, 1.)
+                            },
+                            MoveKind::Cut,
+                        ));
+                    }
+                }
+                joints = touched.iter().filter(|t| **t).count();
+                cut_moves = split
+                    .iter()
+                    .enumerate()
+                    .skip(lead_in_moves)
+                    .find(|(_, (_, k))| *k == MoveKind::Lead)
+                    .map_or(split.len(), |(i, _)| i);
+                cuts = split;
+            }
+            for (k, (curve, kind)) in cuts.into_iter().enumerate() {
+                if kind == MoveKind::Rapid {
+                    // Over a joint: beam off, across, fire again.
+                    if thc {
+                        steps.push_back(Step::Event(Event::HeightControl { on: false }));
+                    }
+                    steps.push_back(Step::Event(Event::Beam { power_percent: 0. }));
+                    pos = curve.end();
+                    steps.push_back(Step::Move(curve, MoveKind::Rapid, None));
+                    steps.push_back(Step::Event(Event::Beam {
+                        power_percent: power,
+                    }));
+                    if op.pierce_delay_s > 0. {
+                        steps.push_back(Step::Event(Event::Dwell {
+                            seconds: op.pierce_delay_s,
+                        }));
+                    }
+                    if thc {
+                        steps.push_back(Step::Event(Event::HeightControl { on: true }));
+                    }
+                    continue;
+                }
+                let mut check = curve.clone();
+                for p in match &mut check {
+                    Curve::Line { start, end } => vec![start, end],
+                    Curve::Arc {
+                        start, end, center, ..
+                    }
+                    | Curve::Helix {
+                        start, end, center, ..
+                    } => {
+                        vec![start, end, center]
+                    }
+                } {
+                    p[2] = z_check;
+                }
+                probe(
+                    &kerf_probe,
+                    check,
+                    if kind == MoveKind::Cut {
+                        "kerf path"
+                    } else {
+                        "lead"
+                    },
+                )?;
+                if wear && k == 0 {
+                    steps.push_back(Step::Event(Event::CutterCompensation {
+                        side: comp_side,
+                        plane: crate::motion::Plane::Xy,
+                    }));
+                }
+                if thc && k == lead_in_moves {
+                    steps.push_back(Step::Event(Event::HeightControl { on: true }));
+                }
+                if thc && k == cut_moves {
+                    steps.push_back(Step::Event(Event::HeightControl { on: false }));
+                }
+                if wear
+                    && kind == MoveKind::Lead
+                    && k >= cut_moves
+                    && matches!(curve, Curve::Line { .. })
+                {
+                    steps.push_back(Step::Event(Event::CutterCompensation {
+                        side: CompensationSide::Off,
+                        plane: crate::motion::Plane::Xy,
+                    }));
+                }
+                if kind == MoveKind::Cut {
+                    cut_length += curve.prepare(op.tolerance_mm)?.length_mm();
+                }
+                pos = curve.end();
+                steps.push_back(Step::Move(curve, kind, Some(feed)));
+            }
+            if thc
+                && steps.iter().rev().find_map(|s| match s {
+                    Step::Event(Event::HeightControl { on }) => Some(*on),
+                    _ => None,
+                }) == Some(true)
+            {
+                steps.push_back(Step::Event(Event::HeightControl { on: false }));
+            }
+            steps.push_back(Step::Event(Event::Beam { power_percent: 0. }));
+            steps.push_back(Step::Done);
+            micro_joints += joints;
+            if program {
+                push_move(
+                    &mut steps,
+                    [pos[0], pos[1], z_travel],
+                    &mut pos,
+                    MoveKind::Rapid,
+                    None,
+                );
+            }
+        }
+        // Validate the complete outline before emitting any beam-on event.
+        // A clipped thermal outline would no longer produce the requested part.
+        if let Some(limits) = op.limits.as_ref().filter(|l| !l.is_empty()) {
+            let prepared = crate::limits::PreparedLimits::new(limits, kerf / 2., op.tolerance_mm)?;
+            for step in &steps {
+                if let Step::Move(curve, kind, _) = step {
+                    let cutting = !kind.is_rapid();
+                    let checked = if cutting {
+                        // The beam reaches the sheet bottom even when the nozzle
+                        // stays above the top of an avoid area.
+                        let lower = |mut p: Vec3| {
+                            p[2] = spec.min_mm[2];
+                            p
+                        };
+                        match curve {
+                            Curve::Line { start, end } => Curve::Line {
+                                start: lower(*start),
+                                end: lower(*end),
+                            },
+                            Curve::Arc {
+                                start,
+                                end,
+                                center,
+                                plane,
+                                sweep_rad,
+                            } => Curve::Arc {
+                                start: lower(*start),
+                                end: lower(*end),
+                                center: lower(*center),
+                                plane: *plane,
+                                sweep_rad: *sweep_rad,
+                            },
+                            Curve::Helix { .. } => {
+                                return Err("thermal limits: unexpected helical path".into());
+                            }
+                        }
+                    } else {
+                        curve.clone()
+                    };
+                    // A vertical pierce becomes a stationary beam footprint
+                    // when projected to the sheet bottom.
+                    let allowed = if checked.start() == checked.end()
+                        && matches!(checked, Curve::Line { .. })
+                    {
+                        let p = checked.start();
+                        prepared.margin([p[0], p[1]], p[2], cutting)? >= 0.
+                    } else {
+                        prepared.allows_curve(&checked, cutting)?
+                    };
+                    if !allowed {
+                        return Err(format!(
+                            "thermal cut {}: a {kind:?} move reaches an avoid area or leaves containment; change the limits or part placement",
+                            op.id
+                        ));
+                    }
+                }
+            }
+        }
+        // Events before the first move are handed out before it.
+        let mut events = vec![];
+        while let Some(Step::Event(_)) = steps.front() {
+            if let Some(Step::Event(e)) = steps.pop_front() {
+                events.push(e);
+            }
+        }
+        let report = ThermalCutReport {
+            strategy: "thermal_cut",
+            geometric_residual_status: ResidualStatus::Pending,
+            kerf_mm: kerf,
+            applied_offset_mm: offset,
+            parts: definition.components.len(),
+            loops: order.len(),
+            small_holes: small,
+            pierces: order.len(),
+            micro_joints,
+            cut_length_mm: cut_length,
+            order: report_order,
+            loops_completed: 0,
+            diagnostics,
+        };
+        Ok(Self {
+            id: op.id,
+            tool: op.tool,
+            work_offset: op.work_offset,
+            tool_number: op.tool_number,
+            length_register: op.length_register,
+            initial,
+            spec: spec.clone(),
+            steps,
+            events,
+            next_id: first_id,
+            expected_generation: None,
+            drained: false,
+            tolerance: op.tolerance_mm,
+            report,
+        })
+    }
+    pub fn report(&self) -> &ThermalCutReport {
+        &self.report
+    }
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+    pub fn prefix_events(&self) -> Vec<Event> {
+        vec![
+            Event::WorkOffset {
+                number: self.work_offset,
+            },
+            Event::ToolChange {
+                tool: self.tool.clone(),
+                number: self.tool_number,
+                length_register: self.length_register,
+                position_after_mm: self.initial,
+            },
+        ]
+    }
+    pub fn suffix_events(&self) -> Vec<Event> {
+        vec![]
+    }
+    pub fn finish_report(&mut self, cancel: &impl CancelSignal) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("thermal cut report cancelled".into());
+        }
+        if !self.drained {
+            return Err("drain committed thermal cut motions first".into());
+        }
+        self.report.geometric_residual_status = ResidualStatus::Estimated;
+        Ok(())
+    }
+    pub fn next_motion_with_stock(
+        &mut self,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Motion>, String> {
+        if stock.spec() != &self.spec
+            || self
+                .expected_generation
+                .is_some_and(|g| g != stock.generation())
+        {
+            return Err("commit preceding thermal cut motion to matching stock".into());
+        }
+        if cancel.is_cancelled() {
+            return Err("thermal cut cancelled".into());
+        }
+        while let Some(step) = self.steps.pop_front() {
+            match step {
+                Step::Event(e) => self.events.push(e),
+                Step::Done => self.report.loops_completed += 1,
+                Step::Move(curve, kind, feed) => {
+                    curve.prepare(self.tolerance)?;
+                    let m = Motion {
+                        id: self.next_id,
+                        operation: self.id.clone(),
+                        tool: self.tool.clone(),
+                        curve,
+                        kind,
+                        feed_mm_min: if kind.is_rapid() { None } else { feed },
+                    };
+                    self.next_id += 1;
+                    self.expected_generation = Some(stock.generation() + 1);
+                    // Events due right after this move stay queued until the
+                    // next call hands them out with take_events.
+                    while let Some(Step::Event(_) | Step::Done) = self.steps.front() {
+                        match self.steps.pop_front() {
+                            Some(Step::Event(e)) => self.events.push(e),
+                            Some(Step::Done) => self.report.loops_completed += 1,
+                            _ => unreachable!(),
+                        }
+                    }
+                    return Ok(Some(m));
+                }
+            }
+        }
+        self.drained = true;
+        Ok(None)
+    }
+}

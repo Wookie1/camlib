@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "run": {
+    "id": "helical-adaptive",
+    "revision": "helical-1"
+  },
+  "stock": {
+    "version": 1,
+    "units": "mm",
+    "min_mm": [
+      0,
+      0,
+      0
+    ],
+    "max_mm": [
+      32,
+      24,
+      10
+    ],
+    "cell_size_mm": 0.4,
+    "max_cells": 1048576
+  },
+  "tools": [
+    {
+      "id": "t1",
+      "cutter": {
+        "id": "em4",
+        "name": "em4",
+        "shape": {
+          "kind": "flat"
+        },
+        "diameter_mm": 4,
+        "cutting_length_mm": 20,
+        "overall_length_mm": 50,
+        "shank_diameter_mm": 4,
+        "flutes": 3,
+        "center_cutting": true,
+        "material": "carbide",
+        "neck": null
+      },
+      "stickout_mm": 30,
+      "gauge_length_mm": 60,
+      "holders": [
+        {
+          "z_min_mm": 30,
+          "z_max_mm": 60,
+          "radius_min_mm": 4,
+          "radius_max_mm": 4
+        }
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "id": "helical",
+      "tool": "t1",
+      "region": {
+        "version": 1,
+        "units": "mm",
+        "name": "helical-island",
+        "boundary_error_mm": 1.0000000000000002e-07,
+        "components": [
+          {
+            "outer": {
+              "vertices": [
+                [
+                  29.0,
+                  3.0,
+                  0.0
+                ],
+                [
+                  3.0,
+                  3.0,
+                  0.0
+                ],
+                [
+                  3.0,
+                  21.0,
+                  0.0
+                ],
+                [
+                  29.0,
+                  21.0,
+                  0.0
+                ]
+              ]
+            },
+            "holes": [
+              {
+                "vertices": [
+                  [
+                    19.0,
+                    12.0,
+                    0.9999999999999999
+                  ],
+                  [
+                    13.0,
+                    12.0,
+                    0.9999999999999999
+                  ]
+                ]
+              }
+            ]
+          }
+        ],
+        "source": {
+          "model": "CadQuery island pocket",
+          "revision": "helical-1",
+          "cadquery_version": "2.9.0.dev0",
+          "ocp_version": "8.0.1.1",
+          "python_version": "3.12.13",
+          "floor_z_mm": 6.0,
+          "adapter": "analytic_horizontal_lines_circles_v1",
+          "curve_counts": {
+            "line": 4,
+            "circle": 1
+          },
+          "adapter_sha256": "c51a74031f07eb9a17590173051c73cbf2360a94b30cae2cc40e4c038e25dfb6",
+          "error_components_mm": {
+            "chord": 0.0,
+            "joining": 0.0,
+            "cad_topology": 1.0000000000000002e-07
+          },
+          "extraction_ms": 1.2207250110805035
+        }
+      },
+      "top_z_mm": 10,
+      "floor_z_mm": 6,
+      "stepdown_mm": 2,
+      "stepover_mm": 1.5,
+      "clearance_z_mm": 12,
+      "feed_mm_min": 600,
+      "plunge_mm_min": 150,
+      "radial_allowance_mm": 0,
+      "bottom_allowance_mm": 0,
+      "tolerance_mm": 1e-05,
+      "spindle_rpm": 12000,
+      "work_offset": 1,
+      "tool_number": 1,
+      "length_register": 1,
+      "coolant": "flood",
+      "entry": {
+        "kind": "helix",
+        "angle_rad": 0.05235987755982989
+      },
+      "kind": "adaptive_pocket",
+      "max_engagement_deg": 90,
+      "boundary_tolerance_mm": 0.01,
+      "clockwise": true,
+      "orbit_radius_mm": 1,
+      "min_orbit_radius_mm": 0.25,
+      "local_orbit_tolerance_mm": 0.05
+    }
+  ],
+  "initial_position_mm": [
+    0,
+    0,
+    12
+  ],
+  "sweep": {
+    "tolerance_mm": 1e-05,
+    "chord_error_mm": 0.002,
+    "max_tip_step_mm": 0.1,
+    "max_segments": 100000,
+    "max_scratch_cells": 1048576,
+    "max_changed_cells": 1048576,
+    "max_cell_visits": 100000000
+  }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "camlib-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+camlib = { path = "../.." }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+crc32fast = "=1.5.0"
+pyo3 = { version = "=0.27.2", features = ["extension-module", "abi3-py312"] }

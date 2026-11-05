@@ -1,0 +1,513 @@
+//! Lazy whole-stock planar facing. Coverage and exterior entry/link contract:
+//! docs/facing.md. Nominal coverage is separate from stock/model uncertainty.
+use crate::{
+    motion::{Coolant, Curve, Event, Motion, MoveKind, SpindleDirection, Vec3},
+    pocket::ResidualStatus,
+    stock::{CancelSignal, Stock, StockSpec},
+    tool::{CutterShape, ToolAssembly, valid_id},
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraverseAxis {
+    X,
+    Y,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FacingMode {
+    Zigzag,
+    OneWay,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FacingOperation {
+    pub id: String,
+    pub tool: String,
+    pub floor_z_mm: f64,
+    pub stepdown_mm: f64,
+    pub stepover_mm: f64,
+    pub clearance_z_mm: f64,
+    pub feed_mm_min: f64,
+    pub plunge_mm_min: f64,
+    pub axis: TraverseAxis,
+    pub mode: FacingMode,
+    pub reverse: bool,
+    pub entry_air_gap_mm: f64,
+    pub edge_overlap_mm: Option<f64>,
+    pub tolerance_mm: f64,
+    pub spindle_rpm: f64,
+    pub work_offset: u8,
+    pub tool_number: u32,
+    pub length_register: u32,
+    pub coolant: Coolant,
+    /// Rapid travel height between rows (absolute Z). Default: clearance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retract_z_mm: Option<f64>,
+    /// Rapid descent stops here and plunge feed begins; leaving a row, feed
+    /// changes to rapid here (absolute Z, above the stock top). Default: retract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_z_mm: Option<f64>,
+    /// Containment and avoid areas (clamps, fixtures, features to leave alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::limits::Limits>,
+}
+#[derive(Debug, Serialize)]
+pub struct FacingReport {
+    pub strategy: &'static str,
+    pub geometric_residual_status: ResidualStatus,
+    pub depth_passes: usize,
+    pub rows_per_pass: usize,
+    pub row_pitch_mm: f64,
+    pub target_z_mm: f64,
+    pub stock_xy_min_mm: [f64; 2],
+    pub stock_xy_max_mm: [f64; 2],
+    pub center_xy_min_mm: [f64; 2],
+    pub center_xy_max_mm: [f64; 2],
+    pub edge_overlap_mm: f64,
+    pub entry_air_gap_mm: f64,
+    pub axis: TraverseAxis,
+    pub mode: FacingMode,
+    pub cut_rows_emitted: usize,
+    pub side_links_emitted: usize,
+    pub clearance_returns: usize,
+    pub nominal_uncovered_area_mm2: f64,
+    pub entry_policy: &'static str,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Lift,
+    Approach,
+    Entry,
+    Cut,
+    SideLink,
+    Retract,
+    /// Feed height -> retract height (clearance after the last row).
+    Rise,
+    /// Travel height -> feed height above the next row start.
+    Descend,
+    Done,
+}
+pub struct FacingPlan {
+    op: FacingOperation,
+    heights: crate::heights::Heights,
+    spec: StockSpec,
+    initial: Vec3,
+    position: Vec3,
+    axis: usize,
+    low: f64,
+    high: f64,
+    first_row: f64,
+    last_row: f64,
+    pass: usize,
+    row: usize,
+    phase: Phase,
+    drained: bool,
+    next_id: u64,
+    expected_generation: Option<u64>,
+    report: FacingReport,
+}
+impl FacingPlan {
+    pub fn prepare(
+        op: FacingOperation,
+        assembly: &ToolAssembly,
+        spec: &StockSpec,
+        initial: Vec3,
+        first_id: u64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Self, String> {
+        if cancel.is_cancelled() {
+            return Err("facing planning cancelled".into());
+        }
+        spec.grid()?;
+        let prepared = assembly.prepare()?;
+        let cutter = prepared.cutter().definition();
+        let r = cutter.diameter_mm / 2.;
+        let guard = 16. * op.tolerance_mm;
+        let overlap = op.edge_overlap_mm.unwrap_or(cutter.diameter_mm * 0.1);
+        let numbers = [
+            op.floor_z_mm,
+            op.stepdown_mm,
+            op.stepover_mm,
+            op.clearance_z_mm,
+            op.feed_mm_min,
+            op.plunge_mm_min,
+            op.entry_air_gap_mm,
+            overlap,
+            op.tolerance_mm,
+            op.spindle_rpm,
+        ];
+        crate::heights::require(
+            "facing",
+            [
+                (
+                    valid_id(&op.id),
+                    format!("id {:?} is not a valid identifier", op.id),
+                ),
+                (
+                    op.tool == assembly.id,
+                    format!(
+                        "tool {:?} does not match the assembly {:?}",
+                        op.tool, assembly.id
+                    ),
+                ),
+                (
+                    matches!(cutter.shape, CutterShape::Flat),
+                    "facing needs a flat end mill".into(),
+                ),
+                (
+                    numbers.iter().all(|n| n.is_finite()),
+                    "all numeric parameters must be finite".into(),
+                ),
+                (
+                    (1e-7..=0.01).contains(&op.tolerance_mm),
+                    format!("tolerance_mm {} must be within 1e-7..0.01", op.tolerance_mm),
+                ),
+                (
+                    op.floor_z_mm >= spec.min_mm[2] && op.floor_z_mm < spec.max_mm[2],
+                    format!(
+                        "floor_z_mm {} must be within the stock Z range {}..{}",
+                        op.floor_z_mm, spec.min_mm[2], spec.max_mm[2]
+                    ),
+                ),
+                (
+                    spec.max_mm[2] - op.floor_z_mm <= cutter.cutting_length_mm - guard,
+                    format!(
+                        "facing depth {} below the stock top exceeds the cutting length {}",
+                        spec.max_mm[2] - op.floor_z_mm,
+                        cutter.cutting_length_mm
+                    ),
+                ),
+                (
+                    op.stepdown_mm > guard && op.stepdown_mm <= cutter.cutting_length_mm,
+                    format!(
+                        "stepdown_mm {} must be positive and at most the cutting length {}",
+                        op.stepdown_mm, cutter.cutting_length_mm
+                    ),
+                ),
+                (
+                    op.stepover_mm > guard && op.stepover_mm <= 2. * (r - guard),
+                    format!(
+                        "stepover_mm {} must be positive and less than the cutter diameter {}",
+                        op.stepover_mm, cutter.diameter_mm
+                    ),
+                ),
+                (
+                    (0. ..=r - guard).contains(&overlap),
+                    format!(
+                        "edge_overlap_mm {overlap} must be between 0 and the cutter radius {r}"
+                    ),
+                ),
+                (
+                    op.entry_air_gap_mm >= guard,
+                    format!("entry_air_gap_mm {} must be positive", op.entry_air_gap_mm),
+                ),
+                (
+                    op.feed_mm_min > 0. && op.plunge_mm_min > 0. && op.spindle_rpm > 0.,
+                    format!(
+                        "feed_mm_min {}, plunge_mm_min {} and spindle_rpm {} must be positive",
+                        op.feed_mm_min, op.plunge_mm_min, op.spindle_rpm
+                    ),
+                ),
+                (
+                    op.clearance_z_mm > spec.max_mm[2] + guard && op.clearance_z_mm.abs() <= 1e6,
+                    format!(
+                        "clearance_z_mm {} must be above the stock top {}",
+                        op.clearance_z_mm, spec.max_mm[2]
+                    ),
+                ),
+                (
+                    initial.iter().all(|n| n.is_finite() && n.abs() <= 1e6),
+                    "start position must be finite".into(),
+                ),
+                (
+                    initial[2] >= op.clearance_z_mm,
+                    format!(
+                        "start Z {} is below clearance_z_mm {}",
+                        initial[2], op.clearance_z_mm
+                    ),
+                ),
+                (
+                    (1..=9).contains(&op.work_offset),
+                    format!("work_offset {} must be 1..9", op.work_offset),
+                ),
+                (
+                    op.tool_number > 0 && op.length_register > 0,
+                    "tool_number and length_register must be positive".into(),
+                ),
+            ],
+        )?;
+        let axis = if op.axis == TraverseAxis::X { 0 } else { 1 };
+        let cross = 1 - axis;
+        let low = spec.min_mm[axis] - r - op.entry_air_gap_mm - guard;
+        let high = spec.max_mm[axis] + r + op.entry_air_gap_mm + guard;
+        let first_row = spec.min_mm[cross] + r - overlap - guard;
+        let last_row = spec.max_mm[cross] - r + overlap + guard;
+        let (first_row, last_row, rows, pitch) = if first_row >= last_row {
+            let midpoint = (spec.min_mm[cross] + spec.max_mm[cross]) / 2.;
+            (midpoint, midpoint, 1, 0.)
+        } else {
+            let span = last_row - first_row;
+            let intervals = (span / op.stepover_mm).ceil() as usize;
+            (
+                first_row,
+                last_row,
+                intervals.saturating_add(1),
+                span / intervals as f64,
+            )
+        };
+        let passes = ((spec.max_mm[2] - op.floor_z_mm) / op.stepdown_mm).ceil() as usize;
+        if passes == 0
+            || first_id == 0
+            || first_id.checked_add(1).is_none()
+            || [low, high, first_row, last_row]
+                .iter()
+                .any(|n| !n.is_finite() || n.abs() > 1e6)
+        {
+            return Err("facing exceeds bounded rows/passes/IDs or coordinate overtravel".into());
+        }
+        let mut xymin = [0.; 2];
+        let mut xymax = [0.; 2];
+        xymin[axis] = low;
+        xymin[cross] = first_row;
+        xymax[axis] = high;
+        xymax[cross] = last_row;
+        let report = FacingReport {
+            strategy: "facing",
+            geometric_residual_status: ResidualStatus::Pending,
+            depth_passes: passes,
+            rows_per_pass: rows,
+            row_pitch_mm: pitch,
+            target_z_mm: op.floor_z_mm,
+            stock_xy_min_mm: [spec.min_mm[0], spec.min_mm[1]],
+            stock_xy_max_mm: [spec.max_mm[0], spec.max_mm[1]],
+            center_xy_min_mm: xymin,
+            center_xy_max_mm: xymax,
+            edge_overlap_mm: overlap,
+            entry_air_gap_mm: op.entry_air_gap_mm,
+            axis: op.axis,
+            mode: op.mode,
+            cut_rows_emitted: 0,
+            side_links_emitted: 0,
+            clearance_returns: 0,
+            nominal_uncovered_area_mm2: 0.,
+            entry_policy: "vertical entries and zigzag links outside initial stock; one-way returns at clearance",
+        };
+        let heights = crate::heights::Heights::resolve(
+            op.clearance_z_mm,
+            op.retract_z_mm,
+            op.feed_z_mm,
+            spec.max_mm[2],
+            guard,
+        )?;
+        Ok(Self {
+            heights,
+            op,
+            spec: spec.clone(),
+            initial,
+            position: initial,
+            axis,
+            low,
+            high,
+            first_row,
+            last_row,
+            pass: 0,
+            row: 0,
+            phase: Phase::Lift,
+            drained: false,
+            next_id: first_id,
+            expected_generation: None,
+            report,
+        })
+    }
+    pub fn report(&self) -> &FacingReport {
+        &self.report
+    }
+    pub fn prefix_events(&self) -> Vec<Event> {
+        vec![
+            Event::WorkOffset {
+                number: self.op.work_offset,
+            },
+            Event::ToolChange {
+                tool: self.op.tool.clone(),
+                number: self.op.tool_number,
+                length_register: self.op.length_register,
+                position_after_mm: self.initial,
+            },
+            Event::Spindle {
+                rpm: self.op.spindle_rpm,
+                direction: SpindleDirection::Cw,
+            },
+            Event::Coolant {
+                mode: self.op.coolant,
+            },
+        ]
+    }
+    pub fn suffix_events(&self) -> Vec<Event> {
+        vec![
+            Event::Coolant { mode: Coolant::Off },
+            Event::Spindle {
+                rpm: 0.,
+                direction: SpindleDirection::Cw,
+            },
+        ]
+    }
+    pub fn finish_report(&mut self, cancel: &impl CancelSignal) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("facing report cancelled".into());
+        }
+        if !self.drained {
+            return Err("drain committed facing motions before final report".into());
+        }
+        self.report.geometric_residual_status = ResidualStatus::Estimated;
+        Ok(())
+    }
+    fn row_point(&self, row: usize, z: f64, end: bool) -> Vec3 {
+        let reverse = self.op.reverse ^ (self.op.mode == FacingMode::Zigzag && row % 2 == 1);
+        let mut p = [0., 0., z];
+        p[self.axis] = if reverse ^ end { self.high } else { self.low };
+        p[1 - self.axis] = if row + 1 == self.report.rows_per_pass {
+            self.last_row
+        } else {
+            self.first_row + row as f64 * self.report.row_pitch_mm
+        };
+        p
+    }
+    fn emit(&mut self, end: Vec3, kind: MoveKind) -> Result<Option<Motion>, String> {
+        if end == self.position {
+            return Ok(None);
+        }
+        let curve = Curve::Line {
+            start: self.position,
+            end,
+        };
+        curve.prepare(self.op.tolerance_mm)?;
+        let motion = Motion {
+            id: self.next_id,
+            operation: self.op.id.clone(),
+            tool: self.op.tool.clone(),
+            kind,
+            curve,
+            feed_mm_min: if kind == MoveKind::Rapid {
+                None
+            } else {
+                Some(if kind == MoveKind::Plunge {
+                    self.op.plunge_mm_min
+                } else {
+                    self.op.feed_mm_min
+                })
+            },
+        };
+        self.position = end;
+        self.next_id += 1;
+        Ok(Some(motion))
+    }
+    pub fn next_motion_with_stock(
+        &mut self,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Motion>, String> {
+        if stock.spec() != &self.spec
+            || stock.generation() == u64::MAX
+            || self
+                .expected_generation
+                .is_some_and(|g| g != stock.generation())
+        {
+            return Err("commit preceding facing motion to matching stock before planning".into());
+        }
+        loop {
+            if cancel.is_cancelled() {
+                return Err("facing planning cancelled".into());
+            }
+            let z = (self.spec.max_mm[2] - (self.pass + 1) as f64 * self.op.stepdown_mm)
+                .max(self.op.floor_z_mm);
+            let result = match self.phase {
+                Phase::Lift => {
+                    let m = self.emit(
+                        [self.position[0], self.position[1], self.heights.clearance],
+                        MoveKind::Rapid,
+                    )?;
+                    self.phase = Phase::Approach;
+                    m
+                }
+                Phase::Approach => {
+                    // Travel at the current rapid height (clearance first,
+                    // then the retract height).
+                    let m = self.emit(
+                        self.row_point(self.row, self.position[2], false),
+                        MoveKind::Rapid,
+                    )?;
+                    self.phase = Phase::Descend;
+                    m
+                }
+                Phase::Descend => {
+                    let m = self.emit(
+                        [self.position[0], self.position[1], self.heights.feed],
+                        MoveKind::Rapid,
+                    )?;
+                    self.phase = Phase::Entry;
+                    m
+                }
+                Phase::Entry => {
+                    let m = self.emit(self.row_point(self.row, z, false), MoveKind::Plunge)?;
+                    self.phase = Phase::Cut;
+                    m
+                }
+                Phase::Cut => {
+                    let m = self.emit(self.row_point(self.row, z, true), MoveKind::Cut)?;
+                    self.report.cut_rows_emitted += 1;
+                    self.phase = if self.op.mode == FacingMode::Zigzag
+                        && self.row + 1 < self.report.rows_per_pass
+                    {
+                        Phase::SideLink
+                    } else {
+                        Phase::Retract
+                    };
+                    m
+                }
+                Phase::SideLink => {
+                    let m = self.emit(self.row_point(self.row + 1, z, false), MoveKind::Link)?;
+                    self.report.side_links_emitted += 1;
+                    self.row += 1;
+                    self.phase = Phase::Cut;
+                    m
+                }
+                Phase::Retract => {
+                    let m = self.emit(
+                        [self.position[0], self.position[1], self.heights.feed],
+                        MoveKind::Retract,
+                    )?;
+                    self.report.clearance_returns += 1;
+                    self.phase = Phase::Rise;
+                    m
+                }
+                Phase::Rise => {
+                    self.row += 1;
+                    if self.row == self.report.rows_per_pass {
+                        self.row = 0;
+                        self.pass += 1;
+                    }
+                    let last = self.pass == self.report.depth_passes;
+                    let z = if last {
+                        self.heights.clearance
+                    } else {
+                        self.heights.retract
+                    };
+                    let m = self.emit([self.position[0], self.position[1], z], MoveKind::Rapid)?;
+                    self.phase = if last { Phase::Done } else { Phase::Approach };
+                    m
+                }
+                Phase::Done => {
+                    self.drained = true;
+                    return Ok(None);
+                }
+            };
+            if result.is_some() {
+                self.expected_generation = Some(stock.generation() + 1);
+                return Ok(result);
+            }
+        }
+    }
+}

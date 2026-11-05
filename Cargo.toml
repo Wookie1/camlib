@@ -1,0 +1,44 @@
+[package]
+name = "camlib"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/stevecad/camlib"
+readme = "README.md"
+description = "Native CAM engine with a Python API: three-axis milling, turning and plasma/laser cutting"
+publish = false
+
+[workspace]
+members = [".", "bindings/python"]
+default-members = ["."]
+resolver = "3"
+
+[features]
+profile-planning = []
+
+[dependencies]
+robust = "=1.2.0"
+cavalier_contours = "=0.9.0"
+clipper2-rust = "=1.2.0"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "=0.10.9"
+crc32fast = "=1.5.0"
+
+
+[[bin]]
+name = "cam-sim-stream"
+path = "src/bin/sim_stream.rs"
+
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.iteration]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true

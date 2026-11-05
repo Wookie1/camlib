@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=78", "wheel>=0.42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "camlib"
+version = "0.1.0"
+description = "Python-programmable native CAM engine: three-axis milling, turning and plasma/laser cutting"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+
+[project.urls]
+Repository = "https://github.com/stevecad/camlib"
+Documentation = "https://github.com/stevecad/camlib/tree/main/docs"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+packages = ["camlib"]
+include-package-data = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Explicit, so every ruff version checks the same rules: syntax and
+# statement errors and pyflakes (undefined/unused names, imports).
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+quote-style = "preserve"

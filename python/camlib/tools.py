@@ -1,0 +1,248 @@
+"""Immutable Python tool definitions, validated/prepared by the Rust engine.
+
+All profile heights are millimetres above the tool tip toward the spindle.
+Feeds/speeds belong to the program, not this geometry definition.
+"""
+
+from dataclasses import dataclass, asdict
+import math
+
+
+@dataclass(frozen=True)
+class Neck:
+    diameter_mm: float
+    length_mm: float
+
+
+@dataclass(frozen=True)
+class Cutter:
+    id: str
+    name: str
+    shape: tuple
+    diameter_mm: float
+    cutting_length_mm: float
+    overall_length_mm: float
+    shank_diameter_mm: float
+    flutes: int
+    center_cutting: bool
+    material: str
+    neck: Neck | None = None
+
+    def to_dict(self):
+        result = asdict(self)
+        result["shape"] = dict(self.shape)
+        return result
+
+    @classmethod
+    def from_dict(cls, data):
+        data = dict(data)
+        data["shape"] = tuple(data["shape"].items())
+        if data.get("neck") is not None:
+            data["neck"] = Neck(**data["neck"])
+        return cls(**data)
+
+
+def _cutter(
+    id,
+    shape,
+    *,
+    diameter,
+    flute_length,
+    overall_length,
+    shank_diameter=None,
+    flutes=3,
+    center_cutting=True,
+    material="carbide",
+    name=None,
+    neck=None,
+):
+    return Cutter(
+        id,
+        name or id,
+        tuple(shape.items()),
+        diameter,
+        flute_length,
+        overall_length,
+        diameter if shank_diameter is None else shank_diameter,
+        flutes,
+        center_cutting,
+        material,
+        neck,
+    )
+
+
+def EndMill(id, **dimensions):
+    return _cutter(id, {"kind": "flat"}, **dimensions)
+
+
+def BallEndMill(id, **dimensions):
+    return _cutter(id, {"kind": "ball"}, **dimensions)
+
+
+def BullEndMill(id, *, corner_radius, **dimensions):
+    return _cutter(id, {"kind": "bull", "corner_radius_mm": corner_radius}, **dimensions)
+
+
+def Drill(id, *, point_angle=118, **dimensions):
+    dimensions.setdefault("flutes", 2)
+    return _cutter(id, {"kind": "drill", "point_angle_rad": math.radians(point_angle)}, **dimensions)
+
+
+def ChamferMill(id, *, angle=90, tip_diameter=0, **dimensions):
+    return _cutter(
+        id,
+        {"kind": "chamfer", "included_angle_rad": math.radians(angle), "tip_diameter_mm": tip_diameter},
+        **dimensions,
+    )
+
+
+def ThreadMill(
+    id,
+    *,
+    diameter,
+    tooth_height,
+    neck_diameter,
+    neck_length,
+    overall_length,
+    shank_diameter=None,
+    flutes=3,
+    material="carbide",
+    name=None,
+):
+    """Single-profile thread mill: a tooth of ``diameter`` and ``tooth_height``
+    on a neck. Modeled as a flat, non-center-cutting cutter with a neck, so
+    the stock shows the swept tooth envelope (not the thread form)."""
+    return _cutter(
+        id,
+        {"kind": "flat"},
+        diameter=diameter,
+        flute_length=tooth_height,
+        overall_length=overall_length,
+        shank_diameter=shank_diameter,
+        flutes=flutes,
+        center_cutting=False,
+        material=material,
+        name=name,
+        neck=Neck(neck_diameter, neck_length),
+    )
+
+
+def BoringBar(
+    id,
+    *,
+    diameter,
+    bar_diameter,
+    reach,
+    overall_length,
+    insert_length=1,
+    shank_diameter=None,
+    material="carbide",
+    name=None,
+):
+    """Single-point boring bar: the insert cuts ``diameter`` at the end of a
+    bar of ``bar_diameter`` reaching ``reach`` below the shank. Modeled as a
+    flat, non-center-cutting cutter of the bore diameter (``insert_length``
+    long) on a neck of the bar, so fine boring can prove its shift stays in
+    the bore. The stopped bar lies within its diameter except the cutting
+    edge."""
+    if not 0 < insert_length < reach:
+        raise ValueError("insert_length must be positive and shorter than reach")
+    return _cutter(
+        id,
+        {"kind": "flat"},
+        diameter=diameter,
+        flute_length=insert_length,
+        overall_length=overall_length,
+        shank_diameter=shank_diameter,
+        flutes=1,
+        center_cutting=False,
+        material=material,
+        name=name,
+        neck=Neck(bar_diameter, reach - insert_length),
+    )
+
+
+def _beam(id, kerf_width, nozzle_diameter, nozzle_length, body_diameter, body_length, name):
+    if not 0 < kerf_width < nozzle_diameter <= body_diameter:
+        raise ValueError("kerf_width < nozzle_diameter <= body_diameter")
+    cutter = _cutter(
+        id,
+        {"kind": "beam"},
+        diameter=kerf_width,
+        flute_length=nozzle_length / 2,
+        overall_length=nozzle_length,
+        shank_diameter=nozzle_diameter,
+        flutes=1,
+        center_cutting=True,
+        material="",
+        name=name,
+    )
+    # The body (torch or laser head) above the nozzle, for collision checks.
+    holder = (
+        HolderSection(nozzle_length * 0.75, nozzle_length * 0.75 + body_length, body_diameter / 2, body_diameter / 2),
+    )
+    return ToolAssembly(id, cutter, nozzle_length * 0.75, nozzle_length * 0.75 + body_length, holder)
+
+
+def Torch(id, *, kerf_width, nozzle_diameter=6, nozzle_length=20, body_diameter=30, body_length=150, name=None):
+    """Plasma torch: the arc cuts a kerf of ``kerf_width`` through the whole
+    sheet below the nozzle tip. The nozzle and torch body are collision
+    geometry. Returns a ToolAssembly ready for ThermalCut."""
+    return _beam(id, kerf_width, nozzle_diameter, nozzle_length, body_diameter, body_length, name)
+
+
+def LaserHead(id, *, kerf_width, nozzle_diameter=3, nozzle_length=15, body_diameter=25, body_length=80, name=None):
+    """Laser cutting head: the beam cuts a kerf of ``kerf_width`` through the
+    sheet below the nozzle (focus) tip. Returns a ToolAssembly."""
+    return _beam(id, kerf_width, nozzle_diameter, nozzle_length, body_diameter, body_length, name)
+
+
+def Tap(id, *, drill_diameter, thread_length, overall_length, shank_diameter, flutes=3, material="hss", name=None):
+    """Tap modeled by its drill (minor) diameter: a flat, non-center-cutting
+    cutter whose cutting length is the thread length. The stock then keeps
+    the thread flanks (conservative). The pitch belongs to the operation."""
+    return _cutter(
+        id,
+        {"kind": "flat"},
+        diameter=drill_diameter,
+        flute_length=thread_length,
+        overall_length=overall_length,
+        shank_diameter=shank_diameter,
+        flutes=flutes,
+        center_cutting=False,
+        material=material,
+        name=name,
+    )
+
+
+@dataclass(frozen=True)
+class HolderSection:
+    z_min_mm: float
+    z_max_mm: float
+    radius_min_mm: float
+    radius_max_mm: float
+
+
+@dataclass(frozen=True)
+class ToolAssembly:
+    id: str
+    cutter: Cutter
+    stickout_mm: float
+    gauge_length_mm: float
+    holders: tuple[HolderSection, ...]
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "cutter": self.cutter.to_dict(),
+            "stickout_mm": self.stickout_mm,
+            "gauge_length_mm": self.gauge_length_mm,
+            "holders": [asdict(s) for s in self.holders],
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        data = dict(data)
+        data["cutter"] = Cutter.from_dict(data["cutter"])
+        data["holders"] = tuple(HolderSection(**s) for s in data["holders"])
+        return cls(**data)

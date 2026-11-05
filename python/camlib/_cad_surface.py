@@ -1,0 +1,399 @@
+"""CAD-kernel triangulation with independently bounded parametric interpolation.
+
+The CAD kernel supplies valid trimmed-face topology. Requested mesher deflection
+is only a seed: surface Hessians and trimming-curve derivative bounds determine
+acceptance. No sampled distance is used as an error certificate.
+"""
+
+from collections import Counter
+import math
+import time
+
+
+def _norm(values):
+    return math.sqrt(sum(x * x for x in values))
+
+
+def _bezier_bounds(curve, span=1.0):
+    """Convex-hull bounds for rational Bezier first/second derivatives."""
+    points = [tuple(curve.Pole(i).Coord()) for i in range(1, curve.NbPoles() + 1)]
+    weights = [curve.Weight(i) for i in range(1, curve.NbPoles() + 1)]
+    if not points or min(weights) <= 0 or not math.isfinite(span) or span <= 0:
+        raise ValueError('invalid bounded Bezier curve')
+    anchor = points[0]
+    radius = max(_norm(tuple(a - b for a, b in zip(p, anchor))) for p in points)
+    numerator = [tuple(w * (a - b) for a, b in zip(p, anchor)) for p, w in zip(points, weights)]
+
+    def derivative(poles):
+        degree = len(poles) - 1
+        return [tuple(degree * (b - a) / span for a, b in zip(p, q)) for p, q in zip(poles, poles[1:])]
+
+    n1 = derivative(numerator)
+    n2 = derivative(n1)
+    w1 = derivative([(w,) for w in weights])
+    w2 = derivative(w1)
+    n1max = max(map(_norm, n1), default=0.0)
+    n2max = max(map(_norm, n2), default=0.0)
+    w1max = max(map(_norm, w1), default=0.0)
+    w2max = max(map(_norm, w2), default=0.0)
+    speed = (n1max + w1max * radius) / min(weights)
+    accel = (n2max + w2max * radius + 2 * w1max * speed) / min(weights)
+    return speed, accel
+
+
+def _curve_bounds(adaptor, dimension):
+    """Global derivative bounds over the represented analytic/Bezier spans."""
+    from OCP.GeomAbs import GeomAbs_Line, GeomAbs_Circle, GeomAbs_Ellipse, GeomAbs_BezierCurve, GeomAbs_BSplineCurve
+
+    kind = adaptor.GetType()
+    if kind == GeomAbs_Line:
+        return 1.0, 0.0
+    if kind == GeomAbs_Circle:
+        r = adaptor.Circle().Radius()
+        return r, r
+    if kind == GeomAbs_Ellipse:
+        r = adaptor.Ellipse().MajorRadius()
+        return r, r
+    if kind == GeomAbs_BezierCurve:
+        return _bezier_bounds(adaptor.Bezier())
+    if kind == GeomAbs_BSplineCurve:
+        try:
+            from OCP.TColStd import TColStd_Array1OfReal
+        except ImportError:  # OCP 8 moved collection aliases.
+            from OCP.collections import Array1_double as TColStd_Array1OfReal
+        if dimension == 2:
+            from OCP.Geom2dConvert import Geom2dConvert_BSplineCurveToBezierCurve as Converter
+        else:
+            from OCP.GeomConvert import GeomConvert_BSplineCurveToBezierCurve as Converter
+        converter = Converter(adaptor.BSpline(), adaptor.FirstParameter(), adaptor.LastParameter(), 1e-12)
+        count = converter.NbArcs()
+        if count < 1:
+            raise ValueError('CAD curve has no Bezier spans')
+        knots = TColStd_Array1OfReal(1, count + 1)
+        converter.Knots(knots)
+        bounds = [_bezier_bounds(converter.Arc(i), knots.Value(i + 1) - knots.Value(i)) for i in range(1, count + 1)]
+        spline = adaptor.BSpline()
+        c1 = all(spline.Multiplicity(i) <= spline.Degree() - 1 for i in range(2, spline.NbKnots()))
+        return max(b[0] for b in bounds), max(b[1] for b in bounds) if c1 else None
+    raise ValueError(f'no derivative bound for CAD trimming/basis curve {kind}')
+
+
+def _surface_bounds(adaptor):
+    """Bounds for |Fu|, |Fv|, |Fuu|, |Fuv|, |Fvv| in world coordinates."""
+    from OCP.GeomAbs import (
+        GeomAbs_Plane,
+        GeomAbs_Cylinder,
+        GeomAbs_Cone,
+        GeomAbs_Sphere,
+        GeomAbs_Torus,
+        GeomAbs_SurfaceOfExtrusion,
+    )
+
+    kind = adaptor.GetType()
+    if kind == GeomAbs_Plane:
+        return 1.0, 1.0, 0.0, 0.0, 0.0
+    if kind == GeomAbs_Cylinder:
+        r = adaptor.Cylinder().Radius()
+        return r, 1.0, r, 0.0, 0.0
+    if kind == GeomAbs_Cone:
+        cone = adaptor.Cone()
+        sine = abs(math.sin(cone.SemiAngle()))
+        r = max(
+            abs(cone.RefRadius() + v * math.sin(cone.SemiAngle()))
+            for v in (adaptor.FirstVParameter(), adaptor.LastVParameter())
+        )
+        return r, 1.0, r, sine, 0.0
+    if kind == GeomAbs_Sphere:
+        r = adaptor.Sphere().Radius()
+        return r, r, r, r, r
+    if kind == GeomAbs_Torus:
+        torus = adaptor.Torus()
+        r = torus.MinorRadius()
+        total = torus.MajorRadius() + r
+        return total, r, total, r, r
+    if kind == GeomAbs_SurfaceOfExtrusion:
+        speed, accel = _curve_bounds(adaptor.BasisCurve(), 3)
+        return speed, 1.0, accel or 0.0, 0.0, 0.0, accel is None
+    raise ValueError(f'no parametric interpolation bound for CAD surface {kind}')
+
+
+def _interpolation_error(uv, bounds):
+    # Taylor's integral remainder and barycentric interpolation cancel the
+    # first derivative. Variance <= span^2/4; |covariance| <= du*dv/4.
+    du = max(p[0] for p in uv) - min(p[0] for p in uv)
+    dv = max(p[1] for p in uv) - min(p[1] for p in uv)
+    if len(bounds) > 5 and bounds[5]:
+        return bounds[0] * du / 2  # C0 spline: first-derivative Lipschitz bound.
+    return (bounds[2] * du * du + 2 * bounds[3] * du * dv + bounds[4] * dv * dv) / 8
+
+
+def _regularize_facet(points):
+    """Represent collapsed parameter facets with a tiny, explicitly bounded face.
+
+    Pole UV edges can map to one point. The replacement displaces each vertex
+    by at most the returned distance; convex interpolation inherits that bound.
+    This changes no source surface or machining tolerance.
+    """
+    a, b, c = points
+    ab = tuple(y - x for x, y in zip(a, b))
+    ac = tuple(y - x for x, y in zip(a, c))
+    cross = (ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0])
+    if _norm(cross) > 2e-10:
+        return points, 0.0
+    pairs = [(math.dist(points[i], points[j]), i, j) for i, j in ((0, 1), (1, 2), (2, 0))]
+    length, i, j = max(pairs)
+    k = 3 - i - j
+    result = list(points)
+    if length < 1e-5:
+        # All original vertices are within 10 nm of a; a 30 nm triangle has
+        # area above the native numeric-resolution floor.
+        result = [a, (a[0] + 3e-5, a[1], a[2]), (a[0], a[1] + 3e-5, a[2])]
+    else:
+        direction = tuple((q - p) / length for p, q in zip(points[i], points[j]))
+        axis = min(range(3), key=lambda n: abs(direction[n]))
+        normal = tuple((1.0 if n == axis else 0.0) - direction[axis] * direction[n] for n in range(3))
+        norm = _norm(normal)
+        displacement = max(1e-6, 4e-10 / length)
+        result[k] = tuple(p + displacement * n / norm for p, n in zip(points[k], normal))
+    error = max(math.dist(p, q) for p, q in zip(points, result))
+    if error > 1e-4:
+        raise ValueError('CAD facet regularization exceeds numeric error reserve')
+    return tuple(result), error
+
+
+def _check_cancel(cancel):
+    if cancel is not None and cancel():
+        raise ValueError('CAD surface export cancelled')
+
+
+def _face_data(face, cancel):
+    """Check UV mesh orientation/incidence and every trim's parameter chain."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve2d
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.TopLoc import TopLoc_Location
+
+    adaptor = BRepAdaptor_Surface(face.wrapped)
+    bounds = _surface_bounds(adaptor)
+    if not all(math.isfinite(x) and x >= 0 for x in bounds):
+        raise ValueError('nonfinite CAD derivative bound')
+    location = TopLoc_Location()
+    mesh = BRep_Tool.Triangulation_s(face.wrapped, location)
+    if mesh is None or not mesh.HasUVNodes():
+        raise ValueError('CAD mesher omitted face UV nodes')
+    uv = [None] + [tuple(mesh.UVNode(i).Coord()) for i in range(1, mesh.NbNodes() + 1)]
+    if any(not all(math.isfinite(v) for v in p) for p in uv[1:]):
+        raise ValueError('nonfinite CAD UV mesh')
+    indices = []
+    edges = Counter()
+    directions = Counter()
+    for i in range(1, mesh.NbTriangles() + 1):
+        if i % 1024 == 0:
+            _check_cancel(cancel)
+        triangle = tuple(mesh.Triangle(i).Get())
+        a, b, c = (uv[j] for j in triangle)
+        area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        if area <= 0 or not math.isfinite(area):
+            raise ValueError('CAD UV mesh has reversed/degenerate triangles')
+        indices.append(triangle)
+        for p, q in zip(triangle, (*triangle[1:], triangle[0])):
+            edges[tuple(sorted((p, q)))] += 1
+            directions[(p, q)] += 1
+    if any(n not in (1, 2) for n in edges.values()) or any(
+        n == 2 and (directions[(p, q)] != 1 or directions[(q, p)] != 1) for (p, q), n in edges.items()
+    ):
+        raise ValueError('CAD UV mesh has inconsistent edge incidence')
+    boundary = {edge for edge, n in edges.items() if n == 1}
+    represented = Counter()
+    trim_error = 0.0
+    trim_segments = 0
+    # The input BRep is valid; matching every topological trim once to the mesh
+    # boundary retains its holes/seams. Interior edges cancel in opposite pairs.
+    for wire in face.Wires():
+        explorer = BRepTools_WireExplorer(wire.wrapped, face.wrapped)
+        while explorer.More():
+            _check_cancel(cancel)
+            edge = explorer.Current()
+            curve = BRepAdaptor_Curve2d(edge, face.wrapped)
+            polygon = BRep_Tool.PolygonOnTriangulation_s(edge, mesh, location)
+            if polygon is None or not polygon.HasParameters():
+                raise ValueError('CAD trim has no mesh parameter correspondence')
+            count = polygon.NbNodes()
+            if count < 2:
+                raise ValueError('invalid CAD trim node count')
+            first, last = curve.FirstParameter(), curve.LastParameter()
+            params = [polygon.Parameter(i) for i in range(1, count + 1)]
+            guard = 1e-10 * max(1.0, abs(first), abs(last))
+            if (
+                abs(params[0] - first) > guard
+                or abs(params[-1] - last) > guard
+                or any(b < a for a, b in zip(params, params[1:]))
+            ):
+                raise ValueError('CAD trim parameter chain is incomplete')
+            speed, accel = _curve_bounds(curve, 2)
+            ids = [polygon.Node(i) for i in range(1, count + 1)]
+            first_uv = tuple(curve.Value(params[0]).Coord())
+            shift = [0.0, 0.0]
+            for axis, periodic, period in (
+                (0, adaptor.IsUPeriodic(), adaptor.UPeriod),
+                (1, adaptor.IsVPeriodic(), adaptor.VPeriod),
+            ):
+                if periodic:
+                    value = period()
+                    shift[axis] = round((uv[ids[0]][axis] - first_uv[axis]) / value) * value
+            gap = max(
+                math.dist(uv[j], tuple(v + delta for v, delta in zip(curve.Value(t).Coord(), shift)))
+                for j, t in zip(ids, params)
+            )
+            gap += speed * (abs(params[0] - first) + abs(params[-1] - last))
+            for p, q, t0, t1 in zip(ids, ids[1:], params, params[1:]):
+                represented[tuple(sorted((p, q)))] += 1
+                deviation = speed * (t1 - t0) / 2 if accel is None else accel * (t1 - t0) ** 2 / 8
+                trim_error = max(trim_error, math.hypot(bounds[0], bounds[1]) * (gap + deviation))
+                trim_segments += 1
+            explorer.Next()
+    if set(represented) != boundary or any(n != 1 for n in represented.values()):
+        raise ValueError('CAD trim chains do not cover mesh boundary exactly once')
+    return adaptor, bounds, uv, indices, trim_error, trim_segments
+
+
+def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
+    import cadquery as cq
+    import OCP
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRepTools import BRepTools
+    from OCP.TopAbs import TopAbs_REVERSED
+    from .surface import SurfaceMesh
+
+    started = time.perf_counter()
+    _check_cancel(cancel)
+    if not math.isfinite(max_error_mm) or not 1e-6 <= max_error_mm <= 0.1:
+        raise ValueError('max_error_mm must be finite in [1e-6, .1]')
+    if max_facets is not None and (type(max_facets) is not int or max_facets < 4):
+        raise ValueError('max_facets must be None (no cap) or an integer >= 4')
+    # Meshing mutates kernel caches: use an owned copy, never the caller's BRep.
+    shape = cq.Shape.cast(BRepBuilderAPI_Copy(shape.wrapped, True, False).Shape())
+    faces = shape.Faces()
+    if not faces:
+        raise ValueError('CAD surface has no faces')
+    topology = max(
+        [BRep_Tool.Tolerance_s(v.wrapped) for v in shape.Vertices()]
+        + [BRep_Tool.Tolerance_s(e.wrapped) for e in shape.Edges()]
+        + [BRep_Tool.Tolerance_s(f.wrapped) for f in faces]
+    )
+    box = shape.BoundingBox()
+    magnitude = max(1.0, *(abs(v) for v in (box.xmin, box.xmax, box.ymin, box.ymax, box.zmin, box.zmax)))
+    numerical = 8192 * math.ulp(magnitude) + 1e-10
+    fixed_error = 2 * topology + numerical
+    budget = max_error_mm - fixed_error
+    if budget <= 0:
+        raise ValueError('CAD topology/numerical error exceeds requested surface error')
+    # Check supported surface definitions before invoking a potentially costly mesh.
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+
+    for face in faces:
+        _surface_bounds(BRepAdaptor_Surface(face.wrapped))
+    seed_deflection = budget / 4
+    for attempt in range(5):
+        _check_cancel(cancel)
+        BRepTools.Clean_s(shape.wrapped)
+        BRepMesh_IncrementalMesh(shape.wrapped, seed_deflection, False, 0.5, True)
+        data = [_face_data(f, cancel) for f in faces]
+        if max(row[4] for row in data) <= budget / 2:
+            break
+        seed_deflection /= 4
+    else:
+        raise ValueError('CAD trim approximation exceeds requested bound')
+    result = []
+    face_reports = []
+    max_error = 0.0
+    evaluations = 0
+    for face, (adaptor, bounds, uv, indices, trim_error, trim_segments) in zip(faces, data):
+        _check_cancel(cancel)
+        reserve = min(1e-4, (budget - trim_error) / 4)
+        remaining = budget - trim_error - reserve
+        pending = [(tuple(uv[i] for i in tri), 0) for tri in indices]
+        count = 0
+        max_interior = 0.0
+        regularization = 0.0
+        point_cache = {}
+
+        def point(p):
+            nonlocal evaluations
+            if p not in point_cache:
+                point_cache[p] = tuple(adaptor.Value(*p).Coord())
+                evaluations += 1
+            return point_cache[p]
+
+        while pending:
+            if max_facets is not None and len(result) + len(pending) > max_facets:
+                raise ValueError('CAD surface exceeds max_facets at requested error')
+            if count % 1024 == 0:
+                _check_cancel(cancel)
+            triangle, depth = pending.pop()
+            error = _interpolation_error(triangle, bounds)
+            if error > remaining:
+                if depth >= 24:
+                    raise ValueError('CAD surface interpolation exceeds refinement depth')
+
+                def edge_cost(pair):
+                    a, b = (triangle[i] for i in pair)
+                    du, dv = abs(a[0] - b[0]), abs(a[1] - b[1])
+                    if len(bounds) > 5 and bounds[5]:
+                        return bounds[0] * du
+                    return bounds[2] * du * du + 2 * bounds[3] * du * dv + bounds[4] * dv * dv
+
+                i, j = max(((0, 1), (1, 2), (2, 0)), key=edge_cost)
+                a, b, c = triangle[i], triangle[j], triangle[3 - i - j]
+                middle = tuple((x + y) / 2 for x, y in zip(a, b))
+                pending.extend(((t, depth + 1) for t in ((a, middle, c), (middle, b, c))))
+                continue
+            xyz = tuple(point(p) for p in triangle)
+            if any(not all(math.isfinite(v) and abs(v) <= 1e6 for v in p) for p in xyz):
+                raise ValueError('CAD surface exceeds bounded coordinates')
+            xyz, displacement = _regularize_facet(xyz)
+            if displacement > reserve:
+                raise ValueError('requested error is below CAD facet numeric resolution')
+            regularization = max(regularization, displacement)
+            if face.wrapped.Orientation() == TopAbs_REVERSED:
+                xyz = (xyz[0], xyz[2], xyz[1])
+            result.append(xyz)
+            count += 1
+            max_interior = max(max_interior, error)
+        achieved = max_interior + trim_error + regularization + fixed_error
+        max_error = max(max_error, achieved)
+        face_reports.append(
+            dict(
+                kind=face.geomType(),
+                facets=count,
+                trim_segments=trim_segments,
+                interpolation_error_mm=max_interior,
+                trim_error_mm=trim_error,
+                regularization_mm=regularization,
+            )
+        )
+    _check_cancel(cancel)
+    return SurfaceMesh(
+        result,
+        max_error,
+        dict(
+            source or {},
+            adapter='bounded_parametric_cad_solid_v1',
+            cadquery_version=cq.__version__,
+            ocp_version=OCP.__version__,
+            requested_error_mm=max_error_mm,
+            error_basis=(
+                'CAD-kernel valid trim topology; matched UV boundary chains; '
+                'analytic/Bezier derivative bounds for trim and barycentric surface interpolation'
+            ),
+            cad_topology_error_mm=2 * topology,
+            numerical_guard_mm=numerical,
+            face_bounds=face_reports,
+            triangle_count=len(result),
+            surface_evaluations=evaluations,
+            seed_deflection_mm=seed_deflection,
+            extraction_ms=(time.perf_counter() - started) * 1000,
+        ),
+    )
