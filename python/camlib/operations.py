@@ -1198,6 +1198,11 @@ class AdaptiveClearing:
     path_strategy='stock_front' is a development strategy: it can stream a
     productive prefix but raises if coverage/steering is unresolved. Its
     cutting_sense is 'climb' (default) or 'conventional' with the CW spindle.
+
+    path_strategy='engagement_front' (Roughing only) follows the cut/uncut
+    stock boundary at about max_radial_engagement_mm per step, entering from
+    air or proven-cleared stock and helixing only into enclosed material.
+    Orbit options do not apply to it.
     """
 
     max_radial_engagement_mm: float

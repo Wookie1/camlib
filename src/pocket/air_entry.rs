@@ -12,7 +12,7 @@ impl PocketPlan {
     pub(crate) fn share_entry_scene(&mut self, cache: &EntrySceneCache) {
         self.entry_scene = cache.clone();
     }
-    pub(super) fn cleared_entry_start(
+    pub(crate) fn cleared_entry_start(
         &self,
         center: Point,
         orbit: f64,
