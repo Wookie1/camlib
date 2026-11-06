@@ -113,6 +113,56 @@ fn clipped(triangle: [Vec3; 3], z: f64) -> Vec<Point> {
     }
     hull(points)
 }
+/// Step-up levels between a full stepdown layer at `z` and the layer (or
+/// material top) `above` it: evenly spaced, at most `stepup` apart, ascending,
+/// so each climbs back up through the stair the full stepdown left on sloped
+/// and stepped walls. Established practice: the "step up" of rest-aware
+/// adaptive roughing (for example Mastercam Dynamic OptiRough, Cut
+/// Parameters, "Step up"); ported from CAMBuddy's MIT `plan_stepup_levels`.
+pub(crate) fn stepup_layers(z: f64, above: f64, stepup: f64, guard: f64) -> Vec<f64> {
+    let depth = above - z;
+    // Also refuses NaN: callers validate finite inputs first.
+    if depth.is_nan() || depth <= stepup.max(guard) {
+        return vec![];
+    }
+    let count = (depth / stepup).ceil() as usize;
+    let pitch = depth / count as f64;
+    (1..count).map(|j| z + j as f64 * pitch).collect()
+}
+
+/// The region a step-up layer at `region`'s depth may still find material in:
+/// next to the part, within the layer `below`'s shadow grown by three times
+/// `reach` (cutter radius plus radial allowance).
+///
+/// After the full layer `below`, every point farther than `reach = r + a`
+/// from its shadow is a valid cutter centre there and so was cut down to
+/// `below`. Material left at this height is therefore within `reach` of that
+/// shadow, and a cutter centre that reaches it lies within `2r + a`; keeping
+/// that centre `reach` inside the band needs the band to extend `3r + 2a`
+/// (plus the shadow's own construction error) beyond the shadow. The band is
+/// intersected with this layer's own region, so it never adds area the full
+/// layer would not cut.
+#[allow(clippy::too_many_arguments)]
+fn stepup_band(
+    target: &PreparedRoughingTarget,
+    region: &PlanarRegion,
+    below: f64,
+    axial_allowance_mm: f64,
+    reach: f64,
+    options: ConstructionOptions,
+    work: &mut usize,
+    cancel: &impl CancelSignal,
+) -> Result<PlanarRegion, String> {
+    let shadow = target.shadow(below, axial_allowance_mm, work, cancel)?;
+    // 3 * reach = 3r + 3a covers the 3r + 2a needed, with the allowance spare.
+    let grow = 3. * reach + shadow.report.boundary_error_mm + options.tolerance_mm;
+    let band = shadow.region.prepare(options)?.offset(-grow)?.region;
+    Ok(region
+        .prepare(options)?
+        .boolean(&band.prepare(options)?, Boolean::Intersection)?
+        .region)
+}
+
 fn count_vertices(region: &PlanarRegion) -> usize {
     region
         .components
@@ -332,6 +382,11 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     pub top_z_mm: f64,
     pub floor_z_mm: f64,
     pub stepdown_mm: f64,
+    /// Step-up levels: after each full stepdown layer, extra layers climb back
+    /// up through the remaining depth at most this far apart, each cut only in
+    /// a band next to the part. See `stepup_layers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepup_mm: Option<f64>,
     pub clearance_z_mm: f64,
     pub feed_mm_min: f64,
     pub plunge_mm_min: f64,
@@ -374,6 +429,7 @@ impl<G> RoughingOperation<G> {
             top_z_mm: self.top_z_mm,
             floor_z_mm: self.floor_z_mm,
             stepdown_mm: self.stepdown_mm,
+            stepup_mm: self.stepup_mm,
             clearance_z_mm: self.clearance_z_mm,
             feed_mm_min: self.feed_mm_min,
             plunge_mm_min: self.plunge_mm_min,
@@ -396,6 +452,9 @@ impl<G> RoughingOperation<G> {
 #[derive(Clone, Serialize)]
 pub struct RoughingLayerReport {
     pub tip_z_mm: f64,
+    /// For a step-up layer: the full stepdown layer below it whose band it cuts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_up_of_z_mm: Option<f64>,
     pub shadow: ShadowReport,
     pub clearing: serde_json::Value,
 }
@@ -671,6 +730,14 @@ impl RoughingPlan {
                     format!("stepdown_mm {} must be positive", op.stepdown_mm),
                 ),
                 (
+                    op.stepup_mm
+                        .is_none_or(|s| s.is_finite() && s >= numeric_guard && s < op.stepdown_mm),
+                    format!(
+                        "stepup_mm {:?} must be positive and smaller than stepdown_mm {}",
+                        op.stepup_mm, op.stepdown_mm
+                    ),
+                ),
+                (
                     op.bottom_allowance_mm >= 0. && op.radial_allowance_mm >= 0.,
                     "allowances must not be negative".into(),
                 ),
@@ -867,7 +934,17 @@ impl RoughingPlan {
                     "roughing top_mm: first material depth Z{z} is above retained part; face the stock first"
                 ));
             }
-            depths.push(z);
+            depths.push((z, None));
+            if let Some(stepup) = op.stepup_mm {
+                // Climb back up through this layer's full depth, below the
+                // previous layer (or the material top) and never in air.
+                let above = (op.top_z_mm - i as f64 * op.stepdown_mm).min(material_spec.max_mm[2]);
+                for up in stepup_layers(z, above, stepup, numeric_guard) {
+                    if up + 16. * op.tolerance_mm < material_spec.max_mm[2] {
+                        depths.push((up, Some(z)));
+                    }
+                }
+            }
         }
         // Offset/guide construction can dominate preflight even for a simple
         // faceted solid. Independent depth layers already have deterministic
@@ -886,14 +963,27 @@ impl RoughingPlan {
             cancel,
             |i, signal| {
                 let cancel = || signal.is_cancelled();
-                let z = depths[i];
+                let (z, step_up_of) = depths[i];
                 let mut work = 0;
                 let shadow = target
                     .shadow(z, op.bottom_allowance_mm, &mut work, &cancel)
                     .map_err(|e| format!("roughing shadow at Z{z}: {e}"))?;
-                let region = expanded
+                let mut region = expanded
                     .boolean(&shadow.region.prepare(options)?, Boolean::Difference)?
                     .region;
+                if let Some(below) = step_up_of {
+                    region = stepup_band(
+                        &target,
+                        &region,
+                        below,
+                        op.bottom_allowance_mm,
+                        r + op.radial_allowance_mm,
+                        options,
+                        &mut work,
+                        &cancel,
+                    )
+                    .map_err(|e| format!("roughing step-up band at Z{z}: {e}"))?;
+                }
                 let layer_vertices = count_vertices(&region);
                 let step = match op.clearing {
                     RoughingClearing::Raster { stepover_mm, .. }
@@ -998,6 +1088,7 @@ impl RoughingPlan {
                 };
                 let report = RoughingLayerReport {
                     tip_z_mm: z,
+                    step_up_of_z_mm: step_up_of,
                     shadow: shadow.report,
                     clearing: plan.report(),
                 };

@@ -164,6 +164,14 @@ cleared. Further options:
   part (face the stock first).
 - `clearing_tolerance_mm` sets the allowed construction error of each layer's
   clearing region; the operation fails if it cannot be kept.
+- `stepup_mm` adds step-up layers: after each full `stepdown_mm` layer, layers
+  at most `stepup_mm` apart climb back up through that layer's depth, each
+  clearing only a band next to the part (the layer's shadow grown by three
+  times the cutter radius plus radial allowance, which contains every point
+  the full layer could not reach). The stair a full stepdown leaves on sloped
+  and stepped walls shrinks to one step-up. Each step-up layer is reported
+  with `step_up_of_z_mm`, the full layer it climbs from. Must be positive and
+  smaller than `stepdown_mm`.
 
 ## Contour: `Contour`
 
