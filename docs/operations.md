@@ -152,6 +152,17 @@ Clears stock in Z layers while staying above the part surface plus
   passes, with that much overlap reserved for the coverage proof,
 - `AdaptiveClearing(max_radial_engagement_mm)`: engagement-limited, with the
   same orbit, `cutting_sense` and `path_strategy` options as `AdaptivePocket`.
+- `AdaptiveClearing(w, path_strategy="engagement_front")` (roughing only):
+  follows the boundary between cut and uncut stock, turning so each step
+  removes a radial width of about `w`. Passes start from air or from stock
+  already cleared (proven clear by the committed cuts) and helix only into
+  enclosed material; short moves between passes stay down when the link
+  is clear. The engagement is steered on a fine grid built from the stock
+  model, so `max_estimated_engagement_mm` in the layer report is an
+  estimate. Every cutting and link move is checked exactly against the
+  layer region before it is emitted, and the run fails rather than emit
+  one that does not fit. Orbit options and `omit_empty_cuts` do not apply,
+  and the entry must be `StockEdgeEntry`.
 
 Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster
 and offset clearing. `RestRoughing` machines only what earlier operations left
