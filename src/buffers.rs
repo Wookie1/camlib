@@ -19,7 +19,7 @@ fn valid_grid(buffer: &impl HeightRead, bottom: f64, top: f64) -> Result<usize, 
         || top.abs() > 1e6
         || !buffer.scalar_len().is_multiple_of(2)
         || buffer.scalar_len() == 0
-        || buffer.scalar_len() > 2 * u32::MAX as usize
+        || buffer.scalar_len() as u64 > 2 * u64::from(u32::MAX)
     {
         return Err("invalid bounded height buffer shape or stock limits".into());
     }

@@ -31,7 +31,7 @@ const HEADER: usize = 20;
 /// Largest frame the binary format can express: the payload length field is
 /// a u32. This is the only frame-size invariant; callers may pass smaller
 /// explicit limits.
-pub const MAX_FRAME_BYTES: usize = HEADER + u32::MAX as usize;
+pub const MAX_FRAME_BYTES: usize = HEADER.saturating_add(u32::MAX as usize);
 pub const DEFAULT_FRAME_LIMIT: usize = MAX_FRAME_BYTES;
 pub const CHECKPOINT_FRAME_LIMIT: usize = MAX_FRAME_BYTES;
 /// A canonical manifest is carried in one frame.
