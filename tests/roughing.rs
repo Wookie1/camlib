@@ -1023,6 +1023,171 @@ fn stock_front_saved_frustum_completes_all_layers_with_checked_stock_and_quality
     );
 }
 
+fn engagement_front_frustum() -> StreamManifest {
+    let saved: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json")).unwrap();
+    let mut input = saved["cases"]["adaptive"]["policies"]["omit_proven_empty"]["input"].clone();
+    let op = &mut input["operations"][0];
+    op["omit_empty_cuts"] = false.into();
+    let clearing = op["clearing"].as_object_mut().unwrap();
+    for key in [
+        "orbit_radius_mm",
+        "min_orbit_radius_mm",
+        "local_orbit_tolerance_mm",
+    ] {
+        clearing.remove(key);
+    }
+    clearing.insert("path_strategy".into(), "engagement_front".into());
+    serde_json::from_value(input).unwrap()
+}
+
+#[test]
+fn engagement_front_frustum_clears_every_layer_without_touching_the_part() {
+    let m = engagement_front_frustum();
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let mut history: Vec<camlib::motion::Motion> = Vec::new();
+    let mut current = m.initial_position_mm;
+    let mut nominal = 0.;
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(history.len() < 60000, "unbounded engagement_front path");
+        assert_eq!(motion.id, history.len() as u64 + 1);
+        assert_eq!(motion.curve.start(), current);
+        current = motion.curve.end();
+        if motion.kind == MoveKind::Rapid {
+            assert!(motion.curve.start()[2] >= 12. && current[2] >= 12.);
+        }
+        // Independent analytic part certificate (not the planner's region).
+        certify_part(&motion.curve);
+        if motion.kind == MoveKind::Plunge && current[2] < 10. {
+            // Vertical entries must descend through cut or outside stock:
+            // exact heights left by every earlier motion around the axis.
+            for radial in [0., 0.5, 1.] {
+                for i in 0..16 {
+                    let angle = TAU * i as f64 / 16.;
+                    let p = [
+                        current[0] + radial * angle.cos(),
+                        current[1] + radial * angle.sin(),
+                    ];
+                    if p[0] < 0. || p[0] > 32. || p[1] < 0. || p[1] > 28. {
+                        continue;
+                    }
+                    let height = history
+                        .iter()
+                        .filter(|old| old.kind != MoveKind::Rapid)
+                        .map(|old| exact_height(&old.curve, p))
+                        .fold(10f64, f64::min);
+                    assert!(
+                        height <= current[2] + 1e-6,
+                        "plunge into material at {p:?}: {height} > {}",
+                        current[2]
+                    );
+                }
+            }
+        }
+        nominal += motion
+            .curve
+            .prepare(m.sweep.tolerance_mm)
+            .unwrap()
+            .length_mm()
+            / motion.feed_mm_min.unwrap_or(6000.)
+            * 60.;
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+        history.push(motion);
+    }
+    plan.finish_report(&|| false).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    assert_eq!(report["completed_layers"], 4);
+    let mut helices = 0;
+    for layer in report["layers"].as_array().unwrap() {
+        let clearing = &layer["clearing"];
+        eprintln!("layer Z{}: {clearing}", layer["tip_z_mm"]);
+        assert_eq!(clearing["strategy"], "engagement_front");
+        assert_eq!(clearing["geometric_residual_status"], "estimated");
+        assert!(clearing["passes"].as_u64().unwrap() > 0);
+        assert!(
+            clearing["max_estimated_engagement_mm"].as_f64().unwrap() <= 0.25 * 1.3,
+            "{clearing}"
+        );
+        helices += clearing["helical_entries"].as_u64().unwrap();
+    }
+    // The 4 x 4 mm opening in the frustum top is enclosed: it needs a helix.
+    assert!(helices > 0);
+    assert_eq!(report["helical_entries"].as_u64().unwrap(), helices);
+    let floor = report["target_z_mm"].as_f64().unwrap();
+    for (i, cell) in stock.cells().iter().enumerate() {
+        let p = stock.cell_center(i).unwrap();
+        let height = history
+            .iter()
+            .filter(|m| m.kind != MoveKind::Rapid)
+            .map(|m| exact_height(&m.curve, p))
+            .fold(10f64, f64::min);
+        assert!(
+            cell.lower_mm <= height + 1e-6 && cell.upper_mm >= height - 1e-6,
+            "{p:?}: {cell:?} misses independent exact height {height}"
+        );
+        // The reachable floor outside the base and inside the opening is cut.
+        if p[0] < 5.
+            || p[0] > 27.
+            || p[1] < 5.
+            || p[1] > 23.
+            || (p[0] > 15.4 && p[0] < 16.6 && p[1] > 13.4 && p[1] < 14.6)
+        {
+            assert!(
+                height <= floor + 1e-6,
+                "uncut reachable floor {p:?}: {height}"
+            );
+        }
+    }
+    eprintln!(
+        "engagement_front frustum: {} motions, nominal {nominal:.0} s",
+        history.len()
+    );
+    assert!(nominal <= 2400., "nominal cycle {nominal} s");
+}
+
+#[test]
+fn engagement_front_refuses_orbits_empty_cut_omission_and_helix_only_entry() {
+    let base = engagement_front_frustum();
+    let prepare = |m: &StreamManifest| {
+        let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        OperationPlan::prepare_with_stock(
+            m.operations[0].clone(),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .err()
+        .unwrap_or_default()
+    };
+    let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = serde_json::to_value(&base).unwrap();
+        f(&mut v["operations"][0]);
+        serde_json::from_value::<StreamManifest>(v).unwrap()
+    };
+    let orbit = edit(&|op| op["clearing"]["orbit_radius_mm"] = 0.5.into());
+    assert!(prepare(&orbit).contains("does not use orbits"));
+    let omit = edit(&|op| op["omit_empty_cuts"] = true.into());
+    assert!(prepare(&omit).contains("omit_empty_cuts"));
+    let helix = edit(&|op| op["entry"]["kind"] = "helix".into());
+    assert!(prepare(&helix).contains("StockEdgeEntry"));
+}
+
 #[test]
 fn roughing_preflight_rejects_enclosed_outside_only_entry_reach_and_work_before_motion() {
     let cancel = AtomicBool::new(false);
