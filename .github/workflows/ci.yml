@@ -234,3 +234,33 @@ jobs:
           name: camlib-windows-x64-wheel
           path: dist/*.whl
           retention-days: 14
+
+  macos-wheel:
+    name: macOS wheel (installed package)
+    # Apple's linker refuses a Python extension's undefined libpython symbols
+    # unless the module is linked with -undefined dynamic_lookup
+    # (bindings/python/build.rs). This job builds and imports it without any
+    # extra RUSTFLAGS, the way a user installs camlib on a Mac.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps --wheel-dir dist
+      - name: Install into a fresh environment
+        run: |
+          python -m venv wheel-env
+          wheel-env/bin/python -m pip install dist/camlib-*-macosx_*.whl cadquery
+      - name: Test installed package without source-build fallback
+        run: |
+          mv target target-hidden
+          wheel-env/bin/python -m unittest discover -s python/tests
+          wheel-env/bin/python examples/standalone_job.py out-wheel
+          wheel-env/bin/python examples/cadquery_job.py out-wheel-cad

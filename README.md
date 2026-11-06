@@ -73,6 +73,9 @@ python examples/standalone_job.py out      # writes out/pocket.nc
 For native Windows x64 installation, build tools and PowerShell commands, see
 [Windows setup](docs/windows.md).
 
+On macOS (Apple silicon or Intel) the same `pip install .` works with Xcode's
+command line tools and a Rust toolchain; no extra linker flags are needed.
+
 The CadQuery example (`examples/cadquery_job.py`) also needs CadQuery/OCP
 installed in the same Python environment.
 
