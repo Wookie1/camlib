@@ -643,15 +643,22 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         if row is None or row[4] > budget / 2:
             # Only this face is re-triangulated (finer, alone, or spanned).
             alone = _mesh_face_alone(f, seed_deflection, budget / 2, cancel)
+            if alone is None and row is not None and row[4] < budget * 0.75:
+                alone = row  # over half the budget: interior refines into the rest
             if alone is None:
                 if problem is None:
-                    raise ValueError('CAD trim approximation exceeds requested bound')
+                    raise ValueError(
+                        f'CAD trim approximation exceeds requested bound on face {n} ({f.geomType()}, '
+                        f'{f.Area():.3f} mm2): trim error {row[4]:.5f} mm, budget {budget:.5f} mm after '
+                        f'2 x CAD tolerance {2 * topology:.5f} mm'
+                    )
                 raise ValueError(
                     f'CAD mesher cannot triangulate face {n} ({f.geomType()}, {f.Area():.3f} mm2) '
                     f'consistently with its trims: {problem}'
                 )
+            if alone is not row:
+                remeshed.add(n)
             row = alone
-            remeshed.add(n)
         data.append(row)
     result = []
     face_reports = []
