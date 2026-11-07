@@ -78,6 +78,209 @@ def _curve_bounds(adaptor, dimension):
     raise ValueError(f'no derivative bound for CAD trimming/basis curve {kind}')
 
 
+def _trim_deviation(adaptor):
+    """speed, deviation(t0, t1): bound on a 2D trim's distance from its chord.
+
+    B-spline trims use each Bezier arc's own second-derivative bound. A chord
+    across a C0 knot k is split at C(k): |C - L| <= |C - M| + |M - L| for the
+    polyline M through the knots, and |M - L| peaks at a knot, where it is
+    evaluated directly."""
+    from bisect import bisect_left, bisect_right
+    from OCP.GeomAbs import GeomAbs_BSplineCurve
+
+    speed, accel = _curve_bounds(adaptor, 2)
+    if adaptor.GetType() != GeomAbs_BSplineCurve:
+        if accel is None:
+            return speed, lambda t0, t1: speed * (t1 - t0) / 2
+        return speed, lambda t0, t1: accel * (t1 - t0) ** 2 / 8
+    try:
+        from OCP.TColStd import TColStd_Array1OfReal
+    except ImportError:  # OCP 8 moved collection aliases.
+        from OCP.collections import Array1_double as TColStd_Array1OfReal
+    from OCP.Geom2dConvert import Geom2dConvert_BSplineCurveToBezierCurve
+
+    spline = adaptor.BSpline()
+    converter = Geom2dConvert_BSplineCurveToBezierCurve(spline, adaptor.FirstParameter(), adaptor.LastParameter(), 1e-12)
+    count = converter.NbArcs()
+    knots = TColStd_Array1OfReal(1, count + 1)
+    converter.Knots(knots)
+    knots = [knots.Value(i) for i in range(1, count + 2)]
+    accels = [_bezier_bounds(converter.Arc(i), knots[i] - knots[i - 1])[1] for i in range(1, count + 1)]
+    corners = sorted(
+        spline.Knot(i)
+        for i in range(2, spline.NbKnots())
+        if spline.Multiplicity(i) >= spline.Degree() and knots[0] < spline.Knot(i) < knots[-1]
+    )
+
+    def value(t):
+        return tuple(adaptor.Value(t).Coord())
+
+    def deviation(t0, t1):
+        if t1 <= t0:
+            return 0.0
+        i0 = min(max(bisect_right(knots, t0) - 1, 0), count - 1)
+        i1 = min(max(bisect_left(knots, t1) - 1, i0), count - 1)
+        a = max(accels[i0 : i1 + 1])
+        inside = corners[bisect_right(corners, t0) : bisect_left(corners, t1)]
+        if not inside:
+            return a * (t1 - t0) ** 2 / 8
+        nodes = [t0, *inside, t1]
+        h = max(y - x for x, y in zip(nodes, nodes[1:]))
+        c0, c1 = value(t0), value(t1)
+        kink = max(
+            math.dist(value(k), tuple(p + (k - t0) / (t1 - t0) * (q - p) for p, q in zip(c0, c1))) for k in inside
+        )
+        return a * h * h / 8 + kink
+
+    return speed, deviation
+
+
+def _bezier_patch_bounds(patch, su=1.0, sv=1.0):
+    """Convex-hull bounds for a rational Bezier patch's first/second partials.
+
+    With G = F - A for an anchor pole A, G*W = N where N has poles w*(P-A)
+    and W is the weight polynomial, so |G| <= R (the pole radius about A) and
+    G_u = (N_u - G W_u)/W, G_uu = (N_uu - 2 G_u W_u - G W_uu)/W,
+    G_uv = (N_uv - G_u W_v - G_v W_u - G W_uv)/W. Each hodograph is bounded by
+    its control net; W >= the smallest (positive) weight."""
+    nu, nv = patch.NbUPoles(), patch.NbVPoles()
+    points = [[tuple(patch.Pole(i, j).Coord()) for j in range(1, nv + 1)] for i in range(1, nu + 1)]
+    weights = [[patch.Weight(i, j) for j in range(1, nv + 1)] for i in range(1, nu + 1)]
+    wmin = min(min(row) for row in weights)
+    if wmin <= 0 or not (math.isfinite(su) and math.isfinite(sv) and su > 0 and sv > 0):
+        raise ValueError('invalid bounded Bezier surface')
+    anchor = points[0][0]
+    radius = max(_norm(tuple(a - b for a, b in zip(p, anchor))) for row in points for p in row)
+    numer = [[tuple(w * (a - b) for a, b in zip(p, anchor)) for p, w in zip(prow, wrow)] for prow, wrow in zip(points, weights)]
+    weight = [[(w,) for w in row] for row in weights]
+    def diff(net, du, dv):
+        # Control net of d^(du+dv)/du^du dv^dv of a tensor Bezier, over [0,su]x[0,sv].
+        for _ in range(du):
+            k = len(net) - 1
+            net = [[tuple(k * (b - a) / su for a, b in zip(x, y)) for x, y in zip(r0, r1)] for r0, r1 in zip(net, net[1:])]
+        for _ in range(dv):
+            net = [[tuple((len(row) - 1) * (b - a) / sv for a, b in zip(x, y)) for x, y in zip(row, row[1:])] for row in net]
+        return max((_norm(x) for row in net for x in row), default=0.0)
+
+    nu1, nv1 = diff(numer, 1, 0), diff(numer, 0, 1)
+    wu1, wv1 = diff(weight, 1, 0), diff(weight, 0, 1)
+    fu = (nu1 + wu1 * radius) / wmin
+    fv = (nv1 + wv1 * radius) / wmin
+    fuu = (diff(numer, 2, 0) + 2 * fu * wu1 + radius * diff(weight, 2, 0)) / wmin
+    fvv = (diff(numer, 0, 2) + 2 * fv * wv1 + radius * diff(weight, 0, 2)) / wmin
+    fuv = (diff(numer, 1, 1) + fu * wv1 + fv * wu1 + radius * diff(weight, 1, 1)) / wmin
+    return fu, fv, fuu, fuv, fvv
+
+
+class _PatchBounds(tuple):
+    """Whole-face bounds (|Fu|, |Fv|, |Fuu|, |Fuv|, |Fvv|, False) plus a local
+    lookup over the Bezier patches a UV box overlaps, and the interior knot
+    lines where the surface is only C0 (triangles are cut along them first, so
+    the second-derivative bound holds on each piece)."""
+
+    def __new__(cls, uknots, vknots, patches, c0_u, c0_v):
+        whole = tuple(max(b[k] for row in patches for b in row) for k in range(5))
+        self = super().__new__(cls, (*whole, False))
+        self.uknots, self.vknots, self.patches = uknots, vknots, patches
+        self.c0 = ((0, tuple(c0_u)), (1, tuple(c0_v)))
+        return self
+
+    def local(self, uv):
+        from bisect import bisect_left, bisect_right
+
+        def span(knots, lo, hi):
+            # Control-net bounds hold only inside each patch's own domain.
+            guard = 1e-9 * max(1.0, knots[-1] - knots[0])
+            if lo < knots[0] - guard or hi > knots[-1] + guard:
+                raise ValueError('CAD UV mesh leaves the B-spline surface domain')
+            last = len(knots) - 2
+            i0 = min(max(bisect_right(knots, lo) - 1, 0), last)
+            i1 = min(max(bisect_left(knots, hi) - 1, i0), last)
+            return range(i0, i1 + 1)
+
+        us = span(self.uknots, min(p[0] for p in uv), max(p[0] for p in uv))
+        vs = span(self.vknots, min(p[1] for p in uv), max(p[1] for p in uv))
+        rows = [self.patches[i][j] for i in us for j in vs]
+        return (*(max(b[k] for b in rows) for k in range(5)), False)
+
+
+def _spline_surface_bounds(spline):
+    try:
+        from OCP.TColStd import TColStd_Array1OfReal
+    except ImportError:  # OCP 8 moved collection aliases.
+        from OCP.collections import Array1_double as TColStd_Array1OfReal
+    from OCP.GeomConvert import GeomConvert_BSplineSurfaceToBezierSurface
+
+    if spline.IsUPeriodic() or spline.IsVPeriodic():
+        # Same geometry and parameters, written as one non-periodic period.
+        from OCP.Geom import Geom_BSplineSurface
+
+        spline = spline.Copy()
+        if not isinstance(spline, Geom_BSplineSurface):
+            raise ValueError("CAD B-spline surface copy failed")
+        if spline.IsUPeriodic():
+            spline.SetUNotPeriodic()
+        if spline.IsVPeriodic():
+            spline.SetVNotPeriodic()
+    converter = GeomConvert_BSplineSurfaceToBezierSurface(spline)
+    nu, nv = converter.NbUPatches(), converter.NbVPatches()
+    if nu < 1 or nv < 1:
+        raise ValueError('CAD surface has no Bezier patches')
+    uk, vk = TColStd_Array1OfReal(1, nu + 1), TColStd_Array1OfReal(1, nv + 1)
+    converter.UKnots(uk)
+    converter.VKnots(vk)
+    uknots = tuple(uk.Value(i) for i in range(1, nu + 2))
+    vknots = tuple(vk.Value(i) for i in range(1, nv + 2))
+    patches = [
+        [
+            _bezier_patch_bounds(converter.Patch(i, j), uknots[i] - uknots[i - 1], vknots[j] - vknots[j - 1])
+            for j in range(1, nv + 1)
+        ]
+        for i in range(1, nu + 1)
+    ]
+    c0_u = [spline.UKnot(i) for i in range(2, spline.NbUKnots()) if spline.UMultiplicity(i) >= spline.UDegree()]
+    c0_v = [spline.VKnot(i) for i in range(2, spline.NbVKnots()) if spline.VMultiplicity(i) >= spline.VDegree()]
+    return _PatchBounds(uknots, vknots, patches, c0_u, c0_v)
+
+
+def _local_bounds(bounds, uv):
+    return bounds.local(uv) if isinstance(bounds, _PatchBounds) else bounds
+
+
+def _cut_at_c0(triangle, bounds):
+    """Split a CCW UV triangle along the surface's C0 knot lines."""
+    pieces = [triangle]
+    if not isinstance(bounds, _PatchBounds):
+        return pieces
+    for axis, lines in bounds.c0:
+        for k in lines:
+            out = []
+            for tri in pieces:
+                s = [p[axis] - k for p in tri]
+                if min(s) >= 0 or max(s) <= 0:
+                    out.append(tri)
+                    continue
+                for side in (1, -1):
+                    poly = []
+                    for n in range(3):
+                        a, b = tri[n], tri[(n + 1) % 3]
+                        sa, sb = side * s[n], side * s[(n + 1) % 3]
+                        if sa >= 0:
+                            poly.append(a)
+                        if sa * sb < 0:
+                            t = sa / (sa - sb)
+                            x = tuple(pa + t * (pb - pa) for pa, pb in zip(a, b))
+                            x = tuple(k if i == axis else v for i, v in enumerate(x))
+                            poly.append(x)
+                    for m in range(1, len(poly) - 1):
+                        c = (poly[0], poly[m], poly[m + 1])
+                        area = (c[1][0] - c[0][0]) * (c[2][1] - c[0][1]) - (c[1][1] - c[0][1]) * (c[2][0] - c[0][0])
+                        if area > 0:
+                            out.append(c)
+            pieces = out
+    return pieces
+
+
 def _surface_bounds(adaptor):
     """Bounds for |Fu|, |Fv|, |Fuu|, |Fuv|, |Fvv| in world coordinates."""
     from OCP.GeomAbs import (
@@ -87,6 +290,8 @@ def _surface_bounds(adaptor):
         GeomAbs_Sphere,
         GeomAbs_Torus,
         GeomAbs_SurfaceOfExtrusion,
+        GeomAbs_BSplineSurface,
+        GeomAbs_BezierSurface,
     )
 
     kind = adaptor.GetType()
@@ -114,10 +319,18 @@ def _surface_bounds(adaptor):
     if kind == GeomAbs_SurfaceOfExtrusion:
         speed, accel = _curve_bounds(adaptor.BasisCurve(), 3)
         return speed, 1.0, accel or 0.0, 0.0, 0.0, accel is None
+    if kind == GeomAbs_BSplineSurface:
+        return _spline_surface_bounds(adaptor.BSpline())
+    if kind == GeomAbs_BezierSurface:
+        patch = adaptor.Bezier()
+        u0, u1, v0, v1 = patch.Bounds()
+        b = _bezier_patch_bounds(patch, u1 - u0, v1 - v0)
+        return _PatchBounds((u0, u1), (v0, v1), [[b]], (), ())
     raise ValueError(f'no parametric interpolation bound for CAD surface {kind}')
 
 
 def _interpolation_error(uv, bounds):
+    bounds = _local_bounds(bounds, uv)
     # Taylor's integral remainder and barycentric interpolation cancel the
     # first derivative. Variance <= span^2/4; |covariance| <= du*dv/4.
     du = max(p[0] for p in uv) - min(p[0] for p in uv)
@@ -175,7 +388,7 @@ def _face_data(face, cancel):
 
     adaptor = BRepAdaptor_Surface(face.wrapped)
     bounds = _surface_bounds(adaptor)
-    if not all(math.isfinite(x) and x >= 0 for x in bounds):
+    if not all(math.isfinite(x) and x >= 0 for x in bounds[:5]):
         raise ValueError('nonfinite CAD derivative bound')
     location = TopLoc_Location()
     mesh = BRep_Tool.Triangulation_s(face.wrapped, location)
@@ -230,7 +443,7 @@ def _face_data(face, cancel):
                 or any(b < a for a, b in zip(params, params[1:]))
             ):
                 raise ValueError('CAD trim parameter chain is incomplete')
-            speed, accel = _curve_bounds(curve, 2)
+            speed, deviation_of = _trim_deviation(curve)
             ids = [polygon.Node(i) for i in range(1, count + 1)]
             first_uv = tuple(curve.Value(params[0]).Coord())
             shift = [0.0, 0.0]
@@ -248,7 +461,7 @@ def _face_data(face, cancel):
             gap += speed * (abs(params[0] - first) + abs(params[-1] - last))
             for p, q, t0, t1 in zip(ids, ids[1:], params, params[1:]):
                 represented[tuple(sorted((p, q)))] += 1
-                deviation = speed * (t1 - t0) / 2 if accel is None else accel * (t1 - t0) ** 2 / 8
+                deviation = deviation_of(t0, t1)
                 trim_error = max(trim_error, math.hypot(bounds[0], bounds[1]) * (gap + deviation))
                 trim_segments += 1
             explorer.Next()
@@ -314,7 +527,7 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         _check_cancel(cancel)
         reserve = min(1e-4, (budget - trim_error) / 4)
         remaining = budget - trim_error - reserve
-        pending = [(tuple(uv[i] for i in tri), 0) for tri in indices]
+        pending = [(piece, 0) for tri in indices for piece in _cut_at_c0(tuple(uv[i] for i in tri), bounds)]
         count = 0
         max_interior = 0.0
         regularization = 0.0
@@ -338,12 +551,14 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
                 if depth >= 24:
                     raise ValueError('CAD surface interpolation exceeds refinement depth')
 
+                local = _local_bounds(bounds, triangle)
+
                 def edge_cost(pair):
                     a, b = (triangle[i] for i in pair)
                     du, dv = abs(a[0] - b[0]), abs(a[1] - b[1])
-                    if len(bounds) > 5 and bounds[5]:
-                        return bounds[0] * du
-                    return bounds[2] * du * du + 2 * bounds[3] * du * dv + bounds[4] * dv * dv
+                    if len(local) > 5 and local[5]:
+                        return local[0] * du
+                    return local[2] * du * du + 2 * local[3] * du * dv + local[4] * dv * dv
 
                 i, j = max(((0, 1), (1, 2), (2, 0)), key=edge_cost)
                 a, b, c = triangle[i], triangle[j], triangle[3 - i - j]
@@ -386,7 +601,8 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
             requested_error_mm=max_error_mm,
             error_basis=(
                 'CAD-kernel valid trim topology; matched UV boundary chains; '
-                'analytic/Bezier derivative bounds for trim and barycentric surface interpolation'
+                'analytic/Bezier derivative bounds (B-spline surfaces per Bezier patch, cut at C0 knots) '
+                'for trim and barycentric surface interpolation'
             ),
             cad_topology_error_mm=2 * topology,
             numerical_guard_mm=numerical,
