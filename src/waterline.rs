@@ -1225,11 +1225,27 @@ impl WaterlinePlan {
                     self.limits,
                     &self.region_limits,
                 );
+                // The ball's centre at this level, and how far below it a
+                // dropped ball may rest and still count as resting here: a
+                // contour point is only within the contour error of the
+                // exact contour, which moves a dropped ball by that error
+                // times the slope's tangent (4: slopes up to about 76 deg).
+                let level_center = z + self.radius;
+                let hanging = 4. * self.op.contour_error_mm + self.op.tolerance_mm;
                 let mut runs = crate::finishing::filter_runs(vec![closed.clone()], spacing, |p| {
                     if let Some((lo, hi)) = slope {
-                        let angle = surface
-                            .contact(p, inflated, &mut slope_work, cancel)?
-                            .contact_angle(inflated);
+                        let dropped = surface.contact(p, inflated, &mut slope_work, cancel)?;
+                        // A ball on this level's contour that would drop
+                        // further touches the part only beside it (a wall
+                        // below its top edge): its contact normal is at or
+                        // past horizontal, a 90 deg contact. The dropped
+                        // ball's contact (often the floor at the wall's
+                        // foot) is not this level's contact.
+                        let angle = if dropped.center_z < level_center - hanging {
+                            std::f64::consts::FRAC_PI_2
+                        } else {
+                            dropped.contact_angle(inflated)
+                        };
                         if angle < lo - 1e-9 || angle > hi + 1e-9 {
                             return Ok(false);
                         }
