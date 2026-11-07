@@ -413,3 +413,33 @@ class SplineSurfaceTest(unittest.TestCase):
         with mock.patch.object(cad, '_face_data', side_effect=ValueError('CAD trim chains do not cover mesh boundary exactly once')):
             with self.assertRaisesRegex(ValueError, 'cannot triangulate face 0'):
                 export_surface_mesh(lofted(), max_error_mm=0.01)
+
+    def test_full_turn_band_the_mesher_skips_is_spanned_from_its_uv_rectangle(self):
+        from unittest import mock
+        import cadquery as cq
+        import camlib._cad_surface as cad
+
+        original = cad._face_data
+
+        def no_mesh_for_cones(face, cancel):
+            if face.geomType() == 'CONE':
+                raise ValueError('CAD mesher omitted face UV nodes')
+            return original(face, cancel)
+
+        # A 1 degree taper pin like the one the mesher skipped on a real part.
+        cone = cq.Solid.makeCone(1.1, 1.1 - 3.2 * math.tan(math.radians(1)), 3.2)
+        with mock.patch.object(cad, '_face_data', no_mesh_for_cones):
+            mesh = export_surface_mesh(cone, max_error_mm=0.01)
+        side = [f for f in mesh.source['face_bounds'] if f['kind'] == 'CONE']
+        self.assertEqual(len(side), 1)
+        self.assertTrue(side[0]['remeshed_alone'])
+        self.assertEqual(side[0]['trim_error_mm'], 0.0)
+        top = 1.1 - 3.2 * math.tan(math.radians(1))
+        for tri in mesh.triangles:
+            for p in (*tri, tuple(sum(p[k] for p in tri) / 3 for k in range(3))):
+                if 1e-6 < p[2] < 3.2 - 1e-6:
+                    expected = 1.1 + (top - 1.1) * p[2] / 3.2
+                    self.assertLessEqual(abs(math.hypot(p[0], p[1]) - expected), mesh.surface_error_mm + 1e-9)
+        # A face whose trims are not its parameter rectangle is not spanned.
+        disk = next(f for f in cone.Faces() if f.geomType() == 'PLANE')
+        self.assertIsNone(cad._rectangle_face_data(disk, None))

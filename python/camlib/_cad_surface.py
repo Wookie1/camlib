@@ -510,7 +510,54 @@ def _mesh_face_alone(face, deflection, trim_budget, cancel):
                 continue
             if row[4] <= trim_budget:
                 return row
-    return None
+    return _rectangle_face_data(face, cancel)
+
+
+def _rectangle_face_data(face, cancel):
+    """Last resort when the CAD mesher yields nothing usable for a face whose
+    single trim loop is exactly its UV parameter rectangle (iso-line pcurves,
+    e.g. a full-turn cone or cylinder band). Two UV triangles span the
+    rectangle; the caller's bounded refinement subdivides them. The trims
+    are the rectangle's sides themselves, so the trim error is zero (the
+    edges' 3D curves stay within the topology tolerance the caller charges).
+    Returns _face_data's row, or None when the trims are not that rectangle."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve2d
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.GeomAbs import GeomAbs_Line
+
+    _check_cancel(cancel)
+    if len(face.Wires()) != 1:
+        return None
+    adaptor = BRepAdaptor_Surface(face.wrapped)
+    bounds = _surface_bounds(adaptor)
+    u0, u1 = adaptor.FirstUParameter(), adaptor.LastUParameter()
+    v0, v1 = adaptor.FirstVParameter(), adaptor.LastVParameter()
+    if not all(math.isfinite(x) for x in (u0, u1, v0, v1)) or u1 <= u0 or v1 <= v0:
+        return None
+    guard = 1e-9 * max(1.0, abs(u0), abs(u1), abs(v0), abs(v1))
+    covered = {('u', u0): 0.0, ('u', u1): 0.0, ('v', v0): 0.0, ('v', v1): 0.0}
+    segments = 0
+    explorer = BRepTools_WireExplorer(face.Wires()[0].wrapped, face.wrapped)
+    while explorer.More():
+        curve = BRepAdaptor_Curve2d(explorer.Current(), face.wrapped)
+        if curve.GetType() != GeomAbs_Line:
+            return None
+        a = tuple(curve.Value(curve.FirstParameter()).Coord())
+        b = tuple(curve.Value(curve.LastParameter()).Coord())
+        for axis, other, side in (('u', 1, 0), ('v', 0, 1)):
+            match = next((k for (name, k) in covered if name == axis and abs(a[side] - k) <= guard and abs(b[side] - k) <= guard), None)
+            if match is not None:
+                covered[(axis, match)] += abs(b[other] - a[other])
+                break
+        else:
+            return None
+        segments += 1
+        explorer.Next()
+    span = {'u': v1 - v0, 'v': u1 - u0}
+    if any(abs(length - span[axis]) > 1e3 * guard for (axis, _), length in covered.items()):
+        return None
+    uv = [None, (u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    return adaptor, bounds, uv, [(1, 2, 3), (1, 3, 4)], 0.0, segments
 
 
 def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
