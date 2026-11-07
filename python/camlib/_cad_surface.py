@@ -444,6 +444,25 @@ def _face_data(face, cancel):
     ):
         raise ValueError('CAD UV mesh has inconsistent edge incidence')
     boundary = {edge for edge, n in edges.items() if n == 1}
+    if isinstance(bounds, _PatchBounds):
+        # The mesher may place trim nodes a hair outside a spline's domain
+        # (loose CAD tolerances); patch bounds hold only inside it. Clamp them
+        # onto the domain: the trim check below measures each node against
+        # its pcurve, so the move is charged to the trim error.
+        on_boundary = {i for edge in boundary for i in edge}
+        lo = (bounds.uknots[0], bounds.vknots[0])
+        hi = (bounds.uknots[-1], bounds.vknots[-1])
+        span = max(hi[0] - lo[0], hi[1] - lo[1])
+        for i in range(1, len(uv)):
+            p = uv[i]
+            q = tuple(min(max(p[k], lo[k]), hi[k]) for k in (0, 1))
+            if q != p:
+                if i not in on_boundary or math.dist(p, q) > 1e-6 * span:
+                    raise ValueError(
+                        f'CAD UV mesh node {p} leaves the B-spline surface domain '
+                        f'[{lo[0]}, {hi[0]}] x [{lo[1]}, {hi[1]}]'
+                    )
+                uv[i] = q
     represented = Counter()
     trim_error = 0.0
     trim_segments = 0
