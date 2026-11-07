@@ -113,9 +113,9 @@ fn is_zero(n: &usize) -> bool {
 
 /// Ramp angle of a run's entry through stock left above it (3 deg, the
 /// helix angle of the roughing entries).
-const ENTRY_RAMP_RAD: f64 = 0.052_359_877_559_829_89;
+pub(crate) const ENTRY_RAMP_RAD: f64 = 0.052_359_877_559_829_89;
 /// Stock above a run's height that a straight plunge may still remove.
-const ENTRY_PLUNGE_MM: f64 = 0.05;
+pub(crate) const ENTRY_PLUNGE_MM: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 struct Tri {
@@ -1638,7 +1638,9 @@ impl FlatPlan {
 
 /// Highest live stock upper bound over the cells a disk of radius r at xy
 /// can touch (whole cells: an overestimate, never an underestimate).
-fn stock_top(stock: &Stock, xy: [f64; 2], r: f64) -> f64 {
+/// Highest live stock under a tool of radius `r` at `xy` (cell centres
+/// within `r` plus half a cell diagonal).
+pub(crate) fn stock_top(stock: &Stock, xy: [f64; 2], r: f64) -> f64 {
     let spec = stock.spec();
     let [nx, ny] = stock.dimensions();
     let [wx, wy] = stock.cell_widths_mm();
