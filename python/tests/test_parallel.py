@@ -1,6 +1,7 @@
 from dataclasses import replace
 import importlib.util
 import itertools
+import math
 import os
 from pathlib import Path
 import unittest
@@ -14,8 +15,9 @@ from camlib.playback import Cursor, Player, RecordedRun
 from camlib.material import Options, SurfaceTarget, Verifier
 from camlib.simulation import OperationUpdate, ReachRefused, Simulation, SimulationError, VerificationUpdate
 from camlib.surface import SurfaceMesh
-from camlib.tools import EndMill, ToolAssembly, HolderSection
+from camlib.tools import BallEndMill, EndMill, ToolAssembly, HolderSection
 from camlib.verification import StockContactOptions, StreamChecks
+from camlib.simulation import Update
 
 
 def example():
@@ -350,3 +352,62 @@ class ActualDepthTest(unittest.TestCase):
         self.assertEqual((r.top_z_mm, r.depth_available_mm), (20.5, 18))
         self.assertAlmostEqual(r.depth_needed_mm, r.top_z_mm - r.z_mm)
         self.assertLess(r.z_mm, 20.5 - 18)
+
+
+class RowEntryTest(unittest.TestCase):
+    def test_rows_under_stock_are_entered_by_a_ramp_not_a_plunge(self):
+        # Fresh 8 mm stock stands over a stepped part (flats at 4 and 7).
+        # Rows limited to slopes up to 45 deg skip the boss walls and
+        # re-enter beside and on the boss under that stock: a straight
+        # plunge would take the ball down through it each time.
+        import cadquery as cq
+        import camlib
+        from camlib.cadquery import export_surface_mesh
+
+        part = cq.Workplane("XY").box(24, 16, 4, centered=False).union(
+            cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4))
+        )
+        surface = export_surface_mesh(part, source=dict(model="stepped", revision="1"))
+        tool = ToolAssembly(
+            "ball4",
+            BallEndMill("b4", diameter=4, flute_length=20, overall_length=50),
+            30,
+            60,
+            (HolderSection(30, 60, 4, 4),),
+        )
+        op = camlib.Parallel(
+            "rows", tool, surface, 0, 2, 12, slope_to_deg=45,
+            feed_mm_min=600, plunge_mm_min=150, spindle_rpm=12000,
+            tool_number=1, length_register=1, coolant="flood",
+        )
+        report, motions = None, []
+        with Simulation(
+            stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), 0.25),
+            tools=(tool,),
+            operations=(op,),
+            revision="1",
+            initial_position_mm=(0, 0, 12),
+            verification=camlib.StreamChecks(stock_contact=camlib.StockContactOptions()),
+        ) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, Update):
+                    motions.append(update.motion)
+                elif isinstance(update, OperationUpdate) and update.stage == "end":
+                    report = update.report
+        self.assertGreater(report["ramped_entries"], 0)
+        # Every plunge stops above the stock it would otherwise go through
+        # (the boss top at 7 and the floor at 4 lie under 8 mm stock).
+        for m in motions:
+            if m["kind"] == "plunge":
+                self.assertGreater(m["curve"]["end"][2], 7.5, m)
+        # Entry ramps: feed moves that descend while going back and forth
+        # along the row, never steeper than 10 deg.
+        slope = math.tan(math.radians(10)) + 1e-9
+        ramps = 0
+        for prev, m in zip(motions, motions[1:]):
+            a, b = m["curve"]["start"], m["curve"]["end"]
+            run = math.hypot(b[0] - a[0], b[1] - a[1])
+            if prev["kind"] == "plunge" and m["kind"] == "lead" and b[2] < a[2]:
+                ramps += 1
+                self.assertLessEqual((a[2] - b[2]) / run, slope)
+        self.assertEqual(ramps, report["ramped_entries"])
