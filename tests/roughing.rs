@@ -3074,4 +3074,129 @@ fn simplified_shadows_contain_the_exact_one_with_few_vertices() {
             .simplified
             .is_none()
     );
+/// Analytic height of the `roughing.json` frustum at a point on its +X slope
+/// (independent of every planner region): 2 at x = 8 rising to 10 at x = 11.
+fn frustum_x_slope_height(p: [f64; 2]) -> f64 {
+    2. + (p[0] - 8.) * 8. / 3.
+}
+
+#[test]
+fn step_up_layers_climb_each_stepdown_and_cut_the_wall_stair_without_touching_the_part() {
+    for clearing in [
+        camlib::roughing::RoughingClearing::Offset {
+            stepover_mm: 0.8,
+            coverage_margin_mm: 0.01,
+        },
+        camlib::roughing::RoughingClearing::Raster {
+            stepover_mm: 0.8,
+            routing: Some(camlib::pocket::RasterRouting::Economical),
+        },
+    ] {
+        let mut manifest = fixture(false);
+        let Operation::Roughing(op) = &mut manifest.operations[0] else {
+            panic!("rough")
+        };
+        op.clearing = clearing.clone();
+        let base = scheduled_run(&manifest);
+        let Operation::Roughing(op) = &mut manifest.operations[0] else {
+            panic!("rough")
+        };
+        op.stepup_mm = Some(0.5);
+        let run = scheduled_run(&manifest);
+
+        // Schedule: each full layer, then its step-ups climbing back up,
+        // evenly spaced at most 0.5 apart and below the layer above it.
+        let layers = run.report["layers"].as_array().unwrap();
+        let full: Vec<f64> = base.report["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["tip_z_mm"].as_f64().unwrap())
+            .collect();
+        let mut above = 10.;
+        let mut index = 0;
+        for &z in &full {
+            assert_eq!(layers[index]["tip_z_mm"].as_f64().unwrap(), z);
+            assert!(layers[index].get("step_up_of_z_mm").is_none());
+            index += 1;
+            let mut last = z;
+            while index < layers.len() && layers[index].get("step_up_of_z_mm").is_some() {
+                let up = layers[index]["tip_z_mm"].as_f64().unwrap();
+                assert_eq!(layers[index]["step_up_of_z_mm"].as_f64().unwrap(), z);
+                assert!(up > last && up - last <= 0.5 + 1e-9 && up < above);
+                last = up;
+                index += 1;
+            }
+            assert!(
+                above - last <= 0.5 + 1e-9,
+                "stair left between Z{last} and Z{above}"
+            );
+            above = z;
+        }
+        assert_eq!(index, layers.len());
+        assert_eq!(run.report["completed_layers"], layers.len());
+
+        // Independent part oracle on every motion: no column of the part cut.
+        for motion in &run.motions {
+            certify_part(&motion.curve);
+        }
+        // Never leaves more anywhere, and the +X wall stair is cut down:
+        // leftover above the analytic slope drops from about a full stepdown
+        // to at most one step-up plus the allowances.
+        let (mut base_worst, mut worst) = (0f64, 0f64);
+        for (i, _) in run.stock.cells().iter().enumerate() {
+            let p = run.stock.cell_center(i).unwrap();
+            let height = |r: &ScheduledRun| {
+                r.motions
+                    .iter()
+                    .map(|m| exact_height(&m.curve, p))
+                    .fold(10f64, f64::min)
+            };
+            let (old, new) = (height(&base), height(&run));
+            assert!(
+                new <= old + 1e-6,
+                "step-up left more at {p:?}: {new} > {old}"
+            );
+            if (8.6..10.4).contains(&p[0]) && (11.0..17.0).contains(&p[1]) {
+                let part = frustum_x_slope_height(p);
+                base_worst = base_worst.max(old - part);
+                worst = worst.max(new - part);
+            }
+        }
+        eprintln!(
+            "step-up {clearing:?}: wall leftover {base_worst:.3} -> {worst:.3} mm; {} -> {} motions; {:.1} -> {:.1} nominal s",
+            base.motions.len(),
+            run.motions.len(),
+            base.nominal,
+            run.nominal
+        );
+        assert!(
+            base_worst > 1.5,
+            "fixture no longer shows the stair: {base_worst}"
+        );
+        assert!(worst < 1.0, "step-up layers left {worst} mm on the wall");
+    }
+}
+
+#[test]
+fn step_up_must_be_smaller_than_stepdown() {
+    let cancel = AtomicBool::new(false);
+    for bad in [0., -0.5, 2., 3., f64::NAN] {
+        let mut manifest = fixture(false);
+        let Operation::Roughing(op) = &mut manifest.operations[0] else {
+            panic!("rough")
+        };
+        op.stepup_mm = Some(bad);
+        let error = OperationPlan::prepare(
+            manifest.operations[0].clone(),
+            &manifest.tools[0],
+            manifest.stock.height().unwrap(),
+            manifest.initial_position_mm,
+            1,
+            &cancel,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("stepup_mm {bad} accepted"));
+        assert!(error.contains("stepup_mm"), "{error}");
+    }
 }

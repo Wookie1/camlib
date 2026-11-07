@@ -1173,6 +1173,9 @@ class Roughing:
     # None: a quarter of radial_allowance_mm; 0: off. At most the allowance;
     # leaves at most twice this more stock.
     contour_tolerance_mm: float | None = None
+    # Step-up layers: after each full stepdown, climb back up through its depth
+    # at most this far apart, cutting only a band next to the part.
+    stepup_mm: float | None = None
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1195,7 +1198,7 @@ class Roughing:
             result.pop('clearing_tolerance_mm')
         if not self.require_part_at_first_depth:
             result.pop('require_part_at_first_depth')
-        for key in ('retract_z_mm', 'feed_z_mm'):
+        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm'):
             if result[key] is None:
                 result.pop(key)
         for key in ("target", "clearing", "entry"):
