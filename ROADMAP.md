@@ -35,9 +35,7 @@ is ordered by real dependency, not by size:
 
 ## Phase 1: Correctness
 
-- [ ] #72 Material check stays uncertain on a correctly machined prismatic part (wall cells, through-hole interiors)
-- [ ] #87 Project along flow_paths(along="u") fails: duplicate last row gives a zero-length link
-- [ ] #88 steep_and_shallow: Waterline and Parallel floor rules conflict for parts taller than the cutting length
+- [ ] #106 Material check: per-move gouge proof for prismatic targets
 
 ## Phase 2: Complete milling
 
@@ -48,6 +46,7 @@ Smaller, independent items first, then the 3D stock and what needs it.
 - [ ] #92 Deburr: ball-end and bull-nose tools
 - [ ] #93 Deburr: edges next to drafted or filleted walls
 - [ ] #94 Deburr: sloped and vertical edges (3-axis part needs #92; tilted tool with #5/#6)
+- [ ] #107 Material check: prove ball and bull-nose ends with their real shape (shares contact work with #92)
 - [ ] #1 3D stock model (tri-dexel) for undercuts and multi-axis machining
 - [ ] #8 Undercut milling tools: T-slot, keyseat, lollipop and dovetail cutters (needs #1)
 
@@ -127,6 +126,7 @@ These can run in parallel with any phase.
 - [ ] #95 Siemens 808D posts: tapping (CYCLE84 / G331, ISO G84/G74)
 - [ ] #96 FANUC 0i-MB post: M29 S rigid tapping form
 - [ ] #97 Haas NGC post: G86 needs a source for spindle restart
+- [ ] #108 Material check: keep the per-move proof across resumed streams; scale work budgets
 
 ## Done
 
@@ -137,3 +137,6 @@ These can run in parallel with any phase.
 - [x] #13 Haas NGC post: dwell and canned drilling cycles
 - [x] #11 Deburr finishing (edge breaking along sharp edges)
 - [x] #65 Multi-tool jobs: post fails at the first tool change unless `Setup.tool_change` matches the tool table
+- [x] #87 Project along flow_paths(along="u") fails: duplicate last row gives a zero-length link
+- [x] #88 steep_and_shallow: Waterline and Parallel floor rules conflict for parts taller than the cutting length
+- [x] #72 Material check stays uncertain on a correctly machined prismatic part (wall cells, through-hole interiors)
