@@ -470,6 +470,49 @@ def _face_data(face, cancel):
     return adaptor, bounds, uv, indices, trim_error, trim_segments
 
 
+def _remeshable(error):
+    """Mesher/topology mismatches (not missing bounds or cancellation)."""
+    text = str(error)
+    return not any(k in text for k in ('cancelled', 'interpolation bound', 'derivative bound', 'invalid bounded'))
+
+
+def _mesh_face_alone(face, deflection, trim_budget, cancel):
+    """Triangulate one face on its own when the whole-solid mesh of it does
+    not match its trims (imported parts with loose tolerances: the mesher
+    merges trim nodes closer than the tolerance, or skips the face).
+
+    Each face's facets are bounded against that face's own surface and
+    trims, so faces need not share boundary nodes. Tightening tolerances on
+    the private copy changes no geometry: the caller still charges twice the
+    original topology tolerance. Returns _face_data's row, or None."""
+    import cadquery as cq
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRepTools import BRepTools
+    from OCP.ShapeFix import ShapeFix_ShapeTolerance
+    from OCP.TopAbs import TopAbs_SHAPE
+
+    for tight in (False, True):
+        for scale in (1.0, 0.5, 2.0, 0.25):
+            _check_cancel(cancel)
+            alone = cq.Face(BRepBuilderAPI_Copy(face.wrapped, True, False).Shape())
+            if alone.wrapped.Orientation() != face.wrapped.Orientation():
+                return None
+            if tight:
+                ShapeFix_ShapeTolerance().LimitTolerance(alone.wrapped, 1e-7, 1e-7, TopAbs_SHAPE)
+            BRepTools.Clean_s(alone.wrapped)
+            BRepMesh_IncrementalMesh(alone.wrapped, deflection * scale, False, 0.5, True)
+            try:
+                row = _face_data(alone, cancel)
+            except ValueError as e:
+                if not _remeshable(e):
+                    raise
+                continue
+            if row[4] <= trim_budget:
+                return row
+    return None
+
+
 def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
     import cadquery as cq
     import OCP
@@ -509,11 +552,30 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
     for face in faces:
         _surface_bounds(BRepAdaptor_Surface(face.wrapped))
     seed_deflection = budget / 4
+    remeshed = set()
     for attempt in range(5):
         _check_cancel(cancel)
         BRepTools.Clean_s(shape.wrapped)
         BRepMesh_IncrementalMesh(shape.wrapped, seed_deflection, False, 0.5, True)
-        data = [_face_data(f, cancel) for f in faces]
+        data = []
+        for n, f in enumerate(faces):
+            try:
+                row = _face_data(f, cancel)
+            except ValueError as e:
+                if not _remeshable(e):
+                    raise
+                row, problem = None, e
+            if row is None or row[4] > budget / 2:
+                alone = _mesh_face_alone(f, seed_deflection, budget / 2, cancel)
+                if alone is not None:
+                    row = alone
+                    remeshed.add(n)
+                elif row is None:
+                    raise ValueError(
+                        f'CAD mesher cannot triangulate face {n} ({f.geomType()}, {f.Area():.3f} mm2) '
+                        f'consistently with its trims: {problem}'
+                    )
+            data.append(row)
         if max(row[4] for row in data) <= budget / 2:
             break
         seed_deflection /= 4
@@ -523,7 +585,7 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
     face_reports = []
     max_error = 0.0
     evaluations = 0
-    for face, (adaptor, bounds, uv, indices, trim_error, trim_segments) in zip(faces, data):
+    for n, (face, (adaptor, bounds, uv, indices, trim_error, trim_segments)) in enumerate(zip(faces, data)):
         _check_cancel(cancel)
         reserve = min(1e-4, (budget - trim_error) / 4)
         remaining = budget - trim_error - reserve
@@ -582,6 +644,7 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         face_reports.append(
             dict(
                 kind=face.geomType(),
+                remeshed_alone=n in remeshed,
                 facets=count,
                 trim_segments=trim_segments,
                 interpolation_error_mm=max_interior,

@@ -389,3 +389,27 @@ class SplineSurfaceTest(unittest.TestCase):
                     self.assertLessEqual(distance(p), mesh.surface_error_mm + 1e-9)
         mesh = export_surface_mesh(lofted(), max_error_mm=0.01)
         self.assertLessEqual(mesh.surface_error_mm, 0.01)
+
+    def test_face_whose_solid_mesh_misses_its_trims_is_meshed_alone(self):
+        from unittest import mock
+        import camlib._cad_surface as cad
+
+        original = cad._face_data
+        calls = []
+
+        def flaky(face, cancel):
+            calls.append(face)
+            if len(calls) == 1:  # the whole-solid mesh of the first face
+                raise ValueError('CAD trim chains do not cover mesh boundary exactly once')
+            return original(face, cancel)
+
+        with mock.patch.object(cad, '_face_data', flaky):
+            mesh = export_surface_mesh(lofted(), max_error_mm=0.01)
+        flags = [f['remeshed_alone'] for f in mesh.source['face_bounds']]
+        self.assertEqual(flags.count(True), 1)
+        self.assertTrue(flags[0])
+        self.assertLessEqual(mesh.surface_error_mm, 0.01)
+        self.assertEqual(sum(f['facets'] for f in mesh.source['face_bounds']), len(mesh.triangles))
+        with mock.patch.object(cad, '_face_data', side_effect=ValueError('CAD trim chains do not cover mesh boundary exactly once')):
+            with self.assertRaisesRegex(ValueError, 'cannot triangulate face 0'):
+                export_surface_mesh(lofted(), max_error_mm=0.01)
