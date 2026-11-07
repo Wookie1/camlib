@@ -262,6 +262,18 @@ def _local_bounds(bounds, uv):
     return bounds.local(uv) if isinstance(bounds, _PatchBounds) else bounds
 
 
+def _uv_box(bounds, a, b, reach):
+    """Corners of the UV box around a and b grown by `reach`, clamped to a
+    spline's domain (the trim and its chord lie inside the face)."""
+    lo = [min(a[k], b[k]) - reach for k in (0, 1)]
+    hi = [max(a[k], b[k]) + reach for k in (0, 1)]
+    if isinstance(bounds, _PatchBounds):
+        for k, knots in ((0, bounds.uknots), (1, bounds.vknots)):
+            lo[k] = min(max(lo[k], knots[0]), knots[-1])
+            hi[k] = min(max(hi[k], knots[0]), knots[-1])
+    return ((lo[0], lo[1]), (hi[0], hi[1]))
+
+
 def _cut_at_c0(triangle, bounds):
     """Split a CCW UV triangle along the surface's C0 knot lines."""
     pieces = [triangle]
@@ -469,15 +481,18 @@ def _face_data(face, cancel):
                 if periodic:
                     value = period()
                     shift[axis] = round((uv[ids[0]][axis] - first_uv[axis]) / value) * value
-            gap = max(
+            gaps = [
                 math.dist(uv[j], tuple(v + delta for v, delta in zip(curve.Value(t).Coord(), shift)))
                 for j, t in zip(ids, params)
-            )
-            gap += speed * (abs(params[0] - first) + abs(params[-1] - last))
-            for p, q, t0, t1 in zip(ids, ids[1:], params, params[1:]):
+            ]
+            ends = speed * (abs(params[0] - first) + abs(params[-1] - last))
+            for p, q, t0, t1, g0, g1 in zip(ids, ids[1:], params, params[1:], gaps, gaps[1:]):
                 represented[tuple(sorted((p, q)))] += 1
-                deviation = deviation_of(t0, t1)
-                trim_error = max(trim_error, math.hypot(bounds[0], bounds[1]) * (gap + deviation))
+                reach = max(g0, g1) + ends + deviation_of(t0, t1)
+                # |F'| over the UV box holding this chord and the trim span
+                # it stands for (B-splines: only the patches it overlaps).
+                fu, fv = _local_bounds(bounds, _uv_box(bounds, uv[p], uv[q], reach))[:2]
+                trim_error = max(trim_error, math.hypot(fu, fv) * reach)
                 trim_segments += 1
             explorer.Next()
     if set(represented) != boundary or any(n != 1 for n in represented.values()):
