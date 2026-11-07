@@ -106,6 +106,8 @@ pub struct EngagementFrontReport {
     pub engagement_grid_mm: f64,
     pub passes: usize,
     pub stay_down_links: usize,
+    /// Stay-down links routed around uncut stock through cleared area.
+    pub routed_links: usize,
     pub lifts: usize,
     pub stock_edge_entries: usize,
     pub helical_entries: usize,
@@ -137,6 +139,7 @@ impl Default for EngagementFrontReport {
             engagement_grid_mm: 0.,
             passes: 0,
             stay_down_links: 0,
+            routed_links: 0,
             lifts: 0,
             stock_edge_entries: 0,
             helical_entries: 0,
@@ -398,6 +401,9 @@ fn fit_strokes(pts: &[Point], tol: f64, max_radius: f64) -> Vec<Stroke> {
     out
 }
 
+/// Line/arc fit tolerance as a fraction of the steering grid cell.
+const FIT_FRACTION: f64 = 0.25;
+
 type Pending = (Curve, MoveKind, Option<f64>);
 
 pub(crate) struct EngagementFrontPlan {
@@ -579,7 +585,7 @@ impl EngagementFrontPlan {
             + 4. * self.op.tolerance_mm
             + 1.5 * c
             + c / 8.
-            + c / 10.
+            + FIT_FRACTION * c
     }
 
     fn build_layer(&mut self, stock: &Stock, cancel: &impl CancelSignal) -> Result<(), String> {
@@ -860,6 +866,146 @@ impl EngagementFrontPlan {
         (pts, cut_any)
     }
 
+    /// A stay-down link from `a` to `b` through already cleared stock: the
+    /// shortest 8-connected grid route whose cutter centres keep material at
+    /// least `r - w/2` away, simplified, then re-checked step by step with
+    /// [`Self::link_samples`] and certified exactly against the region.
+    /// Returns (waypoints after `a`, samples to cut, widest step).
+    fn routed_link(
+        &self,
+        a: Point,
+        b: Point,
+        max_len: f64,
+    ) -> Option<(Vec<Point>, Vec<Point>, f64)> {
+        let layer = self.layer.as_ref().unwrap();
+        let g = layer.g;
+        let (r, c) = (self.r, g.c);
+        let straight = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if straight > max_len {
+            return None;
+        }
+        let margin = 2. * r + 0.5 * (max_len - straight).min(straight) + 4. * c;
+        let (ia, ja) = g.cell(a)?;
+        let (ib, jb) = g.cell(b)?;
+        let m = (margin / c).ceil() as usize;
+        let i0 = ia.min(ib).saturating_sub(m);
+        let j0 = ja.min(jb).saturating_sub(m);
+        let i1 = (ia.max(ib) + m).min(g.nx - 1);
+        let j1 = (ja.max(jb) + m).min(g.ny - 1);
+        let w = Grid {
+            x0: g.x0 + i0 as f64 * c,
+            y0: g.y0 + j0 as f64 * c,
+            c,
+            nx: i1 - i0 + 1,
+            ny: j1 - j0 + 1,
+        };
+        let n = w.nx * w.ny;
+        let global = |k: usize| g.idx(i0 + k % w.nx, j0 + k / w.nx);
+        let mat: Vec<bool> = (0..n).map(|k| layer.material(global(k))).collect();
+        let dmat = edt(&w, &mat);
+        // Material beyond the window is unseen: its border ring is closed.
+        let ring = ((r + c) / c).ceil() as usize + 1;
+        let passable: Vec<bool> = (0..n)
+            .map(|k| {
+                let (i, j) = (k % w.nx, k / w.nx);
+                let border = (i < ring && i0 > 0)
+                    || (j < ring && j0 > 0)
+                    || (i + ring >= w.nx && i1 + 1 < g.nx)
+                    || (j + ring >= w.ny && j1 + 1 < g.ny);
+                !border && layer.allowed[global(k)] && dmat[k] >= r - 0.5 * self.width
+            })
+            .collect();
+        let start = w.idx(ia - i0, ja - j0);
+        let goal = w.idx(ib - i0, jb - j0);
+        if !passable[goal] {
+            return None;
+        }
+        // Dijkstra on the window (the start may still touch the front).
+        let mut dist = vec![f64::INFINITY; n];
+        let mut prev = vec![usize::MAX; n];
+        let mut heap = std::collections::BinaryHeap::new();
+        dist[start] = 0.;
+        heap.push((std::cmp::Reverse(0u64), start));
+        let limit = max_len / c;
+        while let Some((std::cmp::Reverse(d), k)) = heap.pop() {
+            let d = d as f64 / 1024.;
+            if d > dist[k] + 1e-9 {
+                continue;
+            }
+            if k == goal || d > limit {
+                break;
+            }
+            let (i, j) = ((k % w.nx) as i64, (k / w.nx) as i64);
+            for (di, dj, step) in [
+                (1, 0, 1.),
+                (-1, 0, 1.),
+                (0, 1, 1.),
+                (0, -1, 1.),
+                (1, 1, std::f64::consts::SQRT_2),
+                (1, -1, std::f64::consts::SQRT_2),
+                (-1, 1, std::f64::consts::SQRT_2),
+                (-1, -1, std::f64::consts::SQRT_2),
+            ] {
+                let (ni, nj) = (i + di, j + dj);
+                if ni < 0 || nj < 0 || ni >= w.nx as i64 || nj >= w.ny as i64 {
+                    continue;
+                }
+                let nk = w.idx(ni as usize, nj as usize);
+                let near_start = d < 2. * self.width / c;
+                if !passable[nk] && !(near_start && dmat[nk] >= r - self.width) {
+                    continue;
+                }
+                let nd = d + step;
+                if nd < dist[nk] {
+                    dist[nk] = nd;
+                    prev[nk] = k;
+                    heap.push((std::cmp::Reverse((nd * 1024.) as u64), nk));
+                }
+            }
+        }
+        if !dist[goal].is_finite() || dist[goal] * c > max_len {
+            return None;
+        }
+        let mut chain = vec![b];
+        let mut k = prev[goal];
+        while k != start && k != usize::MAX {
+            chain.push(w.center(k));
+            k = prev[k];
+        }
+        chain.push(a);
+        chain.reverse();
+        // Simplify greedily: the longest straight jump each step may take
+        // while the bounded-engagement check and region certificate hold.
+        let mut waypoints = vec![];
+        let mut samples = vec![];
+        let mut widest: f64 = 0.;
+        let mut at = 0;
+        while at + 1 < chain.len() {
+            let mut best = None;
+            let mut hi = chain.len() - 1;
+            loop {
+                if let Some((s, wd)) = self.link_samples(chain[at], chain[hi])
+                    && self
+                        .guides
+                        .stroke_geometry_fits_radius(Stroke::line(chain[at], chain[hi]), r)
+                {
+                    best = Some((hi, s, wd));
+                    break;
+                }
+                if hi == at + 1 {
+                    break;
+                }
+                hi = at + 1 + (hi - at - 1) / 2;
+            }
+            let (next, s, wd) = best?;
+            samples.extend(s);
+            widest = widest.max(wd);
+            waypoints.push(chain[next]);
+            at = next;
+        }
+        Some((waypoints, samples, widest))
+    }
+
     /// Front step length: short against the cutter and the target width.
     fn step_mm(&self, c: f64) -> f64 {
         (0.15 * self.r).min(0.6 * self.width).max(2. * c)
@@ -950,7 +1096,7 @@ impl EngagementFrontPlan {
     fn emit_cuts(&mut self, pts: &[Point]) -> Result<(), String> {
         let c = self.layer.as_ref().unwrap().g.c;
         let z = self.z;
-        for s in fit_strokes(pts, c / 10., 1000. * self.r) {
+        for s in fit_strokes(pts, FIT_FRACTION * c, 1000. * self.r) {
             self.certify(s)?;
             if s.arc.is_some() {
                 self.report.arcs += 1;
@@ -1008,13 +1154,18 @@ impl EngagementFrontPlan {
             let here = self.position;
             let at_layer = (here[2] - z).abs() < 1e-9;
             let len = (q[0] - here[0]).hypot(q[1] - here[1]);
-            let link = if at_layer && len <= keep_down {
-                self.link_samples([here[0], here[1]], q).filter(|_| {
-                    self.guides
-                        .stroke_geometry_fits_radius(Stroke::line([here[0], here[1]], q), r)
-                })
-            } else {
+            let from = [here[0], here[1]];
+            let link = if !at_layer {
                 None
+            } else if len <= keep_down
+                && let Some((samples, widest)) = self.link_samples(from, q)
+                && self
+                    .guides
+                    .stroke_geometry_fits_radius(Stroke::line(from, q), r)
+            {
+                Some((vec![q], samples, widest))
+            } else {
+                self.routed_link(from, q, 3. * keep_down)
             };
             if link.is_none() {
                 // A vertical entry needs the committed sweeps (or air outside
@@ -1035,7 +1186,7 @@ impl EngagementFrontPlan {
                 self.mark_dead(q, 3);
                 continue;
             }
-            if let Some((samples, widest)) = link {
+            if let Some((waypoints, samples, widest)) = link {
                 let layer = self.layer.as_mut().unwrap();
                 for p in samples {
                     layer.cut(p, r);
@@ -1043,8 +1194,16 @@ impl EngagementFrontPlan {
                 self.report.max_estimated_engagement_mm =
                     self.report.max_estimated_engagement_mm.max(widest);
                 self.report.stay_down_links += 1;
-                self.report.certified_strokes += 1;
-                self.line(here, [q[0], q[1], z], MoveKind::Link);
+                if waypoints.len() > 1 {
+                    self.report.routed_links += 1;
+                }
+                let mut at = here;
+                for w in waypoints {
+                    self.report.certified_strokes += 1;
+                    let next = [w[0], w[1], z];
+                    self.line(at, next, MoveKind::Link);
+                    at = next;
+                }
             } else {
                 let above = self.travel(here, q);
                 self.line(above, [q[0], q[1], z], MoveKind::Plunge);
