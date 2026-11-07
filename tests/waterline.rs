@@ -702,3 +702,59 @@ fn slope_limits_keep_vertical_walls_below_their_top_edge() {
     }
     assert!(beside > 0, "no wall contour below a top edge was kept");
 }
+#[test]
+fn loops_are_entered_from_beside_the_wall_not_on_it() {
+    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
+    // A box: the ball plunges at a point moved away from the wall, then
+    // leads in sideways, so stock left on the wall is not cut by its tip.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = operation(&m);
+    let (a, b, c, d) = ([8., 5., 6.], [16., 5., 6.], [16., 11., 6.], [8., 11., 6.]);
+    op.surface = SurfaceMesh {
+        version: 1,
+        units: "mm".into(),
+        surface_error_mm: 0.,
+        source: serde_json::Value::Null,
+        triangles: vec![[a, b, c], [a, c, d]].into(),
+    };
+    let mut plan = WaterlinePlan::prepare(
+        op,
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let to_box = |p: [f64; 3]| {
+        let dx = (8. - p[0]).max(p[0] - 16.).max(0.);
+        let dy = (5. - p[1]).max(p[1] - 11.).max(0.);
+        dx.hypot(dy)
+    };
+    let (mut plunges, mut entry) = (0, None);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+        match motion.kind {
+            MoveKind::Plunge => entry = Some(motion.curve.end()),
+            MoveKind::Lead if entry.is_some() => {
+                // The lead onto the loop is horizontal and comes 1 mm (the
+                // ball radius 2 halved, at least 1) from farther out.
+                let (e, start) = (entry.take().unwrap(), motion.curve.end());
+                assert_eq!(e[2], start[2]);
+                assert!(
+                    to_box(e) >= to_box(start) + 0.9,
+                    "plunge at {e:?} is not beside the loop start {start:?}"
+                );
+                plunges += 1;
+            }
+            _ => (),
+        }
+    }
+    assert!(plunges > 0);
+}
