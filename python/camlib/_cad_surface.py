@@ -7,6 +7,8 @@ acceptance. No sampled distance is used as an error certificate.
 
 from collections import Counter
 import math
+import os
+import sys
 import time
 
 
@@ -204,6 +206,9 @@ class _PatchBounds(tuple):
         return (*(max(b[k] for b in rows) for k in range(5)), False)
 
 
+SPLIT_PATCHES = 4
+
+
 def _spline_surface_bounds(spline):
     try:
         from OCP.TColStd import TColStd_Array1OfReal
@@ -229,15 +234,25 @@ def _spline_surface_bounds(spline):
     uk, vk = TColStd_Array1OfReal(1, nu + 1), TColStd_Array1OfReal(1, nv + 1)
     converter.UKnots(uk)
     converter.VKnots(vk)
-    uknots = tuple(uk.Value(i) for i in range(1, nu + 2))
-    vknots = tuple(vk.Value(i) for i in range(1, nv + 2))
-    patches = [
-        [
-            _bezier_patch_bounds(converter.Patch(i, j), uknots[i] - uknots[i - 1], vknots[j] - vknots[j - 1])
-            for j in range(1, nv + 1)
-        ]
-        for i in range(1, nu + 1)
-    ]
+    uknots = [uk.Value(i) for i in range(1, nu + 2)]
+    vknots = [vk.Value(i) for i in range(1, nv + 2)]
+    # Control-net bounds tighten as a patch is split (its net converges to
+    # the surface): bound each patch as SPLIT x SPLIT sub-patches.
+    k = SPLIT_PATCHES
+    fine_u = [a + (b - a) * s / k for a, b in zip(uknots, uknots[1:]) for s in range(k)] + [uknots[-1]]
+    fine_v = [a + (b - a) * t / k for a, b in zip(vknots, vknots[1:]) for t in range(k)] + [vknots[-1]]
+    patches = [[None] * (nv * k) for _ in range(nu * k)]
+    for i in range(1, nu + 1):
+        su = (uknots[i] - uknots[i - 1]) / k
+        for j in range(1, nv + 1):
+            sv = (vknots[j] - vknots[j - 1]) / k
+            patch = converter.Patch(i, j)
+            for s in range(k):
+                for t in range(k):
+                    piece = patch.Copy()
+                    piece.Segment(s / k, (s + 1) / k, t / k, (t + 1) / k)
+                    patches[(i - 1) * k + s][(j - 1) * k + t] = _bezier_patch_bounds(piece, su, sv)
+    uknots, vknots = tuple(fine_u), tuple(fine_v)
     c0_u = [spline.UKnot(i) for i in range(2, spline.NbUKnots()) if spline.UMultiplicity(i) >= spline.UDegree()]
     c0_v = [spline.VKnot(i) for i in range(2, spline.NbVKnots()) if spline.VMultiplicity(i) >= spline.VDegree()]
     return _PatchBounds(uknots, vknots, patches, c0_u, c0_v)
@@ -492,25 +507,38 @@ def _mesh_face_alone(face, deflection, trim_budget, cancel):
     from OCP.ShapeFix import ShapeFix_ShapeTolerance
     from OCP.TopAbs import TopAbs_SHAPE
 
-    for tight in (False, True):
-        for scale in (1.0, 0.5, 2.0, 0.25):
-            _check_cancel(cancel)
-            alone = cq.Face(BRepBuilderAPI_Copy(face.wrapped, True, False).Shape())
-            if alone.wrapped.Orientation() != face.wrapped.Orientation():
-                return None
-            if tight:
-                ShapeFix_ShapeTolerance().LimitTolerance(alone.wrapped, 1e-7, 1e-7, TopAbs_SHAPE)
-            BRepTools.Clean_s(alone.wrapped)
-            BRepMesh_IncrementalMesh(alone.wrapped, deflection * scale, False, 0.5, True)
-            try:
-                row = _face_data(alone, cancel)
-            except ValueError as e:
-                if not _remeshable(e):
-                    raise
-                continue
-            if row[4] <= trim_budget:
+    def attempt(tight, scale):
+        _check_cancel(cancel)
+        alone = cq.Face(BRepBuilderAPI_Copy(face.wrapped, True, False).Shape())
+        if alone.wrapped.Orientation() != face.wrapped.Orientation():
+            return None
+        if tight:
+            ShapeFix_ShapeTolerance().LimitTolerance(alone.wrapped, 1e-7, 1e-7, TopAbs_SHAPE)
+        BRepTools.Clean_s(alone.wrapped)
+        BRepMesh_IncrementalMesh(alone.wrapped, deflection * scale, False, 0.5, True)
+        try:
+            row = _face_data(alone, cancel)
+        except ValueError as e:
+            if not _remeshable(e):
+                raise
+            return None
+        return row if row[4] <= trim_budget else None
+
+    # Nearby deflections first, then an exactly spanned parameter rectangle
+    # (cheap, zero trim error), then ever finer trims.
+    for tight, scale in ((False, 1.0), (False, 0.5), (False, 2.0), (True, 1.0), (True, 0.5)):
+        row = attempt(tight, scale)
+        if row is not None:
+            return row
+    row = _rectangle_face_data(face, cancel)
+    if row is not None:
+        return row
+    for scale in (0.25, 1 / 16, 1 / 64, 1 / 256):
+        for tight in (False, True):
+            row = attempt(tight, scale)
+            if row is not None:
                 return row
-    return _rectangle_face_data(face, cancel)
+    return None
 
 
 def _rectangle_face_data(face, cancel):
@@ -600,39 +628,40 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         _surface_bounds(BRepAdaptor_Surface(face.wrapped))
     seed_deflection = budget / 4
     remeshed = set()
-    for attempt in range(5):
-        _check_cancel(cancel)
-        BRepTools.Clean_s(shape.wrapped)
-        BRepMesh_IncrementalMesh(shape.wrapped, seed_deflection, False, 0.5, True)
-        data = []
-        for n, f in enumerate(faces):
-            try:
-                row = _face_data(f, cancel)
-            except ValueError as e:
-                if not _remeshable(e):
-                    raise
-                row, problem = None, e
-            if row is None or row[4] > budget / 2:
-                alone = _mesh_face_alone(f, seed_deflection, budget / 2, cancel)
-                if alone is not None:
-                    row = alone
-                    remeshed.add(n)
-                elif row is None:
-                    raise ValueError(
-                        f'CAD mesher cannot triangulate face {n} ({f.geomType()}, {f.Area():.3f} mm2) '
-                        f'consistently with its trims: {problem}'
-                    )
-            data.append(row)
-        if max(row[4] for row in data) <= budget / 2:
-            break
-        seed_deflection /= 4
-    else:
-        raise ValueError('CAD trim approximation exceeds requested bound')
+    _check_cancel(cancel)
+    BRepTools.Clean_s(shape.wrapped)
+    BRepMesh_IncrementalMesh(shape.wrapped, seed_deflection, False, 0.5, True)
+    data = []
+    for n, f in enumerate(faces):
+        problem = None
+        try:
+            row = _face_data(f, cancel)
+        except ValueError as e:
+            if not _remeshable(e):
+                raise
+            row, problem = None, e
+        if row is None or row[4] > budget / 2:
+            # Only this face is re-triangulated (finer, alone, or spanned).
+            alone = _mesh_face_alone(f, seed_deflection, budget / 2, cancel)
+            if alone is None:
+                if problem is None:
+                    raise ValueError('CAD trim approximation exceeds requested bound')
+                raise ValueError(
+                    f'CAD mesher cannot triangulate face {n} ({f.geomType()}, {f.Area():.3f} mm2) '
+                    f'consistently with its trims: {problem}'
+                )
+            row = alone
+            remeshed.add(n)
+        data.append(row)
     result = []
     face_reports = []
     max_error = 0.0
     evaluations = 0
+    progress = os.environ.get('CAMLIB_CAD_PROGRESS') == '1'
+    if progress:
+        print(f'cad: meshed {len(faces)} faces in {time.perf_counter() - started:.1f} s, remeshed {sorted(remeshed)}', file=sys.stderr, flush=True)
     for n, (face, (adaptor, bounds, uv, indices, trim_error, trim_segments)) in enumerate(zip(faces, data)):
+        face_started = time.perf_counter()
         _check_cancel(cancel)
         reserve = min(1e-4, (budget - trim_error) / 4)
         remaining = budget - trim_error - reserve
@@ -688,6 +717,8 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
             max_interior = max(max_interior, error)
         achieved = max_interior + trim_error + regularization + fixed_error
         max_error = max(max_error, achieved)
+        if progress:
+            print(f'cad: face {n} {face.geomType()} {count} facets {time.perf_counter() - face_started:.1f} s', file=sys.stderr, flush=True)
         face_reports.append(
             dict(
                 kind=face.geomType(),
