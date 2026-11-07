@@ -3239,6 +3239,8 @@ fn simplified_shadows_contain_the_exact_one_with_few_vertices() {
             .simplified
             .is_none()
     );
+}
+
 /// Analytic height of the `roughing.json` frustum at a point on its +X slope
 /// (independent of every planner region): 2 at x = 8 rising to 10 at x = 11.
 fn frustum_x_slope_height(p: [f64; 2]) -> f64 {
