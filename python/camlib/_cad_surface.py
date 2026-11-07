@@ -703,6 +703,8 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         print(f'cad: meshed {len(faces)} faces in {time.perf_counter() - started:.1f} s, remeshed {sorted(remeshed)}', file=sys.stderr, flush=True)
     for n, (face, (adaptor, bounds, uv, indices, trim_error, trim_segments)) in enumerate(zip(faces, data)):
         face_started = time.perf_counter()
+        if progress:
+            print(f'cad: face {n} {face.geomType()} start, {len(result)} facets so far', file=sys.stderr, flush=True)
         _check_cancel(cancel)
         reserve = min(1e-4, (budget - trim_error) / 4)
         remaining = budget - trim_error - reserve
@@ -721,7 +723,10 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
 
         while pending:
             if max_facets is not None and len(result) + len(pending) > max_facets:
-                raise ValueError('CAD surface exceeds max_facets at requested error')
+                raise ValueError(
+                    f'CAD surface exceeds max_facets {max_facets} at requested error, on face {n} '
+                    f'({face.geomType()}, {face.Area():.3f} mm2, {count} facets of it so far)'
+                )
             if count % 1024 == 0:
                 _check_cancel(cancel)
             triangle, depth = pending.pop()
