@@ -638,3 +638,67 @@ fn parallel_quad_tree_gives_exactly_the_serial_contours() {
         assert!(!serial.loops.is_empty());
     }
 }
+#[test]
+fn slope_limits_keep_vertical_walls_below_their_top_edge() {
+    use camlib::{motion::MoveKind, stock::Stock, surface::SurfaceWork, waterline::WaterlinePlan};
+    // On a contour below a vertical wall's top edge the ball touches the
+    // wall beside it, a 90 degree contact, while a ball dropped at that XY
+    // lands lower (on the floor at the wall's foot). Those wall contours are
+    // steep and must be kept by a steep-only waterline.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = operation(&m);
+    // A box: one top face at Z6, its vertical walls down to the base.
+    let (a, b, c, d) = ([8., 5., 6.], [16., 5., 6.], [16., 11., 6.], [8., 11., 6.]);
+    op.surface = SurfaceMesh {
+        version: 1,
+        units: "mm".into(),
+        surface_error_mm: 0.,
+        source: serde_json::Value::Null,
+        triangles: vec![[a, b, c], [a, c, d]].into(),
+    };
+    op.slope_from_deg = 80.;
+    let (radius, inflated) = (2., 2.005);
+    let hanging = 4. * op.contour_error_mm + op.tolerance_mm;
+    let mut plan = WaterlinePlan::prepare(
+        op.clone(),
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut cuts = vec![];
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+        if motion.kind == MoveKind::Cut {
+            cuts.push(motion);
+        }
+    }
+    let surface = op.surface.prepare(op.floor_z_mm, 1e-5, &cancel).unwrap();
+    let mut work = SurfaceWork::default();
+    let mut beside = 0;
+    for cut in &cuts {
+        for p in [cut.curve.start(), cut.curve.end()] {
+            let dropped = surface
+                .contact([p[0], p[1]], inflated, &mut work, &cancel)
+                .unwrap();
+            if dropped.center_z < p[2] + radius - hanging {
+                beside += 1;
+            } else {
+                let angle = dropped.contact_angle(inflated).to_degrees();
+                assert!(
+                    angle >= 80. - 1e-6,
+                    "steep-only cut at contact angle {angle}"
+                );
+            }
+        }
+    }
+    assert!(beside > 0, "no wall contour below a top edge was kept");
+}

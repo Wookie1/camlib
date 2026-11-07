@@ -163,14 +163,36 @@ fn stepup_band(
     below: f64,
     axial_allowance_mm: f64,
     reach: f64,
+    cutter_radius_mm: f64,
+    simplify_mm: f64,
     options: ConstructionOptions,
     work: &mut usize,
     cancel: &impl CancelSignal,
 ) -> Result<PlanarRegion, String> {
-    let shadow = target.shadow(below, axial_allowance_mm, work, cancel)?;
+    // The same (simplified) shadow construction the layers use: it contains
+    // the exact shadow, so the band only grows, and its boundary is as
+    // coarse as the layer region it is intersected with (an exact fine-mesh
+    // shadow left sliver components that failed topology validation).
+    let shadow = target.shadow_simplified(
+        below,
+        axial_allowance_mm,
+        cutter_radius_mm,
+        simplify_mm,
+        work,
+        cancel,
+    )?;
     // 3 * reach = 3r + 3a covers the 3r + 2a needed, with the allowance spare.
     let grow = 3. * reach + shadow.report.boundary_error_mm + options.tolerance_mm;
-    let band = shadow.region.prepare(options)?.offset(-grow)?.region;
+    // Square-join growth contains the round growth and keeps straight
+    // edges: a round offset's arcs came back from the intersection as
+    // thousands of tiny segments, whose erosion envelope then let the
+    // cutter-centre region creep inside the clearance the pocket proves.
+    let band = shadow
+        .region
+        .prepare(options)?
+        .inflate_square(grow, 0.)?
+        .0
+        .region;
     Ok(region
         .prepare(options)?
         .boolean(&band.prepare(options)?, Boolean::Intersection)?
@@ -1258,6 +1280,8 @@ impl RoughingPlan {
                         below,
                         op.bottom_allowance_mm,
                         r + op.radial_allowance_mm,
+                        r,
+                        contour,
                         options,
                         &mut work,
                         &cancel,
@@ -1658,5 +1682,93 @@ mod simplify_tests {
         for p in [[20., 0.], [30., 0.2], [25., 0.1], [0., 0.], [10., 10.]] {
             assert!(grown.query(p).unwrap().signed_clearance_mm.unwrap() > 0.07);
         }
+    }
+
+    #[test]
+    fn step_up_band_of_a_round_shadow_stays_straight_sided_and_unnormalized() {
+        // A finely faceted cone: its shadow is round. A round offset of it
+        // came back from the band intersection as thousands of tiny
+        // segments; eroding that by the cutter needed a normalization
+        // envelope whose error the pocket's clearance proof then refused
+        // (Core/test-block step-up layers). The band must stay coarse.
+        let n = 512;
+        let apex = [0., 0., 10.];
+        let rim = |k: usize| {
+            let t = std::f64::consts::TAU * k as f64 / n as f64;
+            [10. * t.cos(), 10. * t.sin(), 0.]
+        };
+        let mesh = SurfaceMesh {
+            version: 1,
+            units: "mm".into(),
+            surface_error_mm: 0.,
+            source: serde_json::Value::Null,
+            triangles: (0..n)
+                .map(|k| [rim(k), rim(k + 1), apex])
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let cancel = || false;
+        let target = PreparedRoughingTarget::prepare(mesh, 1e-5, &cancel).unwrap();
+        let options = ConstructionOptions { tolerance_mm: 1e-5 };
+        let (r, allowance, contour) = (3., 0.4, 0.075);
+        let reach = r + allowance;
+        // The layer at Z6 around the cone, inside a 60 mm square of stock.
+        let shadow = target
+            .shadow_simplified(6., 0., r, contour, &mut 0, &cancel)
+            .unwrap();
+        let square = PlanarRegion {
+            version: 1,
+            units: "mm".into(),
+            name: "stock".into(),
+            components: vec![Component {
+                outer: rect(-30., -30., 30., 30.),
+                holes: vec![],
+            }],
+            boundary_error_mm: 0.,
+            source: serde_json::Value::Null,
+        };
+        let layer = square
+            .prepare(options)
+            .unwrap()
+            .boolean(
+                &shadow.region.prepare(options).unwrap(),
+                Boolean::Difference,
+            )
+            .unwrap()
+            .region;
+        let band = stepup_band(
+            &target, &layer, 4., 0., reach, r, contour, options, &mut 0, &cancel,
+        )
+        .unwrap();
+        let vertices: Vec<_> = band
+            .components
+            .iter()
+            .flat_map(|c| std::iter::once(&c.outer).chain(&c.holes))
+            .flat_map(|b| &b.vertices)
+            .collect();
+        assert!(vertices.iter().all(|v| v[2] == 0.), "band has arcs");
+        assert!(vertices.len() < 400, "band has {} vertices", vertices.len());
+        // It still reaches 3r + 2a beyond the shadow at Z4 (radius 6 here).
+        let prepared = band.prepare(options).unwrap();
+        for k in 0..64 {
+            let t = std::f64::consts::TAU * k as f64 / 64.;
+            let d = 6. + 3. * r + 2. * allowance - 0.01;
+            assert!(
+                prepared
+                    .query([d * t.cos(), d * t.sin()])
+                    .unwrap()
+                    .signed_clearance_mm
+                    .unwrap()
+                    > 0.,
+                "band misses {t}"
+            );
+        }
+        // The cutter-centre construction needs no normalization envelope.
+        let centres = prepared.cutter_region(r, allowance).unwrap();
+        assert_eq!(
+            centres.normalization_error_mm, 0.,
+            "{:?}",
+            centres.diagnostics
+        );
     }
 }
