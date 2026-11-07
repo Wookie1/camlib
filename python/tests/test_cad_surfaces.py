@@ -275,3 +275,117 @@ class ParametricCadTest(unittest.TestCase):
             player.seek(cursor)
             self.assertEqual(player.state.heights.tobytes(), partial)
             self.assertLess(run.posting_status()['max_chunk_bytes'], 512 * 1024)
+
+
+def nurbs(shape):
+    import cadquery as cq
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
+
+    return cq.Shape.cast(BRepBuilderAPI_NurbsConvert(shape.wrapped, True).Shape())
+
+
+def lofted():
+    import cadquery as cq
+
+    corners = [cq.Vector(-3, -2, 6), cq.Vector(3, -2, 6), cq.Vector(3, 2, 6), cq.Vector(-3, 2, 6)]
+    return cq.Solid.makeLoft(
+        [cq.Wire.makeCircle(5, cq.Vector(0, 0, 0), cq.Vector(0, 0, 1)), cq.Wire.makePolygon(corners, close=True)], True
+    )
+
+
+class SplineSurfaceTest(unittest.TestCase):
+    def test_spline_patch_bounds_cover_interpolation_within_and_across_c1_patches(self):
+        import cadquery as cq
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from camlib._cad_surface import _PatchBounds
+
+        shapes = (nurbs(cq.Solid.makeCylinder(3, 5)), nurbs(cq.Solid.makeSphere(4)), nurbs(cq.Solid.makeTorus(5, 1)), lofted())
+        checked = 0
+        for shape in shapes:
+            shape = shape.rotate((0, 0, 0), (1, 2, 3), 31).translate((200, -50, 17))
+            for face in shape.Faces():
+                if face.geomType() != 'BSPLINE':
+                    continue
+                surface = BRepAdaptor_Surface(face.wrapped)
+                bounds = _surface_bounds(surface)
+                self.assertIsInstance(bounds, _PatchBounds)
+                cu = [k for axis, ks in bounds.c0 if axis == 0 for k in ks]
+                cv = [k for axis, ks in bounds.c0 if axis == 1 for k in ks]
+                # Cells between consecutive C0 knot lines (each may span C1 patches).
+                us = sorted({bounds.uknots[0], bounds.uknots[-1], *cu})
+                vs = sorted({bounds.vknots[0], bounds.vknots[-1], *cv})
+                for u0, u1 in zip(us, us[1:]):
+                    for v0, v1 in zip(vs, vs[1:]):
+                        for fu, fv in ((0.1, 0.8), (0.7, 0.03), (1.0, 1.0)):
+                            uv = (
+                                (u0, v0),
+                                (u0 + (u1 - u0) * fu, v0 + (v1 - v0) * fv),
+                                (u0 + (u1 - u0) * fu * 0.4, v0 + (v1 - v0) * fv * 0.9),
+                            )
+                            points = [tuple(surface.Value(*p).Coord()) for p in uv]
+                            bound = _interpolation_error(uv, bounds)
+                            for weights in ((0.2, 0.3, 0.5), (0.05, 0.9, 0.05), (0.6, 0.1, 0.3)):
+                                p = tuple(sum(w * q[k] for w, q in zip(weights, uv)) for k in (0, 1))
+                                actual = tuple(surface.Value(*p).Coord())
+                                linear = tuple(sum(w * q[k] for w, q in zip(weights, points)) for k in range(3))
+                                self.assertLessEqual(math.dist(actual, linear), bound + 1e-9)
+                                checked += 1
+        self.assertGreater(checked, 150)
+
+    def test_c0_knot_lines_cut_triangles_and_bound_trim_chords(self):
+        from OCP.gp import gp_Pnt2d
+        from OCP.Geom2d import Geom2d_BSplineCurve
+        from OCP.Geom2dAdaptor import Geom2dAdaptor_Curve
+        from camlib._cad_surface import _PatchBounds, _cut_at_c0, _trim_deviation
+
+        try:
+            from OCP.TColgp import TColgp_Array1OfPnt2d as Points
+            from OCP.TColStd import TColStd_Array1OfReal as Reals, TColStd_Array1OfInteger as Integers
+        except ImportError:
+            from OCP.collections import Array1_gp_Pnt2d as Points, Array1_double as Reals, Array1_int as Integers
+        flat = (1.0, 1.0, 0.0, 0.0, 0.0)
+        bounds = _PatchBounds((0.0, 0.5, 1.0), (0.0, 1.0), [[flat], [flat]], (0.5,), ())
+        pieces = _cut_at_c0(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), bounds)
+        self.assertEqual(len(pieces), 3)
+        area = 0.0
+        for a, b, c in pieces:
+            twice = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            self.assertGreater(twice, 0)
+            self.assertTrue(max(p[0] for p in (a, b, c)) <= 0.5 or min(p[0] for p in (a, b, c)) >= 0.5)
+            area += twice / 2
+        self.assertAlmostEqual(area, 0.5)
+        # A quadratic 2D trim with a corner (C0 knot) at t = 0.5.
+        points = Points(1, 5)
+        for i, (x, y) in enumerate(((0, 0), (0.5, 1), (1, 0), (1.5, 1), (2, 0)), 1):
+            points.SetValue(i, gp_Pnt2d(x, y))
+        knots, mults = Reals(1, 3), Integers(1, 3)
+        for i, (k, m) in enumerate(((0, 3), (0.5, 2), (1, 3)), 1):
+            knots.SetValue(i, k)
+            mults.SetValue(i, m)
+        curve = Geom2dAdaptor_Curve(Geom2d_BSplineCurve(points, knots, mults, 2))
+        _, deviation = _trim_deviation(curve)
+        for t0, t1 in ((0.0, 1.0), (0.1, 0.45), (0.3, 0.9), (0.49, 0.52)):
+            c0, c1 = (tuple(curve.Value(t).Coord()) for t in (t0, t1))
+            bound = deviation(t0, t1)
+            for n in range(1, 64):
+                t = t0 + (t1 - t0) * n / 64
+                chord = tuple(p + n / 64 * (q - p) for p, q in zip(c0, c1))
+                self.assertLessEqual(math.dist(tuple(curve.Value(t).Coord()), chord), bound + 1e-12)
+
+    def test_whole_spline_solids_export_within_their_reported_error(self):
+        import cadquery as cq
+
+        cases = (
+            (nurbs(cq.Solid.makeCylinder(3, 5)), lambda p: abs(math.hypot(p[0], p[1]) - 3) if 1e-6 < p[2] < 5 - 1e-6 else 0.0),
+            # makeSphere is a hemisphere over a flat cap at z = 0.
+            (nurbs(cq.Solid.makeSphere(4)), lambda p: abs(math.sqrt(sum(v * v for v in p)) - 4) if p[2] > 1e-6 else 0.0),
+        )
+        for shape, distance in cases:
+            mesh = export_surface_mesh(shape, max_error_mm=0.01)
+            self.assertLessEqual(mesh.surface_error_mm, 0.01)
+            self.assertIn('BSPLINE', {f['kind'] for f in mesh.source['face_bounds']})
+            for tri in mesh.triangles:
+                for p in (*tri, tuple(sum(p[k] for p in tri) / 3 for k in range(3))):
+                    self.assertLessEqual(distance(p), mesh.surface_error_mm + 1e-9)
+        mesh = export_surface_mesh(lofted(), max_error_mm=0.01)
+        self.assertLessEqual(mesh.surface_error_mm, 0.01)

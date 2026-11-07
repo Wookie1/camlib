@@ -328,9 +328,10 @@ class RoughingTest(unittest.TestCase):
         )
         self.assertLessEqual(supported.target.surface_error_mm, 0.005)
         self.assertTrue(any(f['kind'] == 'CYLINDER' for f in supported.target.source['face_bounds']))
-        # General B-spline patches still lack an interpolation bound. A real
-        # nonuniformly scaled sphere exercises unsupported-surface preflight,
-        # while cylinders now use the bounded curved importer.
+        # B-spline patches are bounded per Bezier patch: a nonuniformly scaled
+        # sphere (general rational B-spline) now imports. Surfaces of
+        # revolution still lack an interpolation bound and exercise
+        # unsupported-surface preflight.
         ellipsoid = (
             cq.Workplane('XY')
             .sphere(3)
@@ -338,11 +339,38 @@ class RoughingTest(unittest.TestCase):
             .transformGeometry(cq.Matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1.5, 0], [0, 0, 0, 1]]))
         )
         self.assertTrue(ellipsoid.isValid())
+        spline = Roughing.from_solid(
+            'ellipsoid',
+            c['tools'][0],
+            ellipsoid,
+            **{
+                'feed_mm_min': 600,
+                'plunge_mm_min': 150,
+                'spindle_rpm': 12000,
+                'tool_number': 1,
+                'length_register': 1,
+                'coolant': "flood",
+                **parameters,
+            },
+        )
+        self.assertLessEqual(spline.target.surface_error_mm, 0.005)
+        self.assertTrue(any(f['kind'] == 'BSPLINE' for f in spline.target.source['face_bounds']))
+        revolved = (
+            cq.Workplane('XZ')
+            .moveTo(0, 0)
+            .lineTo(3, 0)
+            .spline([(2.5, 2), (3, 4)], includeCurrent=True)
+            .lineTo(0, 4)
+            .close()
+            .revolve(360, (0, 0, 0), (0, 1, 0))
+            .val()
+        )
+        self.assertTrue(revolved.isValid())
         with self.assertRaisesRegex(ValueError, 'no parametric interpolation bound'):
             Roughing.from_solid(
                 'unsupported',
                 c['tools'][0],
-                ellipsoid,
+                revolved,
                 **{
                     'feed_mm_min': 600,
                     'plunge_mm_min': 150,
