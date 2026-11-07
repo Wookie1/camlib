@@ -95,6 +95,10 @@ pub(crate) struct ProfileMotion {
     /// Ramp: the first pass of each loop descends from this height to its
     /// depth along the loop (entered at this height).
     pub ramp_from: Option<f64>,
+    /// Per loop, an XY point the tool plunges at instead of the tangent
+    /// lead point (None for a loop: the tangent lead). Set by an operation
+    /// that has proven the horizontal lead from it to the loop start clear.
+    pub entry_points: Vec<Option<[f64; 2]>>,
 }
 type CutMove = (crate::motion::Curve, crate::motion::MoveKind);
 /// Holding tabs on the tool-center loops: around each center (arc length),
@@ -343,6 +347,7 @@ impl ProfileMotion {
             cut: None,
             limits: None,
             ramp_from: None,
+            entry_points: vec![],
         }
     }
     /// The stretches of a loop at depth z the limits block, as arc-length
@@ -450,6 +455,14 @@ impl ProfileSettings {
     }
 }
 impl ProfileMotion {
+    /// Where the current loop is entered at height z: its proven entry
+    /// point, else the tangent lead point.
+    fn entry_point(&self, z: f64, lead_in: f64) -> crate::motion::Vec3 {
+        match self.entry_points.get(self.ring).copied().flatten() {
+            Some(p) => [p[0], p[1], z],
+            None => lead_point(&self.loops[self.ring], z, lead_in, false),
+        }
+    }
     pub fn next(
         &mut self,
         stock: &crate::stock::Stock,
@@ -502,7 +515,7 @@ impl ProfileMotion {
                 Phase::Approach => {
                     // Travel at the current rapid height (clearance before the
                     // first pass, the retract height between passes).
-                    let mut end = lead_point(&self.loops[self.ring], z, s.lead_in, false);
+                    let mut end = self.entry_point(z, s.lead_in);
                     end[2] = self.position[2];
                     (
                         Curve::Line {
@@ -524,7 +537,7 @@ impl ProfileMotion {
                 Phase::Entry => (
                     Curve::Line {
                         start: self.position,
-                        end: lead_point(&self.loops[self.ring], entry_z, s.lead_in, false),
+                        end: self.entry_point(entry_z, s.lead_in),
                     },
                     MoveKind::Plunge,
                     Phase::LeadIn,

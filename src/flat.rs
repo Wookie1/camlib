@@ -100,8 +100,22 @@ pub struct FlatReport {
     /// Row length near flats that could not be proven clear and was dropped.
     pub dropped_length_mm: f64,
     pub runs_completed: usize,
+    /// Runs entered by a shallow zigzag ramp along the run because the
+    /// live stock stood above the run's height at its start.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ramped_entries: usize,
     pub clearance_proof: &'static str,
 }
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Ramp angle of a run's entry through stock left above it (3 deg, the
+/// helix angle of the roughing entries).
+const ENTRY_RAMP_RAD: f64 = 0.052_359_877_559_829_89;
+/// Stock above a run's height that a straight plunge may still remove.
+const ENTRY_PLUNGE_MM: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 struct Tri {
@@ -1483,6 +1497,7 @@ enum Phase {
     Approach,
     Descend,
     Plunge,
+    Ramp,
     Cut,
     Retract,
     Rise,
@@ -1496,6 +1511,8 @@ pub struct FlatPlan {
     runs: Vec<Run>,
     run: usize,
     phase: Phase,
+    radius: f64,
+    ramp: std::collections::VecDeque<(Vec3, MoveKind)>,
     initial: Vec3,
     position: Vec3,
     next_id: u64,
@@ -1780,6 +1797,7 @@ impl FlatPlan {
                 .sum(),
             dropped_length_mm: dropped,
             runs_completed: 0,
+            ramped_entries: 0,
             clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; vertical entries above proven runs",
         };
         Ok(Self {
@@ -1789,6 +1807,8 @@ impl FlatPlan {
             runs: merged,
             run: 0,
             phase: Phase::Lift,
+            radius: r,
+            ramp: Default::default(),
             initial,
             position: initial,
             next_id: first_id,
@@ -1799,6 +1819,47 @@ impl FlatPlan {
     }
     pub fn report(&self) -> &FlatReport {
         &self.report
+    }
+    /// A run whose start has more than ENTRY_PLUNGE_MM of live stock above
+    /// its height is entered by zigzagging along the run itself, descending
+    /// at ENTRY_RAMP_RAD from just above that stock, then cutting back to
+    /// its start. Every ramp point lies vertically above the proven run, so
+    /// it clears the part like the run does; None: a straight plunge.
+    fn entry_ramp(&self, run: Run, top: f64) -> Option<Vec<(Vec3, MoveKind)>> {
+        if top <= run.z + ENTRY_PLUNGE_MM {
+            return None;
+        }
+        let length = (run.b[0] - run.a[0]).hypot(run.b[1] - run.a[1]);
+        if length <= 16. * self.op.tolerance_mm {
+            return None;
+        }
+        let drop = length * ENTRY_RAMP_RAD.tan();
+        let mut z = (top + ENTRY_PLUNGE_MM).min(self.heights.feed);
+        let mut at_a = true;
+        let mut moves = vec![];
+        while z > run.z {
+            let (from, to) = if at_a { (run.a, run.b) } else { (run.b, run.a) };
+            if z - drop > run.z {
+                z -= drop;
+                moves.push(([to[0], to[1], z], MoveKind::Cut));
+                at_a = !at_a;
+            } else {
+                let f = (z - run.z) / drop;
+                let q = [
+                    from[0] + f * (to[0] - from[0]),
+                    from[1] + f * (to[1] - from[1]),
+                ];
+                moves.push(([q[0], q[1], run.z], MoveKind::Cut));
+                if q != run.a {
+                    moves.push(([run.a[0], run.a[1], run.z], MoveKind::Cut));
+                }
+                z = run.z;
+            }
+            if moves.len() > 4096 {
+                return None;
+            }
+        }
+        Some(moves)
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         vec![
@@ -1880,11 +1941,32 @@ impl FlatPlan {
                     MoveKind::Rapid,
                     Phase::Plunge,
                 ),
-                Phase::Plunge => (
-                    [p[0], p[1], self.runs[self.run].z],
-                    MoveKind::Plunge,
-                    Phase::Cut,
-                ),
+                Phase::Plunge => {
+                    let run = self.runs[self.run];
+                    let top = stock_top(stock, run.a, self.radius);
+                    match self.entry_ramp(run, top) {
+                        Some(moves) => {
+                            self.ramp = moves.into();
+                            self.report.ramped_entries += 1;
+                            // Down through air to just above the stock.
+                            let z = (top + ENTRY_PLUNGE_MM).min(p[2]).max(run.z);
+                            ([p[0], p[1], z], MoveKind::Plunge, Phase::Ramp)
+                        }
+                        None => ([p[0], p[1], run.z], MoveKind::Plunge, Phase::Cut),
+                    }
+                }
+                Phase::Ramp => {
+                    let (end, kind) = self.ramp.pop_front().expect("ramp move");
+                    (
+                        end,
+                        kind,
+                        if self.ramp.is_empty() {
+                            Phase::Cut
+                        } else {
+                            Phase::Ramp
+                        },
+                    )
+                }
                 Phase::Cut => {
                     let run = self.runs[self.run];
                     ([run.b[0], run.b[1], run.z], MoveKind::Cut, Phase::Retract)
@@ -1934,6 +2016,31 @@ impl FlatPlan {
             return Ok(Some(motion));
         }
     }
+}
+
+/// Highest live stock upper bound over the cells a disk of radius r at xy
+/// can touch (whole cells: an overestimate, never an underestimate).
+fn stock_top(stock: &Stock, xy: [f64; 2], r: f64) -> f64 {
+    let spec = stock.spec();
+    let [nx, ny] = stock.dimensions();
+    let [wx, wy] = stock.cell_widths_mm();
+    let reach = r + 0.5 * wx.hypot(wy);
+    let range = |c: f64, lo: f64, w: f64, n: usize| {
+        let a = ((c - reach - lo) / w).floor().max(0.) as usize;
+        let b = (((c + reach - lo) / w).ceil().max(0.) as usize).min(n);
+        a..b
+    };
+    let mut top = spec.min_mm[2];
+    for j in range(xy[1], spec.min_mm[1], wy, ny) {
+        for i in range(xy[0], spec.min_mm[0], wx, nx) {
+            let k = j * nx + i;
+            let c = stock.cell_center(k).unwrap_or(xy);
+            if (c[0] - xy[0]).hypot(c[1] - xy[1]) <= reach {
+                top = top.max(stock.cells()[k].upper_mm);
+            }
+        }
+    }
+    top
 }
 
 #[cfg(test)]
