@@ -607,7 +607,7 @@ impl EngagementFrontPlan {
                 }
             }
             xs.sort_by(f64::total_cmp);
-            for pair in xs.chunks_exact(2) {
+            for pair in xs.as_chunks::<2>().0 {
                 let i0 = ((pair[0] - g.x0) / g.c - 0.5).ceil().max(0.) as usize;
                 let i1 = ((pair[1] - g.x0) / g.c - 0.5).floor().min(g.nx as f64 - 1.);
                 if i1 < 0. {
