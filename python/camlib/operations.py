@@ -1181,6 +1181,10 @@ class Roughing:
     # Step-up layers: after each full stepdown, climb back up through its depth
     # at most this far apart, cutting only a band next to the part.
     stepup_mm: float | None = None
+    # Opt-in for targets tessellated face by face: each layer's shadow is
+    # closed protectively, bridging gaps narrower than twice this (at most half
+    # the cutter radius). About the mesh's surface error. None: off.
+    seam_bridge_mm: float | None = None
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1203,7 +1207,7 @@ class Roughing:
             result.pop('clearing_tolerance_mm')
         if not self.require_part_at_first_depth:
             result.pop('require_part_at_first_depth')
-        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm'):
+        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm', 'seam_bridge_mm'):
             if result[key] is None:
                 result.pop(key)
         for key in ("target", "clearing", "entry"):

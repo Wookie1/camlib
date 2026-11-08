@@ -155,7 +155,13 @@ disk of half the cutter's radius are protected too, since the cutter cannot
 enter them (the layer report's `shadow.filled_holes`). A target mesh whose faces
 were tessellated separately leaves such slivers between neighbouring faces; a
 gap that still makes the layer's topology ambiguous is refused with its
-location. `clearing` is one of:
+location. For such meshes (CAD meshers that tessellate each face on its own),
+`seam_bridge_mm` (opt-in, about the mesh's surface error, at most half the
+cutter radius) closes each layer's shadow protectively: gaps, notches and holes
+narrower than twice it are bridged and the shadow grows by a few construction
+tolerances, so hairline seams and the sub-tolerance slivers they leave no longer
+make its topology ambiguous. It only adds protection, and each layer reports it
+(`shadow.seam_closing`: growth and bridged width). `clearing` is one of:
 
 - `RasterClearing(stepover_mm, routing=None)`: parallel passes;
   `routing="economical"` orders and joins the rows to shorten links,

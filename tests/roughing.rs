@@ -3439,3 +3439,84 @@ fn needle_wall_facets_beside_a_separately_tessellated_face_give_a_shadow() {
         assert!(signed(&region, [10., -0.1]) < 0.);
     }
 }
+
+/// Six facets of two separately tessellated faces of a CAD import (mirrored,
+/// shifted and rounded): the faces' shared edge vertices differ by about
+/// 0.3 µm, so their boundary edges cross at a small angle and the exact
+/// shadow's outline touches itself within the construction tolerance. The
+/// exact union is refused; with `seam_bridge_mm` the shadow is closed
+/// protectively, built, reported and still covers every facet.
+#[test]
+fn seam_bridge_closes_a_crossing_seam_between_separately_tessellated_faces() {
+    let triangles = vec![
+        [
+            [-0.0372, -0.1014, 0.3887],
+            [-0.1664, 0.1699, 0.4674],
+            [-0.2292, 0.1279, 0.4163],
+        ],
+        [
+            [-0.3143, 0.2937, 0.4733],
+            [-0.2292, 0.1279, 0.4163],
+            [-0.1664, 0.1699, 0.4674],
+        ],
+        [
+            [-0.3143, 0.2937, 0.4733],
+            [-0.1664, 0.1699, 0.4674],
+            [-0.0887, 0.2111, 0.5162],
+        ],
+        [
+            [0.0879, -0.1681, 0.4082],
+            [-0.0887, 0.2111, 0.5162],
+            [-0.0642, 0.0546, 0.4492],
+        ],
+        [
+            [-0.037, -0.1012, 0.3882],
+            [-0.1473, -0.0417, 0.3658],
+            [-0.0708, -0.1458, 0.3494],
+        ],
+        [
+            [0.0881, -0.1678, 0.4075],
+            [-0.037, -0.1012, 0.3882],
+            [-0.0708, -0.1458, 0.3494],
+        ],
+    ];
+    let cancel = AtomicBool::new(false);
+    let target = |bridge| {
+        PreparedRoughingTarget::prepare(mesh(triangles.clone(), 0.0272), 1e-5, &cancel)
+            .unwrap()
+            .with_seam_bridge(bridge)
+            .unwrap()
+    };
+    let (allowance, r, contour) = (0.381, 6.343, 0.095);
+    let refused = target(None)
+        .shadow_simplified(0., allowance, r, contour, &mut 0, &cancel)
+        .err()
+        .unwrap();
+    assert!(refused.contains("intersect or touch"), "{refused}");
+    for bridge in [0.01, 0.0272] {
+        let shadow = target(Some(bridge))
+            .shadow_simplified(0., allowance, r, contour, &mut 0, &cancel)
+            .unwrap();
+        let closing = shadow.report.seam_closing.unwrap();
+        assert_eq!(closing.bridged_below_mm, 2. * bridge);
+        assert!(closing.growth_mm > 8e-5 && closing.growth_mm < 2e-4);
+        assert!(shadow.report.boundary_error_mm >= 0.0272 + closing.growth_mm);
+        let region = shadow
+            .region
+            .prepare(ConstructionOptions::default())
+            .unwrap();
+        for p in triangles.iter().flatten() {
+            assert!(signed(&region, [p[0], p[1]]) > 0., "{p:?}");
+        }
+        // Grown by the contour tolerance and a little, no more.
+        assert!(signed(&region, [0.4, 0.]) < 0.);
+        assert!(signed(&region, [0., -0.4]) < 0.);
+    }
+    // Out of range: refused, not clamped.
+    assert!(
+        PreparedRoughingTarget::prepare(mesh(triangles.clone(), 0.0272), 1e-5, &cancel)
+            .unwrap()
+            .with_seam_bridge(Some(0.))
+            .is_err()
+    );
+}
