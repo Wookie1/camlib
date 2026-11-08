@@ -462,6 +462,8 @@ pub(crate) struct EngagementFrontPlan {
     op: PocketOperation,
     entry: PocketEntry,
     heights: Heights,
+    /// See `RoughingOperation::rapid_descent_clearance_mm`.
+    rapid_descent: Option<f64>,
     r: f64,
     width: f64,
     climb: bool,
@@ -528,6 +530,7 @@ impl EngagementFrontPlan {
             op,
             entry,
             heights,
+            rapid_descent: None,
             r,
             width,
             climb,
@@ -543,6 +546,11 @@ impl EngagementFrontPlan {
             report,
             scratch: vec![],
         })
+    }
+    /// See `RoughingOperation::rapid_descent_clearance_mm` (validated there).
+    pub(crate) fn with_rapid_descent(mut self, clearance: Option<f64>) -> Self {
+        self.rapid_descent = clearance;
+        self
     }
     pub(crate) fn construction_error_mm(&self) -> f64 {
         self.guides.construction_error_mm()
@@ -1166,7 +1174,16 @@ impl EngagementFrontPlan {
         self.line(safe, up, MoveKind::Rapid);
         up
     }
-    fn travel(&mut self, from: Vec3, to: Point) -> Vec3 {
+    /// Rapid to above `to`, descending to the feed height, or to the
+    /// rapid-descent clearance above `proven` (a height down to which the
+    /// committed sweeps prove the whole tool's descent at `to` clear) when
+    /// that is lower. Returns the pose.
+    /// A height `cleared_entry_start` returned, when it is a proof: it
+    /// returns the operation top unexamined when nothing is committed yet.
+    fn proven(&self, height: f64) -> Option<f64> {
+        (height < self.op.top_z_mm - 0.01_f64.max(64. * self.op.tolerance_mm)).then_some(height)
+    }
+    fn travel(&mut self, from: Vec3, to: Point, proven: Option<f64>) -> Vec3 {
         let up = if (from[2] - self.heights.retract).abs() < 1e-12 || from[2] >= self.heights.feed {
             let up = [from[0], from[1], from[2].max(self.heights.retract)];
             self.line(from, up, MoveKind::Rapid);
@@ -1176,7 +1193,11 @@ impl EngagementFrontPlan {
         };
         let across = [to[0], to[1], up[2]];
         self.line(up, across, MoveKind::Rapid);
-        let above = [to[0], to[1], self.heights.feed];
+        let stop = match (self.rapid_descent, proven) {
+            (Some(d), Some(h)) => self.heights.feed.min(h + d),
+            _ => self.heights.feed,
+        };
+        let above = [to[0], to[1], stop];
         self.line(across, above, MoveKind::Rapid);
         above
     }
@@ -1261,6 +1282,7 @@ impl EngagementFrontPlan {
             } else {
                 self.routed_link(from, q, 3. * keep_down)
             };
+            let mut proven = None;
             if link.is_none() {
                 // A vertical entry needs the committed sweeps (or air outside
                 // the original stock) to prove the whole column clear.
@@ -1272,6 +1294,7 @@ impl EngagementFrontPlan {
                     self.mark_dead(q, 1);
                     continue;
                 }
+                proven = self.proven(height);
             }
             let side = if self.climb { 1. } else { -1. };
             let heading = (side * dir[0]).atan2(-side * dir[1]);
@@ -1299,7 +1322,7 @@ impl EngagementFrontPlan {
                     at = next;
                 }
             } else {
-                let above = self.travel(here, q);
+                let above = self.travel(here, q, proven);
                 self.line(above, [q[0], q[1], z], MoveKind::Plunge);
                 self.report.lifts += 1;
                 self.report.stock_edge_entries += 1;
@@ -1363,7 +1386,8 @@ impl EngagementFrontPlan {
             let curves = helix.curves(q, rh, top.max(z), z, !self.climb, opposite)?;
             let start = curves[0].start();
             let here = self.position;
-            let above = self.travel(here, [start[0], start[1]]);
+            let proven = self.proven(top);
+            let above = self.travel(here, [start[0], start[1]], proven);
             self.line(above, start, MoveKind::Plunge);
             let feed = Some(helix.feed_mm_min.unwrap_or(self.op.plunge_mm_min));
             self.report.entry_turns += curves.len() - 1;

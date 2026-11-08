@@ -620,6 +620,13 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// radial allowance; 0: off. Adds at most twice this to the stock left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contour_tolerance_mm: Option<f64>,
+    /// engagement_front only. A descent into a column that the committed
+    /// sweeps prove clear for the whole tool assembly is rapid down to this
+    /// far above the proven height, and only the rest is fed; without it
+    /// every entry feeds down from `feed_z_mm` through material already
+    /// cut. None: rapid descent stops at `feed_z_mm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rapid_descent_clearance_mm: Option<f64>,
     pub id: String,
     pub tool: String,
     pub target: G,
@@ -646,10 +653,10 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     pub clockwise: bool,
     #[serde(default = "automatic_entry")]
     pub entry: PocketEntry,
-    /// See `PocketOperation::retract_z_mm`. Raster/offset clearing only.
+    /// See `PocketOperation::retract_z_mm`. Raster, offset and engagement_front clearing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retract_z_mm: Option<f64>,
-    /// See `PocketOperation::feed_z_mm`. Raster/offset clearing only.
+    /// See `PocketOperation::feed_z_mm`. Raster, offset and engagement_front clearing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_z_mm: Option<f64>,
     /// Containment and avoid areas (clamps, fixtures, features to leave alone).
@@ -668,6 +675,7 @@ impl<G> RoughingOperation<G> {
             require_part_at_first_depth: self.require_part_at_first_depth,
             clearing_tolerance_mm: self.clearing_tolerance_mm,
             contour_tolerance_mm: self.contour_tolerance_mm,
+            rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
             id: self.id,
             tool: self.tool,
             target: f(self.target)?,
@@ -1151,6 +1159,24 @@ impl RoughingPlan {
             feed_z_mm: op.feed_z_mm,
         };
         template.validate_authoring(tool, prepared_tool.cutter().definition(), initial, r)?;
+        if let Some(d) = op.rapid_descent_clearance_mm {
+            if !matches!(
+                op.clearing,
+                RoughingClearing::Adaptive {
+                    path_strategy: AdaptivePathStrategy::EngagementFront,
+                    ..
+                }
+            ) {
+                return Err(
+                    "rapid_descent_clearance_mm applies to engagement_front clearing only".into(),
+                );
+            }
+            if !d.is_finite() || d <= 0. {
+                return Err(format!(
+                    "roughing rapid_descent_clearance_mm {d} must be positive and finite"
+                ));
+            }
+        }
         match op.clearing {
             RoughingClearing::Offset {
                 coverage_margin_mm, ..
@@ -1376,7 +1402,9 @@ impl RoughingPlan {
                             max_radial_engagement_mm,
                             cutting_sense.unwrap_or(CuttingSense::Climb) == CuttingSense::Climb,
                             &cancel,
-                        )?)),
+                        )?
+                        .with_rapid_descent(op.rapid_descent_clearance_mm),
+                        )),
                         RoughingClearing::Adaptive {
                             path_strategy,
                             cutting_sense,
