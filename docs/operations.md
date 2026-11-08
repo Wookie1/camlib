@@ -195,7 +195,15 @@ location. `clearing` is one of:
   (opt-in, on `Roughing`), a descent into a column that the committed cuts
   prove clear for the whole tool assembly is rapid down to that far above
   the proven height, and only the rest is fed; otherwise every entry feeds
-  down from `feed_z_mm` through material already cut.
+  down from `feed_z_mm` through material already cut. An entry beside the
+  material it cuts (where the whole-cell stock bounds still hold that
+  material) then plunges a few stock cells back, where the bounds let the
+  rapid come lower, and feeds across at depth. A helical entry ramps only
+  through material: above the height the committed cuts or the stock cell
+  bounds prove clear over its whole bore it descends straight down, and a
+  bore that is clear to the layer gets a straight plunge (reported as
+  `air_entries`). `ramp_clearance_mm` (opt-in, on `Roughing`) starts each
+  helix that far above the material it meets, never above `feed_z_mm`.
 
 Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster,
 offset and engagement_front clearing. `RestRoughing` machines only what earlier operations left

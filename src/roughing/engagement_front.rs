@@ -116,6 +116,13 @@ pub struct EngagementFrontReport {
     pub stock_edge_entries: usize,
     pub helical_entries: usize,
     pub entry_turns: usize,
+    /// Entries the helix search chose whose whole bore was proven air (by
+    /// the committed sweeps or the stock cell bounds): a straight plunge.
+    pub air_entries: usize,
+    /// Vertical entries made by plunging a few stock cells back from the
+    /// material (where the cell bounds proved the rapid could come lower)
+    /// and feeding across at depth.
+    pub offset_descents: usize,
     pub unproven_air_starts: usize,
     pub grid_refreshes: usize,
     /// Why passes ended: material exhausted ahead, the far side would
@@ -152,6 +159,8 @@ impl Default for EngagementFrontReport {
             stock_edge_entries: 0,
             helical_entries: 0,
             entry_turns: 0,
+            air_entries: 0,
+            offset_descents: 0,
             unproven_air_starts: 0,
             grid_refreshes: 0,
             pass_ends_exhausted: 0,
@@ -464,6 +473,8 @@ pub(crate) struct EngagementFrontPlan {
     heights: Heights,
     /// See `RoughingOperation::rapid_descent_clearance_mm`.
     rapid_descent: Option<f64>,
+    /// See `RoughingOperation::ramp_clearance_mm`.
+    ramp_clearance: Option<f64>,
     r: f64,
     width: f64,
     climb: bool,
@@ -531,6 +542,7 @@ impl EngagementFrontPlan {
             entry,
             heights,
             rapid_descent: None,
+            ramp_clearance: None,
             r,
             width,
             climb,
@@ -548,6 +560,10 @@ impl EngagementFrontPlan {
         })
     }
     /// See `RoughingOperation::rapid_descent_clearance_mm` (validated there).
+    pub(crate) fn with_ramp_clearance(mut self, clearance: Option<f64>) -> Self {
+        self.ramp_clearance = clearance;
+        self
+    }
     pub(crate) fn with_rapid_descent(mut self, clearance: Option<f64>) -> Self {
         self.rapid_descent = clearance;
         self
@@ -1204,6 +1220,70 @@ impl EngagementFrontPlan {
         above
     }
 
+    /// A vertical entry at `q` sits beside the material it is about to cut,
+    /// so the whole-cell stock bounds under the tool there still hold that
+    /// material's height and the rapid descent must stop above it (the
+    /// stream's stock-contact check reads those same bounds). When a point a
+    /// few stock cells back from the material (opposite `toward`) is proven
+    /// clear lower down, by the committed sweeps and the cell bounds both,
+    /// descend there instead and feed across to `q` at depth: the plunge
+    /// through cleared air becomes a rapid. The link is part-certified and
+    /// sampled against the engagement limit like a stay-down link. Returns
+    /// the descent point, its proven height and the link samples.
+    #[allow(clippy::type_complexity)]
+    fn offset_descent(
+        &self,
+        stock: &Stock,
+        q: Point,
+        toward: Point,
+        proven: Option<f64>,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<(Point, Option<f64>, Vec<Point>)>, String> {
+        let (Some(d), Some(h)) = (self.rapid_descent, proven) else {
+            return Ok(None);
+        };
+        let z = self.z;
+        let stop = self.heights.feed.min(h + d);
+        // Worth a link only when it saves real feed travel.
+        if stop - (z + d) <= 1. {
+            return Ok(None);
+        }
+        let [wx, wy] = stock.cell_widths_mm();
+        let w = wx.max(wy);
+        let guard = 0.01_f64.max(64. * self.op.tolerance_mm);
+        for n in [2., 4., 8.] {
+            let back = (n * w).min(self.r);
+            let p = [q[0] - back * toward[0], q[1] - back * toward[1]];
+            if !self.layer.as_ref().unwrap().allowed_at(p)
+                || !self
+                    .guides
+                    .stroke_geometry_fits_radius(Stroke::line(p, q), self.r)
+            {
+                continue;
+            }
+            let (height, _) = self
+                .guides
+                .cleared_entry_start(p, 0., z, Some(stock), cancel)?;
+            if height - z > guard {
+                continue;
+            }
+            let Some(at) = self
+                .proven(height)
+                .map(|h| h.max(self.guides.cell_entry_height(stock, p)))
+            else {
+                continue;
+            };
+            if self.heights.feed.min(at + d) > stop - 1. {
+                continue;
+            }
+            let Some((samples, _)) = self.link_samples(p, q) else {
+                continue;
+            };
+            return Ok(Some((p, Some(at), samples)));
+        }
+        Ok(None)
+    }
+
     fn emit_cuts(&mut self, pts: &[Point]) -> Result<(), String> {
         let c = self.layer.as_ref().unwrap().g.c;
         let z = self.z;
@@ -1285,6 +1365,7 @@ impl EngagementFrontPlan {
                 self.routed_link(from, q, 3. * keep_down)
             };
             let mut proven = None;
+            let mut descent = None;
             if link.is_none() {
                 // A vertical entry needs the committed sweeps (or air outside
                 // the original stock) to prove the whole column clear.
@@ -1299,6 +1380,7 @@ impl EngagementFrontPlan {
                 proven = self
                     .proven(height)
                     .map(|h| h.max(self.guides.cell_entry_height(stock, q)));
+                descent = self.offset_descent(stock, q, dir, proven, cancel)?;
             }
             let side = if self.climb { 1. } else { -1. };
             let heading = (side * dir[0]).atan2(-side * dir[1]);
@@ -1325,6 +1407,20 @@ impl EngagementFrontPlan {
                     self.line(at, next, MoveKind::Link);
                     at = next;
                 }
+            } else if let Some((p, proven_p, samples)) = descent {
+                // Plunge beside the entry, where the stock bounds let the
+                // rapid come down, then feed across to it at depth.
+                let above = self.travel(here, p, proven_p);
+                self.line(above, [p[0], p[1], z], MoveKind::Plunge);
+                let layer = self.layer.as_mut().unwrap();
+                for s in samples {
+                    layer.cut(s, r);
+                }
+                self.report.certified_strokes += 1;
+                self.line([p[0], p[1], z], [q[0], q[1], z], MoveKind::Link);
+                self.report.lifts += 1;
+                self.report.stock_edge_entries += 1;
+                self.report.offset_descents += 1;
             } else {
                 let above = self.travel(here, q, proven);
                 self.line(above, [q[0], q[1], z], MoveKind::Plunge);
@@ -1384,24 +1480,53 @@ impl EngagementFrontPlan {
                     arc: Some((q, PI)),
                 })?;
             }
-            let (top, opposite) = self
-                .guides
-                .cleared_entry_start(q, rh, z, Some(stock), cancel)?;
-            let curves = helix.curves(q, rh, top.max(z), z, !self.climb, opposite)?;
-            let start = curves[0].start();
+            let (swept, opposite) =
+                self.guides
+                    .cleared_entry_start(q, rh, z, Some(stock), cancel)?;
+            // The helix ramps only through material: above the committed
+            // sweeps' proof, or above every whole-cell stock bound the tool
+            // can meet anywhere on the bore, it is air. Descend straight
+            // down to there (a rapid to the proven height, then the feed
+            // plunge) and ramp from there; a bore that is air down to the
+            // layer needs no helix at all.
+            let top = swept
+                .min(self.guides.cell_sweep_height(stock, q, rh))
+                .max(z);
+            let air = top <= z + 64. * self.op.tolerance_mm;
+            // The ramp starts `ramp_clearance` above the material it found
+            // (never above the feed height), so the helix is already turning
+            // when the cutter reaches stock.
+            let begin = (top + self.ramp_clearance.unwrap_or(0.))
+                .min(self.heights.feed)
+                .max(top);
+            let curves = if air {
+                vec![]
+            } else {
+                helix.curves(q, rh, begin, z, !self.climb, opposite)?
+            };
+            let start = curves.first().map_or_else(
+                || [q[0] + if opposite { -rh } else { rh }, q[1], z],
+                Curve::start,
+            );
             let here = self.position;
             let proven = self
                 .proven(top)
                 .map(|h| h.max(self.guides.cell_entry_height(stock, [start[0], start[1]])));
             let above = self.travel(here, [start[0], start[1]], proven);
-            self.line(above, start, MoveKind::Plunge);
-            let feed = Some(helix.feed_mm_min.unwrap_or(self.op.plunge_mm_min));
-            self.report.entry_turns += curves.len() - 1;
-            for curve in curves {
-                self.queue(curve, MoveKind::Lead, feed);
+            if above[2] > start[2] {
+                self.line(above, start, MoveKind::Plunge);
+            }
+            if air {
+                self.report.air_entries += 1;
+            } else {
+                let feed = Some(helix.feed_mm_min.unwrap_or(self.op.plunge_mm_min));
+                self.report.entry_turns += curves.len() - 1;
+                for curve in curves {
+                    self.queue(curve, MoveKind::Lead, feed);
+                }
+                self.report.helical_entries += 1;
             }
             self.layer.as_mut().unwrap().cut(q, r + rh);
-            self.report.helical_entries += 1;
             self.report.lifts += 1;
             self.position = [start[0], start[1], z];
             // Continue clearing from the helix: follow the new front.
