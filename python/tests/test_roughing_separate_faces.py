@@ -116,6 +116,54 @@ class SeparatelyTessellatedRoughingTest(unittest.TestCase):
                     self.assertGreater(sum(filled), 0)
                     self.assertLess(area, 1)
 
+    def test_seam_bridge_is_opt_in_and_reported(self):
+        solid = plate(True, True, "hexagon")
+        common = dict(
+            top_z_mm=0,
+            floor_z_mm=-18.5,
+            stepdown_mm=4,
+            clearance_z_mm=10,
+            clearing=RasterClearing(6, routing="economical"),
+            radial_allowance_mm=0.3,
+            bottom_allowance_mm=0.2,
+            omit_empty_cuts=True,
+            **CUT,
+        )
+        mesh = face_by_face(solid)
+        self.assertNotIn("seam_bridge_mm", Roughing("rough", TOOL, mesh, **common).to_dict())
+        rough = Roughing("rough", TOOL, mesh, seam_bridge_mm=0.01, **common)
+        self.assertEqual(rough.to_dict()["seam_bridge_mm"], 0.01)
+        face = Facing("face", TOOL, floor_z_mm=-1, stepdown_mm=4, stepover_mm=6, clearance_z_mm=10, **CUT)
+        report = None
+        with Simulation(
+            stock=StockSpec((0, 0, -19), (104, 60, 0), 0.5),
+            tools=(TOOL,),
+            operations=(face, rough),
+            revision="1",
+            initial_position_mm=(0, 0, 10),
+        ) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, OperationUpdate) and update.stage == "end" and update.operation == "rough":
+                    report = update.report
+            self.assertTrue(sim.state.finished)
+            from camlib.cadquery import export_surface_mesh
+
+            target = SurfaceTarget("plate", "1", export_surface_mesh(solid), -19)
+            material = Verifier(target, Options(max_findings=1)).check(sim.state)
+        self.assertEqual(material["gouge"]["definite_cells"], 0)
+        closings = [layer["shadow"].get("seam_closing") for layer in report["layers"]]
+        self.assertTrue(closings and all(c and c["bridged_below_mm"] == 0.02 for c in closings), closings)
+        with self.assertRaises(Exception):
+            with Simulation(
+                stock=StockSpec((0, 0, -19), (104, 60, 0), 0.5),
+                tools=(TOOL,),
+                operations=(Roughing("rough", TOOL, mesh, seam_bridge_mm=2.0, **common),),
+                revision="1",
+                initial_position_mm=(0, 0, 10),
+            ) as sim:
+                for _ in sim.run_operations():
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main()
