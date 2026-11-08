@@ -444,11 +444,13 @@ def _face_data(face, cancel):
     ):
         raise ValueError('CAD UV mesh has inconsistent edge incidence')
     boundary = {edge for edge, n in edges.items() if n == 1}
+    clamp_error = 0.0
     if isinstance(bounds, _PatchBounds):
         # The mesher may place trim nodes a hair outside a spline's domain
         # (loose CAD tolerances); patch bounds hold only inside it. Clamp them
         # onto the domain: the trim check below measures each node against
         # its pcurve, so the move is charged to the trim error.
+        # Interior nodes may only round across it; every clamp is charged.
         on_boundary = {i for edge in boundary for i in edge}
         lo = (bounds.uknots[0], bounds.vknots[0])
         hi = (bounds.uknots[-1], bounds.vknots[-1])
@@ -457,11 +459,14 @@ def _face_data(face, cancel):
             p = uv[i]
             q = tuple(min(max(p[k], lo[k]), hi[k]) for k in (0, 1))
             if q != p:
-                if i not in on_boundary or math.dist(p, q) > 1e-6 * span:
+                moved = math.dist(p, q)
+                if moved > (1e-6 if i in on_boundary else 1e-9) * span:
                     raise ValueError(
                         f'CAD UV mesh node {p} leaves the B-spline surface domain '
                         f'[{lo[0]}, {hi[0]}] x [{lo[1]}, {hi[1]}]'
                     )
+                fu, fv = _local_bounds(bounds, _uv_box(bounds, q, q, moved))[:2]
+                clamp_error = max(clamp_error, math.hypot(fu, fv) * moved)
                 uv[i] = q
     represented = Counter()
     trim_error = 0.0
@@ -516,13 +521,15 @@ def _face_data(face, cancel):
             explorer.Next()
     if set(represented) != boundary or any(n != 1 for n in represented.values()):
         raise ValueError('CAD trim chains do not cover mesh boundary exactly once')
-    return adaptor, bounds, uv, indices, trim_error, trim_segments
+    return adaptor, bounds, uv, indices, trim_error + clamp_error, trim_segments
 
 
 def _remeshable(error):
     """Mesher/topology mismatches (not missing bounds or cancellation)."""
     text = str(error)
-    return not any(k in text for k in ('cancelled', 'interpolation bound', 'derivative bound', 'invalid bounded'))
+    return not any(
+        k in text for k in ('cancelled', 'interpolation bound', 'derivative bound', 'invalid bounded', 'surface domain')
+    )
 
 
 def _mesh_face_alone(face, deflection, trim_budget, cancel):
@@ -567,7 +574,7 @@ def _mesh_face_alone(face, deflection, trim_budget, cancel):
     row = _rectangle_face_data(face, cancel)
     if row is not None:
         return row
-    for scale in (0.25, 1 / 16, 1 / 64, 1 / 256):
+    for scale in (0.25, 1 / 16):
         for tight in (False, True):
             row = attempt(tight, scale)
             if row is not None:
@@ -662,12 +669,16 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         _surface_bounds(BRepAdaptor_Surface(face.wrapped))
     seed_deflection = budget / 4
     remeshed = set()
+    progress = os.environ.get('CAMLIB_CAD_PROGRESS') == '1'
     _check_cancel(cancel)
     BRepTools.Clean_s(shape.wrapped)
     BRepMesh_IncrementalMesh(shape.wrapped, seed_deflection, False, 0.5, True)
+    if progress:
+        print(f'cad: solid mesh at {seed_deflection:.6f} mm in {time.perf_counter() - started:.1f} s', file=sys.stderr, flush=True)
     data = []
     for n, f in enumerate(faces):
         problem = None
+        checked = time.perf_counter()
         try:
             row = _face_data(f, cancel)
         except ValueError as e:
@@ -693,12 +704,14 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
             if alone is not row:
                 remeshed.add(n)
             row = alone
+        if progress:
+            print(f'cad: trims of face {n} {f.geomType()} {time.perf_counter() - checked:.1f} s'
+                  + (f' (remeshed: {problem or "trim error"})' if n in remeshed else ''), file=sys.stderr, flush=True)
         data.append(row)
     result = []
     face_reports = []
     max_error = 0.0
     evaluations = 0
-    progress = os.environ.get('CAMLIB_CAD_PROGRESS') == '1'
     if progress:
         print(f'cad: meshed {len(faces)} faces in {time.perf_counter() - started:.1f} s, remeshed {sorted(remeshed)}', file=sys.stderr, flush=True)
     for n, (face, (adaptor, bounds, uv, indices, trim_error, trim_segments)) in enumerate(zip(faces, data)):
