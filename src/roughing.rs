@@ -60,6 +60,7 @@ pub struct SeamClosing {
     pub growth_mm: f64,
     pub bridged_below_mm: f64,
 }
+#[derive(Clone)]
 pub struct RoughingShadow {
     pub region: PlanarRegion,
     pub report: ShadowReport,
@@ -171,44 +172,45 @@ pub(crate) fn stepup_layers(z: f64, above: f64, stepup: f64, guard: f64) -> Vec<
 #[allow(clippy::too_many_arguments)]
 fn stepup_band(
     target: &PreparedRoughingTarget,
-    region: &PlanarRegion,
-    below: f64,
-    axial_allowance_mm: f64,
+    shadow: &RoughingShadow,
     reach: f64,
-    cutter_radius_mm: f64,
-    simplify_mm: f64,
     options: ConstructionOptions,
-    work: &mut usize,
-    cancel: &impl CancelSignal,
 ) -> Result<PlanarRegion, String> {
-    // The same (simplified) shadow construction the layers use: it contains
-    // the exact shadow, so the band only grows, and its boundary is as
-    // coarse as the layer region it is intersected with (an exact fine-mesh
-    // shadow left sliver components that failed topology validation).
-    let shadow = target.shadow_simplified(
-        below,
-        axial_allowance_mm,
-        cutter_radius_mm,
-        simplify_mm,
-        work,
-        cancel,
-    )?;
+    // `shadow` is the step-up's parent layer shadow: the same (simplified)
+    // construction the layers use. It contains the exact shadow, so the band
+    // only grows, and its boundary is as coarse as the layer region it is
+    // intersected with (an exact fine-mesh shadow left sliver components that
+    // failed topology validation).
     // 3 * reach = 3r + 3a covers the 3r + 2a needed, with the allowance spare.
     let grow = 3. * reach + shadow.report.boundary_error_mm + options.tolerance_mm;
     // Square-join growth contains the round growth and keeps straight
     // edges: a round offset's arcs came back from the intersection as
     // thousands of tiny segments, whose erosion envelope then let the
     // cutter-centre region creep inside the clearance the pocket proves.
-    let band = shadow
+    Ok(shadow
         .region
         .prepare(options)?
         .inflate_square(grow, 0., target.square_bridge())?
         .0
-        .region;
-    Ok(region
-        .prepare(options)?
-        .boolean(&band.prepare(options)?, Boolean::Intersection)?
         .region)
+}
+
+/// A value several layers need (a step-up parent's shadow or band), built
+/// once by the first worker that asks; the others wait for it. The clipping
+/// work it took is kept with it and counted once.
+type Shared<T> = OnceLock<Result<(T, usize), String>>;
+
+fn shared<T: Clone>(
+    cell: &Shared<T>,
+    build: impl FnOnce(&mut usize) -> Result<T, String>,
+) -> Result<T, String> {
+    match cell.get_or_init(|| {
+        let mut work = 0;
+        build(&mut work).map(|value| (value, work))
+    }) {
+        Ok((value, _)) => Ok(value.clone()),
+        Err(e) => Err(e.clone()),
+    }
 }
 
 fn count_vertices(region: &PlanarRegion) -> usize {
@@ -1375,6 +1377,21 @@ impl RoughingPlan {
         } else {
             1
         };
+        // A full layer and each of its step-ups share that layer's shadow, and
+        // the step-ups the band around it: build each once, not per layer
+        // (Core Front's 25 step-ups rebuilt them about 400 CPU s).
+        let mut parents: Vec<f64> = vec![];
+        for &(_, of) in &depths {
+            if let Some(below) = of
+                && !parents.iter().any(|p| p.to_bits() == below.to_bits())
+            {
+                parents.push(below);
+            }
+        }
+        let parent_shadows: Vec<Shared<RoughingShadow>> =
+            parents.iter().map(|_| OnceLock::new()).collect();
+        let parent_bands: Vec<Shared<PlanarRegion>> =
+            parents.iter().map(|_| OnceLock::new()).collect();
         let prepared = parallel::ordered(
             depths.len(),
             workers,
@@ -1383,26 +1400,29 @@ impl RoughingPlan {
                 let cancel = || signal.is_cancelled();
                 let (z, step_up_of) = depths[i];
                 let mut work = 0;
-                let shadow = target
-                    .shadow_simplified(z, op.bottom_allowance_mm, r, contour, &mut work, &cancel)
-                    .map_err(|e| format!("roughing shadow at Z{z}: {e}"))?;
+                let build_shadow = |z: f64, work: &mut usize| {
+                    target.shadow_simplified(z, op.bottom_allowance_mm, r, contour, work, &cancel)
+                };
+                let parent = |z: f64| parents.iter().position(|p| p.to_bits() == z.to_bits());
+                let shadow = match (step_up_of, parent(z)) {
+                    (None, Some(k)) => shared(&parent_shadows[k], |w| build_shadow(z, w)),
+                    _ => build_shadow(z, &mut work),
+                }
+                .map_err(|e| format!("roughing shadow at Z{z}: {e}"))?;
                 let mut region = expanded
                     .boolean(&shadow.region.prepare(options)?, Boolean::Difference)?
                     .region;
                 if let Some(below) = step_up_of {
-                    region = stepup_band(
-                        &target,
-                        &region,
-                        below,
-                        op.bottom_allowance_mm,
-                        r + op.radial_allowance_mm,
-                        r,
-                        contour,
-                        options,
-                        &mut work,
-                        &cancel,
-                    )
+                    let k = parent(below).ok_or("roughing step-up has no parent layer")?;
+                    let band = shared(&parent_bands[k], |_| {
+                        let shadow = shared(&parent_shadows[k], |w| build_shadow(below, w))?;
+                        stepup_band(&target, &shadow, r + op.radial_allowance_mm, options)
+                    })
                     .map_err(|e| format!("roughing step-up band at Z{z}: {e}"))?;
+                    region = region
+                        .prepare(options)?
+                        .boolean(&band.prepare(options)?, Boolean::Intersection)?
+                        .region;
                 }
                 let layer_vertices = count_vertices(&region);
                 let step = match op.clearing {
@@ -1552,6 +1572,13 @@ impl RoughingPlan {
                 )
             },
         )?;
+        for cell in &parent_shadows {
+            if let Some(Ok((_, shared_work))) = cell.get() {
+                work = work
+                    .checked_add(*shared_work)
+                    .ok_or("roughing clipping work overflow")?;
+            }
+        }
         // One clearance scene for all layers: each layer extends it with the
         // sweeps committed since, instead of rebuilding from the whole job.
         let entry_scene = crate::pocket::EntrySceneCache::default();
@@ -1855,10 +1882,23 @@ mod simplify_tests {
             )
             .unwrap()
             .region;
-        let band = stepup_band(
-            &target, &layer, 4., 0., reach, r, contour, options, &mut 0, &cancel,
-        )
-        .unwrap();
+        // As the layer loop does: the parent (Z4) shadow's band, intersected
+        // with the step-up layer's region.
+        let below = target
+            .shadow_simplified(4., 0., r, contour, &mut 0, &cancel)
+            .unwrap();
+        let band = layer
+            .prepare(options)
+            .unwrap()
+            .boolean(
+                &stepup_band(&target, &below, reach, options)
+                    .unwrap()
+                    .prepare(options)
+                    .unwrap(),
+                Boolean::Intersection,
+            )
+            .unwrap()
+            .region;
         let vertices: Vec<_> = band
             .components
             .iter()

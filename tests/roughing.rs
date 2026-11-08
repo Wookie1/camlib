@@ -3458,6 +3458,43 @@ fn step_up_layers_climb_each_stepdown_and_cut_the_wall_stair_without_touching_th
 }
 
 #[test]
+fn step_up_layers_build_their_parent_shadow_once() {
+    // A full layer and its step-ups share the full layer's shadow (and the
+    // band around it): each depth's shadow is clipped from the mesh once.
+    // Every shadow visits every triangle once, so the clipping work of a
+    // run with step-ups is the per-shadow work of the plain run times its
+    // number of layers. Rebuilding the parent shadow for every step-up
+    // counted it again per step-up.
+    let mut manifest = fixture(false);
+    let Operation::Roughing(op) = &mut manifest.operations[0] else {
+        panic!("rough")
+    };
+    op.clearing = camlib::roughing::RoughingClearing::Offset {
+        stepover_mm: 0.8,
+        coverage_margin_mm: 0.01,
+    };
+    let base = scheduled_run(&manifest);
+    let Operation::Roughing(op) = &mut manifest.operations[0] else {
+        panic!("rough")
+    };
+    op.stepup_mm = Some(0.5);
+    let run = scheduled_run(&manifest);
+    let count = |r: &ScheduledRun| r.report["layers"].as_array().unwrap().len() as u64;
+    let work = |r: &ScheduledRun| r.report["clipping_work"].as_u64().unwrap();
+    let ups = run.report["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l.get("step_up_of_z_mm").is_some())
+        .count();
+    assert!(ups >= 2, "fixture has {ups} step-ups");
+    assert_eq!(work(&base) % count(&base), 0);
+    let per_shadow = work(&base) / count(&base);
+    assert!(per_shadow > 0);
+    assert_eq!(work(&run), per_shadow * count(&run));
+}
+
+#[test]
 fn step_up_must_be_smaller_than_stepdown() {
     let cancel = AtomicBool::new(false);
     for bad in [0., -0.5, 2., 3., f64::NAN] {
