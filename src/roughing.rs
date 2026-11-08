@@ -627,6 +627,13 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// cut. None: rapid descent stops at `feed_z_mm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rapid_descent_clearance_mm: Option<f64>,
+    /// engagement_front only. Each helical entry starts this far above the
+    /// material its bore meets (proven by the committed sweeps or the stock
+    /// cell bounds, and never above `feed_z_mm`), so the cutter is already
+    /// ramping when it reaches stock. None: the helix starts at that
+    /// material top.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ramp_clearance_mm: Option<f64>,
     pub id: String,
     pub tool: String,
     pub target: G,
@@ -676,6 +683,7 @@ impl<G> RoughingOperation<G> {
             clearing_tolerance_mm: self.clearing_tolerance_mm,
             contour_tolerance_mm: self.contour_tolerance_mm,
             rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
+            ramp_clearance_mm: self.ramp_clearance_mm,
             id: self.id,
             tool: self.tool,
             target: f(self.target)?,
@@ -1159,7 +1167,11 @@ impl RoughingPlan {
             feed_z_mm: op.feed_z_mm,
         };
         template.validate_authoring(tool, prepared_tool.cutter().definition(), initial, r)?;
-        if let Some(d) = op.rapid_descent_clearance_mm {
+        for (name, value) in [
+            ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
+            ("ramp_clearance_mm", op.ramp_clearance_mm),
+        ] {
+            let Some(d) = value else { continue };
             if !matches!(
                 op.clearing,
                 RoughingClearing::Adaptive {
@@ -1167,14 +1179,10 @@ impl RoughingPlan {
                     ..
                 }
             ) {
-                return Err(
-                    "rapid_descent_clearance_mm applies to engagement_front clearing only".into(),
-                );
+                return Err(format!("{name} applies to engagement_front clearing only"));
             }
-            if !d.is_finite() || d <= 0. {
-                return Err(format!(
-                    "roughing rapid_descent_clearance_mm {d} must be positive and finite"
-                ));
+            if !d.is_finite() || d <= 0. || d > 1e3 {
+                return Err(format!("roughing {name} {d} must be positive and finite"));
             }
         }
         match op.clearing {
@@ -1403,7 +1411,8 @@ impl RoughingPlan {
                             cutting_sense.unwrap_or(CuttingSense::Climb) == CuttingSense::Climb,
                             &cancel,
                         )?
-                        .with_rapid_descent(op.rapid_descent_clearance_mm),
+                        .with_rapid_descent(op.rapid_descent_clearance_mm)
+                        .with_ramp_clearance(op.ramp_clearance_mm),
                         )),
                         RoughingClearing::Adaptive {
                             path_strategy,

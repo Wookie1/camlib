@@ -1262,6 +1262,93 @@ fn engagement_front_rapid_descent_stops_above_proven_cut_stock() {
     );
 }
 
+/// Top of the material left by the earlier cuts (independent exact heights)
+/// under the cutter's disk at `p`, or over the whole bore of radius `bore`
+/// about `p`: 10 (the stock top) where nothing has cut.
+fn material_top(history: &[camlib::motion::Motion], i: usize, p: [f64; 2], bore: f64) -> f64 {
+    let mut top = f64::NEG_INFINITY;
+    for radial in [0., 0.25, 0.5, 0.75, 1.] {
+        for k in 0..24 {
+            let angle = TAU * k as f64 / 24.;
+            let d = radial * (1. + bore);
+            let q = [p[0] + d * angle.cos(), p[1] + d * angle.sin()];
+            if q[0] < 0. || q[0] > 32. || q[1] < 0. || q[1] > 28. {
+                continue;
+            }
+            let height = history[..i]
+                .iter()
+                .filter(|old| old.kind != MoveKind::Rapid)
+                .map(|old| exact_height(&old.curve, q))
+                .fold(10f64, f64::min);
+            top = top.max(height);
+        }
+    }
+    top
+}
+
+#[test]
+fn engagement_front_entries_feed_only_a_clearance_through_proven_air() {
+    // With a rapid-descent clearance, an entry beside material plunges a few
+    // stock cells back (where the cell bounds let the rapid come down) and
+    // feeds across at depth, and a helix ramps only through material: none
+    // feeds down through air already cleared by more than the clearance
+    // (plus the 0.5 mm stock cells' bound slack).
+    let base = engagement_front_frustum();
+    let mut v = serde_json::to_value(&base).unwrap();
+    v["operations"][0]["rapid_descent_clearance_mm"] = 0.5.into();
+    let run =
+        |v: &serde_json::Value| run_engagement_front(&serde_json::from_value(v.clone()).unwrap()).0;
+    let history = run(&v);
+    let (mut plunges, mut helices, mut air) = (0, 0, 0f64);
+    for (i, motion) in history.iter().enumerate() {
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        if b[2] >= a[2] - 1e-9 || b[2] >= 10. {
+            continue;
+        }
+        let top = match (motion.kind, &motion.curve) {
+            (MoveKind::Plunge, Curve::Line { .. }) => {
+                plunges += 1;
+                material_top(&history, i, [b[0], b[1]], 0.)
+            }
+            (MoveKind::Lead, Curve::Helix { center, .. }) => {
+                helices += 1;
+                let bore = (a[0] - center[0]).hypot(a[1] - center[1]);
+                material_top(&history, i, [center[0], center[1]], bore)
+            }
+            _ => continue,
+        };
+        air = air.max(a[2] - top.max(b[2]));
+    }
+    eprintln!("{plunges} plunges, {helices} helix turns; worst air feed {air:.3} mm");
+    assert!(plunges > 0 && helices > 0);
+    assert!(
+        air <= 0.5 + 0.6,
+        "an entry fed {air} mm through cleared air"
+    );
+
+    // ramp_clearance_mm: each helix starts that far above the material its
+    // bore meets (proven conservatively, so possibly a cell bound higher).
+    v["operations"][0]["ramp_clearance_mm"] = 0.3.into();
+    let history = run(&v);
+    let mut starts = 0;
+    for (i, motion) in history.iter().enumerate() {
+        let Curve::Helix { center, start, .. } = motion.curve else {
+            continue;
+        };
+        if matches!(history[i - 1].curve, Curve::Helix { .. }) {
+            continue;
+        }
+        starts += 1;
+        let bore = (start[0] - center[0]).hypot(start[1] - center[1]);
+        let above = start[2] - material_top(&history, i, [center[0], center[1]], bore);
+        assert!(
+            (0.3 - 1e-6..=0.3 + 0.6).contains(&above),
+            "helix at {start:?} starts {above} mm above the material"
+        );
+    }
+    assert!(starts > 0);
+}
+
 #[test]
 fn engagement_front_refuses_orbits_empty_cut_omission_and_helix_only_entry() {
     let base = engagement_front_frustum();
