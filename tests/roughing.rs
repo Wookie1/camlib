@@ -3943,3 +3943,66 @@ fn engagement_front_link_chip_thinning_needs_a_link_feed() {
         "{error}"
     );
 }
+
+/// A block whose top face and front wall were tessellated separately: the
+/// top face's front-edge vertices sit a hair (up to 3e-7 mm) off the wall's
+/// top edge, and the wall's bottom edge is a hair off its top edge, so each
+/// 20 mm wall facet projects to a needle far thinner than the construction
+/// tolerance. The needle's tips left uncovered past the jittered edge came
+/// back from the union as sliver rings no exact construction can keep (the
+/// Core Front refusal, "constructed short edge cannot be removed"). Thin
+/// facets are now padded like degenerate ones, so every jitter gives a
+/// shadow that still covers each facet.
+#[test]
+fn needle_wall_facets_beside_a_separately_tessellated_face_give_a_shadow() {
+    fn part(jitter: &[f64], tilt: f64, wall_y: f64) -> Vec<[[f64; 3]; 3]> {
+        let n = jitter.len() - 1;
+        let c = [10., 10., 10.];
+        let front: Vec<[f64; 3]> = (0..=n)
+            .map(|i| [20. * i as f64 / n as f64, jitter[i], 10.])
+            .collect();
+        let mut t: Vec<_> = (0..n).map(|i| [front[i], front[i + 1], c]).collect();
+        for (a, b) in [
+            ([20., jitter[n], 10.], [20., 20., 10.]),
+            ([20., 20., 10.], [0., 20., 10.]),
+            ([0., 20., 10.], [0., jitter[0], 10.]),
+        ] {
+            t.push([a, b, c]);
+        }
+        let (a, b) = ([0., wall_y, 10.], [20., wall_y, 10.]);
+        let (a0, b0) = ([0., wall_y - tilt, 0.], [20., wall_y - tilt, 0.]);
+        t.extend([[a, a0, b0], [a, b0, b]]);
+        t
+    }
+    let cancel = AtomicBool::new(false);
+    let mut seed = 12345u64;
+    let mut rnd = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) * 2. - 1.
+    };
+    for trial in 0..60 {
+        let k = 4 + (trial % 30);
+        let jitter: Vec<f64> = (0..=k).map(|_| 3e-7 * rnd()).collect();
+        let triangles = part(&jitter, 1.7e-7 * rnd(), 1e-7 * rnd());
+        let target =
+            PreparedRoughingTarget::prepare(mesh(triangles.clone(), 0.01), 1e-5, &cancel).unwrap();
+        let shadow = target
+            .shadow_for_cutter(5., 0.2, 6., &mut 0, &cancel)
+            .unwrap_or_else(|e| panic!("trial {trial}: {e}"));
+        assert!(shadow.report.enclosed_degenerate_projections >= 2);
+        let region = shadow
+            .region
+            .prepare(ConstructionOptions::default())
+            .unwrap();
+        for p in triangles.iter().flatten() {
+            assert!(
+                signed(&region, [p[0], p[1]]) > -1e-4,
+                "trial {trial}: {p:?}"
+            );
+        }
+        assert!(signed(&region, [10., 10.]) > 9.);
+        assert!(signed(&region, [10., -0.1]) < 0.);
+    }
+}
