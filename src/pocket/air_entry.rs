@@ -8,6 +8,44 @@ pub(super) fn none(n: &usize) -> bool {
 }
 
 impl PocketPlan {
+    /// The lowest tip height at `point` above which every whole-cell stock
+    /// upper bound lies clear of the tool assembly's sections (each section's
+    /// radius plus a guard, over every cell its disk overlaps). The stream's
+    /// stock-contact check reads these same bounds, so a rapid that stops
+    /// above this height can be certified by it, not only by the exact
+    /// committed sweeps. Outside the stock grid nothing is stock.
+    pub(crate) fn cell_entry_height(&self, stock: &Stock, point: Point) -> f64 {
+        let [nx, ny] = stock.dimensions();
+        let [wx, wy] = stock.cell_widths_mm();
+        let min = stock.spec().min_mm;
+        let cells = stock.cells();
+        let guard = 32. * self.operation.tolerance_mm;
+        let mut height = f64::NEG_INFINITY;
+        for &(radius, bottom) in &self.air_entry_parts {
+            let reach = radius + guard;
+            let span = |v: f64, o: f64, w: f64, n: usize| {
+                let lo = ((v - reach - o) / w).floor().max(0.);
+                let hi = ((v + reach - o) / w).floor().min(n as f64 - 1.);
+                (lo as usize, hi)
+            };
+            let (i0, i1) = span(point[0], min[0], wx, nx);
+            let (j0, j1) = span(point[1], min[1], wy, ny);
+            if i1 < 0. || j1 < 0. {
+                continue;
+            }
+            for j in j0..=j1 as usize {
+                for i in i0..=i1 as usize {
+                    let (x0, y0) = (min[0] + i as f64 * wx, min[1] + j as f64 * wy);
+                    let dx = (x0 - point[0]).max(point[0] - x0 - wx).max(0.);
+                    let dy = (y0 - point[1]).max(point[1] - y0 - wy).max(0.);
+                    if dx.hypot(dy) <= reach {
+                        height = height.max(cells[j * nx + i].upper_mm - bottom);
+                    }
+                }
+            }
+        }
+        height
+    }
     /// Use `cache` for committed-clearance entry queries (shared across plans).
     pub(crate) fn share_entry_scene(&mut self, cache: &EntrySceneCache) {
         self.entry_scene = cache.clone();

@@ -1175,9 +1175,11 @@ impl EngagementFrontPlan {
         up
     }
     /// Rapid to above `to`, descending to the feed height, or to the
-    /// rapid-descent clearance above `proven` (a height down to which the
-    /// committed sweeps prove the whole tool's descent at `to` clear) when
-    /// that is lower. Returns the pose.
+    /// rapid-descent clearance above `proven` when that is lower: a height
+    /// down to which the committed sweeps prove the whole tool's descent at
+    /// `to` clear, raised to the whole-cell stock bounds under the tool so
+    /// the stream's stock-contact check certifies the rapid too. Returns the
+    /// pose.
     /// A height `cleared_entry_start` returned, when it is a proof: it
     /// returns the operation top unexamined when nothing is committed yet.
     fn proven(&self, height: f64) -> Option<f64> {
@@ -1294,7 +1296,9 @@ impl EngagementFrontPlan {
                     self.mark_dead(q, 1);
                     continue;
                 }
-                proven = self.proven(height);
+                proven = self
+                    .proven(height)
+                    .map(|h| h.max(self.guides.cell_entry_height(stock, q)));
             }
             let side = if self.climb { 1. } else { -1. };
             let heading = (side * dir[0]).atan2(-side * dir[1]);
@@ -1386,7 +1390,9 @@ impl EngagementFrontPlan {
             let curves = helix.curves(q, rh, top.max(z), z, !self.climb, opposite)?;
             let start = curves[0].start();
             let here = self.position;
-            let proven = self.proven(top);
+            let proven = self
+                .proven(top)
+                .map(|h| h.max(self.guides.cell_entry_height(stock, [start[0], start[1]])));
             let above = self.travel(here, [start[0], start[1]], proven);
             self.line(above, start, MoveKind::Plunge);
             let feed = Some(helix.feed_mm_min.unwrap_or(self.op.plunge_mm_min));
