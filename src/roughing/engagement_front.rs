@@ -95,6 +95,10 @@ pub(crate) struct FrontMemory {
     generation: u64,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct EngagementFrontReport {
     pub strategy: &'static str,
@@ -122,6 +126,10 @@ pub struct EngagementFrontReport {
     pub pass_ends_boundary: usize,
     pub certified_strokes: usize,
     pub arcs: usize,
+    /// Fitted arcs that bowed out of the region between their points and
+    /// were cut as their points' certified polyline instead.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub refitted_arcs: usize,
     pub motions: usize,
     pub stock_top_carried: bool,
     pub geometric_residual_status: ResidualStatus,
@@ -152,6 +160,7 @@ impl Default for EngagementFrontReport {
             pass_ends_boundary: 0,
             certified_strokes: 0,
             arcs: 0,
+            refitted_arcs: 0,
             motions: 0,
             stock_top_carried: false,
             geometric_residual_status: ResidualStatus::Pending,
@@ -186,14 +195,18 @@ impl Layer {
             .cell(p)
             .is_some_and(|(i, j)| self.allowed[self.g.idx(i, j)])
     }
-    fn cut(&mut self, p: Point, rad: f64) {
-        let z = self.z;
-        let cleared = &mut self.cleared;
+    /// Mark the disk cleared; returns how many material cells it cleared.
+    fn cut(&mut self, p: Point, rad: f64) -> usize {
+        let (z, floor) = (self.z, self.z + self.material_guard);
+        let (cleared, top) = (&mut self.cleared, &self.top);
+        let mut removed = 0;
         self.g.for_disk(p, rad, |k, _, _| {
             if cleared[k] > z {
+                removed += usize::from(top[k].min(cleared[k]) > floor);
                 cleared[k] = z;
             }
         });
+        removed
     }
     /// Material cell centres a step of up to `reach` from `p` can meet.
     fn gather(&self, p: Point, reach: f64, out: &mut Vec<Point>) {
@@ -399,6 +412,40 @@ fn fit_strokes(pts: &[Point], tol: f64, max_radius: f64) -> Vec<Stroke> {
         i = j;
     }
     out
+}
+
+/// `fit_strokes`, with every fitted arc that `fits` rejects replaced by the
+/// polyline of the points it stood for. The fit only checks the points: an
+/// arc through points far apart on a tight turn bows out between them and can
+/// come closer to the region than the points do, while the points' own lines
+/// stay as close as the points. Returns the strokes and how many arcs were
+/// replaced; the caller still certifies every stroke.
+fn fit_certifiable(
+    pts: &[Point],
+    tol: f64,
+    max_radius: f64,
+    fits: impl Fn(Stroke) -> bool,
+) -> (Vec<Stroke>, usize) {
+    let mut out = vec![];
+    let mut refitted = 0;
+    let mut at = 0;
+    for s in fit_strokes(pts, tol, max_radius) {
+        // Strokes run between consecutive input points, in order.
+        let from = at + pts[at..].iter().position(|&p| p == s.a).unwrap_or(0);
+        at = from + pts[from..].iter().position(|&p| p == s.b).unwrap_or(0);
+        if s.arc.is_some() && !fits(s) {
+            refitted += 1;
+            out.extend(
+                pts[from..=at]
+                    .windows(2)
+                    .filter(|w| w[0] != w[1])
+                    .map(|w| Stroke::line(w[0], w[1])),
+            );
+        } else {
+            out.push(s);
+        }
+    }
+    (out, refitted)
 }
 
 /// Line/arc fit tolerance as a fraction of the steering grid cell.
@@ -624,6 +671,40 @@ impl EngagementFrontPlan {
                 }
             }
         }
+        // A boundary feature narrower than a cell (a hairline island, a
+        // needle of the target's shadow) can fall between cell centres and
+        // be missed by the centre test above, letting the grid allow centres
+        // the exact certification then rejects. An edge-touched cell whose
+        // centre is inside but which has no outside-centre neighbour holds
+        // such an unseen feature: it counts as outside, so every boundary
+        // point lies in an outside cell or next to an outside centre (as
+        // along an ordinary boundary, which the clearance margin covers).
+        let centre_inside = inside.clone();
+        let seen = |i: usize, j: usize| {
+            (i.saturating_sub(1)..=(i + 1).min(g.nx - 1)).any(|a| {
+                (j.saturating_sub(1)..=(j + 1).min(g.ny - 1)).any(|b| !centre_inside[g.idx(a, b)])
+            })
+        };
+        for &(a, b) in &edges {
+            let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+            let pieces = ((2. * len / g.c).ceil() as usize).clamp(1, 1 << 24);
+            for t in 0..pieces {
+                let f0 = t as f64 / pieces as f64;
+                let f1 = (t + 1) as f64 / pieces as f64;
+                let p = [a[0] + (b[0] - a[0]) * f0, a[1] + (b[1] - a[1]) * f0];
+                let q = [a[0] + (b[0] - a[0]) * f1, a[1] + (b[1] - a[1]) * f1];
+                let cell = |v: f64, o: f64, n: usize| {
+                    ((v - o) / g.c).floor().clamp(0., n as f64 - 1.) as usize
+                };
+                for j in cell(p[1].min(q[1]), g.y0, g.ny)..=cell(p[1].max(q[1]), g.y0, g.ny) {
+                    for i in cell(p[0].min(q[0]), g.x0, g.nx)..=cell(p[0].max(q[0]), g.x0, g.nx) {
+                        if centre_inside[g.idx(i, j)] && !seen(i, j) {
+                            inside[g.idx(i, j)] = false;
+                        }
+                    }
+                }
+            }
+        }
         // The grid border counts as outside.
         for i in 0..g.nx {
             inside[g.idx(i, 0)] = false;
@@ -846,8 +927,11 @@ impl EngagementFrontPlan {
             th += phi;
             p = [p[0] + ds * th.cos(), p[1] + ds * th.sin()];
             max_eng = max_eng.max(a / ds);
-            layer.cut(p, r);
-            cut_any = true;
+            // Progress is material this plan marks cleared, not material the
+            // step merely meets: cells just beyond the cutter's reach along a
+            // boundary count in the step's area but are never cleared, and a
+            // pass that only meets them would be planned again forever.
+            cut_any |= layer.cut(p, r) > 0;
             pts.push(p);
         }
         self.scratch = cells;
@@ -1096,7 +1180,13 @@ impl EngagementFrontPlan {
     fn emit_cuts(&mut self, pts: &[Point]) -> Result<(), String> {
         let c = self.layer.as_ref().unwrap().g.c;
         let z = self.z;
-        for s in fit_strokes(pts, FIT_FRACTION * c, 1000. * self.r) {
+        let guides = &self.guides;
+        let r = self.r;
+        let (strokes, refitted) = fit_certifiable(pts, FIT_FRACTION * c, 1000. * r, |s| {
+            guides.stroke_geometry_fits_radius(s, r)
+        });
+        self.report.refitted_arcs += refitted;
+        for s in strokes {
             self.certify(s)?;
             if s.arc.is_some() {
                 self.report.arcs += 1;
@@ -1404,5 +1494,102 @@ mod tests {
             });
             assert!(near, "{p:?}");
         }
+    }
+
+    /// Three points far apart on a tight circle (a front step of 0.95 mm
+    /// around a 0.86 mm turn, Core Front roughing at Z41.692): the arc
+    /// through them bows 0.14 mm out from the polyline between them. With a
+    /// check that refuses it (here: leaving the polyline by more than the
+    /// tolerance), the points' own lines are cut instead.
+    #[test]
+    fn fitted_arcs_stay_within_tolerance_between_points() {
+        let (rho, tol) = (0.8644863398607524, 0.0625);
+        let pts: Vec<Point> = [0f64, 1.165, 2.33]
+            .iter()
+            .map(|a| [rho * a.cos(), rho * a.sin()])
+            .collect();
+        let polyline = |p: Point| {
+            pts.windows(2)
+                .map(|w| {
+                    let d = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+                    let t = (((p[0] - w[0][0]) * d[0] + (p[1] - w[0][1]) * d[1])
+                        / (d[0] * d[0] + d[1] * d[1]))
+                        .clamp(0., 1.);
+                    (w[0][0] + t * d[0] - p[0]).hypot(w[0][1] + t * d[1] - p[1])
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let sample = |s: Stroke, f: f64| match s.arc {
+            None => [
+                s.a[0] + (s.b[0] - s.a[0]) * f,
+                s.a[1] + (s.b[1] - s.a[1]) * f,
+            ],
+            Some((c, sweep)) => {
+                let r = (s.a[0] - c[0]).hypot(s.a[1] - c[1]);
+                let a = (s.a[1] - c[1]).atan2(s.a[0] - c[0]) + sweep * f;
+                [c[0] + r * a.cos(), c[1] + r * a.sin()]
+            }
+        };
+        let fits = |s: Stroke| (0..=64).all(|k| polyline(sample(s, k as f64 / 64.)) <= tol);
+        let fitted = fit_strokes(&pts, tol, 1000.);
+        assert!(
+            fitted.iter().any(|&s| !fits(s)),
+            "the plain fit no longer bows out here: {fitted:?}"
+        );
+        let (strokes, refitted) = fit_certifiable(&pts, tol, 1000., fits);
+        assert_eq!(refitted, 1);
+        assert_eq!(strokes.len(), 2);
+        for s in strokes {
+            for k in 0..=64 {
+                let p = sample(s, k as f64 / 64.);
+                assert!(
+                    polyline(p) <= tol + 1e-9,
+                    "{s:?} leaves the polyline at {p:?}"
+                );
+            }
+        }
+    }
+
+    /// A pass makes progress only by clearing material in the plan's own
+    /// model. Material just beyond the cutter's reach (here a ring of cells
+    /// between r and r + c/2 from the centre, which a step's area counts in
+    /// part) is never cleared, so cutting the same disk again reports none:
+    /// before, a pass that only met such cells counted as progress and Core
+    /// Front's layer at Z10.436 replanned the same six passes forever.
+    #[test]
+    fn a_repeated_cut_clears_nothing() {
+        let g = Grid {
+            x0: 0.,
+            y0: 0.,
+            c: 0.25,
+            nx: 64,
+            ny: 64,
+        };
+        let n = g.nx * g.ny;
+        let mut layer = Layer {
+            g,
+            top: vec![10.; n],
+            cleared: vec![f64::INFINITY; n],
+            allowed: vec![true; n],
+            reachable: vec![true; n],
+            room: vec![100.; n],
+            dead: vec![false; n],
+            candidates: vec![],
+            z: 0.,
+            material_guard: 1e-4,
+        };
+        let (p, r) = ([8., 8.], 3.);
+        let before = (0..n).filter(|&k| layer.material(k)).count();
+        let first = layer.cut(p, r);
+        assert!(first > 0);
+        assert_eq!(
+            before - first,
+            (0..n).filter(|&k| layer.material(k)).count()
+        );
+        assert_eq!(layer.cut(p, r), 0);
+        // Cells already below the layer (no material) are not progress.
+        layer.top = vec![-1.; n];
+        layer.cleared = vec![f64::INFINITY; n];
+        assert_eq!(layer.cut(p, r), 0);
     }
 }
