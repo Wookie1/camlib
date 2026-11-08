@@ -179,10 +179,14 @@ make its topology ambiguous. It only adds protection, and each layer reports it
   estimate. Every cutting and link move is checked exactly against the
   layer region before it is emitted, and the run fails rather than emit
   one that does not fit. Orbit options and `omit_empty_cuts` do not apply,
-  and the entry must be `StockEdgeEntry`.
+  and the entry must be `StockEdgeEntry`. With `rapid_descent_clearance_mm`
+  (opt-in, on `Roughing`), a descent into a column that the committed cuts
+  prove clear for the whole tool assembly is rapid down to that far above
+  the proven height, and only the rest is fed; otherwise every entry feeds
+  down from `feed_z_mm` through material already cut.
 
-Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster
-and offset clearing. `RestRoughing` machines only what earlier operations left
+Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster,
+offset and engagement_front clearing. `RestRoughing` machines only what earlier operations left
 (`rest_tolerance_mm`, 0.01, is ignored), never repeating strokes proven already
 cleared. Further options:
 

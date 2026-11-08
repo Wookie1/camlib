@@ -1170,7 +1170,7 @@ class Roughing:
     require_part_at_first_depth: bool = False
     omit_empty_cuts: bool = False
     rest_tolerance_mm: float | None = None
-    # See Pocket.retract_z_mm/feed_z_mm. Raster and offset clearing only.
+    # See Pocket.retract_z_mm/feed_z_mm. Raster, offset and engagement_front.
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
     # Each layer's protected shadow simplified within this and grown by it
@@ -1185,6 +1185,10 @@ class Roughing:
     # closed protectively, bridging gaps narrower than twice this (at most half
     # the cutter radius). About the mesh's surface error. None: off.
     seam_bridge_mm: float | None = None
+    # engagement_front only: a descent into a column the committed sweeps
+    # prove clear for the whole tool is rapid down to this far above the
+    # proven height, then fed. None: rapid descent stops at feed_z_mm.
+    rapid_descent_clearance_mm: float | None = None
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1207,7 +1211,7 @@ class Roughing:
             result.pop('clearing_tolerance_mm')
         if not self.require_part_at_first_depth:
             result.pop('require_part_at_first_depth')
-        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm', 'seam_bridge_mm'):
+        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm', 'seam_bridge_mm', 'rapid_descent_clearance_mm'):
             if result[key] is None:
                 result.pop(key)
         for key in ("target", "clearing", "entry"):

@@ -1092,6 +1092,109 @@ fn engagement_front_frustum_clears_every_layer_without_touching_the_part() {
     assert!(nominal <= 2400., "nominal cycle {nominal} s");
 }
 
+/// Plan the frustum to the end, committing each motion; returns the motions
+/// and the nominal cycle (rapids at 6000 mm/min).
+fn run_engagement_front(m: &StreamManifest) -> (Vec<camlib::motion::Motion>, f64) {
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let (mut history, mut nominal) = (Vec::new(), 0.);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(history.len() < 60000, "unbounded engagement_front path");
+        certify_part(&motion.curve);
+        nominal += motion
+            .curve
+            .prepare(m.sweep.tolerance_mm)
+            .unwrap()
+            .length_mm()
+            / motion.feed_mm_min.unwrap_or(6000.)
+            * 60.;
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+        history.push(motion);
+    }
+    (history, nominal)
+}
+
+#[test]
+fn engagement_front_rapid_descent_stops_above_proven_cut_stock() {
+    let base = engagement_front_frustum();
+    let mut v = serde_json::to_value(&base).unwrap();
+    v["operations"][0]["rapid_descent_clearance_mm"] = 0.5.into();
+    let m: StreamManifest = serde_json::from_value(v).unwrap();
+    let (history, nominal) = run_engagement_front(&m);
+    let (_, before) = run_engagement_front(&base);
+    let mut deep = 0;
+    for (i, motion) in history.iter().enumerate() {
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        if motion.kind != MoveKind::Rapid || b[2] >= a[2] || b[2] >= 12. {
+            continue;
+        }
+        deep += 1;
+        // Independent exact heights left by every earlier cut, over the
+        // cutter's disk: the rapid stops at least the clearance above them.
+        for radial in [0., 0.5, 1.] {
+            for k in 0..16 {
+                let angle = TAU * k as f64 / 16.;
+                let p = [b[0] + radial * angle.cos(), b[1] + radial * angle.sin()];
+                if p[0] < 0. || p[0] > 32. || p[1] < 0. || p[1] > 28. {
+                    continue;
+                }
+                let height = history[..i]
+                    .iter()
+                    .filter(|old| old.kind != MoveKind::Rapid)
+                    .map(|old| exact_height(&old.curve, p))
+                    .fold(10f64, f64::min);
+                assert!(
+                    height <= b[2] - 0.5 + 0.02,
+                    "rapid to {b:?} stops {} above material at {p:?}",
+                    b[2] - height
+                );
+            }
+        }
+    }
+    eprintln!(
+        "rapid descents below the feed height: {deep}; nominal {before:.0} -> {nominal:.0} s"
+    );
+    assert!(deep > 0);
+    assert!(nominal < before);
+    // Opt-in for engagement_front only, and positive.
+    let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = serde_json::to_value(&base).unwrap();
+        f(&mut v["operations"][0]);
+        let m = serde_json::from_value::<StreamManifest>(v).unwrap();
+        let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        OperationPlan::prepare_with_stock(
+            m.operations[0].clone(),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .err()
+        .unwrap_or_default()
+    };
+    assert!(edit(&|op| op["rapid_descent_clearance_mm"] = 0.0.into()).contains("positive"));
+    assert!(
+        edit(&|op| {
+            op["rapid_descent_clearance_mm"] = 0.5.into();
+            op["clearing"] = serde_json::json!({"kind": "offset", "stepover_mm": 0.5});
+        })
+        .contains("engagement_front clearing only")
+    );
+}
+
 #[test]
 fn engagement_front_refuses_orbits_empty_cut_omission_and_helix_only_entry() {
     let base = engagement_front_frustum();
