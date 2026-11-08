@@ -455,9 +455,24 @@ impl PreparedRoughingTarget {
             } else {
                 0.
             };
-            if area <= (64. * self.tolerance).powi(2) {
+            // Twice the area over the diameter: at most twice the facet's
+            // narrowest width (area <= width * diameter for a convex set).
+            let diameter = points
+                .iter()
+                .flat_map(|a| points.iter().map(move |b| (a[0] - b[0]).hypot(a[1] - b[1])))
+                .fold(0f64, f64::max);
+            let thin = area <= (64. * self.tolerance).powi(2)
+                || area.abs() <= 64. * self.tolerance * diameter;
+            if thin {
                 // A small Minkowski box preserves even vertical walls/points.
                 // This is explicit overprotection, not a mesh or point sample.
+                // Thin facets too (a near-vertical wall whose bottom edge is
+                // a hair off its top edge projects to a long needle): a
+                // needle's tip left uncovered past a separately tessellated
+                // neighbour comes back from the union as a sliver ring of
+                // width below the construction tolerance, which no exact
+                // construction can keep. Each padded facet still covers its
+                // exact projection.
                 let pad = 32. * self.tolerance;
                 points = hull(
                     points
@@ -484,7 +499,7 @@ impl PreparedRoughingTarget {
                 }],
                 boundary_error_mm: self.mesh.surface_error_mm
                     + self.numerical
-                    + if area <= (64. * self.tolerance).powi(2) {
+                    + if thin {
                         32. * self.tolerance * 2f64.sqrt()
                     } else {
                         0.
