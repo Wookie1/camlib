@@ -3435,12 +3435,21 @@ fn separately_tessellated_faces_give_a_shadow_for_the_cutter() {
         &cancel,
     )
     .unwrap();
-    // Without a cutter the exact union keeps slivers between the two faces'
-    // edges; one touches another boundary within the tolerance, and the
-    // refusal says where and why.
-    let refused = target.shadow(11., 0.2, &mut 0, &cancel).err().unwrap();
-    assert!(refused.contains("intersect or touch near ("), "{refused}");
-    assert!(refused.contains("not watertight"), "{refused}");
+    // The twisted wall's facets project to slivers thinner than the
+    // construction tolerance between the two faces' chords. They are padded
+    // (explicit overprotection, reported), so even the exact union of the
+    // projections is constructible and still covers every facet.
+    let exact = target.shadow(11., 0.2, &mut 0, &cancel).unwrap();
+    assert!(exact.report.enclosed_degenerate_projections > 0);
+    let exact_region = exact
+        .region
+        .prepare(ConstructionOptions::default())
+        .unwrap();
+    for triangle in separately_tessellated_boss(11.) {
+        for p in triangle {
+            assert!(signed(&exact_region, [p[0], p[1]]) > -1e-4, "{p:?}");
+        }
+    }
     // For a 12 mm cutter the slivers are filled: no cutter disk fits in one.
     let shadow = target
         .shadow_for_cutter(11., 0.2, 6., &mut 0, &cancel)
