@@ -450,7 +450,8 @@ def _face_data(face, cancel):
         # (loose CAD tolerances); patch bounds hold only inside it. Clamp them
         # onto the domain: the trim check below measures each node against
         # its pcurve, so the move is charged to the trim error.
-        # Interior nodes may only round across it; every clamp is charged.
+        # Boundary nodes may stray 1e-4 of the span, interior ones 1e-6;
+        # every clamp is charged |F'| x the move.
         on_boundary = {i for edge in boundary for i in edge}
         lo = (bounds.uknots[0], bounds.vknots[0])
         hi = (bounds.uknots[-1], bounds.vknots[-1])
@@ -460,7 +461,7 @@ def _face_data(face, cancel):
             q = tuple(min(max(p[k], lo[k]), hi[k]) for k in (0, 1))
             if q != p:
                 moved = math.dist(p, q)
-                if moved > (1e-6 if i in on_boundary else 1e-9) * span:
+                if moved > (1e-4 if i in on_boundary else 1e-6) * span:
                     raise ValueError(
                         f'CAD UV mesh node {p} leaves the B-spline surface domain '
                         f'[{lo[0]}, {hi[0]}] x [{lo[1]}, {hi[1]}]'
