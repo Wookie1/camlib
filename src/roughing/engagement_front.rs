@@ -209,10 +209,14 @@ impl Layer {
         removed
     }
     /// Material cell centres a step of up to `reach` from `p` can meet.
+    /// Only reachable material counts: stock no allowed centre can cut (the
+    /// part and its allowance beyond the region) lies just past the cutter
+    /// along every wall, and counting it made a pass ride the wall through
+    /// cleared air on material it could never remove.
     fn gather(&self, p: Point, reach: f64, out: &mut Vec<Point>) {
         out.clear();
         self.g.for_disk(p, reach, |k, q, _| {
-            if self.material(k) {
+            if self.reachable[k] && self.material(k) {
                 out.push(q);
             }
         });
@@ -1591,5 +1595,49 @@ mod tests {
         layer.top = vec![-1.; n];
         layer.cleared = vec![f64::INFINITY; n];
         assert_eq!(layer.cut(p, r), 0);
+    }
+
+    #[test]
+    fn a_step_along_a_wall_sees_no_unreachable_material() {
+        // Allowed centres end at the row centred on Y4.875; reachable cells
+        // (within r - c/2 of an allowed centre, as `build_layer` marks them)
+        // end at Y7.75, and the part (stock no centre can cut) stands beyond.
+        // Once the reachable band is cleared, a step along the wall meets
+        // nothing, though the part's first cell row (Y7.875) lies within the
+        // smoothing band of a cutter centred at Y4.9.
+        let g = Grid {
+            x0: 0.,
+            y0: 0.,
+            c: 0.25,
+            nx: 64,
+            ny: 64,
+        };
+        let n = g.nx * g.ny;
+        let r = 3.;
+        let y = |k: usize| g.center(k)[1];
+        let reachable: Vec<bool> = (0..n)
+            .map(|k| y(k) <= 4.875 + r - 0.5 * g.c + 1e-9)
+            .collect();
+        let layer = Layer {
+            g,
+            top: vec![10.; n],
+            cleared: (0..n)
+                .map(|k| if reachable[k] { 0. } else { f64::INFINITY })
+                .collect(),
+            allowed: (0..n).map(|k| y(k) <= 5.).collect(),
+            reachable,
+            room: vec![100.; n],
+            dead: vec![false; n],
+            candidates: vec![],
+            z: 0.,
+            material_guard: 1e-4,
+        };
+        let (p, q) = ([8., 4.9], [8.9, 4.9]);
+        assert!(layer.allowed_at(p) && layer.allowed_at(q));
+        // The part's material is there, inside the cutter's smoothing band.
+        assert!((0..n).any(|k| layer.material(k) && area(&[g.center(k)], q, r, g.c) > 0.));
+        let mut cells = vec![];
+        layer.gather(p, r + g.c, &mut cells);
+        assert_eq!(area(&cells, q, r, g.c), 0.);
     }
 }
