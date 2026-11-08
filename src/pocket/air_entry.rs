@@ -15,6 +15,14 @@ impl PocketPlan {
     /// above this height can be certified by it, not only by the exact
     /// committed sweeps. Outside the stock grid nothing is stock.
     pub(crate) fn cell_entry_height(&self, stock: &Stock, point: Point) -> f64 {
+        self.cell_sweep_height(stock, point, 0.)
+    }
+
+    /// `cell_entry_height` for every tool position within `around` of
+    /// `point` (a helix bore of radius `around` about centre `point`): the
+    /// lowest tip height above which no whole-cell stock upper bound meets
+    /// any tool section anywhere on that disk.
+    pub(crate) fn cell_sweep_height(&self, stock: &Stock, point: Point, around: f64) -> f64 {
         let [nx, ny] = stock.dimensions();
         let [wx, wy] = stock.cell_widths_mm();
         let min = stock.spec().min_mm;
@@ -22,7 +30,7 @@ impl PocketPlan {
         let guard = 32. * self.operation.tolerance_mm;
         let mut height = f64::NEG_INFINITY;
         for &(radius, bottom) in &self.air_entry_parts {
-            let reach = radius + guard;
+            let reach = radius + around + guard;
             let span = |v: f64, o: f64, w: f64, n: usize| {
                 let lo = ((v - reach - o) / w).floor().max(0.);
                 let hi = ((v + reach - o) / w).floor().min(n as f64 - 1.);

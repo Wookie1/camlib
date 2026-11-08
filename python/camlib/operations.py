@@ -1189,6 +1189,10 @@ class Roughing:
     # prove clear for the whole tool is rapid down to this far above the
     # proven height, then fed. None: rapid descent stops at feed_z_mm.
     rapid_descent_clearance_mm: float | None = None
+    # engagement_front only: each helical entry starts this far above the
+    # material its bore meets (never above feed_z_mm), so it is already
+    # ramping when it reaches stock. None: the helix starts at that material.
+    ramp_clearance_mm: float | None = None
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1211,7 +1215,8 @@ class Roughing:
             result.pop('clearing_tolerance_mm')
         if not self.require_part_at_first_depth:
             result.pop('require_part_at_first_depth')
-        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm', 'seam_bridge_mm', 'rapid_descent_clearance_mm'):
+        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm', 'seam_bridge_mm', 'rapid_descent_clearance_mm',
+                    'ramp_clearance_mm'):
             if result[key] is None:
                 result.pop(key)
         for key in ("target", "clearing", "entry"):
