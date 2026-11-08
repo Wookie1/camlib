@@ -40,6 +40,9 @@ pub struct ShadowReport {
     /// (protected): `PreparedRoughingTarget::shadow_for_cutter`.
     pub filled_holes: usize,
     pub filled_hole_area_mm2: f64,
+    /// Seam bridging (`RoughingOperation::seam_bridge_mm`), when used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seam_closing: Option<SeamClosing>,
     /// The shadow simplified within a tolerance and grown by it (None: the
     /// exact shadow).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,6 +51,14 @@ pub struct ShadowReport {
     pub output_vertices: usize,
     pub boolean_operations: usize,
     pub boundary_error_mm: f64,
+}
+/// The projected union closed protectively: grown by at most `growth_mm`
+/// (charged to the shadow's boundary error) and its gaps, notches and holes narrower
+/// than `bridged_below_mm` bridged (protection only, like filled holes).
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct SeamClosing {
+    pub growth_mm: f64,
+    pub bridged_below_mm: f64,
 }
 pub struct RoughingShadow {
     pub region: PlanarRegion,
@@ -58,6 +69,7 @@ pub struct PreparedRoughingTarget {
     tolerance: f64,
     numerical: f64,
     source_sha256: String,
+    seam_bridge: Option<f64>,
 }
 fn check(cancel: &impl CancelSignal) -> Result<(), String> {
     if cancel.is_cancelled() {
@@ -174,6 +186,7 @@ pub(crate) fn stepup_layers(z: f64, above: f64, stepup: f64, guard: f64) -> Vec<
 fn stepup_band(
     shadow: &RoughingShadow,
     reach: f64,
+    square_bridge: f64,
     options: ConstructionOptions,
 ) -> Result<PlanarRegion, String> {
     // `shadow` is the parent layer's shadow, built the same (simplified) way
@@ -190,7 +203,7 @@ fn stepup_band(
     Ok(shadow
         .region
         .prepare(options)?
-        .inflate_square(grow, 0.)?
+        .inflate_square(grow, 0., square_bridge)?
         .0
         .region)
 }
@@ -278,6 +291,7 @@ fn simplify_shadow(
     tolerance: f64,
     construction: f64,
     fill_below_mm2: f64,
+    bridge_mm: f64,
     options: ConstructionOptions,
 ) -> Result<PlanarRegion, String> {
     let ring = |b: &Boundary| -> Vec<Point> {
@@ -319,7 +333,8 @@ fn simplify_shadow(
         source: serde_json::Value::Null,
     }
     .prepare_generated(options)?;
-    let (grown, _) = simplified.inflate_square(tolerance + 4. * construction, fill_below_mm2)?;
+    let (grown, _) =
+        simplified.inflate_square(tolerance + 4. * construction, fill_below_mm2, bridge_mm)?;
     Ok(grown.region)
 }
 
@@ -355,7 +370,29 @@ impl PreparedRoughingTarget {
             tolerance: tolerance_mm,
             numerical,
             source_sha256,
+            seam_bridge: None,
         })
+    }
+    /// Close each cutter shadow protectively, bridging gaps narrower than
+    /// twice `bridge_mm` (`RoughingOperation::seam_bridge_mm`). None: off.
+    pub fn with_seam_bridge(mut self, bridge_mm: Option<f64>) -> Result<Self, String> {
+        if let Some(b) = bridge_mm
+            && !(b.is_finite() && b > 0. && b <= 1.)
+        {
+            return Err(format!(
+                "roughing seam_bridge_mm {b} must be within (0, 1] mm"
+            ));
+        }
+        self.seam_bridge = bridge_mm;
+        Ok(self)
+    }
+    /// The miter bridge for square-grown shadows when seams are bridged.
+    fn square_bridge(&self) -> f64 {
+        if self.seam_bridge.is_some() {
+            16. * self.tolerance
+        } else {
+            0.
+        }
     }
     pub fn mesh(&self) -> &SurfaceMesh {
         &self.mesh
@@ -514,19 +551,37 @@ impl PreparedRoughingTarget {
         }
         check(cancel)?;
         let unions = usize::from(regions.len() > 1);
+        // With seam bridging (opt-in) the union for a cutter is closed
+        // protectively: gaps between separately tessellated faces and the
+        // sub-tolerance needles and near-touches they leave are bridged. Closing by a disc no wider than the cutter leaves the
+        // cutter-centre region unchanged ((X closed by B_b) grown by B_r
+        // equals X grown by B_r for b <= r), so only the small extra growth
+        // (charged to the boundary error) reaches the toolpath.
+        let close = self.seam_bridge.filter(|_| cutter_radius_mm > 0.).map(|b| {
+            let bridge = b.min(cutter_radius_mm / 2.);
+            let grid = (self.tolerance / 128.).max(1e-8);
+            // Round-join sag (0.2 % of the distance) plus rounding, and 4
+            // tolerances more: needles come out at least 8 tolerances wide.
+            (
+                (4. * self.tolerance + 0.002 * bridge + 4. * grid) / 0.998,
+                bridge,
+            )
+        });
         let mut filled = FilledHoles::default();
         let mut region = if regions.len() > 1 {
-            let (union, holes) = PreparedRegion::union_linear_filling(&regions, fill_below_mm2)
-                .map_err(|e| {
-                    format!(
-                        "{e}. The target mesh's facets above Z{level} project to boundaries \
+            let (union, holes) =
+                PreparedRegion::union_linear_filling(&regions, fill_below_mm2, close).map_err(
+                    |e| {
+                        format!(
+                            "{e}. The target mesh's facets above Z{level} project to boundaries \
                          that touch within the construction tolerance {} mm. This usually means \
                          the mesh is not watertight (faces tessellated separately, so neighbouring \
                          faces do not share their edge vertices): export the target with shared \
                          edge vertices",
-                        self.tolerance
-                    )
-                })?;
+                            self.tolerance
+                        )
+                    },
+                )?;
             filled = holes;
             union.region
         } else if let Some(p) = regions.pop() {
@@ -549,6 +604,7 @@ impl PreparedRoughingTarget {
                 simplify_mm,
                 self.tolerance,
                 fill_below_mm2,
+                self.square_bridge(),
                 options,
             )
             .and_then(|r| {
@@ -593,6 +649,14 @@ impl PreparedRoughingTarget {
             enclosed_degenerate_projections: degenerate,
             filled_holes: filled.holes,
             filled_hole_area_mm2: filled.area_mm2,
+            seam_closing: close
+                .filter(|_| unions > 0)
+                .map(|(grow, bridge)| SeamClosing {
+                    // The final miter growth (limit 2) moves the boundary
+                    // at most twice `grow` (`union_linear_filling`).
+                    growth_mm: 2. * grow,
+                    bridged_below_mm: 2. * bridge,
+                }),
             simplified,
             projection_enclosure_mm: if degenerate > 0 {
                 32. * self.tolerance * 2f64.sqrt()
@@ -683,6 +747,16 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// radial engagement, capped at `link_feed_mm_min`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub link_chip_thinning: bool,
+    /// Opt-in for targets tessellated face by face (CAD meshers that do not
+    /// share edge vertices between faces): each layer's shadow is closed
+    /// protectively, bridging gaps, notches and holes narrower than twice
+    /// this (at most half the cutter radius) and growing it by a few
+    /// construction tolerances, so hairline seams between faces and the
+    /// sub-tolerance slivers they leave no longer make its topology
+    /// ambiguous. Protection only; reported per layer (`shadow.seam_closing`).
+    /// Set it to about the mesh's surface error. None: off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seam_bridge_mm: Option<f64>,
     pub id: String,
     pub tool: String,
     pub target: G,
@@ -735,6 +809,7 @@ impl<G> RoughingOperation<G> {
             ramp_clearance_mm: self.ramp_clearance_mm,
             link_feed_mm_min: self.link_feed_mm_min,
             link_chip_thinning: self.link_chip_thinning,
+            seam_bridge_mm: self.seam_bridge_mm,
             id: self.id,
             tool: self.tool,
             target: f(self.target)?,
@@ -1017,7 +1092,8 @@ impl RoughingPlan {
                     .into(),
             );
         }
-        let target = PreparedRoughingTarget::prepare(op.target.clone(), op.tolerance_mm, cancel)?;
+        let target = PreparedRoughingTarget::prepare(op.target.clone(), op.tolerance_mm, cancel)?
+            .with_seam_bridge(op.seam_bridge_mm)?;
         let guard = target.floor_guard_mm();
         let floor = op.floor_z_mm + op.bottom_allowance_mm + guard;
         if op
@@ -1419,7 +1495,12 @@ impl RoughingPlan {
                                 &cancel,
                             )
                             .and_then(|parent| {
-                                stepup_band(&parent, r + op.radial_allowance_mm, options)
+                                stepup_band(
+                                    &parent,
+                                    r + op.radial_allowance_mm,
+                                    target.square_bridge(),
+                                    options,
+                                )
                             })
                             .map_err(|e| format!("roughing step-up band at Z{z}: {e}"))?,
                     ),
@@ -1981,12 +2062,12 @@ mod simplify_tests {
             source: serde_json::Value::Null,
         };
         let options = ConstructionOptions { tolerance_mm: 1e-5 };
-        assert!(simplify_shadow(&region, 0.075, 1e-5, 0., options).is_err());
+        assert!(simplify_shadow(&region, 0.075, 1e-5, 0., 0., options).is_err());
         // Wide enough to keep its ring: simplified, and the island stays
         // protected.
         let mut wide = region.clone();
         wide.components[1].outer = rect(20., 0., 30., 0.2);
-        let grown = simplify_shadow(&wide, 0.075, 1e-5, 0., options)
+        let grown = simplify_shadow(&wide, 0.075, 1e-5, 0., 0., options)
             .unwrap()
             .prepare(options)
             .unwrap();
@@ -2056,7 +2137,7 @@ mod simplify_tests {
             .prepare(options)
             .unwrap()
             .boolean(
-                &stepup_band(&below, reach, options)
+                &stepup_band(&below, reach, 0., options)
                     .unwrap()
                     .prepare(options)
                     .unwrap(),

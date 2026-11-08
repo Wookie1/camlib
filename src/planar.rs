@@ -8,7 +8,7 @@ use cavalier_contours::{
     polyline::*,
     shape_algorithms::{Shape, ShapeOffsetOptions},
 };
-use clipper2_rust::{ClipType, Clipper64, FillRule, Paths64, Point64};
+use clipper2_rust::{ClipType, Clipper64, EndType, FillRule, JoinType, Paths64, Point64};
 use serde::{Deserialize, Serialize};
 pub(crate) mod chain;
 mod components;
@@ -1033,10 +1033,17 @@ impl PreparedRegion {
     /// slivers of uncovered area that the integer backend returns touching
     /// another boundary within the construction tolerance (for example
     /// between facets of a mesh whose faces were tessellated separately).
+    /// With `close` = (grow, bridge) the union is then closed protectively
+    /// (`close_protectively`, round joins): every gap, notch or hole
+    /// narrower than twice `bridge` bridged, then grown by `grow`, so sub-tolerance
+    /// slivers, needles and near-touching boundaries left by separately
+    /// tessellated faces become constructible. `grow` is charged to the
+    /// boundary error; bridged area is protection only, like filled holes.
     /// Returns the construction and the filled holes (count and area).
     pub(crate) fn union_linear_filling(
         regions: &[Self],
         fill_holes_below_mm2: f64,
+        close: Option<(f64, f64)>,
     ) -> Result<(Construction, FilledHoles), String> {
         if !fill_holes_below_mm2.is_finite() || fill_holes_below_mm2 < 0. {
             return Err("hole fill area must be finite and nonnegative".into());
@@ -1057,12 +1064,19 @@ impl PreparedRegion {
         if !clipper.execute(ClipType::Union, FillRule::NonZero, &mut closed, None) {
             return Err("integer batch union backend failed".into());
         }
+        let mut grown = 0.;
+        if let Some((grow, bridge)) = close {
+            closed = close_protectively(&closed, grid, 0., bridge, grow, JoinType::Round)?;
+            // Miter growth (limit 2) moves the boundary at most twice `grow`.
+            grown = 2. * grow;
+        }
         let filled = fill_small_holes(&mut closed, grid, fill_holes_below_mm2);
         let error = regions
             .iter()
             .map(|r| r.definition.boundary_error_mm)
             .fold(0f64, f64::max)
-            + options.tolerance_mm;
+            + options.tolerance_mm
+            + grown;
         first
             .integer_result(closed, "clipper2_rust_1.2.0_linear_batch", error, 0., grid)
             .map(|r| (r.report, filled))
@@ -1074,12 +1088,17 @@ impl PreparedRegion {
     /// corner cut square at `delta_mm` from it, tangent to the circle of
     /// that radius; almost straight corners mitred; concave ones exact): it
     /// contains the region grown by a disc of `delta_mm`, with straight edges
-    /// only. Holes smaller than `fill_holes_below_mm2` are filled. For
-    /// protection regions (it only grows).
+    /// only. Holes smaller than `fill_holes_below_mm2` are filled. With
+    /// `bridge_mm` > 0 the growth is then closed protectively with miter
+    /// joins (`close_protectively`, straight edges only): gaps and notches
+    /// narrower than twice `bridge_mm` are bridged, the result grows by a
+    /// further `bridge_mm` plus 40 construction tolerances. For protection
+    /// regions (it only grows).
     pub(crate) fn inflate_square(
         &self,
         delta_mm: f64,
         fill_holes_below_mm2: f64,
+        bridge_mm: f64,
     ) -> Result<(Construction, FilledHoles), String> {
         if self.linear_components.is_none() {
             return Err("square inflation needs a linear region".into());
@@ -1099,6 +1118,14 @@ impl PreparedRegion {
             2.,
             0.,
         );
+        if bridge_mm > 0. {
+            // Miter erosion by b may cut up to 2b (limit 2): grow by b + 32
+            // tolerances first so the result still contains the square
+            // growth, and by 8 more after the closing to thicken its walls.
+            let tol = self.options.tolerance_mm;
+            let grow = bridge_mm + 32. * tol;
+            closed = close_protectively(&closed, grid, grow, bridge_mm, 8. * tol, JoinType::Miter)?;
+        }
         let filled = fill_small_holes(&mut closed, grid, fill_holes_below_mm2);
         let error = self.definition.boundary_error_mm + self.options.tolerance_mm;
         self.integer_result(
@@ -1112,27 +1139,124 @@ impl PreparedRegion {
     }
 }
 
-/// Drop the holes (negative paths) smaller than `below_mm2`.
+/// Protective closing of integer paths (`grid` mm per unit): grown by
+/// `pre_mm + bridge_mm`, shrunk by `bridge_mm` (both with `join`), then grown
+/// by `post_mm` with miter joins (limit 2, so at most twice `post_mm`).
+/// Morphological closing with a disc keeps everything and fills every gap,
+/// notch or hole narrower than twice the disc (Serra, Image Analysis and
+/// Mathematical Morphology, 1982, ch. 2). A closing can still leave walls
+/// of any thinness between two gaps it did not fill (the complement is a
+/// union of discs, and two discs may nearly touch), so the closed shape is
+/// then grown by `post_mm`: walls become at least twice `post_mm` wide and
+/// the gaps left are unions of discs of `bridge_mm - post_mm`, with
+/// needles at least that wide. The result contains the paths grown by
+/// `pre_mm + post_mm` less the join error.
+/// Join error: round joins put chord vertices on the circle (sag at most
+/// 0.2 % of the distance plus a rounding unit; outward offsets only lose
+/// it, and the erosion after an under-grown dilation can cut that sag into
+/// the original); miter joins (limit 2) contain the round growth and their
+/// erosion stays within twice the distance. The caller sizes the growth to
+/// exceed that error: refused here when it does not.
+fn close_protectively(
+    paths: &Paths64,
+    grid: f64,
+    pre_mm: f64,
+    bridge_mm: f64,
+    post_mm: f64,
+    join: JoinType,
+) -> Result<Paths64, String> {
+    let (pre, bridge, post) = (pre_mm / grid, bridge_mm / grid, post_mm / grid);
+    if !([pre, bridge, post]
+        .iter()
+        .all(|d| d.is_finite() && *d >= 0.)
+        && pre + bridge + post <= 1e12)
+    {
+        return Err("protective closing distances must be finite and nonnegative".into());
+    }
+    if post >= bridge {
+        return Err(format!(
+            "protective closing growth after the closing ({post_mm} mm) must be less than the \
+             bridge ({bridge_mm} mm)"
+        ));
+    }
+    // The final growth uses miter joins whatever `join` is: it contains the
+    // round growth with no sag and adds no arc vertices, so it cannot leave
+    // the sub-tolerance arc edges that a round growth puts beside nearly
+    // touching gaps. Only the closing contributes join error.
+    let error = match join {
+        JoinType::Round => 0.002 * (pre + bridge) + 3.,
+        _ => bridge + 2.,
+    };
+    if pre + post <= error {
+        return Err(format!(
+            "protective closing growth {} mm does not cover its join error {} mm",
+            pre_mm + post_mm,
+            error * grid
+        ));
+    }
+    let mut out = paths.clone();
+    for (delta, join) in [
+        (pre + bridge, join),
+        (-bridge, join),
+        (post, JoinType::Miter),
+    ] {
+        if delta != 0. {
+            out = clipper2_rust::inflate_paths_64(&out, delta, join, EndType::Polygon, 2., 0.);
+        }
+    }
+    Ok(out)
+}
+
+/// Drop the holes (negative paths) smaller than `below_mm2`, and every path
+/// nested inside a dropped hole (an island in it and that island's own
+/// holes): the filled hole covers them, and left alone they would nest in
+/// the component around the hole with no hole between.
 fn fill_small_holes(closed: &mut Paths64, grid: f64, below_mm2: f64) -> FilledHoles {
     let mut filled = FilledHoles::default();
     if below_mm2 > 0. {
         // Exact integer shoelace sum (twice the signed area in grid units);
         // a filled hole only adds area.
-        closed.retain(|path| {
+        let area = |path: &clipper2_rust::Path64| {
             let twice: i128 = (0..path.len())
                 .map(|i| {
                     let (a, b) = (path[i], path[(i + 1) % path.len()]);
                     a.x as i128 * b.y as i128 - b.x as i128 * a.y as i128
                 })
                 .sum();
-            let area = twice as f64 * 0.5 * grid * grid;
-            if area < 0. && -area < below_mm2 {
-                filled.holes += 1;
-                filled.area_mm2 += -area;
-                false
-            } else {
-                true
+            twice as f64 * 0.5 * grid * grid
+        };
+        let areas: Vec<f64> = closed.iter().map(area).collect();
+        let small: Vec<usize> = (0..closed.len())
+            .filter(|&i| areas[i] < 0. && -areas[i] < below_mm2)
+            .collect();
+        let mut drop = vec![false; closed.len()];
+        for &h in &small {
+            drop[h] = true;
+            filled.holes += 1;
+            filled.area_mm2 += -areas[h];
+        }
+        if !small.is_empty() {
+            // Output paths of one boolean never cross: a path with a vertex
+            // strictly inside a filled hole lies inside its closure.
+            for (i, path) in closed.iter().enumerate() {
+                if drop[i] {
+                    continue;
+                }
+                drop[i] = small.iter().any(|&h| {
+                    areas[i].abs() < -areas[h]
+                        && path.iter().any(|&p| {
+                            matches!(
+                                clipper2_rust::point_in_polygon(p, &closed[h]),
+                                clipper2_rust::PointInPolygonResult::IsInside
+                            )
+                        })
+                });
             }
+        }
+        let mut i = 0;
+        closed.retain(|_| {
+            i += 1;
+            !drop[i - 1]
         });
     }
     filled
@@ -1205,4 +1329,46 @@ fn integer_paths(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    fn square(x0: i64, y0: i64, s: i64, ccw: bool) -> clipper2_rust::Path64 {
+        let mut p = vec![
+            Point64::new(x0, y0),
+            Point64::new(x0 + s, y0),
+            Point64::new(x0 + s, y0 + s),
+            Point64::new(x0, y0 + s),
+        ];
+        if !ccw {
+            p.reverse();
+        }
+        p
+    }
+    #[test]
+    fn a_filled_hole_takes_the_island_inside_it_and_keeps_others() {
+        // Outer 1000 units, a 100-unit hole holding a 20-unit island with
+        // its own 5-unit hole, and a 400-unit hole too big to fill.
+        let grid = 1e-3;
+        let mut closed: Paths64 = vec![
+            square(0, 0, 1000, true),
+            square(100, 100, 100, false),
+            square(140, 140, 20, true),
+            square(147, 147, 5, false),
+            square(400, 400, 400, false),
+        ];
+        let filled = fill_small_holes(&mut closed, grid, 0.02);
+        // Both small holes are filled (the island's own is reported too).
+        assert_eq!(filled.holes, 2);
+        assert!((filled.area_mm2 - 0.010025).abs() < 1e-12);
+        assert_eq!(
+            closed,
+            vec![square(0, 0, 1000, true), square(400, 400, 400, false)]
+        );
+        // Nothing filled: nothing dropped.
+        let mut kept: Paths64 = vec![square(0, 0, 1000, true), square(100, 100, 100, false)];
+        fill_small_holes(&mut kept, grid, 0.001);
+        assert_eq!(kept.len(), 2);
+    }
 }

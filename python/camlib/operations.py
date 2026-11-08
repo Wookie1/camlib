@@ -1436,6 +1436,10 @@ class Roughing:
     # the one at feed_mm_min and the clearing's radial engagement; capped at
     # link_feed_mm_min.
     link_chip_thinning: bool = False
+    # Opt-in for targets tessellated face by face: each layer's shadow is
+    # closed protectively, bridging gaps narrower than twice this (at most half
+    # the cutter radius). About the mesh's surface error. None: off.
+    seam_bridge_mm: float | None = None
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1465,6 +1469,7 @@ class Roughing:
             'rapid_descent_clearance_mm',
             'ramp_clearance_mm',
             'link_feed_mm_min',
+            'seam_bridge_mm',
         ):
             if result[key] is None:
                 result.pop(key)
