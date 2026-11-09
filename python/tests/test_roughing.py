@@ -128,6 +128,27 @@ class RoughingTest(unittest.TestCase):
         with self.assertRaises(SimulationError):
             run(dict(base, operations=(replace(operation, stepup_mm=2.0),)))
 
+    def test_engagement_front_clears_every_layer_and_reports_its_estimate(self):
+        c = example().roughing_job(engagement_front=True)
+        clearing = c['operations'][0].clearing
+        self.assertEqual(clearing.to_dict()['path_strategy'], 'engagement_front')
+        report = None
+        with Simulation(**c) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, OperationUpdate) and update.stage == 'end':
+                    report = update.report
+            self.assertTrue(sim.state.finished)
+            self.assertEqual(report['completed_layers'], 4)
+            self.assertEqual(report['motions'], sim.state.completed)
+            self.assertLess(sim.state.completed, 20000)
+            self.assertGreater(sim.state.volume()['removed_lower_mm3'], 5500)
+            self.assertGreaterEqual(report['helical_entries'], 1)
+            for layer in report['layers']:
+                front = layer['clearing']
+                self.assertEqual(front['strategy'], 'engagement_front')
+                self.assertLessEqual(front['max_estimated_engagement_mm'], 0.25 * 1.3)
+                self.assertEqual(front['geometric_residual_status'], 'estimated')
+
     def test_empty_cut_policy_is_an_explicit_strict_python_boolean(self):
         operation = config()['operations'][0]
         self.assertNotIn('omit_empty_cuts', operation.to_dict())

@@ -2466,6 +2466,39 @@ impl PocketPlan {
                     || segment_distance(a, b, s) - guard >= required
             })
     }
+    /// [`Self::link_geometry_fits_radius`] for a line or XY arc stroke: the
+    /// exact distance from the whole stroke to every source edge, plus a
+    /// signed query at its midpoint, must leave the cutter, allowance and
+    /// construction uncertainty inside the region.
+    pub(crate) fn stroke_geometry_fits_radius(&self, s: Stroke, radius: f64) -> bool {
+        let Some((c, sweep)) = s.arc else {
+            return self.link_geometry_fits_radius(s.a, s.b, radius);
+        };
+        let p = &self.operation;
+        let start = (s.a[1] - c[1]).atan2(s.a[0] - c[0]) + sweep / 2.;
+        let rho = norm(s.a, c);
+        let middle = [c[0] + rho * start.cos(), c[1] + rho * start.sin()];
+        let Ok(q) = self.source.query(middle) else {
+            return false;
+        };
+        let required = radius + p.radial_allowance_mm + q.uncertainty_mm + 4. * p.tolerance_mm;
+        if q.signed_clearance_mm.is_none_or(|d| d < required) {
+            return false;
+        }
+        let guard = 1024. * f64::EPSILON * self.source_magnitude;
+        let bounds = StrokeBounds::new(s);
+        self.source_edges
+            .iter()
+            .zip(&self.source_bounds)
+            .all(|(&e, &edge_bounds)| {
+                bounds.separation(edge_bounds) - guard >= required
+                    || stroke_distance(s, e) - guard >= required
+            })
+    }
+    /// The prepared source region this plan clears (before cutter offset).
+    pub(crate) fn source_region(&self) -> &PreparedRegion {
+        &self.source
+    }
     /// Leave the cut at feed up to the feed height (above all stock), then
     /// rapid to `to_z`. Returns the point reached.
     fn queue_lift(&mut self, from: Vec3, to_z: f64) -> Vec3 {
