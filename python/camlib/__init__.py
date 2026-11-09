@@ -47,6 +47,7 @@ _EXPORTS = {
             "Chamfer",
             "Deburr",
             "DeburrLevel",
+            "DeburrBrokenEdge",
             "Drilling",
             "Bore",
             "TrochoidalSlot",
