@@ -1422,18 +1422,19 @@ impl RoughingPlan {
                             max_radial_engagement_mm,
                             cutting_sense,
                             ..
-                        } => LayerPlan::Engagement(Box::new(EngagementFrontPlan::prepare(
-                            pocket,
-                            tool,
-                            &layer_spec,
-                            initial,
-                            max_radial_engagement_mm,
-                            cutting_sense.unwrap_or(CuttingSense::Climb) == CuttingSense::Climb,
-                            &cancel,
-                        )?
-                        .with_rapid_descent(op.rapid_descent_clearance_mm)
-                        .with_ramp_clearance(op.ramp_clearance_mm)
-                        .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning),
+                        } => LayerPlan::Engagement(Box::new(
+                            EngagementFrontPlan::prepare(
+                                pocket,
+                                tool,
+                                &layer_spec,
+                                initial,
+                                max_radial_engagement_mm,
+                                cutting_sense.unwrap_or(CuttingSense::Climb) == CuttingSense::Climb,
+                                &cancel,
+                            )?
+                            .with_rapid_descent(op.rapid_descent_clearance_mm)
+                            .with_ramp_clearance(op.ramp_clearance_mm)
+                            .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning),
                         )),
                         RoughingClearing::Adaptive {
                             path_strategy,
