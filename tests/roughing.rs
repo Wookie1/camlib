@@ -3829,6 +3829,34 @@ fn engagement_front_links_feed_fast_only_through_cleared_air() {
 }
 
 #[test]
+fn engagement_front_rapid_descent_and_ramp_clearances_connect_in_any_order() {
+    // Audit #23: a rapid-descent stop below the helix start (rapid clearance
+    // under the ramp clearance) left a gap the stream refused. Below, equal
+    // and above, with and without the feed-height cap, every motion starts
+    // where the previous one ended.
+    for (rapid, ramp) in [(0.1, 2.0), (1.0, 1.0), (0.5, 0.3), (0.1, 50.0)] {
+        let mut v = serde_json::to_value(engagement_front_frustum()).unwrap();
+        v["operations"][0]["rapid_descent_clearance_mm"] = rapid.into();
+        v["operations"][0]["ramp_clearance_mm"] = ramp.into();
+        let m: StreamManifest = serde_json::from_value(v).unwrap();
+        let (history, _) = run_engagement_front(&m);
+        let mut at = m.initial_position_mm;
+        let mut helices = 0;
+        for motion in &history {
+            let start = motion.curve.start();
+            assert!(
+                (0..3).all(|k| (start[k] - at[k]).abs() < 1e-9),
+                "rapid {rapid} ramp {ramp}: motion {} starts at {start:?}, tool at {at:?}",
+                motion.id
+            );
+            helices += usize::from(matches!(motion.curve, Curve::Helix { .. }));
+            at = motion.curve.end();
+        }
+        assert!(helices > 0, "rapid {rapid} ramp {ramp}: no helix exercised");
+    }
+}
+
+#[test]
 fn engagement_front_thins_link_feed_only_as_far_as_the_chip_allows() {
     // With link chip thinning, a stay-down link that may touch stock runs
     // faster than the cutting feed only as far as radial chip thinning

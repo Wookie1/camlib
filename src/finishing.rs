@@ -145,6 +145,14 @@ pub struct ParallelOperation<G = SurfaceMesh> {
     /// Containment and avoid areas (clamps, fixtures, features to leave alone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<crate::limits::Limits>,
+    /// Opt-in. A row entry whose plunge the stock cells cannot bound to
+    /// ENTRY_PLUNGE_MM, and where no ramp along the row is proven clear, is
+    /// refused by default. True plunges it as before and lists it in the
+    /// report's `unproven_entries`: the caller must then verify those
+    /// plunges independently (for example by re-simulating the posted
+    /// program on a finer grid) before the program is used.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plunge_unproven_entries: bool,
 }
 fn default_axis() -> TraverseAxis {
     TraverseAxis::X
@@ -329,6 +337,7 @@ impl<G> ParallelOperation<G> {
     ) -> Result<ParallelOperation<H>, E> {
         Ok(ParallelOperation {
             limits: self.limits,
+            plunge_unproven_entries: self.plunge_unproven_entries,
             id: self.id,
             tool: self.tool,
             surface: f(self.surface)?,
@@ -380,6 +389,11 @@ pub struct ParallelReport {
     /// stock stood above the row's entry height.
     #[serde(skip_serializing_if = "no_entries")]
     pub ramped_entries: usize,
+    /// Row entries plunged although the stock cells could not bound the
+    /// plunge and no ramp was proven clear (only with
+    /// `plunge_unproven_entries`); each needs independent verification.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unproven_entries: Vec<UnprovenEntry>,
     pub path_error_mm: f64,
     pub safety_margin_mm: f64,
     pub stock_to_leave_mm: f64,
@@ -393,6 +407,18 @@ pub struct ParallelReport {
     pub work: SurfaceWork,
     pub clearance_proof: &'static str,
     pub surface_completion: &'static str,
+}
+/// A row entry plunged without a proof that it stays within ENTRY_PLUNGE_MM
+/// of live stock.
+#[derive(Clone, Debug, Serialize)]
+pub struct UnprovenEntry {
+    pub x_mm: f64,
+    pub y_mm: f64,
+    /// Tip height the row is entered at.
+    pub z_mm: f64,
+    /// The stock-cell bound on the plunge into stock (conservative: cells
+    /// count as stock up to their highest point anywhere in the cell).
+    pub bound_mm: f64,
 }
 fn no_entries(n: &usize) -> bool {
     *n == 0
@@ -1081,6 +1107,7 @@ impl ParallelPlan {
             transition_moves: 0,
             max_transition_height_mm: 0.,
             ramped_entries: 0,
+            unproven_entries: Vec::new(),
             path_error_mm: op.path_error_mm,
             safety_margin_mm: op.safety_margin_mm,
             stock_to_leave_mm: op.stock_to_leave_mm,
@@ -1833,11 +1860,35 @@ impl ParallelPlan {
                         let mut work = self.report.work;
                         let ramp = self.entry_ramp(z0, &mut work, cancel)?;
                         self.report.work = work;
-                        if let Some(ramp) = ramp {
-                            target = z0;
-                            self.ramp = ramp.into();
-                            self.report.ramped_entries += 1;
-                            self.phase = Phase::Ramp;
+                        match ramp {
+                            Some(ramp) => {
+                                target = z0;
+                                self.ramp = ramp.into();
+                                self.report.ramped_entries += 1;
+                                self.phase = Phase::Ramp;
+                            }
+                            None if self.op.plunge_unproven_entries => {
+                                // Explicit opt-in: plunge as before, reported
+                                // for the caller's independent check.
+                                self.report.unproven_entries.push(UnprovenEntry {
+                                    x_mm: xy[0],
+                                    y_mm: xy[1],
+                                    z_mm: entry,
+                                    bound_mm: excess,
+                                });
+                            }
+                            None => {
+                                // No silent full-depth plunge into live stock.
+                                return Err(format!(
+                                    "row entry at X{:.3} Y{:.3} would plunge up to {:.3} mm into \
+                                     stock (stock cell bounds, limit {ENTRY_PLUNGE_MM} mm) and no \
+                                     ramp along the row is proven clear; rough or rest-rough this \
+                                     area first, use finer stock cells, or set \
+                                     plunge_unproven_entries and verify the listed entries \
+                                     independently",
+                                    xy[0], xy[1], excess
+                                ));
+                            }
                         }
                     }
                     self.emit([xy[0], xy[1], target], MoveKind::Plunge)?
@@ -1984,9 +2035,13 @@ fn plunge_excess(stock: &Stock, xy: [f64; 2], tip: f64, r: f64, ball: f64) -> f6
             let Some(c) = stock.cell_center(k) else {
                 continue;
             };
-            // Cell centre distance: `upper_mm` is already the cell's highest
-            // point, and ENTRY_PLUNGE_MM keeps half the gate floor in hand.
-            let rho = (c[0] - xy[0]).hypot(c[1] - xy[1]);
+            // `upper_mm` bounds the whole cell, so test the cell's nearest
+            // point to the axis, not its centre: stock anywhere in a cell
+            // the footprint overlaps may stand there, and the cutter's
+            // lower face is lowest at that nearest point.
+            let gx = ((c[0] - xy[0]).abs() - wx / 2.).max(0.);
+            let gy = ((c[1] - xy[1]).abs() - wy / 2.).max(0.);
+            let rho = gx.hypot(gy);
             if rho > r {
                 continue;
             }
