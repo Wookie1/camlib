@@ -40,7 +40,7 @@ See [Operations](operations.md) for parameters. Summary:
 | Thread milling | Internal/external helical threads; hole or boss proven in the stock first |
 | Tapping | Rigid right- and left-hand tapping cycles (G33.1 under M3/M4, or G84/G74 and G80 where declared); drilled hole proven first |
 | Chamfer | Top edges, depth from the chamfer tool's angle and tip; stepped widths, leads |
-| Deburr | Horizontal edges of a finished part (every upward-facing face's boundary), chamfer mill (chamfer break) or ball-end/bull-nose mill (arc break sized by leg or by the fillet it stays inside); next to vertical or drafted walls (chamfer mill), tangent fillets reported as already broken; the rest of the part proven untouched (whole tool assembly); unreachable and concave stretches reported |
+| Deburr | Horizontal edges of a finished part (every upward-facing face's boundary) and straight sloped edges (ball-end mill), every convex edge accounted for in the report; chamfer mill (chamfer break) or ball-end/bull-nose mill (arc break sized by leg or by the fillet it stays inside); next to vertical or drafted walls (chamfer mill), tangent fillets reported as already broken; the rest of the part proven untouched (whole tool assembly); unreachable and concave stretches reported |
 | Trace / engrave | Open or closed line/arc paths at depth, no radius offset |
 | Undercut | T-slot, keyseat, lollipop and dovetail cutters along paths at one depth under material, entering and leaving through proven-open columns; tri-dexel stock |
 | Feeds and speeds | `cutting_data`: rpm and feed from surface speed and feed per tooth, chip thinning, ball effective diameter |
