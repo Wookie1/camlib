@@ -120,6 +120,40 @@ Every planned tool-centre path is checked against the original region before
 any motion is emitted: if geometry construction ever went wrong, the operation
 fails instead of cutting into an island or wall.
 
+**A top below the remaining stock** (`Pocket` and `AdaptivePocket`, issue
+#129). `top_z_mm` may be below the stock's original top when earlier
+operations removed the material: the depth (and the cutting-length check) is
+then measured from `top_z_mm`. Every stock cell meeting the `region` must be at
+or below it. Stock may stand higher outside the region, for example a low
+pocket beside a tall wall, when the tool assembly clears it:
+
+- Before any motion, the neck, shank and every holder section are checked
+  against that stock for every tool centre the cutter can occupy in the region
+  and every tip at or above the operation's floor (plus bottom allowance).
+  A section that would meet it refuses the operation with a typed reach
+  refusal (below) naming the section, the obstruction's top and the depth.
+- `clearance_z_mm` must then be above all remaining stock, and a planned move
+  that leaves the region's tool centres below that height is refused.
+- The plan's report gives `stock_top.outside_upper_z_mm` (the highest such
+  stock) and `assembly_checked_cells`.
+
+This is conservative (every pose at the lowest tip anywhere in the region);
+configure stock-contact checking (`StreamChecks(stock_contact=...)`) to check
+every move's assembly against the actual stock independently.
+
+**Reach refusals are typed.** When a tool cannot reach the depth an operation
+needs, the run raises `camlib.simulation.ReachRefused` (a `SimulationError`)
+whose `refusal` is a `ReachRefusal`: `operation`, `tool`, `limit`
+(`"cutting_length"`, `"neck"`, `"shank"` or `"holder"`, with
+`holder_section`), `depth_needed_mm`, `depth_available_mm`, `top_z_mm` (the
+material top the depth is measured from: the operation's top, or the
+obstruction's) and `z_mm` (the lowest tip Z needed); `depth_needed_mm =
+top_z_mm - z_mm`. Pocket, adaptive pocket, slot, contour, drilling, bore,
+facing, chamfer, waterline, trace, parallel finishing and roughing layers
+refuse their cutting-length depth this way, and pockets their neck, shank and
+holder sections. In Rust, `camlib::reach::ReachRefusal::parse` reads it from
+the error text.
+
 ## Adaptive pocket: `AdaptivePocket`
 
 Same region and depths as `Pocket`, cleared with bounded tool engagement
@@ -343,7 +377,8 @@ is tapped from the R plane (`feed_z_mm`, default the retract height) to
   declare neither refuse tapping.
 - Left-hand taps: `G33.1` under `M4` (LinuxCNC reverses whatever direction
   is running), or `G74 X… Y… Z… R… F…` and `G80` on machines that declare
-  `tap_cycle_left` (the FANUC 0i-MB example with `rigid_tapping=True`).
+  `tap_cycle_left` (the FANUC 0i-MB example with `rigid_tapping=True`, or
+  `rigid_tapping_m29=True`, which writes `M29 S…` before each cycle).
   Machines with neither refuse a left-hand tap. The decoder reads the hand
   back: `G84` needs the spindle clockwise, `G74` counterclockwise, and the
   decoded spindle direction must match the plan.
@@ -458,6 +493,40 @@ where the controller and precision allow. Nothing protects the part except the
 configured checks, since the path is the programmer's. Supports
 `retract_z_mm`/`feed_z_mm`.
 
+## Undercut: `Undercut`
+
+Required: `paths`, `tip_z_mm`, `entry_mm`, `clearance_z_mm`; optional
+`exit_mm`. An undercut cutter (`TSlotCutter`, `KeyseatCutter`,
+`LollipopCutter`, `DovetailCutter`) follows tool-centre paths (`TracePath`) at
+one tip height, under material left by earlier operations: the wide bottom of
+a T-slot under a slot milled first, a keyseat in a wall, a dovetail on a slot
+or pocket wall. As established practice (Machinery's Handbook, milling
+cutters; cutter makers' application guides), the cutter goes down to depth
+in open space (`entry_mm`: outside the part, or a cleared pocket), cuts
+sideways and goes back up in open space (`exit_mm`, or back along each open
+path to its start and the entry). It never plunges into material.
+
+```python
+from camlib import TracePath, TraceLine, TSlotCutter, Undercut, DexelStockSpec
+
+cutter = TSlotCutter("tslot", diameter=10, width=2, neck_diameter=3,
+                     neck_length=10, overall_length=50, shank_diameter=6)
+op = Undercut("t-slot", tool, (TracePath((-8, 10), (TraceLine((38, 10)),)),),
+              tip_z_mm=3, entry_mm=(-8, 10), exit_mm=(38, 10), clearance_z_mm=20,
+              feed_mm_min=300, plunge_mm_min=100, spindle_rpm=6000,
+              coolant="flood", tool_number=2, length_register=2)
+```
+
+Undercut operations, and lollipop and dovetail cutters in any operation,
+need tri-dexel stock (`DexelStockSpec`); a height-field setup refuses them.
+The plan proves, on the run's height view, that the columns where the tool
+goes down and up are open for the whole assembly, and refuses otherwise. The
+tri-dexel sweep refuses a move whose neck, shank or holder may touch
+material (a neck wider than the slot above). Compare the result with the
+part with `DexelStockState.compare_solid` (a closed mesh of the part); the
+stream's material stages compare the height view, which cannot hold an
+undercut.
+
 ## Chamfer: `Chamfer`
 
 Required: `region`, `top_z_mm`, `width_mm`, `clearance_z_mm`. Chamfers the
@@ -472,11 +541,14 @@ in the stock first.
 
 ## Deburr: `Deburr`
 
-Required: `surface` (the finished part as a `SurfaceMesh`), `levels`,
-`width_mm`, `clearance_z_mm`, and a chamfer mill (`ChamferMill`). Breaks the
-horizontal edges of a finished part: every boundary of every upward-facing
-planar face. `camlib.cadquery.deburr_levels(solid)` makes the levels (the
-faces at each height, exported exactly):
+Required: `surface` (the finished part as a `SurfaceMesh`), `levels`, the
+break size, `clearance_z_mm`, and a chamfer mill (`ChamferMill`), ball-end
+mill (`BallEndMill`) or bull-nose mill (`BullEndMill`). Breaks the horizontal
+edges of a finished part (every boundary of every upward-facing planar face)
+and, given the part's convex `edges`, sloped edges with a ball-end mill,
+accounting for every convex edge.
+`camlib.cadquery.deburr_levels(solid)` makes the levels (the faces at each
+height, exported exactly):
 
 ```python
 from camlib import Deburr
@@ -487,15 +559,63 @@ op = Deburr("deburr", c90, export_surface_mesh(part), deburr_levels(part), 0.5, 
             tool_number=2, length_register=2, coolant="flood")
 ```
 
-- The tool axis runs on the outward offset of each face boundary, so the cone
-  breaks the edge `width_mm` wide on the face and the chamfer depth down a
-  vertical wall (`wall_depth_mm` in the report: equal for 90 degrees),
-  whatever the edge's curvature. `tip_clearance_mm` (0.5) keeps the point out
-  of the cut.
-- Nothing else is touched, by an exact proof for the whole tool (cone,
-  neck, shank and holder) against the part above the face, below the break
-  and anything in the break's height band that is not the face or a vertical
-  wall under its boundary. The proof allows for the mesh's `surface_error_mm`
+- The tool axis runs on the outward offset of each face boundary, so the
+  break is the tool's own profile seen across the edge, whatever the edge's
+  curvature. A face point s inside the boundary is at least the offset plus
+  s from the path (exactly that on a convex stretch).
+- **Chamfer mill:** the cone breaks the edge `width_mm` wide on the face and
+  the chamfer depth down a vertical wall (`wall_depth_mm` in the report:
+  equal for 90 degrees). The axis is `tip_clearance_mm` (0.5) beyond the
+  tip's flat, which keeps the point out of the cut.
+- **Ball-end or bull-nose mill:** the break is a concave arc of the tool's
+  corner radius rc (`break_profile` "arc"). Across the edge, the corner's
+  circle has its centre c outward of the wall and c above the face, on the
+  edge's outward bisector. The tool tip is then rc - c below the face and
+  the axis r - rc + c outward of the boundary (r the tool radius). Because
+  c >= 0, only the corner arc reaches the part: the flat bottom stays
+  outside the wall and the body above the corner stays above the face. Give
+  the size in one of two ways:
+  - `width_mm` L, the leg: equal legs L on the face and down a vertical
+    wall, c = (sqrt(2 rc^2 - L^2) - L) / 2. L is at most rc.
+  - `break_radius_mm` rho (with `width_mm=None`): the largest break that
+    stays inside a fillet of radius rho. The corner circle touches the
+    fillet's circle, c = rc / sqrt(2) - rho (1 - 1 / sqrt(2)), and rho is at
+    most rc (1 + sqrt(2)). The legs are then L = sqrt(rc^2 - c^2) - c, less
+    than rho.
+
+  The report gives the legs (`face_width_mm`, `wall_depth_mm`), the axis
+  offset (`axis_offset_mm`) and `fillet_radius_mm`: the smallest fillet
+  radius whose fillet contains the break. Checking the stock against the
+  part filleted with that radius shows no gouge. The break's lower edge
+  must be at least `tip_clearance_mm` out from the end of the tool's flat
+  (c >= `tip_clearance_mm`, the ball's centre line for a ball), so the
+  point does not cut. A larger break is refused.
+- **Drafted walls** (chamfer mill): a planar wall hanging off the boundary
+  at draft beta below alpha, the cone's half angle, is found in the part
+  mesh. Each of its points is depth tan(beta) out from the boundary. The
+  cone ends the break on it at depth h = width / (tan alpha - tan beta),
+  the slant leg h / cos beta. The level's axis moves out by h tan(beta) for
+  the steepest such wall, so the break's lower edge there keeps the tip
+  clearance and the width on the face stays exact (`level_details`:
+  `axis_offset_mm`, `tip_z_mm`, `max_wall_draft_deg`). The proof excludes
+  such a wall only down to that depth. The cone reaches a point at depth d
+  only if d (tan alpha - tan beta) < width (plus the proof's margins), so
+  nothing deeper is cut. A wall drafted too steeply for the cone, at or near
+  its half angle or beyond its radius, stays an obstacle, and the stretch is
+  reported with that reason. With a ball-end or bull-nose mill, drafted
+  walls stay obstacles and are reported (use a chamfer mill).
+- **Fillets:** `deburr_levels` lists the boundary edges where a face meets
+  a fillet tangentially (`DeburrLevel.broken_edges`, from OpenCascade's
+  `BRepOffset_Analyse`). There is no sharp edge there, so the stretch is
+  reported as already broken (`already_broken_length_mm`), not unreachable.
+- Nothing else is touched, by an exact proof for the whole tool (cone or
+  corner arc, neck, shank and holder) against the part above the face,
+  below the break and anything in the break's height band that is not the
+  face, a vertical wall under its boundary or (to the depth above) a drafted
+  wall hanging off it. The arc's contact is a
+  concave maximisation like the cone's. It is bounded without a slope
+  bound, because a full quarter arc is vertical at its rim, and tested
+  against dense sampling. The proof allows for the mesh's `surface_error_mm`
   and two stock cell diagonals.
 - A stretch that cannot be proven is not cut. The tool retracts and
   re-enters where cutting can be proven again (entries and exits are proven
@@ -503,9 +623,29 @@ op = Deburr("deburr", c90, export_surface_mesh(part), deburr_levels(part), 0.5, 
   wall rises from the face, in `concave_length_mm` (nothing to break); convex
   edges the tool cannot reach in `unreachable_length_mm`.
 - The stock must already be machined to the part. A non-center-cutting
-  chamfer mill enters only where the stock is proven clear under its tip.
-- Not yet: ball-end deburring, and edges that are not horizontal (sloped
-  or vertical edges need tilting the tool, see the multi-axis issues).
+  tool enters only where the stock is proven clear under its tip.
+- **Every convex edge** (`edges`, from `camlib.cadquery.deburr_edges`, which
+  lists each convex edge as horizontal, vertical or sloped with its faces'
+  normals; convexity from OpenCascade's `BRepOffset_Analyse`): the report's
+  `edges` accounts for each one as `cut`, `partly cut` or `skipped`, with
+  the reasons for what was not cut. A horizontal edge on a level's boundary
+  takes the level's result.
+- **Sloped edges** (and horizontal edges under a sloped face), when straight
+  between planar faces, are broken with a ball-end mill. The ball's centre
+  runs on the edge moved s out along the outward bisector b of the faces'
+  normals (cos g = b . n), which leaves a cylindrical cove with equal legs
+  L = sqrt(R^2 - s^2 cos^2 g) - s sin g along both faces, whatever the
+  slope. `width_mm` gives L; `break_radius_mm` rho gives s = R + rho -
+  rho / cos g, the cove touching a rho fillet. For a 90 degree edge these
+  are the horizontal formulas. The proof is against the part with the two
+  faces' strips along the edge replaced by the cove itself (radius R plus
+  the proof's margins), so the whole assembly may touch nothing else. That
+  matters for the shank on a steep edge. Near the edge's ends, where the
+  ball would reach the next face, the path stays unproven and is reported.
+- Skipped with a reason: vertical edges (breaking one needs the tool's side
+  run along it), edges with a face facing down (they need a tilted tool,
+  #5/#6), curved edges that are not on a level, and edges off the levels
+  with a chamfer or bull-nose mill.
 
 ## Parallel finishing: `Parallel`
 
@@ -650,6 +790,10 @@ How it is computed:
   gaps on, a 1:2 slope), else a straight link of at most two stepovers, else
   along the boundary pass or back along the ring just cut; only otherwise a
   retract.
+
+Cancellation is checked while constructing a level, including subdivision
+inside one facet, path chaining and simplification. A cancelled contour returns
+an error; its partial paths cannot become a successful plan.
 
 Verification, independent of the distance field, in the operation report
 (`geodesic`):
@@ -1101,16 +1245,109 @@ its cutting edges: a move whose back (non-cutting) side leads into stock is
 refused, and stock beyond the edges' reach is left for the holder check, so
 a depth of cut beyond the cutting edge is refused.
 
+## Probing and tool setting
+
+camlib plans, simulates and posts probing cycles; it never reads their
+results back from a machine (it never talks to one). Each operation is one
+cycle with a touch probe, `camlib.ProbeTool(id, ball_diameter=,
+stem_diameter=, stylus_length=, body_diameter=, body_length=)` (no defaults:
+the ball is the calibrated effective diameter; the stem is checked as the
+shank and the body as a holder section), or, for tool setting, with the
+cutting tool being measured:
+
+| Operation | Measures | Stores |
+| --- | --- | --- |
+| `ProbeSurface(start_mm, axis, surface_mm)` | One surface square to X, Y or Z, from `start_mm` along that axis and back (Z from above) | That axis of `update_work_offset` |
+| `ProbeOutsideCorner(corner_mm, z_mm, material, inset_mm, clearance_mm)` | The Y face, then the X face, each `inset_mm` along it from the corner and from `clearance_mm` away, over the clearance plane | X and Y |
+| `ProbeInsideCorner(corner_mm, z_mm, material, clearance_mm)` | The Y wall, then the X wall, from one start `clearance_mm` from both | X and Y |
+| `ProbeBore(center_mm, z_mm, diameter_mm)` | +X, -X, +Y, -Y from the centre | X and Y (the centre) |
+| `ProbeBoss(center_mm, z_mm, diameter_mm, clearance_mm)` | +X, -X, +Y, -Y from outside, over the clearance plane | X and Y (the centre) |
+| `ProbePocket(center_mm, z_mm, axis, width_mm)` | + and - across X or Y from the centre | That axis (the centre) |
+| `ProbeWeb(center_mm, z_mm, axis, width_mm, clearance_mm)` | + and - across X or Y from outside | That axis (the centre) |
+| `ToolSetLength(contact_mm, clearance_mm)` | The tool's tip down onto a tool setter's contact face | The tool's length register |
+| `ToolSetDiameter(setter_center_mm, setter_top_z_mm, setter_diameter_mm, depth_mm, clearance_mm)` | The cutter's side against the setter's round face from +X and from -X | The tool table radius |
+
+`material` gives the side of each face where the material lies (+1 or -1
+per axis). `z_mm` is the probe tip: the probe's controlled point is the
+bottom of the stylus ball, so an XY touch happens one ball radius above it.
+Every operation takes `clearance_z_mm` (rapids reach the cycle over it; a
+stylus cycle's protected retract height), `search_mm`, `measure_feed_mm_min`,
+`return_feed_mm_min`, `tool_number`, `length_register` and `work_offset`.
+Stylus cycles also take `position_feed_mm_min` and `update_work_offset` (the
+offset corrected: new offset = active offset + measured error, in the axes
+the feature measures; Renishaw Inspection Plus `S`, LinuxCNC `G10 L2`). Tool
+setting takes `spindle_rpm` (0: stopped) and `spindle_direction`: camlib
+assumes neither.
+
+```python
+probe = camlib.ProbeTool("probe", ball_diameter=4, stem_diameter=3, stylus_length=50,
+                         body_diameter=40, body_length=60)
+corner = camlib.ProbeOutsideCorner(
+    "datum", probe, corner_mm=(0, 0), z_mm=5, material=(1, 1), inset_mm=5, clearance_mm=5,
+    clearance_z_mm=20, search_mm=2, position_feed_mm_min=1000, measure_feed_mm_min=100,
+    return_feed_mm_min=1000, tool_number=20, length_register=20, update_work_offset=1)
+```
+
+The moves of a cycle:
+
+- **Protected positioning** (`probe_position`): every stylus move below the
+  clearance plane that is not measuring stops the machine if the stylus
+  triggers (LinuxCNC `G38.3` and a trip check; Inspection Plus `O9810`).
+- **Measuring** (`probe_measure`, then `probe_touch`): the surface is expected
+  within `search_mm` of its nominal position. The measuring move is planned up
+  to `search_mm` before the expected contact, where nothing may be touched (the
+  whole assembly is checked against stock and scene bodies like a rapid), then
+  over the last `search_mm` to the expected contact, where only the stylus ball
+  (or the measured cutter) may touch: the stem and body stay checked. The
+  controller searches `search_mm` beyond the expected contact.
+- **Back** (`probe_return`) to where the measuring move started, at
+  `return_feed_mm_min`; the ball is not checked (it starts touching).
+
+Probing moves never remove simulated stock, and their whole assembly is
+checked for stock contact without the removal certificates a cutting move
+earns. Avoid areas are honoured like rapids. A probe never cuts: any other
+operation with a probe tool is refused, as is a stylus cycle with a cutting
+tool, a running spindle under a probe, a measuring move no longer than its
+search, and a probing height at or above the clearance plane.
+
+What a cycle stores (the operation report's `stores`) is a premise for the
+rest of the program, recorded in it; camlib cannot check it. Also premises:
+the probe's calibration (ball size, the trigger point as the length), the
+controller's stopping distance after a trigger within the stylus overtravel,
+the features existing within `search_mm` of nominal, and no G5x rotation. The
+tool setter is declared in the setup's work coordinates (declare its body as
+a scene fixture to check the moves around it), so a program refuses a tool
+length set after it probed its own work offset. `ToolSetDiameter` stores the
+full radius, not wear: camlib's wear compensation on that tool afterwards is
+refused.
+
+Posts write cycles through the dialect's declared probing back end
+([Postprocessors](posts.md#probing)): LinuxCNC `G38.x`, or Renishaw Inspection
+Plus macros on FANUC. The decoder reads every move back from the written
+blocks, and each is compared with the plan.
+
+Layout references: LinuxCNC G-code reference (G38.n, G10 L1/L2/L10,
+numbered parameters, `docs/src/gcode` in LinuxCNC 2.9); Renishaw *Inspection
+Plus software programming manual* H-2000-6031 and H-2000-6222 (chapters 5 and
+7: O9810, O9811, O9812, O9814, O9815; chapter 9 feedrates). Probing on tilted
+work planes waits for #2 and #5.
+
 ## Tools
 
 `camlib.tools`: `EndMill`, `BallEndMill`, `BullEndMill(corner_radius=...)`,
 `Drill(point_angle=118)`, `ChamferMill(angle=90, tip_diameter=0)`,
 `ThreadMill(diameter=, tooth_height=, neck_diameter=, neck_length=)`,
 `Tap(drill_diameter=, thread_length=, shank_diameter=)`,
+`TSlotCutter(diameter=, width=, neck_diameter=, neck_length=)` and
+`KeyseatCutter` (a cutting disk on a narrower neck),
+`LollipopCutter(diameter=, neck_diameter=, neck_length=, cutting_length=None)`
+(a sphere on a neck), `DovetailCutter(diameter=, angle=, cutting_length=)`
+(widest at the tip, the flank `angle` degrees from the tip face),
 `BoringBar(diameter=, bar_diameter=, reach=, insert_length=1)`,
 `Torch(kerf_width=, nozzle_diameter=6, body_diameter=30)` and
-`LaserHead(kerf_width=, nozzle_diameter=3, body_diameter=25)` (complete
-assemblies). The cutter helpers take
+`LaserHead(kerf_width=, nozzle_diameter=3, body_diameter=25)` and
+`ProbeTool(ball_diameter=, stem_diameter=, stylus_length=, body_diameter=,
+body_length=)` (complete assemblies). The cutter helpers take
 `diameter`, `flute_length`, `overall_length` and optional `shank_diameter`,
 `flutes`, `center_cutting`, `material`, `name`; `neck=Neck(diameter, length)`
 models a reduced neck above the flutes. A
@@ -1140,6 +1377,7 @@ gives the `effective_diameter_mm` it used. camlib does not pick cutting data.
 
 ## Not supported
 
-Undercuts (other than thread
-grooves and the stopped boring bar's shift) and 4/5-axis motion. Surfaces must
-be reachable from above (a part seen as a height map).
+4/5-axis motion. Surface finishing needs surfaces reachable from above (a
+part seen as a height map). Undercuts are cut with `Undercut` on tri-dexel
+stock only; lollipop finishing along an undercut edge (a surface strategy)
+is not supported yet.
