@@ -102,6 +102,18 @@ same stock as the box. `StockState.stock_mesh()` returns the stock as a closed
 mesh of each cell's upper bound; it contains all the material that may remain
 and says that it is approximate.
 
+Milling setups can use tri-dexel stock instead (`DexelStockSpec`): three grids
+of rays along X, Y and Z, each holding its possible and certain material as
+intervals. It represents undercuts (a T-slot under a slot, material below
+empty space) and resolves walls along the rays across them. The tool axis is
++Z (three-axis milling); the kernel also sweeps along the other stock axes
+for indexed machining once orientations can be declared (#2, #5). Planners
+and height-field checks read the run's height view (a valid height-field
+bound of the same material), so three-axis jobs plan the same toolpaths on
+either stock; the rays decide stock contact the height view leaves
+uncertain. Tri-dexel runs take no regeneration cache. Memory and time
+against the height field are in [Tri-dexel benchmarks](benchmarks-dexel.md).
+
 Configured checks examine every line/arc/helix continuously (not just its
 endpoints) against:
 
