@@ -1425,7 +1425,11 @@ impl EngagementFrontPlan {
     fn proven(&self, height: f64) -> Option<f64> {
         (height < self.op.top_z_mm - 0.01_f64.max(64. * self.op.tolerance_mm)).then_some(height)
     }
-    fn travel(&mut self, from: Vec3, to: Point, proven: Option<f64>) -> Vec3 {
+    /// Rapid from `from` up to the retract height, across to `to`, and down
+    /// to the feed height (or the proven rapid-descent stop below it), never
+    /// below `at_least`: the caller's next motion starts there, so the rapid
+    /// ends at or above it and every endpoint connects.
+    fn travel(&mut self, from: Vec3, to: Point, proven: Option<f64>, at_least: f64) -> Vec3 {
         let up = if (from[2] - self.heights.retract).abs() < 1e-12 || from[2] >= self.heights.feed {
             let up = [from[0], from[1], from[2].max(self.heights.retract)];
             self.line(from, up, MoveKind::Rapid);
@@ -1438,7 +1442,9 @@ impl EngagementFrontPlan {
         let stop = match (self.rapid_descent, proven) {
             (Some(d), Some(h)) => self.heights.feed.min(h + d),
             _ => self.heights.feed,
-        };
+        }
+        .max(at_least)
+        .min(up[2]);
         let above = [to[0], to[1], stop];
         self.line(across, above, MoveKind::Rapid);
         above
@@ -1645,7 +1651,7 @@ impl EngagementFrontPlan {
             } else if let Some((p, proven_p, samples)) = descent {
                 // Plunge beside the entry, where the stock bounds let the
                 // rapid come down, then feed across to it at depth.
-                let above = self.travel(here, p, proven_p);
+                let above = self.travel(here, p, proven_p, z);
                 self.line(above, [p[0], p[1], z], MoveKind::Plunge);
                 let layer = self.layer.as_mut().unwrap();
                 for s in samples {
@@ -1657,7 +1663,7 @@ impl EngagementFrontPlan {
                 self.report.stock_edge_entries += 1;
                 self.report.offset_descents += 1;
             } else {
-                let above = self.travel(here, q, proven);
+                let above = self.travel(here, q, proven, z);
                 self.line(above, [q[0], q[1], z], MoveKind::Plunge);
                 self.report.lifts += 1;
                 self.report.stock_edge_entries += 1;
@@ -1792,9 +1798,18 @@ impl EngagementFrontPlan {
             let proven = self
                 .proven(top)
                 .map(|h| h.max(self.guides.cell_entry_height(stock, [start[0], start[1]])));
-            let above = self.travel(here, [start[0], start[1]], proven);
+            // A rapid-descent stop below the helix start (rapid clearance
+            // under the ramp clearance) ends at the start instead: higher
+            // than the proven stop, so no less safe, and continuous.
+            let above = self.travel(here, [start[0], start[1]], proven, start[2]);
             if above[2] > start[2] {
                 self.line(above, start, MoveKind::Plunge);
+            } else if above[2] < start[2] {
+                return Err(format!(
+                    "engagement_front helix start Z{:.4} is above the retract height \
+                     Z{:.4}; raise retract_z_mm",
+                    start[2], above[2]
+                ));
             }
             if air {
                 self.report.air_entries += 1;
