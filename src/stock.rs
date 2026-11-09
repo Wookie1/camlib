@@ -385,6 +385,7 @@ impl Undercut {
         Ok(true)
     }
 }
+const UNDERCUT_STOCK: &str = "lollipop and dovetail cutters cut above their widest section, under material a height field cannot hold; run them on tri-dexel stock (DexelStockSpec)";
 const REACH: &str = "cutting length cannot span committed stock upper bound at lowest tip; unsupported non-heightfield removal/reach";
 /// Whether every point of the cell centred at `center` lies farther than
 /// `touch` from the move's axis (distance is 1-Lipschitz; `error` covers the
@@ -1304,6 +1305,9 @@ impl Stock {
         // Rapids, oriented shifts and probing moves never remove stock.
         if fraction == 0. || !motion.kind.cuts() {
             return Ok(delta);
+        }
+        if tool.cutter().definition().shape.undercuts() {
+            return Err(UNDERCUT_STOCK.into());
         }
         if matches!(tool.cutter().definition().shape, CutterShape::Beam) {
             self.beam_sweep(&mut delta, tool, motion, fraction, options, cancel)?;
