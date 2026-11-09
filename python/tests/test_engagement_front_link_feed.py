@@ -4,6 +4,9 @@ With link_feed_mm_min, a stay-down link runs at that feed only on stretches
 whose cutter footprint the committed stock proves clear; the rest keeps the
 cutting feed. The stream's own stock checks stay clear, and the program is
 shorter.
+
+With link_chip_thinning, stretches that may touch stock lightly feed between
+the cutting and link feeds (radial chip thinning, capped at the link feed).
 """
 
 import unittest
@@ -16,9 +19,11 @@ from camlib.verification import StockContactOptions, StreamChecks
 from test_engagement_front_rapid_descent import CUT, TOOL, box
 
 
-def rough(link_feed):
+def rough(link_feed, chip_thinning=False):
     mesh = SurfaceMesh(box(12, 28, 12, 28, 0, 9), 0.0)
     extra = {} if link_feed is None else dict(link_feed_mm_min=link_feed)
+    if chip_thinning:
+        extra["link_chip_thinning"] = True
     op = Roughing(
         "rough",
         TOOL,
@@ -62,6 +67,17 @@ class LinkFeedTest(unittest.TestCase):
         plain, plain_statuses = rough(None)
         self.assertEqual(plain_statuses, [])
         self.assertEqual(set(plain), {CUT["feed_mm_min"]})
+
+    def test_chip_thinning_feeds_light_links_between_the_two_feeds(self):
+        feeds, statuses = rough(3000, chip_thinning=True)
+        self.assertEqual(statuses, [])
+        cut = CUT["feed_mm_min"]
+        self.assertTrue(all(cut <= f <= 3000 for f in feeds))
+        self.assertTrue(any(cut < f < 3000 for f in feeds))
+
+    def test_chip_thinning_needs_a_link_feed(self):
+        with self.assertRaises(Exception):
+            rough(None, chip_thinning=True)
 
     def test_link_feed_must_be_positive(self):
         with self.assertRaises(Exception):

@@ -137,6 +137,12 @@ pub struct EngagementFrontReport {
     pub fast_links: usize,
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub fast_link_mm: f64,
+    /// Link stretches fed between the cutting and link feeds by radial chip
+    /// thinning (`link_chip_thinning`), and their total length.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub thinned_links: usize,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub thinned_link_mm: f64,
     pub unproven_air_starts: usize,
     pub grid_refreshes: usize,
     /// Why passes ended: material exhausted ahead, the far side would
@@ -178,6 +184,8 @@ impl Default for EngagementFrontReport {
             remnant_passes: 0,
             fast_links: 0,
             fast_link_mm: 0.,
+            thinned_links: 0,
+            thinned_link_mm: 0.,
             unproven_air_starts: 0,
             grid_refreshes: 0,
             pass_ends_exhausted: 0,
@@ -496,6 +504,8 @@ pub(crate) struct EngagementFrontPlan {
     ramp_clearance: Option<f64>,
     /// See `RoughingOperation::link_feed_mm_min`.
     link_feed: Option<f64>,
+    /// See `RoughingOperation::link_chip_thinning`.
+    chip_thinning: bool,
     r: f64,
     width: f64,
     climb: bool,
@@ -569,6 +579,7 @@ impl EngagementFrontPlan {
             rapid_descent: None,
             ramp_clearance: None,
             link_feed: None,
+            chip_thinning: false,
             r,
             width,
             climb,
@@ -592,8 +603,9 @@ impl EngagementFrontPlan {
         self
     }
     /// See `RoughingOperation::link_feed_mm_min` (validated there).
-    pub(crate) fn with_link_feed(mut self, feed: Option<f64>) -> Self {
+    pub(crate) fn with_link_feed(mut self, feed: Option<f64>, chip_thinning: bool) -> Self {
         self.link_feed = feed;
+        self.chip_thinning = chip_thinning;
         self
     }
     pub(crate) fn with_rapid_descent(mut self, clearance: Option<f64>) -> Self {
@@ -1253,7 +1265,11 @@ impl EngagementFrontPlan {
             let t = i as f64 / n as f64;
             [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2]]
         };
-        let mut runs: Vec<(Vec3, Vec3, bool)> = vec![];
+        let mut runs: Vec<(Vec3, Vec3, Option<f64>)> = vec![];
+        // Cells this layer cut keep an upper bound a path error above its
+        // depth: material no thicker than the layer's material guard (16
+        // tolerances, as `Layer::material`) counts as none.
+        let skin = (16. * self.op.tolerance_mm).min(0.1);
         for i in 0..n {
             let (p, q) = (at(i), if i + 1 == n { b } else { at(i + 1) });
             let probe = Motion {
@@ -1265,10 +1281,6 @@ impl EngagementFrontPlan {
                 feed_mm_min: Some(fast),
             };
             let mut work = 1usize << 20;
-            // Cells this layer cut keep an upper bound a path error above
-            // its depth: material no thicker than the layer's material
-            // guard (16 tolerances, as `Layer::material`) counts as none.
-            let skin = (16. * self.op.tolerance_mm).min(0.1);
             let air = self
                 .guides
                 .cleared_link([p[0], p[1]], [q[0], q[1]], p[2], stock, cancel)?
@@ -1280,24 +1292,119 @@ impl EngagementFrontPlan {
                     &mut work,
                     cancel,
                 )?;
+            let feed = if air {
+                Some(fast)
+            } else if self.chip_thinning {
+                self.thinned_feed(stock, p, q, skin, fast)
+            } else {
+                None
+            };
             match runs.last_mut() {
-                Some(run) if run.2 == air => run.1 = q,
-                _ => runs.push((p, q, air)),
+                Some(run) if run.2 == feed => run.1 = q,
+                _ => runs.push((p, q, feed)),
             }
         }
-        for (p, q, air) in runs {
-            if air {
+        for (p, q, feed) in runs {
+            let length = (q[0] - p[0]).hypot(q[1] - p[1]);
+            if feed == Some(fast) {
                 self.report.fast_links += 1;
-                self.report.fast_link_mm += (q[0] - p[0]).hypot(q[1] - p[1]);
+                self.report.fast_link_mm += length;
+            } else if feed.is_some() {
+                self.report.thinned_links += 1;
+                self.report.thinned_link_mm += length;
             }
-            self.queue(
-                Curve::Line { start: p, end: q },
-                MoveKind::Link,
-                air.then_some(fast),
-            );
+            self.queue(Curve::Line { start: p, end: q }, MoveKind::Link, feed);
         }
         Ok(())
     }
+
+    /// Radial chip thinning on a link stretch `p`-`q` that may touch stock:
+    /// the feed at which no chip is thicker than at the cutting feed and the
+    /// clearing's radial engagement, capped at `cap`. None (the cutting feed)
+    /// when that feed is not above the cutting feed.
+    ///
+    /// On a straight move a tooth at angle t from the feed direction cuts a
+    /// chip fz * cos(t) (Sandvik Coromant, "radial chip thinning": for a
+    /// radial engagement ae < D/2 the maximum is fz * 2 * sqrt(ae/D -
+    /// (ae/D)^2)), and it meets material only where material lies at its
+    /// lateral offset r * sin(t) from the line of motion. So if no material
+    /// the cutter can reach on the stretch lies within lateral offset s of
+    /// the line, no chip is thicker than fz * sqrt(1 - (s/r)^2), the chip of
+    /// a side cut with ae = r - s. This holds at the stretch's ends too, and
+    /// for corner-radius cutters, whose smaller radius near the tip makes the
+    /// tooth angle for the same offset only more oblique. Material is bounded
+    /// by the stock's whole-cell upper bounds: a cell whose bound is above
+    /// the link depth plus `skin` may hold material anywhere in its extent.
+    fn thinned_feed(&self, stock: &Stock, p: Vec3, q: Vec3, skin: f64, cap: f64) -> Option<f64> {
+        let (r, w) = (self.r, self.width);
+        let d_tool = 2. * r;
+        if w >= r {
+            return None;
+        }
+        let [nx, ny] = stock.dimensions();
+        let [wx, wy] = stock.cell_widths_mm();
+        let min = stock.spec().min_mm;
+        let cells = stock.cells();
+        let half = wx.hypot(wy) / 2.;
+        let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+        let length2 = dx * dx + dy * dy;
+        if length2 == 0. {
+            return None;
+        }
+        let length = length2.sqrt();
+        let (nxv, nyv) = (-dy / length, dx / length);
+        let reach = r + half;
+        let lo = |v: f64, o: f64, c: f64| ((v - reach - o) / c).floor().max(0.) as usize;
+        let hi = |v: f64, o: f64, c: f64, n: usize| {
+            (((v + reach - o) / c).floor() as i64).min(n as i64 - 1)
+        };
+        let (i1, j1) = (
+            hi(p[0].max(q[0]), min[0], wx, nx),
+            hi(p[1].max(q[1]), min[1], wy, ny),
+        );
+        // Smallest lateral offset of possible material the cutter can reach.
+        let mut offset = r;
+        if i1 >= 0 && j1 >= 0 {
+            for j in lo(p[1].min(q[1]), min[1], wy)..=j1 as usize {
+                for i in lo(p[0].min(q[0]), min[0], wx)..=i1 as usize {
+                    if cells[j * nx + i].upper_mm <= p[2] + skin {
+                        continue;
+                    }
+                    let c = [
+                        min[0] + (i as f64 + 0.5) * wx,
+                        min[1] + (j as f64 + 0.5) * wy,
+                    ];
+                    let t = (((c[0] - p[0]) * dx + (c[1] - p[1]) * dy) / length2).clamp(0., 1.);
+                    if (c[0] - p[0] - t * dx).hypot(c[1] - p[1] - t * dy) >= reach {
+                        continue;
+                    }
+                    let lateral = ((c[0] - p[0]) * nxv + (c[1] - p[1]) * nyv).abs() - half;
+                    offset = offset.min(lateral.max(0.));
+                }
+            }
+        }
+        // Chip factor 2 sqrt(x - x^2), x = ae/D.
+        let factor = |a: f64| {
+            let x = a / d_tool;
+            2. * (x - x * x).max(0.).sqrt()
+        };
+        let ae = r - offset;
+        if ae >= w {
+            return None;
+        }
+        let reference = self.op.feed_mm_min;
+        let thin = factor(ae);
+        let feed = if thin <= 0. {
+            cap
+        } else {
+            (reference * factor(w) / thin).min(cap)
+        };
+        // Whole 10 mm/min steps, rounded down, keep blocks few and never
+        // exceed the computed feed.
+        let feed = (feed / 10.).floor() * 10.;
+        (feed > reference).then_some(feed)
+    }
+
     /// Lift at feed to the feed height, then rapid to `to_z`; returns the pose.
     fn lift(&mut self, from: Vec3, to_z: f64) -> Vec3 {
         let feed_z = self.heights.feed.max(from[2]);

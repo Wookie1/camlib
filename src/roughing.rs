@@ -749,6 +749,13 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// `feed_mm_min`. None: every link feeds at `feed_mm_min`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_feed_mm_min: Option<f64>,
+    /// engagement_front only, with `link_feed_mm_min`. A link stretch that
+    /// may touch stock feeds faster by radial chip thinning: from an upper
+    /// bound on its radial engagement (whole-cell stock bounds), at the feed
+    /// that keeps the chip no thicker than `feed_mm_min` at the clearing's
+    /// radial engagement, capped at `link_feed_mm_min`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub link_chip_thinning: bool,
     pub id: String,
     pub tool: String,
     pub target: G,
@@ -801,6 +808,7 @@ impl<G> RoughingOperation<G> {
             rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
             ramp_clearance_mm: self.ramp_clearance_mm,
             link_feed_mm_min: self.link_feed_mm_min,
+            link_chip_thinning: self.link_chip_thinning,
             id: self.id,
             tool: self.tool,
             target: f(self.target)?,
@@ -1304,6 +1312,9 @@ impl RoughingPlan {
                 return Err(format!("roughing {name} {d} must be positive and finite"));
             }
         }
+        if op.link_chip_thinning && op.link_feed_mm_min.is_none() {
+            return Err("link_chip_thinning needs link_feed_mm_min: the thinned link feed is capped at the declared link feed".into());
+        }
         match op.clearing {
             RoughingClearing::Offset {
                 coverage_margin_mm, ..
@@ -1512,7 +1523,7 @@ impl RoughingPlan {
                         )?
                         .with_rapid_descent(op.rapid_descent_clearance_mm)
                         .with_ramp_clearance(op.ramp_clearance_mm)
-                        .with_link_feed(op.link_feed_mm_min),
+                        .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning),
                     )),
                     RoughingClearing::Adaptive {
                         path_strategy,

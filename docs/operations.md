@@ -196,7 +196,18 @@ make its topology ambiguous. It only adds protection, and each layer reports it
   that rate wherever the committed stock's whole-cell upper bounds prove the
   cutter's footprint clear of stock (checked in stretches of at most 2 mm);
   any stretch that may touch stock keeps `feed_mm_min`. Reported per layer as
-  `fast_links` and `fast_link_mm`.
+  `fast_links` and `fast_link_mm`. `link_chip_thinning` (opt-in, needs
+  `link_feed_mm_min`) also speeds up stretches that may touch stock lightly:
+  a tooth at angle t from the feed direction cuts a chip fz·cos(t) and meets
+  material only at lateral offset r·sin(t) from the line, so from the
+  smallest lateral offset s of any stock cell the cutter can reach whose
+  upper bound is above the link depth (cell extent included), no chip is
+  thicker than that of a side cut with ae = r − s. The stretch feeds at
+  `feed_mm_min` · f(engagement) / f(r − s), with f(ae) = 2·√(ae/D − (ae/D)²)
+  (Sandvik Coromant, radial chip thinning), rounded down to 10 mm/min and
+  capped at `link_feed_mm_min`, so no chip is thicker than at `feed_mm_min`
+  and the clearing's radial engagement. Reported as `thinned_links` and
+  `thinned_link_mm`.
 
 Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster,
 offset and engagement_front clearing. `RestRoughing` machines only what earlier operations left

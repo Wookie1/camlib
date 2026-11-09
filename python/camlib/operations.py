@@ -1197,6 +1197,12 @@ class Roughing:
     # (mm/min) where the committed stock bounds prove the cutter clear of
     # stock; elsewhere links keep feed_mm_min. None: links feed at feed_mm_min.
     link_feed_mm_min: float | None = None
+    # engagement_front only, with link_feed_mm_min: a link stretch that may
+    # touch stock feeds faster than feed_mm_min by radial chip thinning, from
+    # a proven bound on how close stock lies to its line, so no chip exceeds
+    # the one at feed_mm_min and the clearing's radial engagement; capped at
+    # link_feed_mm_min.
+    link_chip_thinning: bool = False
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1230,6 +1236,8 @@ class Roughing:
         ):
             if result[key] is None:
                 result.pop(key)
+        if not self.link_chip_thinning:
+            result.pop('link_chip_thinning')
         for key in ("target", "clearing", "entry"):
             if hasattr(result[key], "to_dict"):
                 result[key] = result[key].to_dict()
