@@ -3777,3 +3777,53 @@ fn engagement_front_clears_thin_remnants_from_the_side_not_by_helix() {
         );
     }
 }
+
+#[test]
+fn engagement_front_links_feed_fast_only_through_cleared_air() {
+    // With a link feed, a stay-down link runs at it only where the stock
+    // left by every earlier cut (independent exact heights) holds nothing
+    // the cutter could touch at the link's depth; the rest keeps the cutting
+    // feed.
+    let base = engagement_front_frustum();
+    let mut v = serde_json::to_value(&base).unwrap();
+    v["operations"][0]["link_feed_mm_min"] = 5000.0.into();
+    let cutting = v["operations"][0]["feed_mm_min"].as_f64().unwrap();
+    let m: StreamManifest = serde_json::from_value(v).unwrap();
+    let (history, nominal) = run_engagement_front(&m);
+    let (_, before) = run_engagement_front(&base);
+    let (mut fast, mut slow) = (0f64, 0f64);
+    for (i, motion) in history.iter().enumerate() {
+        if motion.kind != MoveKind::Link {
+            continue;
+        }
+        let Curve::Line { start, end } = motion.curve else {
+            continue;
+        };
+        let length = (end[0] - start[0]).hypot(end[1] - start[1]);
+        if motion.feed_mm_min != Some(5000.) {
+            assert_eq!(motion.feed_mm_min, Some(cutting));
+            slow += length;
+            continue;
+        }
+        fast += length;
+        let n = (length / 0.1).ceil() as usize;
+        for k in 0..=n {
+            let t = k as f64 / n.max(1) as f64;
+            let p = [
+                start[0] + (end[0] - start[0]) * t,
+                start[1] + (end[1] - start[1]) * t,
+            ];
+            let top = material_top(&history, i, p, 0.);
+            assert!(
+                top <= start[2] + 1e-6,
+                "fast link {i} at {p:?} meets material {} above its depth",
+                top - start[2]
+            );
+        }
+    }
+    eprintln!(
+        "links: {fast:.0} mm fast, {slow:.0} mm at cutting feed; nominal {before:.0} -> {nominal:.0} s"
+    );
+    assert!(fast > 0.);
+    assert!(nominal < before);
+}

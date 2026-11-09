@@ -1193,6 +1193,10 @@ class Roughing:
     # material its bore meets (never above feed_z_mm), so it is already
     # ramping when it reaches stock. None: the helix starts at that material.
     ramp_clearance_mm: float | None = None
+    # engagement_front only: stay-down links at depth feed at this rate
+    # (mm/min) where the committed stock bounds prove the cutter clear of
+    # stock; elsewhere links keep feed_mm_min. None: links feed at feed_mm_min.
+    link_feed_mm_min: float | None = None
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1215,8 +1219,15 @@ class Roughing:
             result.pop('clearing_tolerance_mm')
         if not self.require_part_at_first_depth:
             result.pop('require_part_at_first_depth')
-        for key in ('retract_z_mm', 'feed_z_mm', 'stepup_mm', 'seam_bridge_mm', 'rapid_descent_clearance_mm',
-                    'ramp_clearance_mm'):
+        for key in (
+            'retract_z_mm',
+            'feed_z_mm',
+            'stepup_mm',
+            'seam_bridge_mm',
+            'rapid_descent_clearance_mm',
+            'ramp_clearance_mm',
+            'link_feed_mm_min',
+        ):
             if result[key] is None:
                 result.pop(key)
         for key in ("target", "clearing", "entry"):

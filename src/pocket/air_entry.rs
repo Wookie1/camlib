@@ -58,6 +58,69 @@ impl PocketPlan {
     pub(crate) fn share_entry_scene(&mut self, cache: &EntrySceneCache) {
         self.entry_scene = cache.clone();
     }
+    /// Whether the committed sweeps prove a horizontal stroke `a`-`b` with
+    /// the tool tip at `z` clear of stock for every tool section (each
+    /// section's radius plus a guard), up to a skin of 0.01 mm (or 64
+    /// tolerances) above `z`, the slack a vertical entry is allowed too.
+    /// Work exhaustion or any uncertainty proves nothing.
+    pub(crate) fn cleared_link(
+        &self,
+        a: Point,
+        b: Point,
+        z: f64,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<bool, String> {
+        let mut cache = self
+            .entry_scene
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cached = cache.take();
+        let (mut scene, mut cursor) = match cached {
+            Some((scene, cursor)) if scene.stock_spec() == stock.spec() => (scene, cursor),
+            _ => (
+                EngagementScene::new_with_cancel(stock.spec().clone(), vec![], cancel)?,
+                crate::stock::ClearanceCursor::default(),
+            ),
+        };
+        let (rebuild, sweeps) =
+            stock.committed_clearance_since(&mut cursor, self.operation.tolerance_mm, cancel)?;
+        if rebuild {
+            scene = EngagementScene::new_with_cancel(stock.spec().clone(), sweeps, cancel)?;
+        } else {
+            for sweep in sweeps {
+                scene.append(sweep)?;
+            }
+        }
+        let scene = &cache.insert((scene, cursor)).0;
+        let skin = 0.01_f64.max(64. * self.operation.tolerance_mm);
+        let guard = 32. * self.operation.tolerance_mm
+            + 4096.
+                * f64::EPSILON
+                * (1. + a[0].abs() + a[1].abs() + b[0].abs() + b[1].abs() + z.abs());
+        let mut work = 100_000;
+        for &(radius, bottom) in &self.air_entry_parts {
+            let height = z + skin + bottom - guard;
+            if height > stock.spec().max_mm[2] {
+                continue;
+            }
+            match scene.clear_line(
+                a,
+                b,
+                radius + guard,
+                height,
+                self.operation.tolerance_mm,
+                &mut work,
+                cancel,
+            ) {
+                Ok(true) => (),
+                Ok(false) => return Ok(false),
+                Err(_) if !cancel.is_cancelled() => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
     pub(crate) fn cleared_entry_start(
         &self,
         center: Point,
