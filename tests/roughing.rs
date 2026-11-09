@@ -3784,3 +3784,134 @@ fn engagement_front_links_feed_fast_only_through_cleared_air() {
     assert!(fast > 0.);
     assert!(nominal < before);
 }
+
+#[test]
+fn engagement_front_thins_link_feed_only_as_far_as_the_chip_allows() {
+    // With link chip thinning, a stay-down link that may touch stock runs
+    // faster than the cutting feed only as far as radial chip thinning
+    // allows: on a straight move a tooth at angle t from the feed direction
+    // cuts fz * cos(t) and meets material only at lateral offset r * sin(t),
+    // so with no material within lateral offset s of the line the chip is at
+    // most fz * sqrt(1 - (s/r)^2). Independently of the planner's stock
+    // bounds, the smallest lateral offset of material left by every earlier
+    // cut (exact heights, sampled at 0.02 mm and taken 0.02 mm closer) must
+    // keep feed * that chip factor within the cutting feed's chip at the
+    // clearing's engagement (Sandvik Coromant, radial chip thinning).
+    // A 0.8 mm engagement (of the 1 mm radius) leaves links room to thin
+    // with the 0.4 mm stock cells.
+    let mut v = serde_json::to_value(engagement_front_frustum()).unwrap();
+    v["operations"][0]["clearing"]["max_radial_engagement_mm"] = 0.8.into();
+    v["operations"][0]["link_feed_mm_min"] = 5000.0.into();
+    let (_, linked) = run_engagement_front(&serde_json::from_value(v.clone()).unwrap());
+    v["operations"][0]["link_chip_thinning"] = true.into();
+    let cutting = v["operations"][0]["feed_mm_min"].as_f64().unwrap();
+    let m: StreamManifest = serde_json::from_value(v).unwrap();
+    let (history, nominal) = run_engagement_front(&m);
+    let (r, d) = (1f64, 2f64);
+    let factor = |ae: f64| {
+        let x = (ae / d).min(0.5);
+        2. * (x - x * x).max(0.).sqrt()
+    };
+    let limit = cutting * factor(0.8);
+    let (mut thinned, mut worst) = (0f64, 0f64);
+    for (i, motion) in history.iter().enumerate() {
+        let feed = motion.feed_mm_min.unwrap_or(0.);
+        if motion.kind != MoveKind::Link || feed <= cutting {
+            continue;
+        }
+        let Curve::Line { start, end } = motion.curve else {
+            panic!("link {i} is not a line");
+        };
+        let (dx, dy) = (end[0] - start[0], end[1] - start[1]);
+        let length = dx.hypot(dy);
+        let (ux, uy) = (dx / length, dy / length);
+        let near: Vec<_> = history[..i]
+            .iter()
+            .filter(|old| old.kind != MoveKind::Rapid)
+            .filter(|old| {
+                // A disc holding the move's whole tool footprint.
+                let (a, b) = (old.curve.start(), old.curve.end());
+                let (c, extent) = match circle(&old.curve) {
+                    Some((o, _)) => ([o[0], o[1]], (a[0] - o[0]).hypot(a[1] - o[1])),
+                    None => (
+                        [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.],
+                        (b[0] - a[0]).hypot(b[1] - a[1]) / 2.,
+                    ),
+                };
+                let reach = 2. * r + extent + 1e-9;
+                let t = (((c[0] - start[0]) * ux + (c[1] - start[1]) * uy) / length).clamp(0., 1.);
+                (c[0] - start[0] - t * dx).hypot(c[1] - start[1] - t * dy) <= reach
+            })
+            .collect();
+        let mut lateral = r;
+        let steps = ((length + 2. * r) / 0.02).ceil() as usize;
+        for k in 0..=steps {
+            let u = -r + (length + 2. * r) * k as f64 / steps as f64;
+            for j in 0..=100 {
+                let w = -r + 2. * r * j as f64 / 100.;
+                if w.abs() >= lateral {
+                    continue;
+                }
+                let along = u.clamp(0., length);
+                if (u - along).hypot(w) > r {
+                    continue;
+                }
+                let q = [start[0] + u * ux - w * uy, start[1] + u * uy + w * ux];
+                if q[0] < 0. || q[0] > 32. || q[1] < 0. || q[1] > 28. {
+                    continue;
+                }
+                let top = near
+                    .iter()
+                    .map(|old| exact_height(&old.curve, q))
+                    .fold(10f64, f64::min);
+                if top > start[2] + 1e-6 {
+                    lateral = w.abs();
+                }
+            }
+        }
+        // No material sampled within reach: an air link (checked by
+        // engagement_front_links_feed_fast_only_through_cleared_air).
+        let chip = if lateral >= r {
+            0.
+        } else {
+            feed * factor(r - (lateral - 0.02).max(0.))
+        };
+        worst = worst.max(chip / limit);
+        assert!(
+            chip <= limit * (1. + 1e-9),
+            "link {i} at {feed} mm/min meets material {lateral:.3} mm off its line: chip {:.3} of the cutting chip",
+            chip / limit
+        );
+        if feed < 5000. {
+            thinned += length;
+        }
+    }
+    eprintln!(
+        "thinned {thinned:.0} mm; worst chip {worst:.3} of the cutting chip; nominal {linked:.0} -> {nominal:.0} s"
+    );
+    assert!(thinned > 0.);
+    assert!(nominal < linked);
+}
+
+#[test]
+fn engagement_front_link_chip_thinning_needs_a_link_feed() {
+    let mut v = serde_json::to_value(engagement_front_frustum()).unwrap();
+    v["operations"][0]["link_chip_thinning"] = true.into();
+    let m: StreamManifest = serde_json::from_value(v).unwrap();
+    let tool = &m.tools[0];
+    let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let error = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        tool,
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error.contains("link_chip_thinning needs link_feed_mm_min"),
+        "{error}"
+    );
+}
