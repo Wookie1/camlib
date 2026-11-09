@@ -98,6 +98,11 @@ pub(crate) struct FrontMemory {
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
+fn is_zero_f64(n: &f64) -> bool {
+    *n == 0.
+}
+/// Longest link stretch proven at once for the link feed (mm).
+const LINK_PIECE: f64 = 2.;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EngagementFrontReport {
@@ -126,6 +131,12 @@ pub struct EngagementFrontReport {
     /// Passes that cleared a remnant too thin for a full step (a sliver
     /// left between passes) from beside it at depth, instead of a helix.
     pub remnant_passes: usize,
+    /// Link stretches run at `link_feed_mm_min` (proven clear of stock), and
+    /// their total length.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fast_links: usize,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub fast_link_mm: f64,
     pub unproven_air_starts: usize,
     pub grid_refreshes: usize,
     /// Why passes ended: material exhausted ahead, the far side would
@@ -165,6 +176,8 @@ impl Default for EngagementFrontReport {
             air_entries: 0,
             offset_descents: 0,
             remnant_passes: 0,
+            fast_links: 0,
+            fast_link_mm: 0.,
             unproven_air_starts: 0,
             grid_refreshes: 0,
             pass_ends_exhausted: 0,
@@ -481,6 +494,8 @@ pub(crate) struct EngagementFrontPlan {
     rapid_descent: Option<f64>,
     /// See `RoughingOperation::ramp_clearance_mm`.
     ramp_clearance: Option<f64>,
+    /// See `RoughingOperation::link_feed_mm_min`.
+    link_feed: Option<f64>,
     r: f64,
     width: f64,
     climb: bool,
@@ -553,6 +568,7 @@ impl EngagementFrontPlan {
             heights,
             rapid_descent: None,
             ramp_clearance: None,
+            link_feed: None,
             r,
             width,
             climb,
@@ -573,6 +589,11 @@ impl EngagementFrontPlan {
     /// See `RoughingOperation::rapid_descent_clearance_mm` (validated there).
     pub(crate) fn with_ramp_clearance(mut self, clearance: Option<f64>) -> Self {
         self.ramp_clearance = clearance;
+        self
+    }
+    /// See `RoughingOperation::link_feed_mm_min` (validated there).
+    pub(crate) fn with_link_feed(mut self, feed: Option<f64>) -> Self {
+        self.link_feed = feed;
         self
     }
     pub(crate) fn with_rapid_descent(mut self, clearance: Option<f64>) -> Self {
@@ -1205,6 +1226,78 @@ impl EngagementFrontPlan {
     fn line(&mut self, a: Vec3, b: Vec3, kind: MoveKind) {
         self.queue(Curve::Line { start: a, end: b }, kind, None);
     }
+    /// A stay-down link at depth. With a link feed, the stretches whose
+    /// whole cutter footprint the committed stock's whole-cell upper bounds
+    /// prove clear of stock (`Stock::may_remove_material`, the bounds the
+    /// stream's stock checks read) run at the link feed; every other stretch
+    /// keeps the cutting feed, and the fast stretch ends before the cutter
+    /// could reach possible stock. Stretches are at most `LINK_PIECE` long
+    /// so a link that only grazes stock near one end is fast elsewhere.
+    fn link(
+        &mut self,
+        stock: &Stock,
+        a: Vec3,
+        b: Vec3,
+        cancel: &impl CancelSignal,
+    ) -> Result<(), String> {
+        let Some(fast) = self.link_feed else {
+            self.line(a, b, MoveKind::Link);
+            return Ok(());
+        };
+        let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if length == 0. {
+            return Ok(());
+        }
+        let n = (length / LINK_PIECE).ceil().max(1.) as usize;
+        let at = |i: usize| -> Vec3 {
+            let t = i as f64 / n as f64;
+            [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2]]
+        };
+        let mut runs: Vec<(Vec3, Vec3, bool)> = vec![];
+        for i in 0..n {
+            let (p, q) = (at(i), if i + 1 == n { b } else { at(i + 1) });
+            let probe = Motion {
+                id: 0,
+                operation: self.op.id.clone(),
+                tool: self.op.tool.clone(),
+                kind: MoveKind::Link,
+                curve: Curve::Line { start: p, end: q },
+                feed_mm_min: Some(fast),
+            };
+            let mut work = 1usize << 20;
+            // Cells this layer cut keep an upper bound a path error above
+            // its depth: material no thicker than the layer's material
+            // guard (16 tolerances, as `Layer::material`) counts as none.
+            let skin = (16. * self.op.tolerance_mm).min(0.1);
+            let air = self
+                .guides
+                .cleared_link([p[0], p[1]], [q[0], q[1]], p[2], stock, cancel)?
+                || !stock.may_remove_material(
+                    &probe,
+                    self.r,
+                    skin,
+                    self.op.tolerance_mm,
+                    &mut work,
+                    cancel,
+                )?;
+            match runs.last_mut() {
+                Some(run) if run.2 == air => run.1 = q,
+                _ => runs.push((p, q, air)),
+            }
+        }
+        for (p, q, air) in runs {
+            if air {
+                self.report.fast_links += 1;
+                self.report.fast_link_mm += (q[0] - p[0]).hypot(q[1] - p[1]);
+            }
+            self.queue(
+                Curve::Line { start: p, end: q },
+                MoveKind::Link,
+                air.then_some(fast),
+            );
+        }
+        Ok(())
+    }
     /// Lift at feed to the feed height, then rapid to `to_z`; returns the pose.
     fn lift(&mut self, from: Vec3, to_z: f64) -> Vec3 {
         let feed_z = self.heights.feed.max(from[2]);
@@ -1439,7 +1532,7 @@ impl EngagementFrontPlan {
                 for w in waypoints {
                     self.report.certified_strokes += 1;
                     let next = [w[0], w[1], z];
-                    self.line(at, next, MoveKind::Link);
+                    self.link(stock, at, next, cancel)?;
                     at = next;
                 }
             } else if let Some((p, proven_p, samples)) = descent {
@@ -1452,7 +1545,7 @@ impl EngagementFrontPlan {
                     layer.cut(s, r);
                 }
                 self.report.certified_strokes += 1;
-                self.line([p[0], p[1], z], [q[0], q[1], z], MoveKind::Link);
+                self.link(stock, [p[0], p[1], z], [q[0], q[1], z], cancel)?;
                 self.report.lifts += 1;
                 self.report.stock_edge_entries += 1;
                 self.report.offset_descents += 1;

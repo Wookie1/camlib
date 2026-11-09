@@ -634,6 +634,12 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// material top.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ramp_clearance_mm: Option<f64>,
+    /// engagement_front only. Stay-down links at depth feed at this rate
+    /// (mm/min) wherever the committed stock's whole-cell bounds prove the
+    /// cutter's footprint clear of stock; stretches that may touch stock keep
+    /// `feed_mm_min`. None: every link feeds at `feed_mm_min`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_feed_mm_min: Option<f64>,
     pub id: String,
     pub tool: String,
     pub target: G,
@@ -684,6 +690,7 @@ impl<G> RoughingOperation<G> {
             contour_tolerance_mm: self.contour_tolerance_mm,
             rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
             ramp_clearance_mm: self.ramp_clearance_mm,
+            link_feed_mm_min: self.link_feed_mm_min,
             id: self.id,
             tool: self.tool,
             target: f(self.target)?,
@@ -1170,6 +1177,7 @@ impl RoughingPlan {
         for (name, value) in [
             ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
             ("ramp_clearance_mm", op.ramp_clearance_mm),
+            ("link_feed_mm_min", op.link_feed_mm_min),
         ] {
             let Some(d) = value else { continue };
             if !matches!(
@@ -1181,7 +1189,8 @@ impl RoughingPlan {
             ) {
                 return Err(format!("{name} applies to engagement_front clearing only"));
             }
-            if !d.is_finite() || d <= 0. || d > 1e3 {
+            let max = if name == "link_feed_mm_min" { 1e6 } else { 1e3 };
+            if !d.is_finite() || d <= 0. || d > max {
                 return Err(format!("roughing {name} {d} must be positive and finite"));
             }
         }
@@ -1412,7 +1421,8 @@ impl RoughingPlan {
                             &cancel,
                         )?
                         .with_rapid_descent(op.rapid_descent_clearance_mm)
-                        .with_ramp_clearance(op.ramp_clearance_mm),
+                        .with_ramp_clearance(op.ramp_clearance_mm)
+                        .with_link_feed(op.link_feed_mm_min),
                         )),
                         RoughingClearing::Adaptive {
                             path_strategy,

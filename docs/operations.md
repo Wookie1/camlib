@@ -204,6 +204,11 @@ location. `clearing` is one of:
   bore that is clear to the layer gets a straight plunge (reported as
   `air_entries`). `ramp_clearance_mm` (opt-in, on `Roughing`) starts each
   helix that far above the material it meets, never above `feed_z_mm`.
+  `link_feed_mm_min` (opt-in, on `Roughing`) feeds the stay-down links at
+  that rate wherever the committed stock's whole-cell upper bounds prove the
+  cutter's footprint clear of stock (checked in stretches of at most 2 mm);
+  any stretch that may touch stock keeps `feed_mm_min`. Reported per layer as
+  `fast_links` and `fast_link_mm`.
 
 Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster,
 offset and engagement_front clearing. `RestRoughing` machines only what earlier operations left
