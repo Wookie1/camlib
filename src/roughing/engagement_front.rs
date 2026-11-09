@@ -123,6 +123,9 @@ pub struct EngagementFrontReport {
     /// material (where the cell bounds proved the rapid could come lower)
     /// and feeding across at depth.
     pub offset_descents: usize,
+    /// Passes that cleared a remnant too thin for a full step (a sliver
+    /// left between passes) from beside it at depth, instead of a helix.
+    pub remnant_passes: usize,
     pub unproven_air_starts: usize,
     pub grid_refreshes: usize,
     /// Why passes ended: material exhausted ahead, the far side would
@@ -161,6 +164,7 @@ impl Default for EngagementFrontReport {
             entry_turns: 0,
             air_entries: 0,
             offset_descents: 0,
+            remnant_passes: 0,
             unproven_air_starts: 0,
             grid_refreshes: 0,
             pass_ends_exhausted: 0,
@@ -192,6 +196,8 @@ struct Layer {
     room: Vec<f32>,
     dead: Vec<bool>,
     candidates: Vec<usize>,
+    /// Starts whose pass found the material beside them too thin to cut.
+    thin: Vec<Point>,
     z: f64,
     material_guard: f64,
 }
@@ -489,6 +495,10 @@ pub(crate) struct EngagementFrontPlan {
     finished: bool,
     report: EngagementFrontReport,
     scratch: Vec<Point>,
+    /// Passes may start on a remnant too thin for a full step (see
+    /// `follow`): set only to clear material a helix would otherwise bore
+    /// onto, until the next pass is planned.
+    remnant: bool,
 }
 
 impl EngagementFrontPlan {
@@ -557,6 +567,7 @@ impl EngagementFrontPlan {
             finished: false,
             report,
             scratch: vec![],
+            remnant: false,
         })
     }
     /// See `RoughingOperation::rapid_descent_clearance_mm` (validated there).
@@ -787,6 +798,7 @@ impl EngagementFrontPlan {
             room,
             dead: vec![false; n],
             candidates: vec![],
+            thin: vec![],
             z: self.z,
             material_guard: 16. * self.op.tolerance_mm,
         });
@@ -864,6 +876,7 @@ impl EngagementFrontPlan {
     fn follow(&mut self, start: Point, heading: f64, approach: bool) -> (Vec<Point>, bool) {
         let (r, w) = (self.r, self.width);
         let side = if self.climb { 1. } else { -1. };
+        let remnant = self.remnant;
         let layer = self.layer.as_mut().unwrap();
         let c = layer.g.c;
         let ds = (0.15 * r).min(0.6 * w).max(2. * c);
@@ -876,6 +889,7 @@ impl EngagementFrontPlan {
         let mut engaged = !approach;
         let mut approached = 0.;
         let mut cut_any = false;
+        let mut idle = 0;
         let mut max_eng: f64 = 0.;
         let mut end = 0;
         for _ in 0..2_000_000 {
@@ -903,7 +917,16 @@ impl EngagementFrontPlan {
             // Material side is -side*fmax; the far side is +side*fmax.
             let into = f(-side * fmax, layer);
             let away = f(side * fmax, layer);
-            if into.min(1e9) < 0.25 * target && away < 0.25 * target {
+            // Material too thin for a full step ends the pass. A remnant
+            // pass that has cut nothing yet still takes its steps: a sliver
+            // thinner than a quarter step (left between passes, e.g. along
+            // the stock face) is cleared from here, at depth beside cleared
+            // stock, rather than bored onto by a helix. A few such steps
+            // that clear nothing end it as before.
+            if (!remnant || cut_any || idle >= 4)
+                && into.min(1e9) < 0.25 * target
+                && away < 0.25 * target
+            {
                 let ahead = f(0., layer);
                 if ahead.is_infinite() || ahead < 0.25 * target {
                     end = 0;
@@ -960,6 +983,7 @@ impl EngagementFrontPlan {
             // boundary count in the step's area but are never cleared, and a
             // pass that only meets them would be planned again forever.
             cut_any |= layer.cut(p, r) > 0;
+            idle += usize::from(!cut_any);
             pts.push(p);
         }
         self.scratch = cells;
@@ -1338,6 +1362,11 @@ impl EngagementFrontPlan {
             }
             let Some((k, dir)) = found else {
                 if refreshed {
+                    if self.revive_thin_starts() {
+                        self.remnant = true;
+                        continue;
+                    }
+                    self.remnant = false;
                     return self.helix_pass(stock, cancel);
                 }
                 let left = self.refresh();
@@ -1386,8 +1415,14 @@ impl EngagementFrontPlan {
             let heading = (side * dir[0]).atan2(-side * dir[1]);
             let (pts, cut) = self.follow(q, heading, true);
             if !cut {
+                if !self.remnant {
+                    self.layer.as_mut().unwrap().thin.push(q);
+                }
                 self.mark_dead(q, 3);
                 continue;
+            }
+            if std::mem::take(&mut self.remnant) {
+                self.report.remnant_passes += 1;
             }
             if let Some((waypoints, samples, widest)) = link {
                 let layer = self.layer.as_mut().unwrap();
@@ -1433,6 +1468,51 @@ impl EngagementFrontPlan {
             self.report.passes += 1;
             return Ok(true);
         }
+    }
+
+    /// Before a helix bores onto the material `helix_pass` would pick: if
+    /// passes started beside it found it too thin to cut, it is a remnant
+    /// reachable at depth, not enclosed. Offer those starts again (once
+    /// each) as remnant passes. Returns whether any were offered.
+    fn revive_thin_starts(&mut self) -> bool {
+        let c = self.layer.as_ref().unwrap().g.c;
+        let need = self.grid_clearance(c);
+        let reach = self.r + 4. * c;
+        let layer = self.layer.as_mut().unwrap();
+        if layer.thin.is_empty() {
+            return false;
+        }
+        let mut best: Option<(f64, usize)> = None;
+        for k in 0..layer.top.len() {
+            if layer.allowed[k] && !layer.dead[k] && layer.material(k) {
+                let room = layer.room[k] as f64 - need;
+                if best.is_none_or(|(b, _)| room > b) {
+                    best = Some((room, k));
+                }
+            }
+        }
+        let Some((_, k)) = best else {
+            return false;
+        };
+        let q = layer.g.center(k);
+        let g = layer.g;
+        let mut revived = false;
+        let thin = std::mem::take(&mut layer.thin);
+        for t in thin {
+            if (t[0] - q[0]).hypot(t[1] - q[1]) > reach {
+                layer.thin.push(t);
+                continue;
+            }
+            let Some((i, j)) = g.cell(t) else { continue };
+            for jj in j.saturating_sub(3)..=(j + 3).min(g.ny - 1) {
+                for ii in i.saturating_sub(3)..=(i + 3).min(g.nx - 1) {
+                    layer.dead[g.idx(ii, jj)] = false;
+                }
+            }
+            layer.candidates.push(g.idx(i, j));
+            revived = true;
+        }
+        revived
     }
 
     /// Enclosed material: helix down at the most open reachable point.
@@ -1734,6 +1814,7 @@ mod tests {
             room: vec![100.; n],
             dead: vec![false; n],
             candidates: vec![],
+            thin: vec![],
             z: 0.,
             material_guard: 1e-4,
         };
@@ -1784,6 +1865,7 @@ mod tests {
             room: vec![100.; n],
             dead: vec![false; n],
             candidates: vec![],
+            thin: vec![],
             z: 0.,
             material_guard: 1e-4,
         };

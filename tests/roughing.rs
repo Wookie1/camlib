@@ -3747,3 +3747,33 @@ fn seam_bridge_closes_a_crossing_seam_between_separately_tessellated_faces() {
             .is_err()
     );
 }
+
+#[test]
+fn engagement_front_clears_thin_remnants_from_the_side_not_by_helix() {
+    // At 0.6 mm engagement the passes along the stock faces leave slivers
+    // too thin for a pass to start on. They lie beside cleared stock, so
+    // they are cleared at depth from there: the only helices are the
+    // operation's first entry (nothing is cut yet) and the bores into the
+    // enclosed 4 x 4 mm opening. Before, the top layer also bored helices
+    // onto slivers at the stock faces.
+    let base = engagement_front_frustum();
+    let mut v = serde_json::to_value(&base).unwrap();
+    v["operations"][0]["clearing"]["max_radial_engagement_mm"] = 0.6.into();
+    let m: StreamManifest = serde_json::from_value(v).unwrap();
+    let (history, _) = run_engagement_front(&m);
+    let mut starts = vec![];
+    for (i, motion) in history.iter().enumerate() {
+        if let Curve::Helix { center, .. } = motion.curve
+            && !matches!(history[i - 1].curve, Curve::Helix { .. })
+        {
+            starts.push([center[0], center[1]]);
+        }
+    }
+    assert!(starts.len() > 1);
+    for c in &starts[1..] {
+        assert!(
+            (13.0..=19.0).contains(&c[0]) && (11.0..=17.0).contains(&c[1]),
+            "helix at {c:?} outside the enclosed opening; helices {starts:?}"
+        );
+    }
+}
