@@ -1198,6 +1198,11 @@ class AdaptiveClearing:
     path_strategy='stock_front' is a development strategy: it can stream a
     productive prefix but raises if coverage/steering is unresolved. Its
     cutting_sense is 'climb' (default) or 'conventional' with the CW spindle.
+
+    path_strategy='engagement_front' (Roughing only) follows the cut/uncut
+    stock boundary at about max_radial_engagement_mm per step, entering from
+    air or proven-cleared stock and helixing only into enclosed material.
+    Orbit options do not apply to it.
     """
 
     max_radial_engagement_mm: float
@@ -1251,7 +1256,7 @@ class Roughing:
     require_part_at_first_depth: bool = False
     omit_empty_cuts: bool = False
     rest_tolerance_mm: float | None = None
-    # See Pocket.retract_z_mm/feed_z_mm. Raster and offset clearing only.
+    # See Pocket.retract_z_mm/feed_z_mm. Raster, offset and engagement_front.
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
     # Each layer's protected shadow simplified within this and grown by it
@@ -1259,6 +1264,27 @@ class Roughing:
     # None: a quarter of radial_allowance_mm; 0: off. At most the allowance;
     # leaves at most twice this more stock.
     contour_tolerance_mm: float | None = None
+    # Step-up layers: after each full stepdown, climb back up through its depth
+    # at most this far apart, cutting only a band next to the part.
+    stepup_mm: float | None = None
+    # engagement_front only: a descent into a column the committed sweeps
+    # prove clear for the whole tool is rapid down to this far above the
+    # proven height, then fed. None: rapid descent stops at feed_z_mm.
+    rapid_descent_clearance_mm: float | None = None
+    # engagement_front only: each helical entry starts this far above the
+    # material its bore meets (never above feed_z_mm), so it is already
+    # ramping when it reaches stock. None: the helix starts at that material.
+    ramp_clearance_mm: float | None = None
+    # engagement_front only: stay-down links at depth feed at this rate
+    # (mm/min) where the committed stock bounds prove the cutter clear of
+    # stock; elsewhere links keep feed_mm_min. None: links feed at feed_mm_min.
+    link_feed_mm_min: float | None = None
+    # engagement_front only, with link_feed_mm_min: a link stretch that may
+    # touch stock feeds faster than feed_mm_min by radial chip thinning, from
+    # a proven bound on how close stock lies to its line, so no chip exceeds
+    # the one at feed_mm_min and the clearing's radial engagement; capped at
+    # link_feed_mm_min.
+    link_chip_thinning: bool = False
 
     @classmethod
     def from_solid(cls, id, tool, solid, *, source=None, **parameters):
@@ -1281,9 +1307,18 @@ class Roughing:
             result.pop('clearing_tolerance_mm')
         if not self.require_part_at_first_depth:
             result.pop('require_part_at_first_depth')
-        for key in ('retract_z_mm', 'feed_z_mm'):
+        for key in (
+            'retract_z_mm',
+            'feed_z_mm',
+            'stepup_mm',
+            'rapid_descent_clearance_mm',
+            'ramp_clearance_mm',
+            'link_feed_mm_min',
+        ):
             if result[key] is None:
                 result.pop(key)
+        if not self.link_chip_thinning:
+            result.pop('link_chip_thinning')
         for key in ("target", "clearing", "entry"):
             if hasattr(result[key], "to_dict"):
                 result[key] = result[key].to_dict()

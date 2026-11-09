@@ -181,9 +181,48 @@ location. `clearing` is one of:
   passes, with that much overlap reserved for the coverage proof,
 - `AdaptiveClearing(max_radial_engagement_mm)`: engagement-limited, with the
   same orbit, `cutting_sense` and `path_strategy` options as `AdaptivePocket`.
+- `AdaptiveClearing(w, path_strategy="engagement_front")` (roughing only):
+  follows the boundary between cut and uncut stock, turning so each step
+  removes a radial width of about `w`. Passes start from air or from stock
+  already cleared (proven clear by the committed cuts) and helix only into
+  enclosed material; short moves between passes stay down when the link
+  is clear. The engagement is steered on a fine grid built from the stock
+  model, so `max_estimated_engagement_mm` in the layer report is an
+  estimate. Every cutting and link move is checked exactly against the
+  layer region before it is emitted, and the run fails rather than emit
+  one that does not fit. Orbit options and `omit_empty_cuts` do not apply,
+  and the entry must be `StockEdgeEntry`. With `rapid_descent_clearance_mm`
+  (opt-in, on `Roughing`), a descent into a column that the committed cuts
+  prove clear for the whole tool assembly is rapid down to that far above
+  the proven height, and only the rest is fed; otherwise every entry feeds
+  down from `feed_z_mm` through material already cut. An entry beside the
+  material it cuts (where the whole-cell stock bounds still hold that
+  material) then plunges a few stock cells back, where the bounds let the
+  rapid come lower, and feeds across at depth. A helical entry ramps only
+  through material: above the height the committed cuts or the stock cell
+  bounds prove clear over its whole bore it descends straight down, and a
+  bore that is clear to the layer gets a straight plunge (reported as
+  `air_entries`). `ramp_clearance_mm` (opt-in, on `Roughing`) starts each
+  helix that far above the material it meets, never above `feed_z_mm`.
+  `link_feed_mm_min` (opt-in, on `Roughing`) feeds the stay-down links at
+  that rate wherever the committed stock's whole-cell upper bounds prove the
+  cutter's footprint clear of stock (checked in stretches of at most 2 mm);
+  any stretch that may touch stock keeps `feed_mm_min`. Reported per layer as
+  `fast_links` and `fast_link_mm`. `link_chip_thinning` (opt-in, needs
+  `link_feed_mm_min`) also speeds up stretches that may touch stock lightly:
+  a tooth at angle t from the feed direction cuts a chip fz·cos(t) and meets
+  material only at lateral offset r·sin(t) from the line, so from the
+  smallest lateral offset s of any stock cell the cutter can reach whose
+  upper bound is above the link depth (cell extent included), no chip is
+  thicker than that of a side cut with ae = r − s. The stretch feeds at
+  `feed_mm_min` · f(engagement) / f(r − s), with f(ae) = 2·√(ae/D − (ae/D)²)
+  (Sandvik Coromant, radial chip thinning), rounded down to 10 mm/min and
+  capped at `link_feed_mm_min`, so no chip is thicker than at `feed_mm_min`
+  and the clearing's radial engagement. Reported as `thinned_links` and
+  `thinned_link_mm`.
 
-Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster
-and offset clearing. `RestRoughing` machines only what earlier operations left
+Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster,
+offset and engagement_front clearing. `RestRoughing` machines only what earlier operations left
 (`rest_tolerance_mm`, 0.01, is ignored), never repeating strokes proven already
 cleared. Further options:
 
@@ -193,6 +232,14 @@ cleared. Further options:
   part (face the stock first).
 - `clearing_tolerance_mm` sets the allowed construction error of each layer's
   clearing region; the operation fails if it cannot be kept.
+- `stepup_mm` adds step-up layers: after each full `stepdown_mm` layer, layers
+  at most `stepup_mm` apart climb back up through that layer's depth, each
+  clearing only a band next to the part (the layer's shadow grown by three
+  times the cutter radius plus radial allowance, which contains every point
+  the full layer could not reach). The stair a full stepdown leaves on sloped
+  and stepped walls shrinks to one step-up. Each step-up layer is reported
+  with `step_up_of_z_mm`, the full layer it climbs from. Must be positive and
+  smaller than `stepdown_mm`.
 
 Total roughing depth may exceed the flute length: each deeper layer is
 prepared for its actual increment below the preceding layer, with a reserve
