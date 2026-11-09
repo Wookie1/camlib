@@ -124,6 +124,59 @@ fn clipped(triangle: [Vec3; 3], z: f64) -> Vec<Point> {
     }
     hull(points)
 }
+/// Step-up levels between a full stepdown layer at `z` and the layer (or
+/// material top) `above` it: evenly spaced, at most `stepup` apart, ascending,
+/// so each climbs back up through the stair the full stepdown left on sloped
+/// and stepped walls. Established practice: the "step up" of rest-aware
+/// adaptive roughing (for example Mastercam Dynamic OptiRough, Cut
+/// Parameters, "Step up"); ported from CAMBuddy's MIT `plan_stepup_levels`.
+pub(crate) fn stepup_layers(z: f64, above: f64, stepup: f64, guard: f64) -> Vec<f64> {
+    let depth = above - z;
+    // Also refuses NaN: callers validate finite inputs first.
+    if depth.is_nan() || depth <= stepup.max(guard) {
+        return vec![];
+    }
+    let count = (depth / stepup).ceil() as usize;
+    let pitch = depth / count as f64;
+    (1..count).map(|j| z + j as f64 * pitch).collect()
+}
+
+/// The region a step-up layer at `region`'s depth may still find material in:
+/// next to the part, within the layer `below`'s shadow grown by three times
+/// `reach` (cutter radius plus radial allowance).
+///
+/// After the full layer `below`, every point farther than `reach = r + a`
+/// from its shadow is a valid cutter centre there and so was cut down to
+/// `below`. Material left at this height is therefore within `reach` of that
+/// shadow, and a cutter centre that reaches it lies within `2r + a`; keeping
+/// that centre `reach` inside the band needs the band to extend `3r + 2a`
+/// (plus the shadow's own construction error) beyond the shadow. The band is
+/// intersected with this layer's own region, so it never adds area the full
+/// layer would not cut.
+fn stepup_band(
+    shadow: &RoughingShadow,
+    reach: f64,
+    options: ConstructionOptions,
+) -> Result<PlanarRegion, String> {
+    // `shadow` is the parent layer's shadow, built the same (simplified) way
+    // as every layer's. It contains the exact shadow, so the band only grows,
+    // and its boundary is no finer than the layer region it is intersected
+    // with (an exact fine-mesh shadow left sliver components that failed
+    // topology validation).
+    // 3 * reach = 3r + 3a covers the 3r + 2a needed, with the allowance spare.
+    let grow = 3. * reach + shadow.report.boundary_error_mm + options.tolerance_mm;
+    // Square-join growth contains the round growth and keeps straight edges:
+    // a round offset's arcs came back from the intersection as thousands of
+    // tiny segments, whose erosion envelope then let the cutter-centre
+    // region creep inside the clearance the pocket proves.
+    Ok(shadow
+        .region
+        .prepare(options)?
+        .inflate_square(grow, 0.)?
+        .0
+        .region)
+}
+
 fn count_vertices(region: &PlanarRegion) -> usize {
     region
         .components
@@ -571,6 +624,11 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     pub top_z_mm: f64,
     pub floor_z_mm: f64,
     pub stepdown_mm: f64,
+    /// Step-up levels: after each full stepdown layer, extra layers climb back
+    /// up through the remaining depth at most this far apart, each cut only in
+    /// a band next to the part. See `stepup_layers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepup_mm: Option<f64>,
     pub clearance_z_mm: f64,
     pub feed_mm_min: f64,
     pub plunge_mm_min: f64,
@@ -614,6 +672,7 @@ impl<G> RoughingOperation<G> {
             top_z_mm: self.top_z_mm,
             floor_z_mm: self.floor_z_mm,
             stepdown_mm: self.stepdown_mm,
+            stepup_mm: self.stepup_mm,
             clearance_z_mm: self.clearance_z_mm,
             feed_mm_min: self.feed_mm_min,
             plunge_mm_min: self.plunge_mm_min,
@@ -636,6 +695,9 @@ impl<G> RoughingOperation<G> {
 #[derive(Clone, Serialize)]
 pub struct RoughingLayerReport {
     pub tip_z_mm: f64,
+    /// For a step-up layer: the full stepdown layer below it whose band it cuts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_up_of_z_mm: Option<f64>,
     pub shadow: ShadowReport,
     pub clearing: serde_json::Value,
 }
@@ -923,6 +985,14 @@ impl RoughingPlan {
                     format!("stepdown_mm {} must be positive", op.stepdown_mm),
                 ),
                 (
+                    op.stepup_mm
+                        .is_none_or(|s| s.is_finite() && s >= numeric_guard && s < op.stepdown_mm),
+                    format!(
+                        "stepup_mm {:?} must be positive and smaller than stepdown_mm {}",
+                        op.stepup_mm, op.stepdown_mm
+                    ),
+                ),
+                (
                     op.bottom_allowance_mm >= 0. && op.radial_allowance_mm >= 0.,
                     "allowances must not be negative".into(),
                 ),
@@ -1102,6 +1172,9 @@ impl RoughingPlan {
         let (mut work, mut vertices, mut guides) = (0usize, 0usize, 0usize);
         let mut maximum_error = guard;
         let mut depths = vec![];
+        // The deepest full layer cut so far: everything above it outside its
+        // shadow is already clear when a later layer (or step-up) starts.
+        let mut last_full: Option<f64> = None;
         for i in 0..count {
             check(cancel)?;
             let z = (op.top_z_mm - (i + 1) as f64 * op.stepdown_mm).max(floor);
@@ -1119,7 +1192,18 @@ impl RoughingPlan {
                     "roughing top_mm: first material depth Z{z} is above retained part; face the stock first"
                 ));
             }
-            depths.push(z);
+            depths.push((z, None, last_full));
+            if let Some(stepup) = op.stepup_mm {
+                // Climb back up through this layer's full depth, below the
+                // previous layer (or the material top) and never in air.
+                let above = (op.top_z_mm - i as f64 * op.stepdown_mm).min(material_spec.max_mm[2]);
+                for up in stepup_layers(z, above, stepup, numeric_guard) {
+                    if up + 16. * op.tolerance_mm < material_spec.max_mm[2] {
+                        depths.push((up, Some(z), last_full));
+                    }
+                }
+            }
+            last_full = Some(z);
         }
         // Offset/guide construction can dominate preflight even for a simple
         // faceted solid. Independent depth layers already have deterministic
@@ -1138,17 +1222,17 @@ impl RoughingPlan {
             cancel,
             |i, signal| {
                 let cancel = || signal.is_cancelled();
-                let z = depths[i];
+                let (z, step_up_of, cleared_above) = depths[i];
                 // Earlier layers clear the space above this one. Keep the
                 // original entry plane while the flutes span it; deeper
-                // layers admit only their actual increment, with a reserve
-                // for the preceding sweep's conservative height bound.
+                // layers admit only their actual increment below the last
+                // full layer above them (a step-up's band cut clears less),
+                // with a reserve for that sweep's conservative height bound.
                 let mut layer_spec = material_spec.clone();
                 if material_spec.max_mm[2] - z > tool.cutter.cutting_length_mm {
-                    layer_spec.max_mm[2] = if i == 0 {
-                        material_spec.max_mm[2]
-                    } else {
-                        depths[i - 1] + 16. * op.tolerance_mm
+                    layer_spec.max_mm[2] = match cleared_above {
+                        None => material_spec.max_mm[2],
+                        Some(above) => above + 16. * op.tolerance_mm,
                     };
                 }
                 let cut_depth = layer_spec.max_mm[2] - z;
@@ -1162,10 +1246,34 @@ impl RoughingPlan {
                 let shadow = target
                     .shadow_simplified(z, op.bottom_allowance_mm, r, contour, &mut work, &cancel)
                     .map_err(|e| format!("roughing shadow at Z{z}: {e}"))?;
+                let band = match step_up_of {
+                    Some(below) => Some(
+                        target
+                            .shadow_simplified(
+                                below,
+                                op.bottom_allowance_mm,
+                                r,
+                                contour,
+                                &mut work,
+                                &cancel,
+                            )
+                            .and_then(|parent| {
+                                stepup_band(&parent, r + op.radial_allowance_mm, options)
+                            })
+                            .map_err(|e| format!("roughing step-up band at Z{z}: {e}"))?,
+                    ),
+                    None => None,
+                };
                 let plan_layer = |shadow: RoughingShadow| -> Result<_, String> {
-                    let region = expanded
+                    let mut region = expanded
                         .boolean(&shadow.region.prepare(options)?, Boolean::Difference)?
                         .region;
+                    if let Some(band) = &band {
+                        region = region
+                            .prepare(options)?
+                            .boolean(&band.prepare(options)?, Boolean::Intersection)?
+                            .region;
+                    }
                     let layer_vertices = count_vertices(&region);
                     let step = match op.clearing {
                         RoughingClearing::Raster { stepover_mm, .. }
@@ -1276,6 +1384,7 @@ impl RoughingPlan {
                     };
                     let report = RoughingLayerReport {
                         tip_z_mm: z,
+                        step_up_of_z_mm: step_up_of,
                         shadow: shadow.report,
                         clearing: plan.report(),
                     };
@@ -1610,5 +1719,106 @@ mod simplify_tests {
         for p in [[20., 0.], [30., 0.2], [25., 0.1], [0., 0.], [10., 10.]] {
             assert!(grown.query(p).unwrap().signed_clearance_mm.unwrap() > 0.07);
         }
+    }
+
+    #[test]
+    fn step_up_band_of_a_round_shadow_stays_straight_sided_and_unnormalized() {
+        // A finely faceted cone: its shadow is round. A round offset of it
+        // came back from the band intersection as thousands of tiny
+        // segments; eroding that by the cutter needed a normalization
+        // envelope whose error the pocket's clearance proof then refused
+        // (Core/test-block step-up layers). The band must stay coarse.
+        let n = 512;
+        let apex = [0., 0., 10.];
+        let rim = |k: usize| {
+            let t = std::f64::consts::TAU * k as f64 / n as f64;
+            [10. * t.cos(), 10. * t.sin(), 0.]
+        };
+        let mesh = SurfaceMesh {
+            version: 1,
+            units: "mm".into(),
+            surface_error_mm: 0.,
+            source: serde_json::Value::Null,
+            triangles: (0..n)
+                .map(|k| [rim(k), rim(k + 1), apex])
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let cancel = || false;
+        let target = PreparedRoughingTarget::prepare(mesh, 1e-5, &cancel).unwrap();
+        let options = ConstructionOptions { tolerance_mm: 1e-5 };
+        let (r, allowance, contour) = (3., 0.4, 0.075);
+        let reach = r + allowance;
+        // The layer at Z6 around the cone, inside a 60 mm square of stock.
+        let shadow = target
+            .shadow_simplified(6., 0., r, contour, &mut 0, &cancel)
+            .unwrap();
+        let square = PlanarRegion {
+            version: 1,
+            units: "mm".into(),
+            name: "stock".into(),
+            components: vec![Component {
+                outer: rect(-30., -30., 30., 30.),
+                holes: vec![],
+            }],
+            boundary_error_mm: 0.,
+            source: serde_json::Value::Null,
+        };
+        let layer = square
+            .prepare(options)
+            .unwrap()
+            .boolean(
+                &shadow.region.prepare(options).unwrap(),
+                Boolean::Difference,
+            )
+            .unwrap()
+            .region;
+        // As the layer loop does: the parent (Z4) shadow's band, intersected
+        // with the step-up layer's region.
+        let below = target
+            .shadow_simplified(4., 0., r, contour, &mut 0, &cancel)
+            .unwrap();
+        let band = layer
+            .prepare(options)
+            .unwrap()
+            .boolean(
+                &stepup_band(&below, reach, options)
+                    .unwrap()
+                    .prepare(options)
+                    .unwrap(),
+                Boolean::Intersection,
+            )
+            .unwrap()
+            .region;
+        let vertices: Vec<_> = band
+            .components
+            .iter()
+            .flat_map(|c| std::iter::once(&c.outer).chain(&c.holes))
+            .flat_map(|b| &b.vertices)
+            .collect();
+        assert!(vertices.iter().all(|v| v[2] == 0.), "band has arcs");
+        assert!(vertices.len() < 400, "band has {} vertices", vertices.len());
+        // It still reaches 3r + 2a beyond the shadow at Z4 (radius 6 here).
+        let prepared = band.prepare(options).unwrap();
+        for k in 0..64 {
+            let t = std::f64::consts::TAU * k as f64 / 64.;
+            let d = 6. + 3. * r + 2. * allowance - 0.01;
+            assert!(
+                prepared
+                    .query([d * t.cos(), d * t.sin()])
+                    .unwrap()
+                    .signed_clearance_mm
+                    .unwrap()
+                    > 0.,
+                "band misses {t}"
+            );
+        }
+        // The cutter-centre construction needs no normalization envelope.
+        let centres = prepared.cutter_region(r, allowance).unwrap();
+        assert_eq!(
+            centres.normalization_error_mm, 0.,
+            "{:?}",
+            centres.diagnostics
+        );
     }
 }
