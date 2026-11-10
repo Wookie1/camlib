@@ -143,6 +143,10 @@ impl Geometry {
     }
 }
 
+/// Work units (`flat::WORK_TRIANGLE`, `flat::WORK_CONTACT`) one motion's
+/// proof may spend before it is left unproven.
+const PROOF_WORK_PER_MOTION: u64 = 1_000_000;
+
 /// A proof state's fixed fields: history flag, proven and unproven counts,
 /// cell count, encoding, payload length.
 const STATE_FIXED: usize = 1 + 8 + 8 + 8 + 1 + 8;
@@ -506,7 +510,13 @@ impl SweepProof {
         };
         let a = proof.erosion;
         let source_error = self.surface_error;
-        let mut remaining_pairs = 1_000_000u64;
+        // Work budget per motion, counted as the chord queries actually
+        // do it (`flat::WORK_TRIANGLE` per triangle returned,
+        // `flat::WORK_CONTACT` per contact search). A motion whose proof
+        // needs more is left unproven, not passed. Charging every chord the
+        // whole mesh up front made arcs of more than a chord or two
+        // unprovable on a fine mesh (#72).
+        let mut remaining_work = PROOF_WORK_PER_MOTION;
         let mut chord = |p: Vec3,
                          q: Vec3,
                          grow: f64,
@@ -532,34 +542,34 @@ impl SweepProof {
                     if cancel.is_cancelled() {
                         return Err("material sweep proof cancelled".into());
                     }
-                    let checks = sections.len() as u64 + u64::from(proof.end.is_some());
-                    let pairs = (index.len() as u64).saturating_mul(checks);
-                    if pairs > remaining_pairs {
-                        return Ok(false);
-                    }
-                    remaining_pairs -= pairs;
                     // The eroded end E ⊕ B_e ⊕ (radial growth): radius
                     // R - a + e + grow, corner rc - a + e, lowered by e.
-                    Ok((sections.is_empty()
-                        || index.sections_chord_clear(
+                    // Out of budget: not proven (Ok(false)).
+                    if !sections.is_empty()
+                        && index.sections_chord_clear_within(
                             p,
                             q,
                             &sections,
                             source_error + lift - a,
                             seen,
                             stamp,
-                        ))
-                        && proof.end.is_none_or(|[r, rc]| {
-                            index.bull_chord_bound_clear(
-                                p,
-                                q,
-                                r + source_error + grow,
-                                rc + source_error,
-                                source_error + lift - a,
-                                seen,
-                                stamp,
-                            )
-                        }))
+                            &mut remaining_work,
+                        ) != Some(true)
+                    {
+                        return Ok(false);
+                    }
+                    Ok(proof.end.is_none_or(|[r, rc]| {
+                        index.bull_chord_bound_clear_within(
+                            p,
+                            q,
+                            r + source_error + grow,
+                            rc + source_error,
+                            source_error + lift - a,
+                            seen,
+                            stamp,
+                            &mut remaining_work,
+                        ) == Some(true)
+                    }))
                 }
                 Geometry::Prism {
                     region,
@@ -1037,6 +1047,71 @@ mod tests {
                 assert!(deepest(&flat, &curve) <= tolerance - error);
             }
         }
+    }
+
+    #[test]
+    fn fine_meshes_charge_only_the_triangles_a_chord_can_meet() {
+        // The box with its top face split into 2 x 240 x 240 small
+        // triangles (~115k): a fine CAD mesh. A full-turn arc 5 mm beside
+        // the box needs at least four chords. The work budget once charged
+        // every triangle of the mesh per chord, so this arc (nowhere near
+        // the top face's triangles) went unproven on a mesh this fine.
+        let n = 240;
+        let mut triangles: Vec<[Vec3; 3]> = cuboid(PART.0, PART.1)
+            .into_iter()
+            .filter(|t| t.iter().any(|v| v[2] < PART.1[2]))
+            .collect();
+        let (lo, hi) = PART;
+        let at = |i: usize, j: usize| {
+            [
+                lo[0] + (hi[0] - lo[0]) * i as f64 / n as f64,
+                lo[1] + (hi[1] - lo[1]) * j as f64 / n as f64,
+                hi[2],
+            ]
+        };
+        for j in 0..n {
+            for i in 0..n {
+                triangles.push([at(i, j), at(i + 1, j), at(i + 1, j + 1)]);
+                triangles.push([at(i, j), at(i + 1, j + 1), at(i, j + 1)]);
+            }
+        }
+        assert!(triangles.len() > 100_000);
+        let mut definition = target(0.);
+        definition.surface.triangles = triangles.into();
+        let flat = tool(CutterShape::Flat).prepare().unwrap();
+        let mut proof = SweepProof::new(
+            &definition,
+            Options {
+                comparison_tolerance_mm: 0.02,
+                ..Options::default()
+            },
+            &spec(),
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        // Tool centre on a 2 mm circle about (-10, 10): its edge stays 5 mm
+        // off the x = 0 wall, and the holder (z >= 30) clears the top.
+        let (c, r) = ([-10., 10., 4.], 2.);
+        let arc = Curve::Arc {
+            start: [c[0] + r, c[1], c[2]],
+            end: [c[0] + r, c[1], c[2]],
+            center: c,
+            plane: Plane::Xy,
+            sweep_rad: std::f64::consts::TAU,
+        };
+        assert!(proves(&mut proof, &flat, arc.clone()));
+        assert_eq!(deepest(&flat, &arc), 0.);
+        // Still exact: the same circle moved into the wall is not proven.
+        let into = Curve::Arc {
+            start: [c[0] + r + 6., c[1], c[2]],
+            end: [c[0] + r + 6., c[1], c[2]],
+            center: [c[0] + 6., c[1], c[2]],
+            plane: Plane::Xy,
+            sweep_rad: std::f64::consts::TAU,
+        };
+        assert!(!proves(&mut proof, &flat, into.clone()));
+        assert!(deepest(&flat, &into) > 0.02);
     }
 
     #[test]
