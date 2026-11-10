@@ -1,7 +1,8 @@
 # Haas NGC2020 Python reference post
 
 This ordinary Python example targets the three-axis milling subset in the
-Haas96-8210 RevN/December2020 manual. It is not a native controller registry,
+Haas96-8210 RevN/December2020 manual. It has an explicit Rust counterpart selected by machine JSON (see
+[Posting without Python](posts.md#named-controller-posts)). It is not a
 CHC/later-firmware alias, external interpreter result or machine qualification.
 
 ## Ordinary Python use

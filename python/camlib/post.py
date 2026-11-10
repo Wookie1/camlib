@@ -139,12 +139,14 @@ def post_job_input(job, setup_id, *, machine, lowering=None, accept=(), run_id=N
 
 
 def post_job(input, *, cancel=None):
-    """Post a setup with the Rust default post, in this process: ``input``
+    """Post a setup with the Rust post selected by its machine declaration: ``input``
     as ``post_job_input`` gives it (or its JSON text). Returns the report:
     ``released``, ``program`` (the NC text, only when released), ``refused``,
     ``findings``, ``accepted``, ``unchecked``, ``machine``, ``posting``.
-    The program is the one ``Job.post_nc`` writes with the default
-    ``GCodePost``; see docs/posts.md."""
+    With no controller, this matches Python's default ``GCodePost``. A named
+    controller matches ``Job.post_nc`` with its explicit matching ``post``
+    and ``decoder`` classes; Python refuses omitted or mismatched classes.
+    See docs/posts.md."""
     text = input if isinstance(input, str) else json.dumps(input, allow_nan=False)
     return json.loads(native.post_job(text, cancel))
 

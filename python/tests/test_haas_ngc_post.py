@@ -129,7 +129,9 @@ class HaasNGCTest(unittest.TestCase):
                     actual = [v for c in chunks for v in c.motions][0]
                     self.assertEqual(actual.kind, 'rapid')
                     self.assertAlmostEqual(actual.feed_mm_min, 3000, delta=0.1)
-                    self.assertEqual(chunks[0].data['definition']['machine']['coordinate_system'], convention)
+                    self.assertEqual(
+                        chunks[0].data['definition']['machine']['controller']['coordinate_system'], convention
+                    )
                     self.oracle(p, m, chunks)
 
     def test_exact_curves_both_senses_mm_inch_and_full_circle_no_endpoint_words(self):

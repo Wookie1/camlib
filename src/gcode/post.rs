@@ -3,6 +3,7 @@
 //! same blocks for the same events. Nothing here is trusted: the engine
 //! decodes every block with the independent decoder (`super::decode`) and
 //! the native intent checker compares the result with the planned events.
+use super::controller::Controller;
 use super::machine::{Machine, ToolSetting};
 use crate::motion::{
     CompensationSide, Coolant, Curve, DrillCycle, Event, Motion, MoveKind, SpindleDirection, Vec3,
@@ -57,6 +58,7 @@ pub struct DefaultPost {
 /// `PostProcessor.version`/`GCodePost.version` of the Python post this one
 /// follows.
 pub const VERSION: &str = "2";
+pub const HAAS_VERSION: &str = "haas-ngc-2020-2";
 
 fn invalid_block(line: &str) -> bool {
     line.bytes()
@@ -191,12 +193,23 @@ impl DefaultPost {
             }
         }
         let unit = if dimensional { self.machine.unit() } else { 1. };
-        crate::post_decode::format_words(
+        let mut words = crate::post_decode::format_words(
             &addresses.concat(),
             &values,
             unit,
             self.machine.decimals as usize,
-        )
+        )?;
+        match &self.machine.controller {
+            Some(Controller::HaasNGC(_)) if dimensional => {
+                for w in &mut words {
+                    if !w.contains('.') {
+                        w.push('.');
+                    }
+                }
+            }
+            None | Some(Controller::HaasNGC(_)) => {}
+        }
+        Ok(words)
     }
     fn modal(&mut self, group: &'static str, word: &str) -> Option<String> {
         if self.modal.get(group).map(String::as_str) == Some(word) {
@@ -853,6 +866,14 @@ impl DefaultPost {
     }
 
     fn on_begin(&mut self, tolerance_mm: f64) -> Result<(), String> {
+        match &self.machine.controller {
+            Some(Controller::HaasNGC(h)) => {
+                let number = h.program_number;
+                self.emit(&["%"])?;
+                self.emit(&[&format!("O{number}")])?;
+            }
+            None => {}
+        }
         self.geometry_tolerance_mm = tolerance_mm;
         let d = self.machine.dialect.clone();
         for optional in ["language_native", "compression_off"] {
@@ -902,6 +923,25 @@ impl DefaultPost {
             if !d.fixed(effect) {
                 self.emit(&[d.code(effect)?])?;
             }
+        }
+        match &self.machine.controller {
+            Some(Controller::HaasNGC(h)) => {
+                let rotation_scaling = h.rotation_scaling;
+                self.lines.retain(|line| line != "G61");
+                for line in &mut self.lines {
+                    if line == "G52" {
+                        *line = "G52 X0 Y0 Z0".into();
+                    }
+                }
+                if rotation_scaling {
+                    self.emit(&["G50"])?;
+                    self.emit(&["G69"])?;
+                }
+                self.emit(&["G100 X0 Y0 Z0"])?;
+                self.emit(&["G187"])?;
+                self.emit(&["G61"])?;
+            }
+            None => {}
         }
         self.spindle_on = false;
         self.coolant_mode = Coolant::Off;
@@ -968,6 +1008,45 @@ impl DefaultPost {
         else {
             unreachable!()
         };
+        match &self.machine.controller {
+            Some(Controller::HaasNGC(h)) => {
+                if matches!(cycle, DrillCycle::Peck | DrillCycle::ChipBreak) {
+                    let code = if *cycle == DrillCycle::Peck {
+                        "G83"
+                    } else {
+                        "G73"
+                    };
+                    let Some(setting) = h.setting_22_mm else {
+                        return Err(format!(
+                            "Haas {code} needs Setting 22 (Can Cycle Delta Z): declare setting_22_mm with the installed value"
+                        ));
+                    };
+                    if *cycle == DrillCycle::Peck {
+                        let Some(s52) = h.setting_52_mm else {
+                            return Err("Haas G83 needs Setting 52 (G83 Retract Above R): declare setting_52_mm".into());
+                        };
+                        if s52 != 0. {
+                            return Err(format!(
+                                "Haas G83 with Setting 52 = {s52} mm clears chips above R, which camlib does not model: set Setting 52 to 0 (setting_52_mm=0) or drill without canned_cycle"
+                            ));
+                        }
+                    }
+                    let (source, name) = if *cycle == DrillCycle::Peck {
+                        (*reentry_mm, "reentry_clearance_mm")
+                    } else {
+                        (*lift_mm, "chip_break_lift_mm")
+                    };
+                    let source = source.ok_or_else(|| format!("Haas {code} requires the operation {name}: declare its return distance in mm"))?;
+                    if (source - setting).abs() > 1e-9 {
+                        return Err(format!(
+                            "the operation {name} {} mm differs from Setting 22 (Can Cycle Delta Z) {setting} mm: set {name}={setting}",
+                            source
+                        ));
+                    }
+                }
+            }
+            None => {}
+        }
         let d = self.machine.dialect.clone();
         let effect = cycle_effect(*cycle);
         if self.feed_rev.is_some_and(|f| f != 0.) {
@@ -1106,6 +1185,35 @@ impl DefaultPost {
             } => Some((*plane, *sweep_rad, matches!(c, Curve::Helix { .. }))),
             Curve::Line { .. } => None,
         };
+        match (&self.machine.controller, circular) {
+            (None, _) | (Some(Controller::HaasNGC(_)), None) => {}
+            (Some(Controller::HaasNGC(_)), Some((plane, sweep, helix))) => {
+                if plane != crate::motion::Plane::Xy {
+                    return Err("native Haas reference arc requires G17".into());
+                }
+                let feed = motion
+                    .feed_mm_min
+                    .ok_or("Haas circular motion requires positive explicit feed")?;
+                self.emit(&["G17"])?;
+                let (end, offsets) = self.circular_values(c)?;
+                let full = c.start()[..2] == c.end()[..2];
+                let mut addresses = Vec::new();
+                let mut values = Vec::new();
+                if !full {
+                    addresses.extend(["X", "Y"]);
+                    values.extend([end[0], end[1]]);
+                }
+                if helix {
+                    addresses.push("Z");
+                    values.push(end[2]);
+                }
+                addresses.extend(["I", "J", "F"]);
+                values.extend([offsets[0], offsets[1], feed]);
+                let mut words = vec![if sweep > 0. { "G3".into() } else { "G2".into() }];
+                words.extend(self.words(&addresses, &values, true)?);
+                return self.emit_owned(words);
+            }
+        }
         let effect = if let Some((plane, sweep, _)) = circular {
             self.emit(&[d.code(&format!("plane_{}", super::decode::plane_name(plane)))?])?;
             if sweep > 0. { "arc_ccw" } else { "arc_cw" }
@@ -1303,6 +1411,12 @@ impl DefaultPost {
                 continue;
             }
             self.emit(&[d.code(effect)?])?;
+        }
+        match &self.machine.controller {
+            Some(Controller::HaasNGC(_)) => {
+                self.emit(&["%"])?;
+            }
+            None => {}
         }
         Ok(())
     }

@@ -104,6 +104,14 @@ class ReferenceMachine(Machine):
     setting_52_mm: float | None = None
     reference: str = 'Haas NGC milling;96-8210 RevN December2020'
 
+    def to_dict(self):
+        data = super().to_dict()
+        from dataclasses import fields
+
+        names = {f.name for f in fields(ReferenceMachine)} - {f.name for f in fields(Machine)}
+        data['controller'] = dict(name='haas_ngc', **{k: data.pop(k) for k in sorted(names)})
+        return data
+
     def __post_init__(self):
         super().__post_init__()
         object.__setattr__(self, 'g92_shift_mm', tuple(islice(iter(self.g92_shift_mm), 4)))
@@ -254,6 +262,7 @@ def define_machine(
 
 
 class HaasNGCPost(GCodePost):
+    controller_name = 'haas_ngc'
     version = 'haas-ngc-2020-2'
 
     def on_begin(self, program):
@@ -301,6 +310,9 @@ class HaasNGCPost(GCodePost):
                     'model: set Setting 52 to 0 (setting_52_mm=0) or drill without canned_cycle'
                 )
             source = event.reentry_mm if event.cycle == 'peck' else event.lift_mm
+            if source is None:
+                name = 'reentry_clearance_mm' if event.cycle == 'peck' else 'chip_break_lift_mm'
+                raise ValueError(f'Haas {code} requires the operation {name}: declare its return distance in mm')
             if abs(source - m.setting_22_mm) > 1e-9:
                 name = 'reentry_clearance_mm' if event.cycle == 'peck' else 'chip_break_lift_mm'
                 raise ValueError(
@@ -323,6 +335,7 @@ class HaasNGCPost(GCodePost):
 class HaasNGCDecoder(NativeGCodeDecoder):
     """Independent actual-block model; no formatter/source geometry input."""
 
+    controller_name = 'haas_ngc'
     version = 'haas-ngc-2020-nominal-1'
 
     def __init__(self, machine, program):

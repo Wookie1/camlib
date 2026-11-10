@@ -92,6 +92,8 @@ pub struct ToolSetting {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Machine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<super::controller::Controller>,
     pub name: String,
     pub tools: Vec<ToolSetting>,
     pub dialect: Dialect,
@@ -547,6 +549,9 @@ impl Machine {
     /// The checks of `Machine.__post_init__` (and the dialect's).
     pub fn validate(&self) -> Result<(), String> {
         self.dialect.validate()?;
+        if let Some(controller) = &self.controller {
+            controller.validate(self)?;
+        }
         if self.schedule_post_feeds && self.motion_policy.is_none() {
             return Err("schedule_post_feeds requires an explicit motion_policy".into());
         }

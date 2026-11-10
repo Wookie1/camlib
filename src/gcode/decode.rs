@@ -4,16 +4,19 @@
 //! source motion's attribution (id, operation, kind); coordinates, feeds,
 //! tools, offsets and spindle states come from the words. It shares no code
 //! with the formatter (`super::post`). Unknown words or effects are refused.
+use super::controller::Controller;
 use super::machine::{Code, Machine, OPTIONAL_EFFECTS, REQUIRED, ToolSetting, code_token};
 use crate::motion::{
     CompensationSide, Coolant, Curve, Event, Motion, MoveKind, Plane, SpindleDirection, Vec3,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod haas;
 mod probe;
 
 /// The version string of the Python decoder this one follows.
 pub const VERSION: &str = "configured_motion_native_v1";
+pub const HAAS_VERSION: &str = "haas-ngc-2020-nominal-1";
 
 pub fn plane_name(p: Plane) -> &'static str {
     match p {
@@ -136,6 +139,7 @@ fn unused(values: &[(char, f64)], used: &BTreeSet<char>) -> Result<(), String> {
 
 #[derive(Clone)]
 pub struct Decoder {
+    haas: haas::HaasState,
     machine: Machine,
     pub position: Vec3,
     pub units: Option<f64>,
@@ -223,6 +227,7 @@ impl Decoder {
             rpm: 0.,
             coolant: Coolant::Off,
             ended: false,
+            haas: haas::HaasState::default(),
             direction: SpindleDirection::Cw,
             tap_return: None,
             cycle_active: false,
@@ -250,7 +255,10 @@ impl Decoder {
             .filter(|r| !self.ready.contains(*r))
             .collect();
         if missing.is_empty() {
-            Ok(())
+            match &self.machine.controller {
+                None => Ok(()),
+                Some(Controller::HaasNGC(h)) => self.haas_initialized(h),
+            }
         } else {
             Err(format!(
                 "incomplete explicit decoder modal initialization: {missing:?}"
@@ -336,6 +344,13 @@ impl Decoder {
         line: &str,
         context: Option<&Context>,
     ) -> Result<Vec<Event>, String> {
+        match self.machine.controller.clone() {
+            None => self.read_base(line, context),
+            Some(Controller::HaasNGC(h)) => self.read_haas(&h, line, context),
+        }
+    }
+
+    fn read_base(&mut self, line: &str, context: Option<&Context>) -> Result<Vec<Event>, String> {
         if self.tap_return.is_none()
             && !self.cycle_active
             && !self.machine.dialect.x_diameter
@@ -1506,6 +1521,19 @@ impl Decoder {
     }
 
     fn length(&mut self, number: Option<f64>) -> Result<Event, String> {
+        match &self.machine.controller {
+            Some(Controller::HaasNGC(h))
+                if h.h_t_agreement
+                    && self
+                        .active
+                        .as_ref()
+                        .is_none_or(|t| number != Some(t.number as f64)) =>
+            {
+                return Err("Haas Setting15 T/H disagreement".into());
+            }
+            None | Some(Controller::HaasNGC(_)) => {}
+        }
+
         let Some(active) = self.active.clone() else {
             return Err("NC length without active tool".into());
         };

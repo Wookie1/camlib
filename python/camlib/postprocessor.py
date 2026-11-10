@@ -2770,6 +2770,20 @@ class PostEngine:
         if self.post.machine != machine:
             raise ValueError('post uses a different machine definition')
         self.post.machine = machine
+        controller = machine.to_dict().get('controller')
+        if controller is not None and (
+            not isinstance(controller, dict) or not isinstance(controller.get('name'), str) or not controller['name']
+        ):
+            raise ValueError('machine controller requires a named controller object')
+        declared = None if controller is None else controller['name']
+        if declared != getattr(self.post, 'controller_name', None) or declared != getattr(
+            decoder, 'controller_name', None
+        ):
+            raise ValueError(
+                f"machine controller {declared!r} requires matching post and decoder: "
+                "pass its post= and decoder= classes explicitly (their controller_name must match), "
+                "or use an undeclared Machine for the default post"
+            )
         self.decoder_type = decoder
         self.decoder = None
         self._session = None
