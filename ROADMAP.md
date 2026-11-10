@@ -38,17 +38,32 @@ is ordered by real dependency, not by size:
 
 ## Phase 1: Correctness
 
-Nothing placed yet. A new correctness bug goes here and jumps the queue.
+Refused-but-valid programs first, the most common setups first.
+
+- #183 Canned cycles are posted in the plane the last arc left (G81 under G18 drills along Y on LinuxCNC)
+- #166 Machine travel: a move starting exactly on the travel limit is uncertain
+- #167 Roughing with AdaptiveClearing: no entry found, or the posted journal grows past 1 GB
+- #160 Roughing: the shank/holder guard can't prove clearance cleared by earlier layers unless a move exactly repeats one
+- #168 Tool change: no mode for a controller whose M6 doesn't move (LinuxCNC T M6 G43 H)
+- #176 Machine travel: one tip box per scene doesn't fit tools of different gauge lengths
 
 ## Phase 2: Complete milling
 
-Done.
+Entry, tab and path options shops expect, then the larger additions.
+
+- #171 Pocket and Contour: ramp entry along the path
+- #172 Tabs at given positions
+- #174 Trace with a side offset (an open chain of edges, cutter on one side)
+- #175 Parallel: rows all cut one way
+- #173 Contour following the part's outline at each depth (silhouette)
+- #157 Milling: an operation that runs a caller-supplied toolpath through the same simulation, checks and posting
 
 ## Phase 3: Complete turning
 
 - #14 Turning: post profile arcs as native G2/G3 instead of chords
 - #110 Tool and holder bodies from supplied models (mesh in the engine; STEP via the CadQuery adapter)
 - #113 Turning: apply the insert's in-plane size tolerance (ISO 1832 d and m) to its body
+- #170 Turning tools: one clearance angle for every side of the insert
 - #114 Turning: solid (one-piece) boring bars with a ground head on a round bar
 
 ## Phase 4: Complete plasma/laser
@@ -120,24 +135,6 @@ These can run in parallel with any phase.
 - #21 Release: PyPI distribution name and published wheels
 - #95 Siemens 808D posts: tapping (CYCLE84 / G331, ISO G84/G74)
 - #97 Haas NGC post: G86 needs a source for spindle restart
-
-## Not yet placed
-
-Open issues that still need a phase. Place each by dependency (correctness
-bugs into Phase 1) in a roadmap-only PR.
-
-- #157 Milling: an operation that runs a caller-supplied toolpath through the same simulation, checks and posting
-- #160 Roughing: the shank/holder guard can't prove clearance cleared by earlier layers unless a move exactly repeats one
-- #166 Machine travel: a move starting exactly on the travel limit is uncertain
-- #167 Roughing with AdaptiveClearing: no entry found, or the posted journal grows past 1 GB
-- #168 Tool change: no mode for a controller whose M6 doesn't move (LinuxCNC T M6 G43 H)
 - #169 Arc radius check at zero tolerance depends on the platform's hypot
-- #170 Turning tools: one clearance angle for every side of the insert
-- #171 Pocket and Contour: ramp entry along the path
-- #172 Tabs at given positions
-- #173 Contour following the part's outline at each depth (silhouette)
-- #174 Trace with a side offset (an open chain of edges, cutter on one side)
-- #175 Parallel: rows all cut one way
-- #176 Machine travel: one tip box per scene doesn't fit tools of different gauge lengths
 - #177 FANUC 0i-MB post with several tools needs measured tip positions
-- #178 Makera Carvera post, in Python and Rust
+- #182 LNC milling post (A-LNC milling series): reference post with independent decoder
