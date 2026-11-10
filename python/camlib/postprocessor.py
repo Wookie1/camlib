@@ -974,6 +974,7 @@ class GCodePost(PostProcessor):
         ):
             if effect not in d.fixed_modes:
                 self.emit(d.code(effect))
+        self._plane = plane[6:]
         # Explicitly stopped above, or the dialect declares it the controller's
         # startup mode. Tracked so later output omits only provably redundant codes.
         self._spindle_on = False
@@ -1367,6 +1368,7 @@ class GCodePost(PostProcessor):
                     f'the operation {name} {source} mm differs from this controller\'s '
                     f'{d.code(effect)} return amount {machine} mm: set {name}={machine}'
                 )
+        self.cycle_plane()
         if getattr(self, '_cycle_open', False) and getattr(self, '_cycle_initial', None) != event.initial_z_mm:
             # FANUC keeps the initial level from where the cycle mode began.
             self.emit(d.code('cycles_off'))
@@ -1387,6 +1389,15 @@ class GCodePost(PostProcessor):
         self.emit(d.code(effect), *words)
         self._cycle_open = True
         self._covered = event.covers
+
+    def cycle_plane(self):
+        """Canned cycles (G73-G89, G84/G74) drill along the plane's normal: in
+        G18 LinuxCNC drills along Y ("performed with respect to the
+        currently-selected plane", LinuxCNC G-code reference, Canned Cycles).
+        camlib's cycles drill along Z, so G17 is selected first (#183)."""
+        if 'xy' in self.machine.planes and getattr(self, '_plane', None) != 'xy':
+            self.emit(self.machine.dialect.code('plane_xy'))
+            self._plane = 'xy'
 
     def cycle_dwell(self, seconds):
         """The G82 P word, rounded up to the controller resolution."""
@@ -1425,6 +1436,7 @@ class GCodePost(PostProcessor):
             return
         if isinstance(c, Arc):
             self.emit(d.code('plane_' + c.plane))
+            self._plane = c.plane
             effect = 'arc_ccw' if c.sweep_rad > 0 else 'arc_cw'
         else:
             effect = 'rapid' if motion.kind in ('rapid', 'shift') and motion.feed_mm_min is None else 'linear'
@@ -1493,6 +1505,8 @@ class GCodePost(PostProcessor):
         rpm = getattr(self, '_rpm', 0)
         if not rpm:
             raise ValueError('tapping needs the spindle running')
+        if 'tap_synchronized' not in commands and cycle in commands:
+            self.cycle_plane()
         scale = 25.4 if self.machine.output_units == 'inch' else 1
         if 'tap_synchronized' in commands:
             # Pitch per spindle revolution, written exactly enough that the
@@ -1732,6 +1746,14 @@ class GCodeDecoder(_TransactionCopy):
             if motion is None or motion.curve.start == motion.curve.end:
                 raise ValueError('cutter compensation needs a move in its block')
             return [*change, motion]
+        if (
+            len(effects) == 1
+            and (effects[0] in ('tap_cycle', 'tap_cycle_left') or effects[0] in _DRILL_CYCLES.values())
+            and 'xy' in self.machine.planes
+            and self.plane != 'xy'
+        ):
+            # Canned cycles drill along Z only in G17 (#183); G33.1 always taps along Z.
+            raise ValueError('canned cycles drill along Z only in G17: select G17 before the cycle')
         if len(effects) == 1 and effects[0] in ('tap_synchronized', 'tap_cycle', 'tap_cycle_left'):
             return [self._tap(effects[0], values, context)]
         if len(effects) == 1 and effects[0] == 'thread_synchronized':
@@ -3025,6 +3047,9 @@ class PostEngine:
                 decoder.plane = plane
                 if plane is not None:
                     decoder.ready.add('plane')
+                    # The native batch wrote the plane codes: keep the post's
+                    # plane in step (canned cycles select G17 from it, #183).
+                    post._plane = plane
                 i = j
                 continue
             # One event through the Python hooks.

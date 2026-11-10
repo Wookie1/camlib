@@ -159,6 +159,26 @@ fn the_decoder_reads_only_declared_words() {
 }
 
 #[test]
+fn canned_cycles_are_refused_outside_g17() {
+    // #183: in G18 LinuxCNC drills along Y; camlib's cycles drill along Z.
+    let machine = Machine::from_json(fixture()["machine"].clone()).unwrap();
+    let header = [
+        "G21", "G90", "G91.1", "G17", "G94", "G97", "G40", "G49", "G80", "G92.1", "G61.1", "M5",
+        "M9",
+    ]
+    .map(String::from);
+    for plane in ["G18", "G19"] {
+        let mut decoder = Decoder::new(&machine, [0., 0., 8.], Default::default()).unwrap();
+        decoder.read(&header, None).unwrap();
+        decoder.read(&[plane.to_string()], None).unwrap();
+        let error = decoder
+            .read(&["G81 X1 Y1 Z-1 R1 F100".to_string()], None)
+            .unwrap_err();
+        assert!(error.contains("G17"), "{plane}: {error}");
+    }
+}
+
+#[test]
 fn cam_post_command_reports_on_stdout() {
     use std::io::Write;
     use std::process::{Command, Stdio};

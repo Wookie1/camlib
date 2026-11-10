@@ -551,6 +551,18 @@ impl Decoder {
             out.push(motion);
             return Ok(out);
         }
+        // Canned cycles drill along Z only in G17 (#183); G33.1 always taps
+        // along Z.
+        if effects.len() == 1
+            && (["tap_cycle", "tap_cycle_left"].contains(&named[0])
+                || DRILL_EFFECTS.contains(&named[0]))
+            && self.machine.planes.contains(&crate::motion::Plane::Xy)
+            && self.plane != Some(crate::motion::Plane::Xy)
+        {
+            return Err(
+                "canned cycles drill along Z only in G17: select G17 before the cycle".into(),
+            );
+        }
         if effects.len() == 1
             && ["tap_synchronized", "tap_cycle", "tap_cycle_left"].contains(&named[0])
         {

@@ -214,7 +214,7 @@ Both Python examples stay available. Remaining controller
 subclasses require Python. Rust job replay does not yet support lathe setups.
 
 Python controller posts (examples): GRBL 1.1h (laser mode `M4 S`), Haas NGC, Makera Carvera,
-FANUC 0i-MB, FANUC lathe (G-code system A), Siemens 808D (native and ISO),
+FANUC 0i-MB, FANUC lathe (G-code system A), LNC milling (LNC-M8000), Siemens 808D (native and ISO),
 Centroid CNC12 (mill, lathe and plasma), LinuxCNC QtPlasmaC, WinCNC plasma.
 
 ## Streaming, replay and reuse

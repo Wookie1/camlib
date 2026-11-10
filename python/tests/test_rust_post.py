@@ -14,7 +14,9 @@ import unittest
 from camlib._buffers import native
 from camlib.export import ExportRefused
 from camlib.motion import (
+    Arc,
     Coolant,
+    Cycle,
     CutterCompensation,
     Dwell,
     FeedPerRev,
@@ -480,6 +482,52 @@ class RustPostEventsTest(unittest.TestCase):
         text = self.assert_same(program, machine)
         self.assertIn("G4 P0.25", text)
         self.assertIn("M4 S1200", text)
+
+    def test_canned_cycles_select_g17_after_an_xz_or_yz_arc(self):
+        """#183: cycles drill along Z only in G17 (in G18 LinuxCNC drills along Y)."""
+        from camlib.post import NativeGCodeDecoder
+        from test_post import fixture
+
+        p, m = fixture()
+        start = (5, 0, 3)
+        for plane, end, centre, sweep in (
+            ("xz", (10, 0, 8), (10, 0, 3), math.pi / 2),
+            ("yz", (5, 5, 8), (5, 5, 3), -math.pi / 2),
+        ):
+            for cycle, extra, code in (
+                ("drill", {}, "G81"),
+                ("dwell", dict(dwell_s=0.5), "G82"),
+                ("bore", {}, "G85"),
+            ):
+                with self.subTest(plane=plane, cycle=code):
+                    x, y, z = end
+                    arc = Motion(1, "op", "t1", Arc(start, end, centre, sweep, plane), 1200)
+                    if cycle == "bore":
+                        # Boring cycles start at the R plane (initial level = R).
+                        moves = (
+                            Motion(2, "op", "t1", Line(end, (x, y, 5)), None, "rapid"),
+                            Cycle("bore", (x, y), 1, 5, 5, 100, 2),
+                            Motion(3, "drill", "t1", Line((x, y, 5), (x, y, 1)), 100),
+                            Motion(4, "drill", "t1", Line((x, y, 1), (x, y, 5)), 100),
+                        )
+                    else:
+                        covers = (
+                            Motion(2, "drill", "t1", Line(end, (x, y, 5)), None, "rapid"),
+                            Motion(3, "drill", "t1", Line((x, y, 5), (x, y, 1)), 150),
+                            *((Dwell(0.5),) if extra else ()),
+                            Motion(4, "drill", "t1", Line((x, y, 1), end), None, "rapid"),
+                        )
+                        moves = (Cycle(cycle, (x, y), 1, 5, 8, 150, len(covers), **extra), *covers)
+                    events = (*p.events[:4], arc, *moves, Coolant("off"), Spindle(0))
+                    program = replace(p, events=events)
+                    text = self.assert_same(program, m).splitlines()
+                    i = next(k for k, line in enumerate(text) if line.startswith(code))
+                    self.assertEqual(text[i - 2 : i], ["G17", "G98"])
+                    broken = text[: i - 2] + text[i - 1 :]
+                    decoder = NativeGCodeDecoder(m, program)
+                    with self.assertRaisesRegex(ValueError, "G17"):
+                        for line in broken:
+                            decoder.read_line(line, dict(id=1, operation="file", kind="cut"))
 
     def test_lathe_words_as_data(self):
         """Diameter X, T<tt><oo>, constant surface speed, feed per revolution."""

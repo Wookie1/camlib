@@ -42,6 +42,9 @@ pub struct DefaultPost {
     pending_compensation: Option<Vec<String>>,
     cycle_open: bool,
     cycle_initial: Option<f64>,
+    /// The plane the last plane code selected: canned cycles drill along Z
+    /// only in G17 (#183).
+    plane: Option<crate::motion::Plane>,
     covered: u32,
     /// The moves still covered are a probing cycle's (none of its events
     /// may be written separately).
@@ -129,6 +132,7 @@ impl DefaultPost {
             feed_rev: None,
             pending_compensation: None,
             cycle_open: false,
+            plane: None,
             cycle_initial: None,
             covered: 0,
             covered_probe: false,
@@ -930,6 +934,11 @@ impl DefaultPost {
                 .ok_or("machine declares no plane")?;
             format!("plane_{}", super::decode::plane_name(*first))
         };
+        self.plane = if self.machine.planes.contains(&crate::motion::Plane::Xy) {
+            Some(crate::motion::Plane::Xy)
+        } else {
+            self.machine.planes.first().copied()
+        };
         let units = if self.machine.output_units == "mm" {
             "units_mm"
         } else {
@@ -1018,6 +1027,20 @@ impl DefaultPost {
         } else {
             self.emit_owned(words)
         }
+    }
+
+    /// Canned cycles (G73-G89, G84/G74) drill along the plane's normal: in
+    /// G18 LinuxCNC drills along Y ("performed with respect to the
+    /// currently-selected plane", LinuxCNC G-code reference, Canned Cycles).
+    /// camlib's cycles drill along Z, so G17 is selected first (#183).
+    fn cycle_plane(&mut self) -> Result<(), String> {
+        use crate::motion::Plane;
+        if self.machine.planes.contains(&Plane::Xy) && self.plane != Some(Plane::Xy) {
+            let code = self.machine.dialect.code("plane_xy")?.to_string();
+            self.emit(&[&code])?;
+            self.plane = Some(Plane::Xy);
+        }
+        Ok(())
     }
 
     fn on_cycle(&mut self, event: &Event) -> Result<(), String> {
@@ -1116,6 +1139,7 @@ impl DefaultPost {
                 }
             }
         }
+        self.cycle_plane()?;
         if self.cycle_open && self.cycle_initial != Some(*initial_z_mm) {
             // FANUC keeps the initial level from where the cycle mode began.
             self.emit(&[d.code("cycles_off")?])?;
@@ -1248,6 +1272,7 @@ impl DefaultPost {
         }
         let effect = if let Some((plane, sweep, _)) = circular {
             self.emit(&[d.code(&format!("plane_{}", super::decode::plane_name(plane)))?])?;
+            self.plane = Some(plane);
             if sweep > 0. { "arc_ccw" } else { "arc_cw" }
         } else if motion.kind.is_rapid() && motion.feed_mm_min.is_none() {
             "rapid"
@@ -1348,6 +1373,9 @@ impl DefaultPost {
         let rpm = self.rpm;
         if rpm == 0. {
             return Err("tapping needs the spindle running".into());
+        }
+        if !d.declares("tap_synchronized") && d.declares(cycle) {
+            self.cycle_plane()?;
         }
         let feed = motion
             .feed_mm_min

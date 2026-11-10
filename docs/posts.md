@@ -259,7 +259,11 @@ hole and `G80` before the next other block. The dialect declares the codes
 (`drill_cycle`, `drill_dwell_cycle`, `peck_cycle`, `chip_break_cycle`,
 `cycle_return_initial`), the G82 dwell unit (`cycle_dwell_unit`, `"s"` or
 `"ms"`) and the controller's fixed return amounts (`peck_reentry_mm`,
-`chip_break_lift_mm`; LinuxCNC 0.254 mm). A cycle block and the hole's moves
+`chip_break_lift_mm`; LinuxCNC 0.254 mm). Cycles drill along Z, so on a
+machine that declares G17 the post selects `G17` before a cycle block (drilling,
+boring, fine boring or G84/G74 tapping) when an arc left G18 or G19 active, and
+the decoder refuses a cycle block outside G17: in G18 LinuxCNC drills along Y
+("performed with respect to the currently-selected plane", #183). A cycle block and the hole's moves
 it covers are checked in one batch, with or without `lowering=`; a cycle
 covering more than 63 events is refused (post that hole with
 `canned_cycle=False`). Boring cycles (`Reaming(canned_cycle=True)`)
@@ -289,6 +293,7 @@ them against your machine before use:
 | `carvera_post.py` | Makera Carvera (metric milling) | Python and Rust named pair; [setup and retract premises](carvera-post.md) |
 | `haas_ngc_post.py` | Haas NGC (2020 manual) | [setup notes](haas-ngc-post.md) |
 | `fanuc_0imb_post.py` | FANUC 0i-MB | [setup notes](fanuc-0imb-post.md); `inspection_plus_fast_feed_mm_min=` posts probing as Renishaw Inspection Plus macros |
+| `lnc_mill_post.py` | LNC milling, LNC-M8000 (A-LNC programming manual V01.02) | [setup notes](lnc-mill-post.md); native G2/G3 in G17/G18/G19 checked against parameter 50048; canned cycles and M29 rigid tapping with the declared parameters |
 | `siemens808d_post.py` | SINUMERIK 808D native | [setup notes](siemens808d-post.md) |
 | `siemens808d_iso_post.py` | SINUMERIK 808D ISO mode | [setup notes](siemens808d-iso-post.md) |
 | `centroid_post.py` | Centroid CNC12 mill (Acorn, Oak, ...) | [setup notes](centroid-post.md) |
