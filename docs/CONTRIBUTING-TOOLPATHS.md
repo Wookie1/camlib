@@ -99,4 +99,5 @@ stock change. Never bypass `emit`.
   reference.
 - `docs/library-capabilities.md`: the capability table.
 - `README.md` if the feature list changes.
-- Tick the issue in `ROADMAP.md`, and close it from the PR (`Closes #N`).
+- Close the issue from the PR (`Closes #N`). Don't edit `ROADMAP.md`: it lists
+  open issues only, and feature PRs leave it alone so they don't conflict.

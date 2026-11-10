@@ -119,6 +119,9 @@ at a time.
 7. **Keep PRs focused**: one issue, or a tightly related group. Note anything
    left undone in the issue rather than half-finishing it silently. Anything a
    PR leaves out gets its own issue.
+8. **Don't edit `ROADMAP.md` in a feature PR.** Closing the issue marks it
+   done. The roadmap changes only to place new issues or reorder, in a
+   roadmap-only PR, so parallel feature PRs don't conflict on it.
 
 ## Commands
 

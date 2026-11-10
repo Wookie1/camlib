@@ -14,8 +14,11 @@ first: it says what camlib is, what it is not, and how to work an issue.
   unsafe or refused-but-valid program goes into Phase 1 and is fixed before
   anything else.
 - **"Any time" issues** may run in parallel with the current phase.
-- **When an issue closes,** tick it here in the same PR. When a new issue is
-  opened, it is placed in a phase by dependency.
+- **This file lists open issues only, and feature PRs don't edit it.** An
+  issue is done when its PR closes it (`Closes #N`); the milestone shows
+  progress. Keeping feature PRs out of this file keeps them from conflicting
+  with each other here. It changes only to place new issues or change the
+  order, in a roadmap-only PR, which also sweeps out closed issues.
 
 ## Why this order
 
@@ -35,47 +38,36 @@ is ordered by real dependency, not by size:
 
 ## Phase 1: Correctness
 
-- [x] #132 macOS extension linking, portable wheel loading and actionable first-use refusals
-
-- [x] #116 Machine crash detection: check the posted program against a declared machine model (safety)
-- [x] #136 Geodesic contour construction: observe cancellation within a level
+Nothing placed yet. A new correctness bug goes here and jumps the queue.
 
 ## Phase 2: Complete milling
 
-Smaller, independent items first, then the 3D stock and what needs it.
-
-- [x] #7 Probing: work offset, feature and tool-setting cycles (3-axis; tilted planes come with #5)
-- [x] #92 Deburr: ball-end and bull-nose tools
-- [x] #93 Deburr: edges next to drafted or filleted walls
-- [x] #94 Deburr: sloped and vertical edges (3-axis part needs #92; tilted tool with #5/#6)
-- [ ] #107 Material check: prove ball and bull-nose ends with their real shape (shares contact work with #92)
-- [x] #1 3D stock model (tri-dexel) for undercuts and multi-axis machining
-- [x] #8 Undercut milling tools: T-slot, keyseat, lollipop and dovetail cutters (needs #1)
+Done.
 
 ## Phase 3: Complete turning
 
-- [ ] #14 Turning: post profile arcs as native G2/G3 instead of chords
-- [ ] #110 Tool and holder bodies from supplied models (mesh in the engine; STEP via the CadQuery adapter)
-- [ ] #113 Turning: apply the insert's in-plane size tolerance (ISO 1832 d and m) to its body
-- [ ] #114 Turning: solid (one-piece) boring bars with a ground head on a round bar
+- #14 Turning: post profile arcs as native G2/G3 instead of chords
+- #110 Tool and holder bodies from supplied models (mesh in the engine; STEP via the CadQuery adapter)
+- #113 Turning: apply the insert's in-plane size tolerance (ISO 1832 d and m) to its body
+- #114 Turning: solid (one-piece) boring bars with a ground head on a round bar
 
 ## Phase 4: Complete plasma/laser
 
-- [ ] #16 Plasma/laser: automatic part nesting
-- [ ] #17 Plasma/laser: common-line cutting (needs #16 for automatic placements)
-- [ ] #18 Plasma/laser: marking and etching
+- #16 Plasma/laser: automatic part nesting
+- #17 Plasma/laser: common-line cutting (needs #16 for automatic placements)
+- #18 Plasma/laser: marking and etching
 
 ## Phase 5: Multi-axis
 
 In dependency order: kinematics, then indexed work, then continuous motion.
 
-- [ ] #2 Machine kinematics: rotary axes (A/B/C), table and head configurations
-- [ ] #3 4th axis: indexed (3+1) machining (needs #2)
-- [ ] #5 5-axis indexed (3+2) machining with tilted work planes (needs #2)
-- [ ] #4 4th axis: continuous rotary machining (wrapping and rotary toolpaths) (needs #1, #2)
-- [ ] #6 5-axis simultaneous machining (tool axis control, swarf, multi-axis finishing) (needs #1, #2, #5)
-- [ ] #15 Mill-turn: live tooling with C and Y axes on a lathe (needs #1, #2, #4)
-- [ ] #19 Plasma/laser: bevel cutting (needs #1, #2, #6)
+- #2 Machine kinematics: rotary axes (A/B/C), table and head configurations
+- #3 4th axis: indexed (3+1) machining (needs #2)
+- #5 5-axis indexed (3+2) machining with tilted work planes (needs #2)
+- #4 4th axis: continuous rotary machining (wrapping and rotary toolpaths) (needs #1, #2)
+- #6 5-axis simultaneous machining (tool axis control, swarf, multi-axis finishing) (needs #1, #2, #5)
+- #15 Mill-turn: live tooling with C and Y axes on a lathe (needs #1, #2, #4)
+- #19 Plasma/laser: bevel cutting (needs #1, #2, #6)
 
 ## Phase 6: Optimization
 
@@ -83,77 +75,69 @@ Every toolpath, measured against the published baseline (`bench/`). The
 shared machinery comes first because most toolpaths use it. Then milling (by
 use: 2D, holes, 3D), turning and thermal.
 
-- [ ] #23 Shared toolpath machinery: linking, ordering, arc fitting and dynamics-aware feeds
-- [ ] #24 Optimize Facing
-- [ ] #25 Optimize Pocket and RestPocket
-- [ ] #26 Optimize AdaptivePocket and adaptive clearing
-- [ ] #28 Optimize Contour (and Tabs)
-- [ ] #34 Optimize TrochoidalSlot
-- [ ] #35 Optimize Chamfer
-- [ ] #36 Optimize Trace (engrave)
-- [ ] #37 Optimize VCarve
-- [ ] #29 Optimize Drilling
-- [ ] #30 Optimize Bore (helical bore milling)
-- [ ] #31 Optimize Reaming and fine boring
-- [ ] #32 Optimize Tapping
-- [ ] #33 Optimize ThreadMilling
-- [ ] #27 Optimize 3D Roughing and RestRoughing
-- [ ] #38 Optimize Flat-area finishing
-- [ ] #39 Optimize Parallel finishing (and rest finishing)
-- [ ] #46 Optimize Waterline finishing (and ramp mode)
-- [ ] #47 Optimize steep-and-shallow finishing (after #39 and #46)
-- [ ] #40 Optimize Spiral finishing
-- [ ] #41 Optimize Radial finishing
-- [ ] #42 Optimize Project finishing
-- [ ] #43 Optimize Morph and flow finishing
-- [ ] #44 Optimize Scallop finishing
-- [ ] #45 Optimize Pencil finishing
-- [ ] #118 Optimize Geodesic finishing
-- [ ] #49 Optimize turning: facing (TurnFace)
-- [ ] #50 Optimize turning: roughing (TurnRough)
-- [ ] #51 Optimize turning: finishing (TurnFinish) (after #14)
-- [ ] #52 Optimize turning: grooving (TurnGroove)
-- [ ] #53 Optimize turning: parting off (TurnPartOff)
-- [ ] #54 Optimize turning: threading (TurnThread)
-- [ ] #55 Optimize turning: drilling on the axis (TurnDrill)
-- [ ] #56 Optimize turning: boring (TurnBoreRough, TurnBoreFinish) (after #14)
-- [ ] #57 Optimize turning: face grooving (TurnFaceGroove)
-- [ ] #48 Optimize ThermalCut (plasma and laser)
+- #23 Shared toolpath machinery: linking, ordering, arc fitting and dynamics-aware feeds
+- #24 Optimize Facing
+- #25 Optimize Pocket and RestPocket
+- #26 Optimize AdaptivePocket and adaptive clearing
+- #28 Optimize Contour (and Tabs)
+- #34 Optimize TrochoidalSlot
+- #35 Optimize Chamfer
+- #36 Optimize Trace (engrave)
+- #37 Optimize VCarve
+- #29 Optimize Drilling
+- #30 Optimize Bore (helical bore milling)
+- #31 Optimize Reaming and fine boring
+- #32 Optimize Tapping
+- #33 Optimize ThreadMilling
+- #27 Optimize 3D Roughing and RestRoughing
+- #38 Optimize Flat-area finishing
+- #39 Optimize Parallel finishing (and rest finishing)
+- #46 Optimize Waterline finishing (and ramp mode)
+- #47 Optimize steep-and-shallow finishing (after #39 and #46)
+- #40 Optimize Spiral finishing
+- #41 Optimize Radial finishing
+- #42 Optimize Project finishing
+- #43 Optimize Morph and flow finishing
+- #44 Optimize Scallop finishing
+- #45 Optimize Pencil finishing
+- #118 Optimize Geodesic finishing
+- #49 Optimize turning: facing (TurnFace)
+- #50 Optimize turning: roughing (TurnRough)
+- #51 Optimize turning: finishing (TurnFinish) (after #14)
+- #52 Optimize turning: grooving (TurnGroove)
+- #53 Optimize turning: parting off (TurnPartOff)
+- #54 Optimize turning: threading (TurnThread)
+- #55 Optimize turning: drilling on the axis (TurnDrill)
+- #56 Optimize turning: boring (TurnBoreRough, TurnBoreFinish) (after #14)
+- #57 Optimize turning: face grooving (TurnFaceGroove)
+- #48 Optimize ThermalCut (plasma and laser)
 
 ## Any time
 
-- [x] #134 Caller-supplied checked recipes, bounded rest correction and declared engagement policy
-
-- [x] #133 Bounded preparation and declared whole-cell stock/material premises (scoped library APIs)
-
 These can run in parallel with any phase.
 
-- [ ] #20 Validate every controller post on real machines (start with the LinuxCNC simulator in CI)
-- [ ] #21 Release: PyPI distribution name and published wheels
-- [ ] #64 SurfaceMesh: document the 0.1 mm `surface_error_mm` limit, and say which check failed
-- [ ] #66 Undercut neck check: give the clearance and the cell size it needs
-- [ ] #95 Siemens 808D posts: tapping (CYCLE84 / G331, ISO G84/G74)
-- [ ] #96 FANUC 0i-MB post: M29 S rigid tapping form
-- [ ] #97 Haas NGC post: G86 needs a source for spindle restart
-- [ ] #108 Material check: keep the per-move proof across resumed streams; scale work budgets
+- #20 Validate every controller post on real machines (start with the LinuxCNC simulator in CI)
+- #21 Release: PyPI distribution name and published wheels
+- #95 Siemens 808D posts: tapping (CYCLE84 / G331, ISO G84/G74)
+- #97 Haas NGC post: G86 needs a source for spindle restart
 
-## Done
+## Not yet placed
 
-- [x] #22 Optimization baseline: benchmark workloads and toolpath quality metrics
-- [x] #58 Posting: adaptive orbits cannot be posted at 3 decimals (native_arcs lowering refuses closed circles)
-- [x] #10 Left-hand tapping
-- [x] #9 Trochoidal slots along curved paths
-- [x] #13 Haas NGC post: dwell and canned drilling cycles
-- [x] #11 Deburr finishing (edge breaking along sharp edges)
-- [x] #65 Multi-tool jobs: post fails at the first tool change unless `Setup.tool_change` matches the tool table
-- [x] #87 Project along flow_paths(along="u") fails: duplicate last row gives a zero-length link
-- [x] #88 steep_and_shallow: Waterline and Parallel floor rules conflict for parts taller than the cutting length
-- [x] #72 Material check stays uncertain on a correctly machined prismatic part (wall cells, through-hole interiors)
-- [x] #106 Material check: per-move gouge proof for prismatic targets
-- [x] #89 Roughing runtime and program length scale with mesh facets, not the allowance
-- [x] #100 Turning: a thread plans and simulates but Job.post stops after the first pass
-- [x] #101 Turning: a face groove as wide as the face-grooving blade fails with 'line must have nonzero length'
-- [x] #102 Turning: an inside groove after facing fails with 'needs an open hole in front of it'
-- [x] #103 Turning: tools need an insert thickness and out-of-plane holder bodies
-- [x] #12 Geodesic finishing
-- [x] #119 Geodesic finishing: tool-centre mode (spacing on the radius-offset surface)
+Open issues that still need a phase. Place each by dependency (correctness
+bugs into Phase 1) in a roadmap-only PR.
+
+- #157 Milling: an operation that runs a caller-supplied toolpath through the same simulation, checks and posting
+- #160 Roughing: the shank/holder guard can't prove clearance cleared by earlier layers unless a move exactly repeats one
+- #166 Machine travel: a move starting exactly on the travel limit is uncertain
+- #167 Roughing with AdaptiveClearing: no entry found, or the posted journal grows past 1 GB
+- #168 Tool change: no mode for a controller whose M6 doesn't move (LinuxCNC T M6 G43 H)
+- #169 Arc radius check at zero tolerance depends on the platform's hypot
+- #170 Turning tools: one clearance angle for every side of the insert
+- #171 Pocket and Contour: ramp entry along the path
+- #172 Tabs at given positions
+- #173 Contour following the part's outline at each depth (silhouette)
+- #174 Trace with a side offset (an open chain of edges, cutter on one side)
+- #175 Parallel: rows all cut one way
+- #176 Machine travel: one tip box per scene doesn't fit tools of different gauge lengths
+- #177 FANUC 0i-MB post with several tools needs measured tip positions
+- #178 Makera Carvera post, in Python and Rust
