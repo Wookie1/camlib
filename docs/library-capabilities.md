@@ -181,7 +181,7 @@ different quantities; setting one does not replace another.
 
 ## Posting
 
-Machines and posts are Python; the named Haas NGC 2020 reference, default post and declared dialects also
+Machines and posts are Python; the named Haas NGC 2020 and Makera Carvera references, default post and declared dialects also
 run in Rust, without Python, with byte-identical output
 ([Posting without Python](posts.md#posting-without-python-rust-webassembly)).
 The engine handles units, modal state, work
@@ -209,10 +209,11 @@ controller parameters, real offsets) is outside what camlib can check.
 
 LinuxCNC is the `GCodeDialect.linuxcnc()` dialect of an ordinary `Machine`.
 Haas NGC 2020 also runs in Rust via the explicit `controller.name="haas_ngc"`
-machine JSON contract; the Python example stays available. Remaining controller
+machine JSON contract; [Makera Carvera](carvera-post.md) uses `controller.name="carvera"`.
+Both Python examples stay available. Remaining controller
 subclasses require Python. Rust job replay does not yet support lathe setups.
 
-Python controller posts (examples): GRBL 1.1h (laser mode `M4 S`), Haas NGC,
+Python controller posts (examples): GRBL 1.1h (laser mode `M4 S`), Haas NGC, Makera Carvera,
 FANUC 0i-MB, FANUC lathe (G-code system A), Siemens 808D (native and ISO),
 Centroid CNC12 (mill, lathe and plasma), LinuxCNC QtPlasmaC, WinCNC plasma.
 

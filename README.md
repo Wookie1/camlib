@@ -79,7 +79,7 @@ refusals, overhang/rotary limits (#1/#2), and external setup premises.
 
 Postprocessors: every machine is a `camlib.post.Machine` with a declared dialect
 (`GCodeDialect.linuxcnc()` for LinuxCNC). Documented Python controller posts:
-GRBL 1.1h (with laser mode), Haas NGC, FANUC 0i-MB and FANUC lathes (system A),
+GRBL 1.1h (with laser mode), Haas NGC, [Makera Carvera](docs/carvera-post.md), FANUC 0i-MB and FANUC lathes (system A),
 Siemens 808D (native and ISO) and Centroid CNC12 (mill, lathe and plasma),
 LinuxCNC QtPlasmaC and WinCNC (plasma). Not
 supported yet: 4/5-axis, undercuts.

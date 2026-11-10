@@ -1,0 +1,375 @@
+{
+  "manifest": {
+    "version": 1,
+    "run": {
+      "id": "carvera-arcs-fixture",
+      "revision": "1@0ead045c41dac91becbf7ffdb041727029836cdb32b80bb72f6441e3a7b23ca8"
+    },
+    "stock": {
+      "version": 1,
+      "units": "mm",
+      "min_mm": [
+        0,
+        0,
+        0
+      ],
+      "max_mm": [
+        40,
+        40,
+        10
+      ],
+      "cell_size_mm": 0.2,
+      "max_cells": 4294967295
+    },
+    "tools": [
+      {
+        "id": "em6",
+        "cutter": {
+          "id": "e6",
+          "name": "e6",
+          "shape": {
+            "kind": "flat"
+          },
+          "diameter_mm": 6,
+          "cutting_length_mm": 20,
+          "overall_length_mm": 60,
+          "shank_diameter_mm": 6,
+          "flutes": 3,
+          "center_cutting": true,
+          "material": "carbide",
+          "neck": null
+        },
+        "stickout_mm": 35,
+        "gauge_length_mm": 60,
+        "holders": [
+          {
+            "z_min_mm": 35,
+            "z_max_mm": 60,
+            "radius_min_mm": 8,
+            "radius_max_mm": 8
+          }
+        ]
+      }
+    ],
+    "initial_position_mm": [
+      0,
+      0,
+      14
+    ],
+    "sweep": {
+      "tolerance_mm": 1e-05,
+      "chord_error_mm": 0.002,
+      "max_tip_step_mm": 0.1,
+      "max_segments": 100000,
+      "max_scratch_cells": 4294967295,
+      "max_changed_cells": 4294967295,
+      "max_cell_visits": 100000000
+    },
+    "operations": [
+      {
+        "id": "walls",
+        "tool": "em6",
+        "region": {
+          "version": 1,
+          "units": "mm",
+          "name": "round",
+          "boundary_error_mm": 0,
+          "components": [
+            {
+              "outer": {
+                "vertices": [
+                  [
+                    9.00390625,
+                    16,
+                    1
+                  ],
+                  [
+                    22.99609375,
+                    16,
+                    1
+                  ]
+                ]
+              },
+              "holes": []
+            }
+          ],
+          "source": {
+            "job_sources": {}
+          }
+        },
+        "floor_z_mm": 8,
+        "stepdown_mm": 2,
+        "clearance_z_mm": 14,
+        "boundaries": "outer",
+        "radial_allowance_mm": 0,
+        "bottom_allowance_mm": 0,
+        "feed_mm_min": 600,
+        "plunge_mm_min": 150,
+        "boundary_tolerance_mm": 0.0078125,
+        "tolerance_mm": 1e-05,
+        "reverse": true,
+        "lead_in_mm": 3,
+        "lead_out_mm": 3,
+        "spindle_rpm": 12000,
+        "work_offset": 1,
+        "tool_number": 1,
+        "length_register": 1,
+        "coolant": "mist",
+        "kind": "contour"
+      }
+    ],
+    "rapid_retracts": true
+  },
+  "program_id": "top",
+  "frame": {
+    "origin_mm": [
+      0,
+      0,
+      0
+    ],
+    "x": [
+      1,
+      0,
+      0
+    ],
+    "y": [
+      0,
+      1,
+      0
+    ],
+    "z": [
+      0,
+      0,
+      1
+    ]
+  },
+  "machine": {
+    "name": "synthetic Carvera",
+    "tools": [
+      {
+        "tool": "em6",
+        "number": 1,
+        "length_register": 1,
+        "gauge_length_mm": 60,
+        "position_after_mm": [
+          0,
+          0,
+          14
+        ],
+        "diameter_register": null
+      }
+    ],
+    "dialect": {
+      "commands": [
+        {
+          "effect": "units_mm",
+          "code": "G21"
+        },
+        {
+          "effect": "absolute",
+          "code": "G90"
+        },
+        {
+          "effect": "plane_xy",
+          "code": "G17"
+        },
+        {
+          "effect": "plane_xz",
+          "code": "G18"
+        },
+        {
+          "effect": "plane_yz",
+          "code": "G19"
+        },
+        {
+          "effect": "feed_per_minute",
+          "code": "G94"
+        },
+        {
+          "effect": "rapid",
+          "code": "G0"
+        },
+        {
+          "effect": "linear",
+          "code": "G1"
+        },
+        {
+          "effect": "arc_cw",
+          "code": "G2"
+        },
+        {
+          "effect": "arc_ccw",
+          "code": "G3"
+        },
+        {
+          "effect": "spindle_cw",
+          "code": "M3"
+        },
+        {
+          "effect": "spindle_off",
+          "code": "M5"
+        },
+        {
+          "effect": "tool_change",
+          "code": "M6"
+        },
+        {
+          "effect": "mist",
+          "code": "M7"
+        },
+        {
+          "effect": "coolant_off",
+          "code": "M9"
+        },
+        {
+          "effect": "end",
+          "code": "M30"
+        },
+        {
+          "effect": "dwell",
+          "code": "G4"
+        }
+      ],
+      "work_offsets": [
+        "G54",
+        "G55",
+        "G56",
+        "G57",
+        "G58",
+        "G59"
+      ],
+      "axes": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "centers": [
+        "I",
+        "J",
+        "K"
+      ],
+      "tool_word": "T",
+      "length_word": "H",
+      "feed_word": "F",
+      "speed_word": "S",
+      "parentheses_comments": true,
+      "tool_change": "m6",
+      "length_activation": "explicit",
+      "radius_tolerance_mm": 0,
+      "radius_relative_tolerance": 0.001,
+      "fixed_modes": [
+        "center_incremental",
+        "rpm_mode",
+        "radius_off",
+        "cycles_off",
+        "frame_reset",
+        "exact_stop"
+      ],
+      "tap_pitch_word": null,
+      "compensation_word": "D",
+      "compensation_with_move": false,
+      "compensation_register": true,
+      "dwell_word": "P",
+      "dwell_resolution_s": 0.001,
+      "dwell_max_s": 100000.0,
+      "cycle_dwell_unit": "s",
+      "peck_reentry_mm": 0.254,
+      "chip_break_lift_mm": 0.254,
+      "oriented_edge_deg": null,
+      "beam_s_max": null,
+      "beam_effect": "spindle_cw",
+      "x_diameter": false,
+      "thread_lead_word": "K",
+      "height_control_word": null,
+      "css_limit_word": null,
+      "probing": null,
+      "probe_fast_feed_mm_min": null,
+      "probe_switching": false
+    },
+    "work_offset": 1,
+    "frame": {
+      "origin_mm": [
+        0,
+        0,
+        0
+      ],
+      "x": [
+        1,
+        0,
+        0
+      ],
+      "y": [
+        0,
+        1,
+        0
+      ],
+      "z": [
+        0,
+        0,
+        1
+      ]
+    },
+    "work_to_machine": {
+      "origin_mm": [
+        0,
+        0,
+        -77
+      ],
+      "x": [
+        1,
+        0,
+        0
+      ],
+      "y": [
+        0,
+        1,
+        0
+      ],
+      "z": [
+        0,
+        0,
+        1
+      ]
+    },
+    "tip_travel_mm": null,
+    "output_units": "mm",
+    "decimals": 3,
+    "tolerance_mm": 0.01,
+    "feed_tolerance_mm_min": 0.1,
+    "traverse_feed_mm_min": null,
+    "max_feed_mm_min": 10000,
+    "max_spindle_rpm": 30000,
+    "planes": [
+      "xy",
+      "xz",
+      "yz"
+    ],
+    "arcs": true,
+    "helices": true,
+    "max_sweep_rad": 3.141592653589793,
+    "max_tool_number": 6,
+    "max_length_register": 6,
+    "tool_changes": true,
+    "flood": false,
+    "mist": true,
+    "revision": "1",
+    "tool_change_position_mode": "table",
+    "tool_change_home_z_mm": null,
+    "rapid_mm_min": 6000,
+    "controller": {
+      "name": "carvera",
+      "initial_gauge_length_mm": 60,
+      "unmodified_coordinates": true,
+      "automatic_tool_length": true
+    }
+  },
+  "accept": [
+    "unchecked_machine"
+  ],
+  "lowering": {
+    "chord_tolerance_mm": 0.0025,
+    "max_segments_per_source": 1000000,
+    "max_total_segments": 10000000,
+    "native_arcs": true
+  }
+}

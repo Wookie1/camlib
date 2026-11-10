@@ -286,6 +286,7 @@ them against your machine before use:
 | --- | --- | --- |
 | `GCodeDialect.linuxcnc()` | LinuxCNC 2.9 | `GCodeDialect.linuxcnc(beam_s_max=...)` writes a beam as `M3 S`/`M5`; `probing="g38"` writes probing cycles |
 | `grbl_post.py` | GRBL 1.1h | Lines only (arcs as checked segments), one preloaded tool, checked with GRBL's own binary32 arithmetic; vertical moves are written with Z only. `define_machine(..., beam_s_max=1000)` (= `$30`) writes a laser as `M4 S` (laser mode `$32=1`). `grbl_linear.py` is a complete example |
+| `carvera_post.py` | Makera Carvera (metric milling) | Python and Rust named pair; [setup and retract premises](carvera-post.md) |
 | `haas_ngc_post.py` | Haas NGC (2020 manual) | [setup notes](haas-ngc-post.md) |
 | `fanuc_0imb_post.py` | FANUC 0i-MB | [setup notes](fanuc-0imb-post.md); `inspection_plus_fast_feed_mm_min=` posts probing as Renishaw Inspection Plus macros |
 | `siemens808d_post.py` | SINUMERIK 808D native | [setup notes](siemens808d-post.md) |
@@ -311,7 +312,7 @@ jobs with canned cycles, tapping, cutter compensation, dwells, plasma words,
 probing cycles on both probing back ends (LinuxCNC G38.x and Inspection Plus
 macros, #147), lowering, inch output and traverse feeds). Posts you write in Python stay
 Python. The default post, dialects declared as data, and the explicitly named
-Haas NGC reference post run in Rust. Other controller subclasses remain Python.
+Haas NGC and Makera Carvera reference posts run in Rust. Other controller subclasses remain Python.
 
 The machine and its dialect cross as JSON: `Machine.to_dict()`, the same form
 a posted run records as its `definition["machine"]`, with the #116
@@ -413,3 +414,8 @@ definition. Those are inputs you supply.
 The post lifecycle follows FreeCAD CAM's
 [postprocessor](https://github.com/FreeCAD/FreeCAD/blob/920d14763241267340e755f3d3b6ece8ef60fa43/src/Mod/CAM/Path/Post/Processor.py)
 concepts.
+
+The named `"name": "carvera"` pair targets metric Makera Carvera milling.
+Its explicit tool-length, coordinate and planned-retract premises are described
+in [Carvera setup notes](carvera-post.md). Python requires `CarveraPost` with
+`CarveraDecoder`; Rust dispatches the same named pair from the machine JSON.

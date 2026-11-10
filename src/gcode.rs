@@ -9,6 +9,7 @@
 //! module serves callers without a Python runtime, such as a WebAssembly
 //! build. Its output is byte-identical to the Python default post's for the
 //! same program and machine (python/tests/test_rust_post.py).
+pub mod carvera;
 pub mod controller;
 pub mod decode;
 pub mod engine;

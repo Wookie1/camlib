@@ -2762,6 +2762,8 @@ class PostEngine:
     def __init__(self, machine, post=GCodePost, *, decoder=NativeGCodeDecoder, lowering=None):
         self.machine = machine
         self.lowering = lowering
+        # Named pairs (including Haas NGC and Carvera) use the same contract
+        # below; a declared machine never silently selects the default pair.
         # Started source events not yet fully checked, oldest first.
         self._sources = []
         # Lowered runs: count of source arcs/helices by output form and reason.
