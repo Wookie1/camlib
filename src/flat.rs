@@ -175,6 +175,21 @@ fn golden_max(mut f: impl FnMut(f64) -> f64, lo: f64, hi: f64, steps: usize) -> 
     }
     fa.max(fb).max(f1).max(f2)
 }
+/// Work units for a triangle a chord query returns (bin lookup, dedupe and
+/// height tests).
+pub(crate) const WORK_TRIANGLE: u64 = 1;
+/// Work units for one triangle/section contact search along a chord (a
+/// golden-section search, two bisections and a concave bound: a few hundred
+/// distance and contact evaluations).
+pub(crate) const WORK_CONTACT: u64 = 64;
+/// Takes `cost` from `work`; false (and nothing taken) when it does not fit.
+fn charge(work: &mut u64, cost: u64) -> bool {
+    if *work < cost {
+        return false;
+    }
+    *work -= cost;
+    true
+}
 /// Where a unimodal (convex) function is least on [lo, hi].
 fn golden_argmin(mut f: impl FnMut(f64) -> f64, lo: f64, hi: f64, steps: usize) -> f64 {
     let phi = (5f64.sqrt() - 1.) / 2.;
@@ -1009,16 +1024,38 @@ impl Index {
         seen: &mut [u32],
         stamp: &mut u32,
     ) -> bool {
+        self.sections_chord_clear_within(a, b, sections, lift, seen, stamp, &mut { u64::MAX })
+            .expect("unlimited work budget")
+    }
+    /// `sections_chord_clear` within a work budget: each triangle the query
+    /// returns costs `WORK_TRIANGLE` and each contact search
+    /// `WORK_CONTACT`, taken from `work`. None when the budget runs out
+    /// before the chord is decided (not proven either way).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sections_chord_clear_within(
+        &self,
+        a: Vec3,
+        b: Vec3,
+        sections: &[Section],
+        lift: f64,
+        seen: &mut [u32],
+        stamp: &mut u32,
+        work: &mut u64,
+    ) -> Option<bool> {
         if a[2].min(b[2]) < self.floor + lift {
-            return false;
+            return Some(false);
         }
         let reach = sections.iter().map(|s| s.r1).fold(0., f64::max);
         let low = a[2].min(b[2]);
         let lowest = sections.iter().map(|s| s.z0).fold(f64::INFINITY, f64::min);
         let at = |t: f64| [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
         let tip = |t: f64| a[2] + t * (b[2] - a[2]);
-        let mut clear = true;
+        let mut clear = Some(true);
         self.visit([a[0], a[1]], [b[0], b[1]], reach, seen, stamp, |t| {
+            if !charge(work, WORK_TRIANGLE) {
+                clear = None;
+                return false;
+            }
             if t.max[2] - lowest + lift <= low {
                 return true;
             }
@@ -1037,6 +1074,10 @@ impl Index {
                 };
                 if gap(0).hypot(gap(1)) > s.r1 {
                     continue;
+                }
+                if !charge(work, WORK_CONTACT) {
+                    clear = None;
+                    return false;
                 }
                 let dist = |u: f64| t.distance_xy(at(u));
                 let near = golden_argmin(dist, 0., 1., 60);
@@ -1060,7 +1101,7 @@ impl Index {
                         .map_or(f64::NEG_INFINITY, |c| c + lift - tip(u))
                 };
                 if concave_max_upper(gap, u0, u1) > 0. {
-                    clear = false;
+                    clear = Some(false);
                     return false;
                 }
             }
@@ -1075,6 +1116,7 @@ impl Index {
     /// contact along the chord is concave in the position (the maximum over
     /// the triangle of a jointly concave function) and the tip height is
     /// linear, so the gap is bounded by `concave_max_upper`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bull_chord_bound_clear(
         &self,
@@ -1086,15 +1128,36 @@ impl Index {
         seen: &mut [u32],
         stamp: &mut u32,
     ) -> bool {
+        self.bull_chord_bound_clear_within(a, b, r, rc, lift, seen, stamp, &mut { u64::MAX })
+            .expect("unlimited work budget")
+    }
+    /// `bull_chord_bound_clear` within a work budget, charged as
+    /// `sections_chord_clear_within`. None when the budget runs out first.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bull_chord_bound_clear_within(
+        &self,
+        a: Vec3,
+        b: Vec3,
+        r: f64,
+        rc: f64,
+        lift: f64,
+        seen: &mut [u32],
+        stamp: &mut u32,
+        work: &mut u64,
+    ) -> Option<bool> {
         if a[2].min(b[2]) < self.floor + lift {
-            return false;
+            return Some(false);
         }
         let low = a[2].min(b[2]);
         let length = (b[0] - a[0]).hypot(b[1] - a[1]);
         let at = |t: f64| [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
         let tip = |t: f64| a[2] + t * (b[2] - a[2]);
-        let mut clear = true;
+        let mut clear = Some(true);
         self.visit([a[0], a[1]], [b[0], b[1]], r, seen, stamp, |t| {
+            if !charge(work, WORK_TRIANGLE) {
+                clear = None;
+                return false;
+            }
             // Contacts never exceed the triangle's top.
             if t.max[2] + lift <= low {
                 return true;
@@ -1106,6 +1169,10 @@ impl Index {
             };
             if gap(0).hypot(gap(1)) > r {
                 return true;
+            }
+            if !charge(work, WORK_CONTACT) {
+                clear = None;
+                return false;
             }
             let dist = |u: f64| t.distance_xy(at(u));
             let near = golden_argmin(dist, 0., 1., 60);
@@ -1143,7 +1210,7 @@ impl Index {
                     .map_or(f64::NEG_INFINITY, |c| c + lift - tip(u))
             };
             if concave_max_upper(gap, u0, u1) > 0. {
-                clear = false;
+                clear = Some(false);
                 return false;
             }
             true
@@ -2736,6 +2803,54 @@ mod tests {
                 assert!(proven, "{a:?}->{b:?} clear by {lowest} but not proven");
             }
         }
+    }
+
+    #[test]
+    fn chord_work_budget_leaves_a_chord_undecided_rather_than_passed() {
+        // The wall chord beside a Z 6 wall: decided with enough work, and
+        // undecided (never proven) when the budget runs out first.
+        let mesh = SurfaceMesh {
+            version: 1,
+            units: "mm".into(),
+            triangles: std::sync::Arc::new(vec![
+                [[0., 0., 0.], [20., 0., 0.], [0., 20., 0.]],
+                [[10., 0., 0.], [10., 20., 0.], [10.0001, 10., 6.]],
+            ]),
+            surface_error_mm: 0.,
+            source: serde_json::json!({}),
+        };
+        let index = Index::new(&mesh, -1., 3., &|| false).unwrap();
+        let mut seen = vec![0; index.len()];
+        let mut stamp = 0;
+        let cone = [Section {
+            z0: 0.,
+            r0: 0.1,
+            r1: 3.,
+            rise: 1.,
+            arc: 0.,
+        }];
+        let (a, b) = ([4., 5., 1.], [8., 15., 1.]);
+        let full = index.sections_chord_clear(a, b, &cone, 0., &mut seen, &mut stamp);
+        let mut work = u64::MAX;
+        let within =
+            index.sections_chord_clear_within(a, b, &cone, 0., &mut seen, &mut stamp, &mut work);
+        assert_eq!(within, Some(full));
+        let used = u64::MAX - work;
+        assert!(used >= WORK_TRIANGLE + WORK_CONTACT, "used {used}");
+        for budget in [0, used - 1] {
+            let mut work = budget;
+            assert_eq!(
+                index
+                    .sections_chord_clear_within(a, b, &cone, 0., &mut seen, &mut stamp, &mut work),
+                None,
+                "budget {budget} of {used}"
+            );
+        }
+        let mut work = 0;
+        assert_eq!(
+            index.bull_chord_bound_clear_within(a, b, 2., 0., 0., &mut seen, &mut stamp, &mut work),
+            None
+        );
     }
 
     #[test]
