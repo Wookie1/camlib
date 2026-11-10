@@ -726,6 +726,20 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// radial engagement, capped at `link_feed_mm_min`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub link_chip_thinning: bool,
+    /// engagement_front only. Cut long one-way passes: instead of always
+    /// starting the next pass at the nearest valid start, dry-run candidate
+    /// starts and take the one whose pass removes the most material per
+    /// second of travel plus cutting, so open strips beside a long wall are
+    /// cleared along their whole length instead of crosswise. Needs
+    /// `rapid_mm_min` to price a lift back to a start. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spiral: bool,
+    /// engagement_front only, with `spiral`. The machine's rapid traverse
+    /// rate (mm/min), declared by the caller: camlib never assumes machine
+    /// values, and scoring a lifted travel back to a pass start divides by
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rapid_mm_min: Option<f64>,
     /// Opt-in for targets tessellated face by face (CAD meshers that do not
     /// share edge vertices between faces): each layer's shadow is closed
     /// protectively, bridging gaps, notches and holes narrower than twice
@@ -788,6 +802,8 @@ impl<G> RoughingOperation<G> {
             ramp_clearance_mm: self.ramp_clearance_mm,
             link_feed_mm_min: self.link_feed_mm_min,
             link_chip_thinning: self.link_chip_thinning,
+            spiral: self.spiral,
+            rapid_mm_min: self.rapid_mm_min,
             seam_bridge_mm: self.seam_bridge_mm,
             id: self.id,
             tool: self.tool,
@@ -1285,6 +1301,7 @@ impl RoughingPlan {
             ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
             ("ramp_clearance_mm", op.ramp_clearance_mm),
             ("link_feed_mm_min", op.link_feed_mm_min),
+            ("rapid_mm_min", op.rapid_mm_min),
         ] {
             let Some(d) = value else { continue };
             if !matches!(
@@ -1296,13 +1313,31 @@ impl RoughingPlan {
             ) {
                 return Err(format!("{name} applies to engagement_front clearing only"));
             }
-            let max = if name == "link_feed_mm_min" { 1e6 } else { 1e3 };
+            let max = if name == "link_feed_mm_min" || name == "rapid_mm_min" {
+                1e6
+            } else {
+                1e3
+            };
             if !d.is_finite() || d <= 0. || d > max {
                 return Err(format!("roughing {name} {d} must be positive and finite"));
             }
         }
         if op.link_chip_thinning && op.link_feed_mm_min.is_none() {
             return Err("link_chip_thinning needs link_feed_mm_min: the thinned link feed is capped at the declared link feed".into());
+        }
+        if op.spiral
+            && !matches!(
+                op.clearing,
+                RoughingClearing::Adaptive {
+                    path_strategy: AdaptivePathStrategy::EngagementFront,
+                    ..
+                }
+            )
+        {
+            return Err("spiral applies to engagement_front clearing only".into());
+        }
+        if op.spiral && op.rapid_mm_min.is_none() {
+            return Err("spiral needs rapid_mm_min: scoring a lift back to a pass start divides by the machine's declared rapid rate".into());
         }
         match op.clearing {
             RoughingClearing::Offset {
@@ -1556,7 +1591,8 @@ impl RoughingPlan {
                             )?
                             .with_rapid_descent(op.rapid_descent_clearance_mm)
                             .with_ramp_clearance(op.ramp_clearance_mm)
-                            .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning),
+                            .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning)
+                            .with_spiral(op.spiral, op.rapid_mm_min),
                         )),
                         RoughingClearing::Adaptive {
                             path_strategy,

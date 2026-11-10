@@ -4201,3 +4201,293 @@ fn seam_bridge_closes_a_crossing_seam_between_separately_tessellated_faces() {
             .is_err()
     );
 }
+
+/// An open part (stock reaching well beyond the target's shadow on every
+/// side): the job's first entry must descend to depth outside the stock and
+/// feed in from the side, never bore a helix inside the stock. Before the
+/// outside-stock air proof, the first entry of a job had no committed sweeps
+/// to prove any start, so every outside candidate was rejected as unproven
+/// and the plan fell back to a helix inside a stock corner.
+#[test]
+fn engagement_front_open_part_first_entry_descends_outside_the_stock() {
+    let saved: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json")).unwrap();
+    let mut input = saved["cases"]["adaptive"]["policies"]["omit_proven_empty"]["input"].clone();
+    // The retained frustum sits at (4,4)-(28,24); widen the stock far past
+    // its shadow so the part is open all around.
+    input["stock"]["min_mm"] = serde_json::json!([-8.0, -8.0, 0.0]);
+    input["stock"]["max_mm"] = serde_json::json!([40.0, 36.0, 10.0]);
+    let op = &mut input["operations"][0];
+    op["omit_empty_cuts"] = false.into();
+    let clearing = op["clearing"].as_object_mut().unwrap();
+    for key in [
+        "orbit_radius_mm",
+        "min_orbit_radius_mm",
+        "local_orbit_tolerance_mm",
+    ] {
+        clearing.remove(key);
+    }
+    clearing.insert("path_strategy".into(), "engagement_front".into());
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let mut descended = f64::NAN;
+    let mut entries = 0;
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(entries < 100, "no cut within the first 100 motions");
+        entries += 1;
+        if motion.kind == MoveKind::Cut {
+            break;
+        }
+        assert!(
+            !matches!(motion.curve, Curve::Helix { .. }) && motion.kind != MoveKind::Lead,
+            "open part began with a bored entry: {:?} {:?}",
+            motion.kind,
+            motion.curve
+        );
+        if motion.kind == MoveKind::Plunge {
+            let p = motion.curve.end();
+            let outside = p[0] < -8. - 1. || p[0] > 40. + 1. || p[1] < -8. - 1. || p[1] > 36. + 1.;
+            assert!(outside, "first descent {p:?} not outside the stock");
+            descended = p[2];
+        }
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+    }
+    // top_z 10, stepdown 2: the first layer cuts at Z8.
+    assert!(
+        descended <= 8. + 1e-6,
+        "first descent stopped at {descended}, above the first layer Z8"
+    );
+}
+
+/// A closed axis-aligned box mesh (outward triangles) for a synthetic target.
+fn closed_box(x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> Vec<[[f64; 3]; 3]> {
+    let p = [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ];
+    let quad = |a, b, c, d| vec![[p[a], p[b], p[c]], [p[a], p[c], p[d]]];
+    [
+        quad(4, 6, 5, 7), // top (+z)
+        quad(0, 2, 1, 3), // bottom (-z)
+        quad(0, 1, 5, 4), // y0 face (-y)
+        quad(3, 7, 6, 2), // y1 face (+y)
+        quad(0, 4, 7, 3), // x0 face (-x)
+        quad(1, 2, 6, 5), // x1 face (+x)
+    ]
+    .concat()
+}
+
+/// Independent part certificate for the bar test (the frustum test's
+/// certificate, for this part): no cutter centre enters the retained bar
+/// x 0..60, y 12..28 grown by the cutter radius plus the radial allowance.
+fn certify_bar(c: &Curve) {
+    if c.start()[2].min(c.end()[2]) > 12. {
+        return;
+    }
+    let part = [[0., 12.], [60., 28.]];
+    let mut stack = vec![(0., 1., 0)];
+    let mut visits = 0;
+    while let Some((a, b, depth)) = stack.pop() {
+        visits += 1;
+        assert!(visits < 200_000, "part certificate work bound");
+        if box_distance(bounds(c, a, b), part) >= 3.1 {
+            continue;
+        }
+        assert!(
+            depth < 32,
+            "uncertified retained-bar column at {c:?}, interval{a}..{b}"
+        );
+        let m = (a + b) / 2.;
+        stack.push((a, m, depth + 1));
+        stack.push((m, b, depth + 1));
+    }
+}
+
+/// The bar job: stock (0,0,0)-(60,40,12) at cell 0.4, a full-length bar
+/// x 0..60, y 12..28, z 0..12 retained, a flat 6 mm tool, engagement_front
+/// clearing at 0.6 mm width, stepdown 6, floor 1. Both side strips run the
+/// stock's whole 60 mm length.
+fn spiral_bar_manifest(spiral: bool) -> StreamManifest {
+    let saved: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json")).unwrap();
+    let mut input = saved["cases"]["adaptive"]["policies"]["omit_proven_empty"]["input"].clone();
+    input["stock"]["min_mm"] = serde_json::json!([0.0, 0.0, 0.0]);
+    input["stock"]["max_mm"] = serde_json::json!([60.0, 40.0, 12.0]);
+    input["stock"]["cell_size_mm"] = 0.4.into();
+    input["initial_position_mm"] = serde_json::json!([0.0, 0.0, 14.0]);
+    input["tools"][0]["cutter"]["diameter_mm"] = 6.0.into();
+    input["tools"][0]["cutter"]["shank_diameter_mm"] = 6.0.into();
+    for holder in input["tools"][0]["holders"].as_array_mut().unwrap() {
+        holder["radius_max_mm"] = 6.0.into();
+        holder["radius_min_mm"] = 6.0.into();
+    }
+    let op = input["operations"][0].as_object_mut().unwrap();
+    op["omit_empty_cuts"] = false.into();
+    op["top_z_mm"] = 12.0.into();
+    op["floor_z_mm"] = 1.0.into();
+    op["stepdown_mm"] = 6.0.into();
+    op["clearance_z_mm"] = 14.0.into();
+    op["radial_allowance_mm"] = 0.1.into();
+    op["bottom_allowance_mm"] = 0.0.into();
+    op["target"] = serde_json::json!({
+        "version": 1,
+        "units": "mm",
+        "triangles": closed_box(0., 12., 0., 60., 28., 12.),
+        "surface_error_mm": 0.0,
+        "source": null,
+    });
+    let clearing = op["clearing"].as_object_mut().unwrap();
+    for key in [
+        "orbit_radius_mm",
+        "min_orbit_radius_mm",
+        "local_orbit_tolerance_mm",
+    ] {
+        clearing.remove(key);
+    }
+    clearing.insert("path_strategy".into(), "engagement_front".into());
+    clearing.insert("max_radial_engagement_mm".into(), 0.6.into());
+    if spiral {
+        let op = input["operations"][0].as_object_mut().unwrap();
+        op.insert("spiral".into(), true.into());
+        op.insert("rapid_mm_min".into(), 10000.0.into());
+    }
+    serde_json::from_value(input).unwrap()
+}
+
+/// Run the bar job to completion, committing every motion to stock, and
+/// return (mean first-layer cut length per pass mm, report). Every motion
+/// is certified against the bar, and every vertical entry is checked to
+/// descend only through cut stock or air (the frustum test's check).
+fn run_spiral_bar(spiral: bool) -> (f64, serde_json::Value) {
+    let m = spiral_bar_manifest(spiral);
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let mut history: Vec<camlib::motion::Motion> = Vec::new();
+    let mut current = m.initial_position_mm;
+    let (mut first_cut, mut first_passes) = (0f64, 0usize);
+    let mut in_cut = false;
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(history.len() < 60000, "unbounded engagement_front path");
+        assert_eq!(motion.curve.start(), current);
+        current = motion.curve.end();
+        certify_bar(&motion.curve);
+        if motion.kind == MoveKind::Plunge && current[2] < 12. {
+            for radial in [0., 1.5, 3.] {
+                for i in 0..16 {
+                    let angle = TAU * i as f64 / 16.;
+                    let p = [
+                        current[0] + radial * angle.cos(),
+                        current[1] + radial * angle.sin(),
+                    ];
+                    if p[0] < 0. || p[0] > 60. || p[1] < 0. || p[1] > 40. {
+                        continue;
+                    }
+                    let height = history
+                        .iter()
+                        .filter(|old| old.kind != MoveKind::Rapid)
+                        .map(|old| exact_height_for(&old.curve, p, 3., 12.))
+                        .fold(12f64, f64::min);
+                    assert!(
+                        height <= current[2] + 1e-6,
+                        "plunge into material at {p:?}: {height} > {}",
+                        current[2]
+                    );
+                }
+            }
+        }
+        let length = motion
+            .curve
+            .prepare(m.sweep.tolerance_mm)
+            .unwrap()
+            .length_mm();
+        // The first layer cuts at Z6: count its cut length and its passes
+        // (a pass is a maximal run of consecutive cutting motions).
+        let first_layer = motion.kind == MoveKind::Cut
+            && (motion.curve.start()[2] - 6.).abs() < 1e-6
+            && (motion.curve.end()[2] - 6.).abs() < 1e-6;
+        if first_layer {
+            first_passes += usize::from(!in_cut);
+            in_cut = true;
+            first_cut += length;
+        } else {
+            in_cut = false;
+        }
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+        history.push(motion);
+    }
+    plan.finish_report(&|| false).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    assert_eq!(report["completed_layers"], 2);
+    for layer in report["layers"].as_array().unwrap() {
+        let clearing = &layer["clearing"];
+        assert_eq!(clearing["strategy"], "engagement_front");
+        assert!(clearing["passes"].as_u64().unwrap() > 0);
+        assert!(
+            clearing["max_estimated_engagement_mm"].as_f64().unwrap() <= 1.3 * 0.6,
+            "{clearing}"
+        );
+    }
+    assert!(first_passes > 0, "no first-layer passes planned");
+    (first_cut / first_passes as f64, report)
+}
+
+/// Open strips beside a long part wall: with `spiral` on, the first layer's
+/// mean cut length per pass is at least 3x the plain mean and at least
+/// 25 mm - full-length one-way passes instead of short crosswise ones -
+/// while every certification, entry proof and engagement rule still holds.
+#[test]
+fn engagement_front_spiral_cuts_open_strips_lengthwise() {
+    let (off_mean, off_report) = run_spiral_bar(false);
+    let (on_mean, on_report) = run_spiral_bar(true);
+    eprintln!(
+        "mean first-layer cut per pass: spiral off {off_mean:.2} mm, spiral on {on_mean:.2} mm"
+    );
+    assert!(
+        on_mean >= 3. * off_mean,
+        "spiral mean {on_mean:.2} mm is not 3x the plain mean {off_mean:.2} mm"
+    );
+    assert!(on_mean >= 25., "spiral mean {on_mean:.2} mm below 25 mm");
+    // The plain run never dry-runs; the spiral run reports its scoring work.
+    for layer in off_report["layers"].as_array().unwrap() {
+        assert!(layer["clearing"].get("spiral_dry_runs").is_none());
+    }
+    let mut dry_runs = 0;
+    for layer in on_report["layers"].as_array().unwrap() {
+        dry_runs += layer["clearing"]["spiral_dry_runs"].as_u64().unwrap_or(0);
+    }
+    assert!(dry_runs > 0, "spiral mode reported no dry runs");
+    eprintln!("spiral dry runs across both layers: {dry_runs}");
+}

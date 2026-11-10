@@ -15,7 +15,7 @@ from unittest import mock
 from camlib import Engine
 from camlib.jobs import Job, Setup, RegenerationCache
 from camlib.motion import Program
-from camlib.operations import Roughing, StockEdgeEntry
+from camlib.operations import RasterClearing, Roughing, StockEdgeEntry
 from camlib.playback import Cursor, Player, RecordedRun
 from camlib.post import LoweringOptions, Machine, ToolSetting, post_events
 from camlib.simulation import OperationUpdate, Simulation, SimulationError
@@ -225,6 +225,79 @@ class RoughingTest(unittest.TestCase):
         self.assertEqual(paths[0], paths[1])
         with self.assertRaisesRegex(SimulationError, 'does not clear with path_strategy disk_front'):
             run(StockEdgeEntry(), AdaptiveClearing(3, path_strategy='disk_front'))
+
+    def test_spiral_mode_round_trips_and_is_refused_without_a_declared_rapid_rate(self):
+        from camlib.operations import AdaptiveClearing
+        from camlib.surface import SurfaceMesh
+        from camlib.simulation import StockSpec
+        from camlib.tools import EndMill, HolderSection, ToolAssembly
+
+        tool = ToolAssembly(
+            'em6',
+            EndMill('em6', diameter=6, flute_length=20, overall_length=60),
+            30,
+            60,
+            (HolderSection(30, 60, 8, 8),),
+        )
+
+        def box(x0, x1, y0, y1, z0, z1):
+            p = [(x, y, z) for z in (z0, z1) for y in (y0, y1) for x in (x0, x1)]
+            quads = ((0, 2, 3, 1), (4, 5, 7, 6), (0, 1, 5, 4), (2, 6, 7, 3), (0, 4, 6, 2), (1, 3, 7, 5))
+            return [
+                tri
+                for quad in quads
+                for tri in ((p[quad[0]], p[quad[1]], p[quad[2]]), (p[quad[0]], p[quad[2]], p[quad[3]]))
+            ]
+
+        def roughing(clearing=None, **extra):
+            return Roughing(
+                'rough',
+                tool,
+                SurfaceMesh(box(4, 20, 12, 20, 0, 9), 0.0),
+                top_z_mm=10,
+                floor_z_mm=1,
+                stepdown_mm=5,
+                clearance_z_mm=20,
+                retract_z_mm=11,
+                feed_z_mm=11,
+                clearing=clearing or AdaptiveClearing(1.0, path_strategy='engagement_front'),
+                radial_allowance_mm=0.2,
+                bottom_allowance_mm=0.2,
+                feed_mm_min=900,
+                plunge_mm_min=250,
+                spindle_rpm=6000,
+                tool_number=1,
+                length_register=1,
+                coolant='flood',
+                **extra,
+            )
+
+        # Defaults omit both options; they round-trip when set.
+        operation = roughing()
+        self.assertNotIn('spiral', operation.to_dict())
+        self.assertNotIn('rapid_mm_min', operation.to_dict())
+        authored = roughing(spiral=True, rapid_mm_min=10000.0).to_dict()
+        self.assertIs(authored['spiral'], True)
+        self.assertEqual(authored['rapid_mm_min'], 10000.0)
+
+        def run(op):
+            with Simulation(
+                stock=StockSpec((0, 0, 0), (24, 32, 10), 0.5),
+                tools=(tool,),
+                operations=(op,),
+                revision='1',
+                initial_position_mm=(0, 0, 20),
+            ) as sim:
+                for _ in sim.run_operations():
+                    pass
+
+        # spiral prices a lift back to a start by the machine's rapid rate:
+        # it is refused unless the caller declares one.
+        with self.assertRaisesRegex(Exception, 'rapid_mm_min'):
+            run(roughing(spiral=True))
+        # And it applies to engagement_front clearing only.
+        with self.assertRaisesRegex(Exception, 'spiral applies to engagement_front clearing only'):
+            run(roughing(clearing=RasterClearing(0.8), spiral=True))
 
     def test_empty_cut_policy_is_an_explicit_strict_python_boolean(self):
         operation = config()['operations'][0]
