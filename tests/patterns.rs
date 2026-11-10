@@ -84,8 +84,9 @@ fn run(m: &StreamManifest, op: ParallelOperation) -> (Vec<Motion>, ParallelPlan,
     plan.finish_report(&cancel).unwrap();
     for e in &plan.report().unproven_entries {
         assert!(
-            motions.iter().any(|m| m.kind == MoveKind::Plunge
-                && m.curve.end() == [e.x_mm, e.y_mm, e.z_mm]),
+            motions
+                .iter()
+                .any(|m| m.kind == MoveKind::Plunge && m.curve.end() == [e.x_mm, e.y_mm, e.z_mm]),
             "listed unproven entry {e:?} has no plunge"
         );
     }

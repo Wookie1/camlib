@@ -76,7 +76,6 @@ class FlatTest(unittest.TestCase):
                         finished += 1
             self.assertGreater(finished, 1000)
 
-
     def test_runs_under_stock_are_entered_by_a_shallow_ramp_not_a_plunge(self):
         # Fresh 8 mm stock stands over both flats (7 and 4): no straight
         # plunge may take the flat end mill down through it; each such run
@@ -90,9 +89,18 @@ class FlatTest(unittest.TestCase):
             (HolderSection(30, 60, 4, 4),),
         )
         op = camlib.Flat(
-            "flats", tool, surface, 0, 1.5, 12,
-            feed_mm_min=600, plunge_mm_min=150, spindle_rpm=12000,
-            tool_number=1, length_register=1, coolant="flood",
+            "flats",
+            tool,
+            surface,
+            0,
+            1.5,
+            12,
+            feed_mm_min=600,
+            plunge_mm_min=150,
+            spindle_rpm=12000,
+            tool_number=1,
+            length_register=1,
+            coolant="flood",
         )
         report, motions = None, []
         with Simulation(
