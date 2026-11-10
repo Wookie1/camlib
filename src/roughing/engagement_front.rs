@@ -145,6 +145,12 @@ pub struct EngagementFrontReport {
     pub thinned_link_mm: f64,
     pub unproven_air_starts: usize,
     pub grid_refreshes: usize,
+    /// Pass starts `spiral` scored by dry-running the pass they lead.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spiral_dry_runs: usize,
+    /// Upstream moves `spiral` accepted while refining a chosen start.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spiral_upstream_moves: usize,
     /// Why passes ended: material exhausted ahead, the far side would
     /// overload, the front thinned out, or the region boundary blocked it.
     pub pass_ends_exhausted: usize,
@@ -188,6 +194,8 @@ impl Default for EngagementFrontReport {
             thinned_link_mm: 0.,
             unproven_air_starts: 0,
             grid_refreshes: 0,
+            spiral_dry_runs: 0,
+            spiral_upstream_moves: 0,
             pass_ends_exhausted: 0,
             pass_ends_overload: 0,
             pass_ends_thin: 0,
@@ -239,6 +247,23 @@ impl Layer {
         self.g.for_disk(p, rad, |k, _, _| {
             if cleared[k] > z {
                 removed += usize::from(top[k].min(cleared[k]) > floor);
+                cleared[k] = z;
+            }
+        });
+        removed
+    }
+    /// `cut`, logging every `(cell, old cleared)` it changes so the caller
+    /// restores it: a scoring dry run follows the front with this and undoes
+    /// the log, leaving the layer exactly as it was. A cell is logged once
+    /// (after its first cut `cleared[k] == z`, so no later step re-cuts it).
+    fn cut_logged(&mut self, p: Point, rad: f64, log: &mut Vec<(usize, f64)>) -> usize {
+        let (z, floor) = (self.z, self.z + self.material_guard);
+        let (cleared, top) = (&mut self.cleared, &self.top);
+        let mut removed = 0;
+        self.g.for_disk(p, rad, |k, _, _| {
+            if cleared[k] > z {
+                removed += usize::from(top[k].min(cleared[k]) > floor);
+                log.push((k, cleared[k]));
                 cleared[k] = z;
             }
         });
@@ -493,6 +518,14 @@ const FIT_FRACTION: f64 = 0.25;
 
 type Pending = (Curve, MoveKind, Option<f64>);
 
+/// State of a scoring dry run of `follow` (`spiral` mode): the undo log of
+/// the cuts the pass makes on the layer and how many material cells it
+/// removed. The caller restores the log so nothing is committed.
+struct DryRun {
+    log: Vec<(usize, f64)>,
+    removed: usize,
+}
+
 pub(crate) struct EngagementFrontPlan {
     guides: PocketPlan,
     op: PocketOperation,
@@ -506,6 +539,10 @@ pub(crate) struct EngagementFrontPlan {
     link_feed: Option<f64>,
     /// See `RoughingOperation::link_chip_thinning`.
     chip_thinning: bool,
+    /// See `RoughingOperation::spiral`.
+    spiral: bool,
+    /// See `RoughingOperation::rapid_mm_min`.
+    rapid_mm_min: Option<f64>,
     r: f64,
     width: f64,
     climb: bool,
@@ -580,6 +617,8 @@ impl EngagementFrontPlan {
             ramp_clearance: None,
             link_feed: None,
             chip_thinning: false,
+            spiral: false,
+            rapid_mm_min: None,
             r,
             width,
             climb,
@@ -606,6 +645,13 @@ impl EngagementFrontPlan {
     pub(crate) fn with_link_feed(mut self, feed: Option<f64>, chip_thinning: bool) -> Self {
         self.link_feed = feed;
         self.chip_thinning = chip_thinning;
+        self
+    }
+    /// See `RoughingOperation::spiral` and `RoughingOperation::rapid_mm_min`
+    /// (validated at the operation: `spiral` comes with a rapid rate).
+    pub(crate) fn with_spiral(mut self, spiral: bool, rapid_mm_min: Option<f64>) -> Self {
+        self.spiral = spiral;
+        self.rapid_mm_min = rapid_mm_min;
         self
     }
     pub(crate) fn with_rapid_descent(mut self, clearance: Option<f64>) -> Self {
@@ -906,7 +952,18 @@ impl EngagementFrontPlan {
 
     /// Follow the material front from `start`. Returns the centre polyline
     /// (first point = start) and whether any material was cut.
-    fn follow(&mut self, start: Point, heading: f64, approach: bool) -> (Vec<Point>, bool) {
+    /// With `dry`, the pass is followed for scoring only (see `spiral`):
+    /// cuts go through `Layer::cut_logged` for the caller to undo, the run
+    /// is capped, and `self.report` is left untouched (the layer's `dead`,
+    /// `thin` and `candidates` are not read or written by `follow`, and
+    /// `scratch` is taken and returned here as in a real pass).
+    fn follow(
+        &mut self,
+        start: Point,
+        heading: f64,
+        approach: bool,
+        mut dry: Option<&mut DryRun>,
+    ) -> (Vec<Point>, bool) {
         let (r, w) = (self.r, self.width);
         let side = if self.climb { 1. } else { -1. };
         let remnant = self.remnant;
@@ -925,7 +982,8 @@ impl EngagementFrontPlan {
         let mut idle = 0;
         let mut max_eng: f64 = 0.;
         let mut end = 0;
-        for _ in 0..2_000_000 {
+        let steps = if dry.is_some() { 4_000 } else { 2_000_000 };
+        for _ in 0..steps {
             layer.gather(p, r + ds + 2. * c, &mut cells);
             let f = |phi: f64, layer: &Layer| {
                 let q = [p[0] + ds * (th + phi).cos(), p[1] + ds * (th + phi).sin()];
@@ -1015,24 +1073,56 @@ impl EngagementFrontPlan {
             // step merely meets: cells just beyond the cutter's reach along a
             // boundary count in the step's area but are never cleared, and a
             // pass that only meets them would be planned again forever.
-            cut_any |= layer.cut(p, r) > 0;
+            let removed = match &mut dry {
+                Some(d) => layer.cut_logged(p, r, &mut d.log),
+                None => layer.cut(p, r),
+            };
+            if let Some(d) = &mut dry {
+                d.removed += removed;
+            }
+            cut_any |= removed > 0;
             idle += usize::from(!cut_any);
             pts.push(p);
         }
         self.scratch = cells;
         if cut_any {
-            match end {
-                0 => self.report.pass_ends_exhausted += 1,
-                1 => self.report.pass_ends_overload += 1,
-                2 => self.report.pass_ends_thin += 1,
-                _ => self.report.pass_ends_boundary += 1,
+            if dry.is_none() {
+                match end {
+                    0 => self.report.pass_ends_exhausted += 1,
+                    1 => self.report.pass_ends_overload += 1,
+                    2 => self.report.pass_ends_thin += 1,
+                    _ => self.report.pass_ends_boundary += 1,
+                }
+                self.report.max_estimated_engagement_mm =
+                    self.report.max_estimated_engagement_mm.max(max_eng);
             }
-            self.report.max_estimated_engagement_mm =
-                self.report.max_estimated_engagement_mm.max(max_eng);
         } else {
             pts.truncate(1);
         }
         (pts, cut_any)
+    }
+
+    /// Run `follow` from `start` as a `spiral` scoring dry run: the pass is
+    /// followed with an undo log and rolled back, so the layer and every
+    /// other piece of plan state (report included) end exactly as they
+    /// began. Returns (cut path length mm, material cells removed).
+    fn dry_run_follow(&mut self, start: Point, heading: f64) -> (f64, usize) {
+        let mut dry = DryRun {
+            log: vec![],
+            removed: 0,
+        };
+        let (pts, cut) = self.follow(start, heading, true, Some(&mut dry));
+        let layer = self.layer.as_mut().unwrap();
+        for (k, old) in dry.log {
+            layer.cleared[k] = old;
+        }
+        let mut length = 0.;
+        if cut {
+            for w in pts.windows(2) {
+                length += (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
+            }
+        }
+        (length, dry.removed)
     }
 
     /// A stay-down link from `a` to `b` through already cleared stock: the
@@ -1546,26 +1636,32 @@ impl EngagementFrontPlan {
                 return Err("engagement_front planning cancelled".into());
             }
             let pos = [self.position[0], self.position[1]];
-            // Nearest valid start among the cached candidates.
-            let mut found = None;
-            loop {
-                let layer = self.layer.as_ref().unwrap();
-                let best = layer
-                    .candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &k)| {
-                        let q = layer.g.center(k);
-                        (i, k, (q[0] - pos[0]).hypot(q[1] - pos[1]))
-                    })
-                    .min_by(|a, b| a.2.total_cmp(&b.2));
-                let Some((i, k, _)) = best else { break };
-                self.layer.as_mut().unwrap().candidates.swap_remove(i);
-                if let Some(dir) = self.candidate_direction(k) {
-                    found = Some((k, dir));
-                    break;
+            // Nearest valid start among the cached candidates, or with
+            // `spiral` the best start found by dry-running candidates.
+            let found = if self.spiral {
+                self.spiral_candidate(pos)
+            } else {
+                let mut found = None;
+                loop {
+                    let layer = self.layer.as_ref().unwrap();
+                    let best = layer
+                        .candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &k)| {
+                            let q = layer.g.center(k);
+                            (i, k, (q[0] - pos[0]).hypot(q[1] - pos[1]))
+                        })
+                        .min_by(|a, b| a.2.total_cmp(&b.2));
+                    let Some((i, k, _)) = best else { break };
+                    self.layer.as_mut().unwrap().candidates.swap_remove(i);
+                    if let Some(dir) = self.candidate_direction(k) {
+                        found = Some((k, dir));
+                        break;
+                    }
                 }
-            }
+                found
+            };
             let Some((k, dir)) = found else {
                 if refreshed {
                     if self.revive_thin_starts() {
@@ -1619,7 +1715,7 @@ impl EngagementFrontPlan {
             }
             let side = if self.climb { 1. } else { -1. };
             let heading = (side * dir[0]).atan2(-side * dir[1]);
-            let (pts, cut) = self.follow(q, heading, true);
+            let (pts, cut) = self.follow(q, heading, true, None);
             if !cut {
                 if !self.remnant {
                     self.layer.as_mut().unwrap().thin.push(q);
@@ -1674,6 +1770,154 @@ impl EngagementFrontPlan {
             self.report.passes += 1;
             return Ok(true);
         }
+    }
+
+    /// `spiral`: score a candidate start `q` with heading `dir`. The pass
+    /// it leads is dry-run (nothing committed), and the score is the area
+    /// it removes per second of travel plus cutting. Travel is the proven
+    /// stay-down link at the link feed when one is possible (the same test
+    /// `plan_pass` makes), else the lift across at the retract height and
+    /// back down, at the caller-declared rapid rate.
+    fn spiral_score(&mut self, q: Point, dir: Point, here: Point, at_layer: bool) -> f64 {
+        let r = self.r;
+        let rapid = self
+            .rapid_mm_min
+            .expect("spiral without rapid_mm_min is refused at the operation");
+        let c = self.layer.as_ref().unwrap().g.c;
+        let z = self.z;
+        let d = (q[0] - here[0]).hypot(q[1] - here[1]);
+        let side = if self.climb { 1. } else { -1. };
+        let heading = (side * dir[0]).atan2(-side * dir[1]);
+        let (length, removed) = self.dry_run_follow(q, heading);
+        self.report.spiral_dry_runs += 1;
+        let keep_down = 6. * r;
+        let link_feed = self.link_feed.unwrap_or(self.op.feed_mm_min);
+        let travel_s = if at_layer
+            && d <= keep_down
+            && self.link_samples(here, q).is_some()
+            && self
+                .guides
+                .stroke_geometry_fits_radius(Stroke::line(here, q), r)
+        {
+            d / link_feed * 60.
+        } else {
+            (2. * (self.heights.retract - z).abs() + d) / rapid * 60.
+        };
+        removed as f64 * c * c / (travel_s + length / self.op.feed_mm_min * 60. + 1e-9)
+    }
+
+    /// `spiral`: choose this pass's start by dry-running candidates instead
+    /// of taking the nearest valid one. Picks: the nearest valid candidate,
+    /// then the nearest valid candidate at least 2r, 4r, 8r, 16r, 32r, 64r,
+    /// 128r and 256r away (a scale with none is skipped), each validated
+    /// with `candidate_direction` as the plain path does (invalid
+    /// candidates leave the list, as there). Each pick's score is its
+    /// dry-run pass's removed area per second of travel plus cutting; the
+    /// best pick is refined upstream along its heading, then returned for
+    /// `plan_pass` to run through the unchanged link / descent / plunge,
+    /// `follow` and `emit_cuts` path.
+    fn spiral_candidate(&mut self, pos: Point) -> Option<(usize, Point)> {
+        let r = self.r;
+        let mut order: Vec<(f64, usize)> = {
+            let layer = self.layer.as_ref().unwrap();
+            layer
+                .candidates
+                .iter()
+                .map(|&k| {
+                    let q = layer.g.center(k);
+                    ((q[0] - pos[0]).hypot(q[1] - pos[1]), k)
+                })
+                .collect()
+        };
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let scales = [0., 2., 4., 8., 16., 32., 64., 128., 256.].map(|m| m * r);
+        let mut picks: Vec<(usize, Point, f64)> = vec![];
+        let mut invalid: Vec<usize> = vec![];
+        let mut scale = 0usize;
+        for &(d, k) in &order {
+            if scale == scales.len() {
+                break;
+            }
+            if d < scales[scale] {
+                continue;
+            }
+            match self.candidate_direction(k) {
+                Some(dir) => {
+                    picks.push((k, dir, d));
+                    while scale < scales.len() && d >= scales[scale] {
+                        scale += 1;
+                    }
+                }
+                None => invalid.push(k),
+            }
+        }
+        if !invalid.is_empty() {
+            self.layer
+                .as_mut()
+                .unwrap()
+                .candidates
+                .retain(|k| !invalid.contains(k));
+        }
+        let z = self.z;
+        let here = self.position;
+        let at_layer = (here[2] - z).abs() < 1e-9;
+        let from = [here[0], here[1]];
+        let mut best: Option<(usize, Point, f64)> = None;
+        for (k, dir, _) in picks {
+            let q = self.layer.as_ref().unwrap().g.center(k);
+            let score = self.spiral_score(q, dir, from, at_layer);
+            if best.is_none_or(|(_, _, b)| score > b) {
+                best = Some((k, dir, score));
+            }
+        }
+        // Upstream refinement of the best pick: with h its initial heading,
+        // try the nearest valid candidate to (start - 2r*k*h) for k = 1..32,
+        // moving while the score improves and stopping at the first
+        // non-improvement. Candidates found invalid here are only skipped:
+        // this is a search for a start, not the plain path's consumption.
+        if let Some((best_k, best_dir, mut best_score)) = best {
+            let side = if self.climb { 1. } else { -1. };
+            let heading = (side * best_dir[0]).atan2(-side * best_dir[1]);
+            let h = [heading.cos(), heading.sin()];
+            let start = self.layer.as_ref().unwrap().g.center(best_k);
+            for m in 1..=32usize {
+                let target = [
+                    start[0] - 2. * r * m as f64 * h[0],
+                    start[1] - 2. * r * m as f64 * h[1],
+                ];
+                let mut near: Vec<(f64, usize)> = {
+                    let layer = self.layer.as_ref().unwrap();
+                    layer
+                        .candidates
+                        .iter()
+                        .map(|&k| {
+                            let q = layer.g.center(k);
+                            ((q[0] - target[0]).hypot(q[1] - target[1]), k)
+                        })
+                        .collect()
+                };
+                near.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut found = None;
+                for &(_, k) in &near {
+                    if let Some(dir) = self.candidate_direction(k) {
+                        found = Some((k, dir));
+                        break;
+                    }
+                }
+                let Some((k, dir)) = found else { break };
+                let q = self.layer.as_ref().unwrap().g.center(k);
+                let score = self.spiral_score(q, dir, from, at_layer);
+                if score <= best_score {
+                    break;
+                }
+                best_score = score;
+                best = Some((k, dir, score));
+                self.report.spiral_upstream_moves += 1;
+            }
+        }
+        let (k, dir, _) = best?;
+        self.layer.as_mut().unwrap().candidates.retain(|&j| j != k);
+        Some((k, dir))
     }
 
     /// Before a helix bores onto the material `helix_pass` would pick: if
@@ -1829,7 +2073,7 @@ impl EngagementFrontPlan {
             let p = [start[0], start[1]];
             let radial = [(p[0] - q[0]) / rh, (p[1] - q[1]) / rh];
             let heading = (side * radial[0]).atan2(-side * radial[1]);
-            let (pts, cut) = self.follow(p, heading, false);
+            let (pts, cut) = self.follow(p, heading, false, None);
             if cut {
                 self.emit_cuts(&pts)?;
                 let end = *pts.last().unwrap();
