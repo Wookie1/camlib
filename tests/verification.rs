@@ -628,6 +628,83 @@ fn machine_travel_includes_arc_extrema_frames_and_declared_feed_limit() {
 }
 
 #[test]
+fn machine_travel_is_closed_a_tip_on_its_limit_is_inside() {
+    // #166: a mill at home sits on its travel limit (X 0, Y 0, Z top).
+    let mut s = scene(vec![]);
+    s.machine = Some(MachineLimits {
+        min_tip_mm: [0., 0., -515.],
+        max_tip_mm: [500., 400., -115.],
+        max_feed_mm_min: 10000.,
+        max_normal_accel_mm_s2: None,
+        max_axis_feed_mm_min: None,
+    });
+    s.work_to_machine.origin_mm = [200., 150., -300.];
+    let home = [-200., -150., 185.];
+    for (name, m) in [
+        ("down from home", line(home, [-200., -150., 150.])),
+        (
+            "along the X0/Y0/Z-top edge",
+            line(home, [-100., -150., 185.]),
+        ),
+        ("diagonal into home", line([-150., -100., 100.], home)),
+        (
+            "arc touching the top",
+            motion(Curve::Arc {
+                start: [-100., -150., 185.],
+                end: [-110., -150., 175.],
+                center: [-100., -150., 175.],
+                plane: Plane::Xz,
+                sweep_rad: -FRAC_PI_2,
+            }),
+        ),
+    ] {
+        let r = check(s.clone(), &m);
+        assert_eq!(r.status, Status::Clear, "{name}: {:?}", r.findings);
+        assert!(r.coverage.machine_tip_travel_examined, "{name}");
+    }
+    // One output unit beyond the limit is still a violation, at the endpoint.
+    let r = check(
+        s.clone(),
+        &line([-200., -150., 150.], [-200., -150., 185.001]),
+    );
+    assert_eq!(r.status, Status::Violation);
+    let travel = r
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::MachineTravel)
+        .unwrap();
+    assert_eq!(travel.witness.as_ref().unwrap().fraction, 1.);
+    // An arc whose middle crosses the top is still found by subdivision.
+    let over = motion(Curve::Arc {
+        start: [-100., -150., 181.],
+        end: [-90., -150., 181.],
+        center: [-95., -150., 181.],
+        plane: Plane::Xz,
+        sweep_rad: PI,
+    });
+    assert_eq!(check(s.clone(), &over).status, Status::Violation);
+    // A rotated frame: the line ends exactly on the +Y limit.
+    s.machine = Some(MachineLimits {
+        min_tip_mm: [90., -10., -10.],
+        max_tip_mm: [110., 10., 30.],
+        max_feed_mm_min: 1000.,
+        max_normal_accel_mm_s2: None,
+        max_axis_feed_mm_min: None,
+    });
+    s.work_to_machine.origin_mm = [100., 0., 0.];
+    s.work_to_machine.x = [0., 1., 0.];
+    s.work_to_machine.y = [-1., 0., 0.];
+    assert_eq!(
+        check(s.clone(), &line([0., 0., 0.], [10., 0., 0.])).status,
+        Status::Clear
+    );
+    assert_eq!(
+        check(s, &line([0., 0., 0.], [10.001, 0., 0.])).status,
+        Status::Violation
+    );
+}
+
+#[test]
 fn budgets_truncation_and_mid_query_cancellation_cannot_fabricate_completion() {
     let s = scene(vec![body("small", [4.9, -0.1, 5.1, 0.1], [0., 2.])]);
     let m = line([-10., 0., 0.], [10., 0., 0.]);

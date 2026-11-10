@@ -1085,12 +1085,96 @@ fn check_body<C: CancelSignal>(
     }))
 }
 
+/// Travel decided without subdivision where the geometry allows it (#166).
+///
+/// The travel box is closed: a machine at home sits on its limit. The limit,
+/// the work offset and the tip position are binary64 values, each carrying
+/// representation error of the order of `guard`, so a tip within `guard` of a
+/// limit is on it, and only a tip more than `guard` beyond is outside (no
+/// controller commands a sub-picometre step).
+///
+/// - A line is inside the convex box exactly when both endpoints are: the
+///   rigid work-to-machine transform keeps it a segment.
+/// - A circular move uses its analytic bounds (endpoints, the tolerated
+///   terminal point and every swept axis extreme) when the work frame is a
+///   pure translation, so the machine bounds are those bounds plus the origin.
+///
+/// Returns `None` when neither applies (curves in a rotated frame, or curve
+/// bounds that cross a limit): subdivision then finds the violation or
+/// reports what it cannot resolve.
+fn travel_decided(
+    scene: &Scene,
+    path: &PreparedCurve,
+    error: f64,
+) -> Result<Option<Option<Finding>>, String> {
+    let limits = scene.machine.as_ref().unwrap();
+    let frame = &scene.work_to_machine;
+    let factor = (0..3)
+        .map(|k| frame.x[k].hypot(frame.y[k]).hypot(frame.z[k]))
+        .fold(1., f64::max);
+    let guard = |p: Vec3| {
+        let scale = p
+            .into_iter()
+            .chain(frame.origin_mm)
+            .map(f64::abs)
+            .sum::<f64>()
+            .max(1.);
+        error * factor + 256. * f64::EPSILON * scale
+    };
+    let outside = |q: Vec3| {
+        (0..3)
+            .map(|k| (limits.min_tip_mm[k] - q[k]).max(q[k] - limits.max_tip_mm[k]))
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    if matches!(path.curve(), crate::motion::Curve::Line { .. }) {
+        for fraction in [0., 1.] {
+            let p = path.position(fraction)?;
+            let (margin, g) = (outside(frame.to_design(p)), guard(p));
+            if margin > g {
+                return Ok(Some(Some(Finding {
+                    status: Status::Violation,
+                    kind: FindingKind::MachineTravel,
+                    object_id: "machine".into(),
+                    part: None,
+                    holder_section: None,
+                    fraction_interval: [fraction, fraction],
+                    witness: Some(Witness {
+                        fraction,
+                        tip_mm: p,
+                        section_height_mm: None,
+                        margin_lower_mm: margin - g,
+                    }),
+                    detail: "Tip exceeds configured travel after rigid work-to-machine transform"
+                        .into(),
+                })));
+            }
+        }
+        return Ok(Some(None));
+    }
+    let translation = frame.x == [1., 0., 0.] && frame.y == [0., 1., 0.] && frame.z == [0., 0., 1.];
+    if translation {
+        let b = path.bounds();
+        let corner: Vec3 = std::array::from_fn(|k| b.min[k].abs().max(b.max[k].abs()));
+        let g = guard(corner);
+        if (0..3).all(|k| {
+            frame.origin_mm[k] + b.min[k] >= limits.min_tip_mm[k] - g
+                && frame.origin_mm[k] + b.max[k] <= limits.max_tip_mm[k] + g
+        }) {
+            return Ok(Some(None));
+        }
+    }
+    Ok(None)
+}
+
 fn check_travel<C: CancelSignal>(
     scene: &Scene,
     path: &PreparedCurve,
     error: f64,
     work: &mut Work<'_, C>,
 ) -> Result<Option<Finding>, String> {
+    if let Some(decided) = travel_decided(scene, path, error)? {
+        return Ok(decided);
+    }
     let limits = scene.machine.as_ref().unwrap();
     let mut stack = vec![(0., 1., 0u8)];
     let mut uncertain = None;

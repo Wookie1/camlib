@@ -67,7 +67,7 @@ These rarely need changing; each failure names the budget it hit.
 | `DexelStockSpec` | `max_rays` caps the three ray grids together; `max_intervals` the stored intervals (two per uncut ray) |
 | `StockContactOptions` | `spatial_resolution_mm` (0.001) smallest region examined; `max_nodes`, `max_cell_reads` work per move; `max_findings` per move |
 | verification `Options` | the same for fixture/part checks, and `target_floor_tolerance_mm` (floor allowance on protected parts) |
-| `MachineLimits` | `min_tip_mm`, `max_tip_mm` (tip travel box), `max_feed_mm_min`, `max_normal_accel_mm_s2`, `max_axis_feed_mm_min` |
+| `MachineLimits` | `min_tip_mm`, `max_tip_mm` (tip travel box, limits included: a tip on a limit, such as a mill at home, is inside), `max_feed_mm_min`, `max_normal_accel_mm_s2`, `max_axis_feed_mm_min` |
 | `RegenerationCache` | `max_entry_bytes`, `max_total_bytes` disk limits |
 
 `CadSource.from_shape(id, revision, shape, document_id=None, reference="body")`

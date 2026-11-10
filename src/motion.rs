@@ -203,6 +203,9 @@ impl Curve {
 }
 
 impl PreparedCurve {
+    pub fn curve(&self) -> &Curve {
+        &self.curve
+    }
     pub fn length_mm(&self) -> f64 {
         self.length_mm
     }

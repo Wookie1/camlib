@@ -140,3 +140,92 @@ class VerificationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TravelLimitTest(unittest.TestCase):
+    """#166: the travel box is closed; a mill at home sits on its limit."""
+
+    def facing_job(self, start, directory):
+        import math
+        from pathlib import Path
+
+        from camlib import Facing, Job, Setup, StockSpec
+        from camlib.export import ExportRefused
+        from camlib.post import LoweringOptions, Machine, ToolSetting
+        from camlib.tools import EndMill, HolderSection, ToolAssembly
+        from camlib.verification import StockContactOptions, StreamChecks
+
+        mill = ToolAssembly(
+            "mill10",
+            EndMill("em10", diameter=10, flute_length=30, overall_length=75),
+            45,
+            115,
+            (HolderSection(45, 115, 20, 20),),
+        )
+        work = WorkFrame((200, 150, -300))
+        # The gauge line travels X 0..500, Y 0..400, Z -400..0; the tip is 115 mm lower.
+        travel = MachineLimits(min_tip_mm=(0, 0, -515), max_tip_mm=(500, 400, -115), max_feed_mm_min=10000)
+        face = Facing(
+            "face",
+            mill,
+            floor_z_mm=20,
+            stepdown_mm=1,
+            stepover_mm=4,
+            clearance_z_mm=30,
+            feed_mm_min=1000,
+            plunge_mm_min=300,
+            spindle_rpm=9000,
+            coolant="off",
+            tool_number=1,
+            length_register=1,
+        )
+        setup = Setup(
+            "top",
+            StockSpec((-5, -5, 0), (105, 65, 21), 0.5),
+            (mill,),
+            (face,),
+            start,
+            verification=StreamChecks(
+                scene=Scene("mill", "1", machine=travel, work_to_machine=work), stock_contact=StockContactOptions()
+            ),
+        )
+        machine = Machine(
+            "mill",
+            (ToolSetting.for_tool(mill, number=1, length_register=1, position_after_mm=start),),
+            dialect=GCodeDialect.linuxcnc(),
+            work_to_machine=work,
+            output_units="mm",
+            decimals=3,
+            max_feed_mm_min=10000,
+            max_spindle_rpm=12000,
+            rapid_mm_min=10000,
+            planes=("xy",),
+            arcs=False,
+            helices=False,
+            max_sweep_rad=math.tau,
+            max_tool_number=1,
+            max_length_register=1,
+            tool_changes=True,
+            flood=False,
+            mist=False,
+            tool_change_position_mode="preserve_tip",
+        )
+        with Job("travel", "1", (setup,)).post("top", machine=machine, lowering=LoweringOptions()) as posted:
+            posted.wait()
+            try:
+                posted.export(Path(directory) / "top.nc", accept={"unchecked_machine"})
+                return None
+            except ExportRefused as refused:
+                return refused
+
+    def test_a_program_starting_at_home_on_the_limit_is_released(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            # Home: machine (0, 0, 0) at the gauge line, in work coordinates.
+            self.assertIsNone(self.facing_job((-200, -150, 300 - 115), directory))
+            # 0.01 mm above the top limit is outside: a violation, not uncertain.
+            refused = self.facing_job((-200, -150, 300 - 115 + 0.01), directory)
+            self.assertIsNotNone(refused)
+            self.assertIn("violation", refused.statuses)
+            self.assertIn("machine_travel", str(refused))
