@@ -1,3 +1,4 @@
+from dataclasses import replace
 import math
 import unittest
 
@@ -45,7 +46,23 @@ class PencilTest(unittest.TestCase):
             length_register=1,
             coolant="flood",
         )
-        cuts, report = [], None
+        # Pencil straight out of fresh 8 mm stock: its entries plunge ~4 mm
+        # into that stock with no ramp proven clear (audit #22), refused by
+        # default.
+        with self.assertRaisesRegex(Exception, "no ramp along the row is proven clear"):
+            with Simulation(
+                stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), 0.25),
+                tools=(tool,),
+                operations=(op,),
+                revision="1",
+                initial_position_mm=(0, 0, 12),
+            ) as sim:
+                for _ in sim.run_operations():
+                    pass
+        # This test checks the corner geometry: opt in, and check below that
+        # every such plunge is listed for independent verification.
+        op = replace(op, plunge_unproven_entries=True)
+        cuts, plunges, report = [], [], None
         with Simulation(
             stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), 0.25),
             tools=(tool,),
@@ -60,8 +77,19 @@ class PencilTest(unittest.TestCase):
                 motion = getattr(update, "motion", None)
                 if motion is not None and motion["kind"] == "cut":
                     cuts.append(motion["curve"])
+                if motion is not None and motion["kind"] == "plunge":
+                    plunges.append(motion["curve"]["end"])
             self.assertTrue(sim.state.finished)
         self.assertEqual(report["strategy"], "pencil")
+        listed = report["unproven_entries"]
+        self.assertTrue(listed)
+        for e in listed:
+            self.assertIn([e["x_mm"], e["y_mm"], e["z_mm"]], [list(p) for p in plunges])
+        # The first entry goes into untouched stock (the box to Z8): its
+        # real depth there is the independent check that it was listed.
+        first = plunges[0]
+        self.assertGreater(8 - first[2], 0.25)
+        self.assertIn([first[0], first[1], first[2]], [[e["x_mm"], e["y_mm"], e["z_mm"]] for e in listed])
         # Cuts along the boss corner: tip on the floor (Z 4), ball center
         # 2.005 from the walls (radius plus safety margin).
         corner = [
