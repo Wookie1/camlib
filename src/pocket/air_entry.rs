@@ -172,7 +172,12 @@ impl PocketPlan {
             // A supported flat pocket has cylindrical cutter/neck/shank sections
             // and linear holder tapers. Maximum endpoint radius encloses every
             // section, from its lowest Z through the entire vertical descent.
-            for _ in 0..12 {
+            // Bisect until the bracket is within the acceptance below: a fixed
+            // 12 halvings left (top - floor) / 4096, over 0.01 mm once the
+            // floor was ~41 mm below the top, so callers comparing the result
+            // with that same acceptance refused every deep entry. 64 halvings
+            // bound the loop; the break ends it far sooner.
+            for _ in 0..64 {
                 if cancel.is_cancelled() {
                     return Err("committed entry search cancelled".into());
                 }

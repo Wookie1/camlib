@@ -4327,14 +4327,25 @@ fn certify_bar(c: &Curve) {
 /// x 0..60, y 12..28, z 0..12 retained, a flat 6 mm tool, engagement_front
 /// clearing at 0.6 mm width, stepdown 6, floor 1. Both side strips run the
 /// stock's whole 60 mm length.
-fn spiral_bar_manifest(spiral: bool) -> StreamManifest {
+fn spiral_bar_manifest(spiral: bool, top_z: f64, ends: bool) -> StreamManifest {
+    // `top_z` is the stock and part height; above 12 the first layer still
+    // cuts at Z6 (one deep stepdown) and the tool is lengthened to reach.
     let saved: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json")).unwrap();
     let mut input = saved["cases"]["adaptive"]["policies"]["omit_proven_empty"]["input"].clone();
     input["stock"]["min_mm"] = serde_json::json!([0.0, 0.0, 0.0]);
-    input["stock"]["max_mm"] = serde_json::json!([60.0, 40.0, 12.0]);
+    input["stock"]["max_mm"] = serde_json::json!([60.0, 40.0, top_z]);
     input["stock"]["cell_size_mm"] = 0.4.into();
-    input["initial_position_mm"] = serde_json::json!([0.0, 0.0, 14.0]);
+    if top_z > 12. {
+        let tool = &mut input["tools"][0];
+        tool["cutter"]["cutting_length_mm"] = (top_z + 6.).into();
+        tool["cutter"]["overall_length_mm"] = (top_z + 26.).into();
+        tool["stickout_mm"] = (top_z + 16.).into();
+        tool["gauge_length_mm"] = (top_z + 46.).into();
+        tool["holders"][0]["z_min_mm"] = (top_z + 16.).into();
+        tool["holders"][0]["z_max_mm"] = (top_z + 46.).into();
+    }
+    input["initial_position_mm"] = serde_json::json!([0.0, 0.0, top_z + 2.]);
     input["tools"][0]["cutter"]["diameter_mm"] = 6.0.into();
     input["tools"][0]["cutter"]["shank_diameter_mm"] = 6.0.into();
     for holder in input["tools"][0]["holders"].as_array_mut().unwrap() {
@@ -4343,16 +4354,26 @@ fn spiral_bar_manifest(spiral: bool) -> StreamManifest {
     }
     let op = input["operations"][0].as_object_mut().unwrap();
     op["omit_empty_cuts"] = false.into();
-    op["top_z_mm"] = 12.0.into();
+    op["top_z_mm"] = top_z.into();
     op["floor_z_mm"] = 1.0.into();
-    op["stepdown_mm"] = 6.0.into();
-    op["clearance_z_mm"] = 14.0.into();
+    op["stepdown_mm"] = (top_z - 6.).into();
+    op["clearance_z_mm"] = (top_z + 2.).into();
     op["radial_allowance_mm"] = 0.1.into();
     op["bottom_allowance_mm"] = 0.0.into();
     op["target"] = serde_json::json!({
         "version": 1,
         "units": "mm",
-        "triangles": closed_box(0., 12., 0., 60., 28., 12.),
+        "triangles": if ends {
+            // End walls close both strips: x 0..4 and 56..60, full height.
+            [
+                closed_box(0., 12., 0., 60., 28., top_z),
+                closed_box(0., 0., 0., 4., 40., top_z),
+                closed_box(56., 0., 0., 60., 40., top_z),
+            ]
+            .concat()
+        } else {
+            closed_box(0., 12., 0., 60., 28., top_z)
+        },
         "surface_error_mm": 0.0,
         "source": null,
     });
@@ -4378,8 +4399,8 @@ fn spiral_bar_manifest(spiral: bool) -> StreamManifest {
 /// return (mean first-layer cut length per pass mm, report). Every motion
 /// is certified against the bar, and every vertical entry is checked to
 /// descend only through cut stock or air (the frustum test's check).
-fn run_spiral_bar(spiral: bool) -> (f64, serde_json::Value) {
-    let m = spiral_bar_manifest(spiral);
+fn run_spiral_bar(spiral: bool, top_z: f64, ends: bool) -> (f64, serde_json::Value) {
+    let m = spiral_bar_manifest(spiral, top_z, ends);
     m.validate().unwrap();
     let tool = m.tools[0].prepare().unwrap();
     let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
@@ -4401,7 +4422,7 @@ fn run_spiral_bar(spiral: bool) -> (f64, serde_json::Value) {
         assert_eq!(motion.curve.start(), current);
         current = motion.curve.end();
         certify_bar(&motion.curve);
-        if motion.kind == MoveKind::Plunge && current[2] < 12. {
+        if motion.kind == MoveKind::Plunge && current[2] < top_z {
             for radial in [0., 1.5, 3.] {
                 for i in 0..16 {
                     let angle = TAU * i as f64 / 16.;
@@ -4415,8 +4436,8 @@ fn run_spiral_bar(spiral: bool) -> (f64, serde_json::Value) {
                     let height = history
                         .iter()
                         .filter(|old| old.kind != MoveKind::Rapid)
-                        .map(|old| exact_height_for(&old.curve, p, 3., 12.))
-                        .fold(12f64, f64::min);
+                        .map(|old| exact_height_for(&old.curve, p, 3., top_z))
+                        .fold(top_z, f64::min);
                     assert!(
                         height <= current[2] + 1e-6,
                         "plunge into material at {p:?}: {height} > {}",
@@ -4450,9 +4471,11 @@ fn run_spiral_bar(spiral: bool) -> (f64, serde_json::Value) {
     }
     plan.finish_report(&|| false).unwrap();
     let report = serde_json::to_value(plan.report()).unwrap();
-    assert_eq!(report["completed_layers"], 2);
-    for layer in report["layers"].as_array().unwrap() {
+    let layers = report["layers"].as_array().unwrap();
+    assert_eq!(report["completed_layers"], layers.len());
+    for layer in layers {
         let clearing = &layer["clearing"];
+
         assert_eq!(clearing["strategy"], "engagement_front");
         assert!(clearing["passes"].as_u64().unwrap() > 0);
         assert!(
@@ -4464,14 +4487,52 @@ fn run_spiral_bar(spiral: bool) -> (f64, serde_json::Value) {
     (first_cut / first_passes as f64, report)
 }
 
+/// The strips closed by end walls (so later passes start beside the stock,
+/// proven only by the committed sweeps), with the operation's top 48 mm
+/// above the Z6 layer (a deep layer, as under a tall part). A vertical entry into cut stock is
+/// proven by bisecting the column between the top and the layer; with a
+/// fixed 12 halvings that search could not resolve below (top - z) / 4096,
+/// over its 0.01 mm acceptance once top - z exceeded ~41 mm, so every such
+/// entry was refused and the layer fell back to short stay-down passes.
+#[test]
+fn engagement_front_deep_layer_entries_are_proven() {
+    let z6 = |report: &serde_json::Value| {
+        report["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| (l["tip_z_mm"].as_f64().unwrap() - 6.).abs() < 1e-6)
+            .expect("a Z6 layer")["clearing"]
+            .clone()
+    };
+    let (shallow_mean, shallow) = run_spiral_bar(true, 12., true);
+    let (deep_mean, deep) = run_spiral_bar(true, 54., true);
+    let (shallow, deep) = (z6(&shallow), z6(&deep));
+    let count = |c: &serde_json::Value, key: &str| c[key].as_u64().unwrap();
+    eprintln!(
+        "Z6 top 12 / top 54: mean pass {shallow_mean:.2} / {deep_mean:.2} mm, unproven entries {} / {}, helixes {} / {}",
+        count(&shallow, "unproven_air_starts"),
+        count(&deep, "unproven_air_starts"),
+        count(&shallow, "helical_entries"),
+        count(&deep, "helical_entries"),
+    );
+    // The same strips, only deeper: entries beside the cut stock are proven
+    // as on the shallow layer, not refused and replaced by helixes.
+    assert!(
+        count(&deep, "unproven_air_starts") <= count(&shallow, "unproven_air_starts") + 4,
+        "deep layer refused entries the shallow one proves: {deep}"
+    );
+    assert!(count(&deep, "helical_entries") <= count(&shallow, "helical_entries"));
+}
+
 /// Open strips beside a long part wall: with `spiral` on, the first layer's
 /// mean cut length per pass is at least 3x the plain mean and at least
 /// 25 mm - full-length one-way passes instead of short crosswise ones -
 /// while every certification, entry proof and engagement rule still holds.
 #[test]
 fn engagement_front_spiral_cuts_open_strips_lengthwise() {
-    let (off_mean, off_report) = run_spiral_bar(false);
-    let (on_mean, on_report) = run_spiral_bar(true);
+    let (off_mean, off_report) = run_spiral_bar(false, 12., false);
+    let (on_mean, on_report) = run_spiral_bar(true, 12., false);
     eprintln!(
         "mean first-layer cut per pass: spiral off {off_mean:.2} mm, spiral on {on_mean:.2} mm"
     );
