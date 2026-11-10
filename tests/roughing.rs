@@ -4096,3 +4096,74 @@ fn seam_bridge_closes_a_crossing_seam_between_separately_tessellated_faces() {
             .is_err()
     );
 }
+
+/// An open part (stock reaching well beyond the target's shadow on every
+/// side): the job's first entry must descend to depth outside the stock and
+/// feed in from the side, never bore a helix inside the stock. Before the
+/// outside-stock air proof, the first entry of a job had no committed sweeps
+/// to prove any start, so every outside candidate was rejected as unproven
+/// and the plan fell back to a helix inside a stock corner.
+#[test]
+fn engagement_front_open_part_first_entry_descends_outside_the_stock() {
+    let saved: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json")).unwrap();
+    let mut input = saved["cases"]["adaptive"]["policies"]["omit_proven_empty"]["input"].clone();
+    // The retained frustum sits at (4,4)-(28,24); widen the stock far past
+    // its shadow so the part is open all around.
+    input["stock"]["min_mm"] = serde_json::json!([-8.0, -8.0, 0.0]);
+    input["stock"]["max_mm"] = serde_json::json!([40.0, 36.0, 10.0]);
+    let op = &mut input["operations"][0];
+    op["omit_empty_cuts"] = false.into();
+    let clearing = op["clearing"].as_object_mut().unwrap();
+    for key in [
+        "orbit_radius_mm",
+        "min_orbit_radius_mm",
+        "local_orbit_tolerance_mm",
+    ] {
+        clearing.remove(key);
+    }
+    clearing.insert("path_strategy".into(), "engagement_front".into());
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let mut descended = f64::NAN;
+    let mut entries = 0;
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(entries < 100, "no cut within the first 100 motions");
+        entries += 1;
+        if motion.kind == MoveKind::Cut {
+            break;
+        }
+        assert!(
+            !matches!(motion.curve, Curve::Helix { .. }) && motion.kind != MoveKind::Lead,
+            "open part began with a bored entry: {:?} {:?}",
+            motion.kind,
+            motion.curve
+        );
+        if motion.kind == MoveKind::Plunge {
+            let p = motion.curve.end();
+            let outside = p[0] < -8. - 1. || p[0] > 40. + 1. || p[1] < -8. - 1. || p[1] > 36. + 1.;
+            assert!(outside, "first descent {p:?} not outside the stock");
+            descended = p[2];
+        }
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+    }
+    // top_z 10, stepdown 2: the first layer cuts at Z8.
+    assert!(
+        descended <= 8. + 1e-6,
+        "first descent stopped at {descended}, above the first layer Z8"
+    );
+}

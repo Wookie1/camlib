@@ -135,6 +135,34 @@ impl PocketPlan {
         let Some(stock) = stock else {
             return Ok((top, false));
         };
+        // Outside the stock there is never material: a column whose every
+        // relevant section disk (sections that descend below the stock top
+        // on the way to `floor`) stays clear of the stock footprint, plus
+        // guard, is proven air down to `floor` before any sweep is
+        // committed. Without this, the first entry of a job has no
+        // committed sweeps and every outside-stock start is "unproven".
+        {
+            let spec = stock.spec();
+            let guard = 32. * self.operation.tolerance_mm
+                + 4096. * f64::EPSILON * (1. + center[0].abs() + center[1].abs() + top.abs());
+            let dx = (spec.min_mm[0] - center[0])
+                .max(center[0] - spec.max_mm[0])
+                .max(0.);
+            let dy = (spec.min_mm[1] - center[1])
+                .max(center[1] - spec.max_mm[1])
+                .max(0.);
+            let reach = self
+                .air_entry_parts
+                .iter()
+                .filter(|&&(_, bottom)| floor + bottom - guard <= spec.max_mm[2])
+                .map(|&(radius, _)| radius)
+                .fold(0., f64::max)
+                + orbit
+                + guard;
+            if dx.hypot(dy) >= reach {
+                return Ok((floor, false));
+            }
+        }
         // Reuse the scene across entries and append only sweeps committed
         // since the last entry; rebuilding it from the whole history at every
         // entry made long jobs quadratic. A failed update drops the cache.
