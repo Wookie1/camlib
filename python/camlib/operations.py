@@ -1400,15 +1400,6 @@ class Roughing:
     # the one at feed_mm_min and the clearing's radial engagement; capped at
     # link_feed_mm_min.
     link_chip_thinning: bool = False
-    # engagement_front only: start each pass by dry-running candidate starts
-    # and taking the one whose pass removes the most material per second of
-    # travel plus cutting, so open strips beside a long wall are cut in long
-    # one-way passes instead of many short crosswise ones. Needs
-    # rapid_mm_min. Off by default.
-    spiral: bool = False
-    # engagement_front only, with spiral: the machine's rapid traverse rate
-    # (mm/min), declared by the caller; camlib never assumes machine values.
-    rapid_mm_min: float | None = None
     # Opt-in for targets tessellated face by face: each layer's shadow is
     # closed protectively, bridging gaps narrower than twice this (at most half
     # the cutter radius). About the mesh's surface error. None: off.
@@ -1443,15 +1434,12 @@ class Roughing:
             'travel_clearance_mm',
             'ramp_clearance_mm',
             'link_feed_mm_min',
-            'rapid_mm_min',
             'seam_bridge_mm',
         ):
             if result[key] is None:
                 result.pop(key)
         if not self.link_chip_thinning:
             result.pop('link_chip_thinning')
-        if not self.spiral:
-            result.pop('spiral')
         for key in ("target", "clearing", "entry"):
             if hasattr(result[key], "to_dict"):
                 result[key] = result[key].to_dict()

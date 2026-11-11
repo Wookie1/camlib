@@ -4327,12 +4327,12 @@ fn certify_bar(c: &Curve) {
 /// x 0..60, y 12..28, z 0..12 retained, a flat 6 mm tool, engagement_front
 /// clearing at 0.6 mm width, stepdown 6, floor 1. Both side strips run the
 /// stock's whole 60 mm length.
-fn spiral_bar_manifest(spiral: bool, top_z: f64, ends: bool) -> StreamManifest {
-    serde_json::from_value(spiral_bar_input(spiral, top_z, ends)).unwrap()
+fn bar_manifest(top_z: f64, ends: bool) -> StreamManifest {
+    serde_json::from_value(bar_input(top_z, ends)).unwrap()
 }
 
 /// The bar job's manifest JSON, for tests that change it before parsing.
-fn spiral_bar_input(spiral: bool, top_z: f64, ends: bool) -> serde_json::Value {
+fn bar_input(top_z: f64, ends: bool) -> serde_json::Value {
     // `top_z` is the stock and part height; above 12 the first layer still
     // cuts at Z6 (one deep stepdown) and the tool is lengthened to reach.
     let saved: serde_json::Value =
@@ -4392,11 +4392,6 @@ fn spiral_bar_input(spiral: bool, top_z: f64, ends: bool) -> serde_json::Value {
     }
     clearing.insert("path_strategy".into(), "engagement_front".into());
     clearing.insert("max_radial_engagement_mm".into(), 0.6.into());
-    if spiral {
-        let op = input["operations"][0].as_object_mut().unwrap();
-        op.insert("spiral".into(), true.into());
-        op.insert("rapid_mm_min".into(), 10000.0.into());
-    }
     input
 }
 
@@ -4404,8 +4399,8 @@ fn spiral_bar_input(spiral: bool, top_z: f64, ends: bool) -> serde_json::Value {
 /// return (mean first-layer cut length per pass mm, report). Every motion
 /// is certified against the bar, and every vertical entry is checked to
 /// descend only through cut stock or air (the frustum test's check).
-fn run_spiral_bar(spiral: bool, top_z: f64, ends: bool) -> (f64, serde_json::Value) {
-    let m = spiral_bar_manifest(spiral, top_z, ends);
+fn run_bar(top_z: f64, ends: bool) -> (f64, serde_json::Value) {
+    let m = bar_manifest(top_z, ends);
     m.validate().unwrap();
     let tool = m.tools[0].prepare().unwrap();
     let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
@@ -4500,7 +4495,7 @@ fn run_spiral_bar(spiral: bool, top_z: f64, ends: bool) -> (f64, serde_json::Val
 /// air there (on alternate step-ups).
 #[test]
 fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
-    let mut input = spiral_bar_input(false, 12., false);
+    let mut input = bar_input(12., false);
     // Walls off the 0.4 mm stock cells, so whole-cell bounds overlap them.
     input["operations"][0]["target"]["triangles"] =
         serde_json::to_value(closed_box(0., 12.15, 0., 60., 27.85, 12.)).unwrap();
@@ -4566,7 +4561,7 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
 /// route and both axis-first doglegs clear the stock and the bar. Returns
 /// (rapid and retract length mm, report).
 fn run_bar_travel(clearance: Option<f64>) -> (f64, serde_json::Value) {
-    let mut input = spiral_bar_input(true, 12., true);
+    let mut input = bar_input(12., true);
     input["initial_position_mm"] = serde_json::json!([0.0, 0.0, 30.0]);
     let op = &mut input["operations"][0];
     op["clearance_z_mm"] = 30.0.into();
@@ -4696,8 +4691,8 @@ fn engagement_front_deep_layer_entries_are_proven() {
             .expect("a Z6 layer")["clearing"]
             .clone()
     };
-    let (shallow_mean, shallow) = run_spiral_bar(true, 12., true);
-    let (deep_mean, deep) = run_spiral_bar(true, 54., true);
+    let (shallow_mean, shallow) = run_bar(12., true);
+    let (deep_mean, deep) = run_bar(54., true);
     let (shallow, deep) = (z6(&shallow), z6(&deep));
     let count = |c: &serde_json::Value, key: &str| c[key].as_u64().unwrap();
     eprintln!(
@@ -4716,30 +4711,14 @@ fn engagement_front_deep_layer_entries_are_proven() {
     assert!(count(&deep, "helical_entries") <= count(&shallow, "helical_entries"));
 }
 
-/// Open strips beside a long part wall: with `spiral` on, the first layer's
-/// mean cut length per pass is at least 3x the plain mean and at least
-/// 25 mm - full-length one-way passes instead of short crosswise ones -
-/// while every certification, entry proof and engagement rule still holds.
+/// Open strips beside a long part wall are cut lengthwise: the first
+/// layer's mean cut length per pass is at least 25 mm (full-length one-way
+/// passes, not short crosswise ones; the strips are 60 mm long), while every
+/// certification, entry proof and engagement rule still holds. The planner
+/// starts each pass at the upstream end of its material.
 #[test]
-fn engagement_front_spiral_cuts_open_strips_lengthwise() {
-    let (off_mean, off_report) = run_spiral_bar(false, 12., false);
-    let (on_mean, on_report) = run_spiral_bar(true, 12., false);
-    eprintln!(
-        "mean first-layer cut per pass: spiral off {off_mean:.2} mm, spiral on {on_mean:.2} mm"
-    );
-    assert!(
-        on_mean >= 3. * off_mean,
-        "spiral mean {on_mean:.2} mm is not 3x the plain mean {off_mean:.2} mm"
-    );
-    assert!(on_mean >= 25., "spiral mean {on_mean:.2} mm below 25 mm");
-    // The plain run never dry-runs; the spiral run reports its scoring work.
-    for layer in off_report["layers"].as_array().unwrap() {
-        assert!(layer["clearing"].get("spiral_dry_runs").is_none());
-    }
-    let mut dry_runs = 0;
-    for layer in on_report["layers"].as_array().unwrap() {
-        dry_runs += layer["clearing"]["spiral_dry_runs"].as_u64().unwrap_or(0);
-    }
-    assert!(dry_runs > 0, "spiral mode reported no dry runs");
-    eprintln!("spiral dry runs across both layers: {dry_runs}");
+fn engagement_front_cuts_open_strips_lengthwise() {
+    let (mean, _) = run_bar(12., false);
+    eprintln!("mean first-layer cut per pass: {mean:.2} mm");
+    assert!(mean >= 25., "mean cut per pass {mean:.2} mm below 25 mm");
 }
