@@ -3,6 +3,7 @@
 //! Disk retention, playback clock and Python/viewer adapters build on this layer.
 use crate::{
     dexel::{DexelDelta, DexelStock, DexelStockSpec, Ray, RayChange, Spans},
+    engagement::ClearedSweep,
     motion::{Curve, Event, Motion, MoveKind, Plane, Vec3},
     operation::OperationReport,
     pocket::Operation,
@@ -658,9 +659,9 @@ impl CheckpointFields {
                 // A producer checkpoint may end with its proof states.
                 let (nx, ny, _) = manifest.stock.height()?.grid()?;
                 self.count == nx * ny
-                    && cell_bytes
-                        .checked_sub(self.count * 16)
-                        .is_some_and(|rest| rest <= max_proof_section(manifest, self.count))
+                    && cell_bytes.checked_sub(self.count * 16).is_some_and(|rest| {
+                        rest <= max_proof_section(manifest, self.count) + MAX_COLUMN_SECTION
+                    })
             }
             RunStockSpec::Turn(spec) => {
                 let rest = cell_bytes.checked_sub(self.count * 32 + 4);
@@ -877,7 +878,7 @@ impl StreamProducer {
             .checks
             .as_ref()
             .and_then(crate::stream_verification::Runtime::proof_states);
-        self.state.checkpoint_with(limit, proofs.as_deref())
+        self.state.checkpoint_with(limit, proofs.as_deref(), true)
     }
     /// Synchronize a disposable query cache from an already committed source
     /// chunk. This reuses receiver CRC/identity/sequence/old-value checks and does
@@ -1565,9 +1566,16 @@ impl StreamReceiver {
         Ok(chunk.motion)
     }
     pub fn checkpoint(&self, limit: usize) -> Result<Vec<u8>, String> {
-        self.checkpoint_with(limit, None)
+        self.checkpoint_with(limit, None, false)
     }
-    fn checkpoint_with(&self, limit: usize, proofs: Option<&[Vec<u8>]>) -> Result<Vec<u8>, String> {
+    /// `columns`: a producer's checkpoint also keeps the stock's committed
+    /// cleared columns (`column_section`).
+    fn checkpoint_with(
+        &self,
+        limit: usize,
+        proofs: Option<&[Vec<u8>]>,
+        columns: bool,
+    ) -> Result<Vec<u8>, String> {
         let mut body = self.identity.clone();
         put_u64(&mut body, self.sequence);
         put_vec3(&mut body, self.position);
@@ -1580,9 +1588,13 @@ impl StreamReceiver {
                 if let Some(controls) = &self.controls {
                     put_control_json(&mut body, controls)?;
                 }
-                let section = proofs
-                    .map(|states| proof_section(states, &cells_digest(stock.cells())))
+                let digest = (proofs.is_some() || columns).then(|| cells_digest(stock.cells()));
+                let mut section = proofs
+                    .map(|states| proof_section(states, digest.as_ref().unwrap()))
                     .unwrap_or_default();
+                if columns {
+                    section.extend(column_section(stock, digest.as_ref().unwrap()));
+                }
                 check_size(body.len() + stock.cells().len() * 16 + section.len(), limit)?;
                 body.reserve(stock.cells().len() * 16 + section.len());
                 for h in stock.cells() {
@@ -1650,8 +1662,9 @@ impl StreamReceiver {
         for _ in 0..fields.count {
             cells.push(body.height()?);
         }
-        let proofs = read_proof_section(body.take(body.left())?, &manifest, fields.count)?;
-        Self::from_checkpoint_cells(manifest, fields, cells, proofs)
+        let (proofs, columns) =
+            read_trailing_sections(body.take(body.left())?, &manifest, fields.count)?;
+        Self::from_checkpoint_cells(manifest, fields, cells, proofs, columns)
     }
     fn from_checkpoint_turn(
         manifest: StreamManifest,
@@ -1813,14 +1826,15 @@ impl StreamReceiver {
         if reader.read(&mut [0u8; 1]).map_err(|e| e.to_string())? != 0 {
             return Err("trailing checkpoint file data".into());
         }
-        let proofs = read_proof_section(&proofs, &manifest, fields.count)?;
-        Self::from_checkpoint_cells(manifest, fields, cells, proofs)
+        let (proofs, columns) = read_trailing_sections(&proofs, &manifest, fields.count)?;
+        Self::from_checkpoint_cells(manifest, fields, cells, proofs, columns)
     }
     fn from_checkpoint_cells(
         manifest: StreamManifest,
         fields: CheckpointFields,
         cells: Vec<HeightBounds>,
         kept: Option<KeptProofs>,
+        columns: Option<KeptColumns>,
     ) -> Result<Self, String> {
         let identity = identity_bytes(&manifest)?;
         // Kept proof states describe the stock they were computed with: for
@@ -1829,11 +1843,17 @@ impl StreamReceiver {
         let restored_proofs = kept
             .filter(|(digest, _)| *digest == cells_digest(&cells))
             .map(|(_, states)| states);
+        // Likewise the kept cleared columns: for other cells they are
+        // dropped, and the resumed stock lowers only what it can prove alone.
+        let columns = columns.filter(|(digest, _)| *digest == cells_digest(&cells));
         let mut stock = Stock::from_snapshot(StockSnapshot {
             spec: manifest.stock.height()?.clone(),
             generation: fields.generation,
             cells,
         })?;
+        if let Some((_, state)) = columns {
+            stock.restore_clearance(state)?;
+        }
         if let Some(initial) = &manifest.initial_stock {
             stock.initial_volume(initial)?;
         }
@@ -2695,6 +2715,120 @@ fn read_proof_section(
 }
 /// A checkpoint's kept proof states and the digest of their stock cells.
 type KeptProofs = ([u8; 32], Vec<Vec<u8>>);
+/// A producer checkpoint's committed cleared columns: the digest of the
+/// cells they were committed with, the stock's height-field flag, and each
+/// column's tolerance and sweep, oldest first.
+type KeptColumns = ([u8; 32], crate::stock::ClearanceState);
+/// A producer checkpoint's second trailing section: the stock's committed
+/// cleared columns (`Stock::clearance_state`). The height-field stock lowers
+/// a cell that several passes clear together from these (no single pass
+/// covers it), so a stream resumed from the checkpoint needs them to lower
+/// the same cells as one that never stopped. The frame's run identity,
+/// cursor and checksum cover it, as they cover the cells.
+const COLUMN_SECTION: &[u8; 8] = b"CAMCOL01";
+const COLUMN_BYTES: usize = 8 + 1 + 8 * crate::engagement::SWEEP_WORDS;
+const MAX_COLUMN_SECTION: usize = COLUMN_SECTION.len()
+    + 32
+    + 1
+    + 2
+    + 256
+    + 4
+    + 4
+    + crate::stock::MAX_COMMITTED_COLUMNS * COLUMN_BYTES;
+fn column_section(stock: &Stock, cells: &[u8; 32]) -> Vec<u8> {
+    let state = stock.clearance_state();
+    let mut out = Vec::with_capacity(320 + state.columns.len() * COLUMN_BYTES);
+    out.extend_from_slice(COLUMN_SECTION);
+    out.extend_from_slice(cells);
+    put_u8(&mut out, u8::from(state.unproven));
+    put_string(&mut out, state.operation.as_deref().unwrap_or(""));
+    put_u32(&mut out, state.union_from as u32);
+    put_u32(&mut out, state.columns.len() as u32);
+    for (tolerance, sweep) in &state.columns {
+        put_f64(&mut out, *tolerance);
+        let (tag, words) = sweep.encode();
+        put_u8(&mut out, tag);
+        for w in words {
+            put_f64(&mut out, w);
+        }
+    }
+    out
+}
+/// A checkpoint's trailing sections, each optional, in order: proof states
+/// (`CAMPRF01`), then cleared columns (`CAMCOL01`).
+fn read_trailing_sections(
+    bytes: &[u8],
+    manifest: &StreamManifest,
+    cells: usize,
+) -> Result<(Option<KeptProofs>, Option<KeptColumns>), String> {
+    let at = column_section_start(bytes);
+    let proofs = read_proof_section(&bytes[..at], manifest, cells)?;
+    let rest = &bytes[at..];
+    if rest.is_empty() {
+        return Ok((proofs, None));
+    }
+    let bad = || "invalid checkpoint column section".to_string();
+    let mut body = Decoder {
+        bytes: rest,
+        offset: 0,
+    };
+    if body.take(COLUMN_SECTION.len()).map_err(|_| bad())? != COLUMN_SECTION {
+        return Err(bad());
+    }
+    let digest: [u8; 32] = body.take(32).map_err(|_| bad())?.try_into().unwrap();
+    let unproven = match body.u8().map_err(|_| bad())? {
+        0 => false,
+        1 => true,
+        _ => return Err(bad()),
+    };
+    let operation = body.string(256).map_err(|_| bad())?;
+    let union_from = body.u32().map_err(|_| bad())? as usize;
+    let count = body.u32().map_err(|_| bad())? as usize;
+    if count > crate::stock::MAX_COMMITTED_COLUMNS || body.left() != count * COLUMN_BYTES {
+        return Err(bad());
+    }
+    let mut columns = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tolerance = body.f64().map_err(|_| bad())?;
+        let tag = body.u8().map_err(|_| bad())?;
+        let mut words = [0.; crate::engagement::SWEEP_WORDS];
+        for w in &mut words {
+            *w = body.f64().map_err(|_| bad())?;
+        }
+        columns.push((tolerance, ClearedSweep::decode(tag, words)?));
+    }
+    let state = crate::stock::ClearanceState {
+        unproven,
+        operation: (!operation.is_empty()).then_some(operation),
+        union_from,
+        columns,
+    };
+    Ok((proofs, Some((digest, state))))
+}
+/// Where the column section starts: after the proof section, whose length
+/// its own headers give (the whole input when it is malformed, so the proof
+/// reader reports it).
+fn column_section_start(bytes: &[u8]) -> usize {
+    if bytes.starts_with(COLUMN_SECTION) {
+        return 0;
+    }
+    let mut body = Decoder { bytes, offset: 0 };
+    let walk = |body: &mut Decoder<'_>| -> Result<(), String> {
+        if body.take(PROOF_SECTION.len())? != PROOF_SECTION {
+            return Err(String::new());
+        }
+        body.take(32)?;
+        for _ in 0..body.u32()? {
+            let n = body.u64()?;
+            body.take(usize::try_from(n).map_err(|_| String::new())?)?;
+        }
+        Ok(())
+    };
+    match walk(&mut body) {
+        Ok(()) => body.offset,
+        Err(_) => bytes.len(),
+    }
+}
 pub fn identity_bytes(manifest: &StreamManifest) -> Result<Vec<u8>, String> {
     let run = &manifest.run;
     let mut bytes = Vec::new();

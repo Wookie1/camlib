@@ -258,8 +258,10 @@ fn removal_bounds_enclose_the_sampled_sweep() {
 }
 
 /// On three-axis moves the height view bounds the same material as the
-/// height field the existing kernel computes: identical for a flat end mill
-/// at constant height (both use the exact distance to the path), and
+/// height field the existing kernel computes: identical lower bounds for a
+/// flat end mill at constant height (both use the exact distance to the
+/// path; the height field may prove a tighter upper bound in cells no single
+/// whole-cell test covers), and
 /// overlapping elsewhere (the dexel columns skip cells the chord's padded
 /// box cannot reach, where the height kernel pads by the cell's circle).
 #[test]
@@ -299,7 +301,11 @@ fn height_view_matches_the_height_field() {
                     "{name}: cell {i} bounds do not overlap: {a:?} {b:?}"
                 );
                 if exact {
-                    assert_eq!(a, b, "{name}: cell {i}");
+                    // Same lower bounds; the height field's upper bound may be
+                    // tighter where it proves a partly covered cell cleared by
+                    // splitting it (`Stock::union_covered`), never looser.
+                    assert_eq!(a.lower_mm, b.lower_mm, "{name}: cell {i}");
+                    assert!(b.upper_mm <= a.upper_mm, "{name}: cell {i}: {a:?} {b:?}");
                 }
             }
             let (h, d) = (height.volume(), dexel.volume());
