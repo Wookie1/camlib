@@ -29,6 +29,8 @@ enum Shape {
         sweep: f64,
     },
 }
+/// f64 words in an encoded [`ClearedSweep`] (`ClearedSweep::encode`).
+pub(crate) const SWEEP_WORDS: usize = 16;
 /// A geometric premise, NOT authority to mark arbitrary material cleared.
 /// Only add a sweep after its matching flat-cutter stock transaction committed.
 /// Its column must be clear from the declared floor through original stock top.
@@ -136,6 +138,102 @@ impl ClearedSweep {
             }
         }
         hash.finalize().into()
+    }
+
+    /// Outer XY box of the cleared footprint (radius and path error included).
+    pub(crate) fn bounds(&self) -> [Point; 2] {
+        self.bounds
+    }
+    pub(crate) fn floor(&self) -> f64 {
+        self.floor
+    }
+    /// Largest ball this sweep can ever contain (its witness extent).
+    pub(crate) fn max_witness_extent(&self) -> f64 {
+        match self.shape {
+            Shape::Arc { radius, sweep, .. } if sweep.abs() >= TAU && radius <= self.radius => {
+                self.radius + radius
+            }
+            _ => self.radius,
+        }
+    }
+    /// The whole closed XY ball (`p`, `extent`) lies in this sweep's cleared
+    /// column at every height from `z` up: the same certificate as the
+    /// engagement scene's box coverage (`clear_box`).
+    pub(crate) fn contains_ball(&self, p: Point, extent: f64, z: f64) -> bool {
+        let numeric = 4096. * f64::EPSILON * (1. + p[0].abs() + p[1].abs() + extent);
+        ball_in_support(self, p, extent, z, numeric)
+    }
+
+    /// Exact words of this sweep for a producer checkpoint (`decode` rebuilds
+    /// the identical sweep, fingerprint included): tag (0 line, 1 arc), then
+    /// [`SWEEP_WORDS`] f64 values.
+    pub(crate) fn encode(&self) -> (u8, [f64; SWEEP_WORDS]) {
+        let mut w = [0.; SWEEP_WORDS];
+        w[..7].copy_from_slice(&[
+            self.floor,
+            self.radius,
+            self.error,
+            self.bounds[0][0],
+            self.bounds[0][1],
+            self.bounds[1][0],
+            self.bounds[1][1],
+        ]);
+        let tag = match self.shape {
+            Shape::Line { a, b, unit, length } => {
+                w[7..14].copy_from_slice(&[a[0], a[1], b[0], b[1], unit[0], unit[1], length]);
+                0
+            }
+            Shape::Arc {
+                a,
+                b,
+                c,
+                radius,
+                angle,
+                sweep,
+            } => {
+                w[7..16]
+                    .copy_from_slice(&[a[0], a[1], b[0], b[1], c[0], c[1], radius, angle, sweep]);
+                1
+            }
+        };
+        (tag, w)
+    }
+    pub(crate) fn decode(tag: u8, w: [f64; SWEEP_WORDS]) -> Result<Self, String> {
+        let bad = || "invalid checkpoint cleared sweep".to_string();
+        if w.iter().any(|v| !v.is_finite()) || !radius_ok(w[1]) || w[2] < 0. {
+            return Err(bad());
+        }
+        let shape = match tag {
+            0 => Shape::Line {
+                a: [w[7], w[8]],
+                b: [w[9], w[10]],
+                unit: [w[11], w[12]],
+                length: w[13],
+            },
+            1 => Shape::Arc {
+                a: [w[7], w[8]],
+                b: [w[9], w[10]],
+                c: [w[11], w[12]],
+                radius: w[13],
+                angle: w[14],
+                sweep: w[15],
+            },
+            _ => return Err(bad()),
+        };
+        let sector = match shape {
+            Shape::Arc { angle, sweep, .. } if sweep.abs() < TAU => {
+                Some(angular::ArcSector::new(angle, sweep))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            shape,
+            sector,
+            floor: w[0],
+            radius: w[1],
+            error: w[2],
+            bounds: [[w[3], w[4]], [w[5], w[6]]],
+        })
     }
 
     pub fn from_motion(motion: &Motion, radius: f64, tolerance_mm: f64) -> Result<Self, String> {
@@ -438,12 +536,7 @@ impl EngagementScene {
         }
         let id = self.supports.len();
         let mut node = self.index.len();
-        let max_witness_extent = match support.shape {
-            Shape::Arc { radius, sweep, .. } if sweep.abs() >= TAU && radius <= support.radius => {
-                support.radius + radius
-            }
-            _ => support.radius,
-        };
+        let max_witness_extent = support.max_witness_extent();
         self.index.push(IndexNode {
             bounds: support.bounds,
             min_floor: support.floor,

@@ -62,7 +62,7 @@ CRC-32), then the payload. Kinds (`src/stream.rs`):
 | Kind | Name | Holds |
 |---|---|---|
 | 1 | Chunk | One milling or thermal move and its height-field cell changes |
-| 2 | Checkpoint | The full committed stock and cursor; a producer's also ends with its material checks' per-move proof states (`CAMPRF01` section, #108) |
+| 2 | Checkpoint | The full committed stock and cursor; a producer's also ends with its material checks' per-move proof states (`CAMPRF01` section, #108) and the stock's committed cleared columns (`CAMCOL01` section) |
 | 3 | Manifest | The canonical manifest (its SHA-256 binds every later frame) |
 | 4 | End | The run finished; final cursor and position |
 | 5 | Preview | A partial move's stock (not committed) |
@@ -85,7 +85,19 @@ can say clear, violation or uncertain honestly.
 - **Height field** (`src/stock.rs`, `Stock`): an XY grid of `HeightBounds`
   (lower: material certainly up to here; upper: no material above here). Used by
   milling and thermal runs. Moves are swept with the full tool assembly
-  (cutter and holder). A run starts from the whole box, or from a closed mesh
+  (cutter and holder). A flat end mill's constant-height line or XY arc
+  lowers a cell's upper bound when the whole cell lies in its swept disk, or
+  when the cell, split into sub-squares down to 1/32 of a cell, has every
+  sub-square entirely inside this move's disk or inside one committed
+  cleared column of the same operation at or below the move's height
+  (`Stock::union_covered`). Without this, a cell that two neighbouring
+  passes clear between them kept its old top and showed as a thin "needle".
+  Sub-squares are tested with their half-diagonal and every path error, so
+  material between passes (a hairline wall) keeps its cell up. Only the
+  operation's own passes count, so an operation's stock changes depend on
+  its starting cells and its own moves (the regeneration cache key); a
+  producer checkpoint keeps the columns, so a resumed run lowers the same
+  cells. A run starts from the whole box, or from a closed mesh
   (`src/stock_mesh.rs`, manifest `stock` with a `mesh`; always build a run's
   starting stock with `RunStockSpec::initial_stock`, since the grid alone is
   the box). The mesh is converted conservatively: a cell's upper bound is the
