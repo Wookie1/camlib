@@ -102,7 +102,9 @@ def _trim_deviation(adaptor):
     from OCP.Geom2dConvert import Geom2dConvert_BSplineCurveToBezierCurve
 
     spline = adaptor.BSpline()
-    converter = Geom2dConvert_BSplineCurveToBezierCurve(spline, adaptor.FirstParameter(), adaptor.LastParameter(), 1e-12)
+    converter = Geom2dConvert_BSplineCurveToBezierCurve(
+        spline, adaptor.FirstParameter(), adaptor.LastParameter(), 1e-12
+    )
     count = converter.NbArcs()
     knots = TColStd_Array1OfReal(1, count + 1)
     converter.Knots(knots)
@@ -153,15 +155,24 @@ def _bezier_patch_bounds(patch, su=1.0, sv=1.0):
         raise ValueError('invalid bounded Bezier surface')
     anchor = points[0][0]
     radius = max(_norm(tuple(a - b for a, b in zip(p, anchor))) for row in points for p in row)
-    numer = [[tuple(w * (a - b) for a, b in zip(p, anchor)) for p, w in zip(prow, wrow)] for prow, wrow in zip(points, weights)]
+    numer = [
+        [tuple(w * (a - b) for a, b in zip(p, anchor)) for p, w in zip(prow, wrow)]
+        for prow, wrow in zip(points, weights)
+    ]
     weight = [[(w,) for w in row] for row in weights]
+
     def diff(net, du, dv):
         # Control net of d^(du+dv)/du^du dv^dv of a tensor Bezier, over [0,su]x[0,sv].
         for _ in range(du):
             k = len(net) - 1
-            net = [[tuple(k * (b - a) / su for a, b in zip(x, y)) for x, y in zip(r0, r1)] for r0, r1 in zip(net, net[1:])]
+            net = [
+                [tuple(k * (b - a) / su for a, b in zip(x, y)) for x, y in zip(r0, r1)] for r0, r1 in zip(net, net[1:])
+            ]
         for _ in range(dv):
-            net = [[tuple((len(row) - 1) * (b - a) / sv for a, b in zip(x, y)) for x, y in zip(row, row[1:])] for row in net]
+            net = [
+                [tuple((len(row) - 1) * (b - a) / sv for a, b in zip(x, y)) for x, y in zip(row, row[1:])]
+                for row in net
+            ]
         return max((_norm(x) for row in net for x in row), default=0.0)
 
     nu1, nv1 = diff(numer, 1, 0), diff(numer, 0, 1)
@@ -615,7 +626,14 @@ def _rectangle_face_data(face, cancel):
         a = tuple(curve.Value(curve.FirstParameter()).Coord())
         b = tuple(curve.Value(curve.LastParameter()).Coord())
         for axis, other, side in (('u', 1, 0), ('v', 0, 1)):
-            match = next((k for (name, k) in covered if name == axis and abs(a[side] - k) <= guard and abs(b[side] - k) <= guard), None)
+            match = next(
+                (
+                    k
+                    for (name, k) in covered
+                    if name == axis and abs(a[side] - k) <= guard and abs(b[side] - k) <= guard
+                ),
+                None,
+            )
             if match is not None:
                 covered[(axis, match)] += abs(b[other] - a[other])
                 break
@@ -675,7 +693,11 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
     BRepTools.Clean_s(shape.wrapped)
     BRepMesh_IncrementalMesh(shape.wrapped, seed_deflection, False, 0.5, True)
     if progress:
-        print(f'cad: solid mesh at {seed_deflection:.6f} mm in {time.perf_counter() - started:.1f} s', file=sys.stderr, flush=True)
+        print(
+            f'cad: solid mesh at {seed_deflection:.6f} mm in {time.perf_counter() - started:.1f} s',
+            file=sys.stderr,
+            flush=True,
+        )
     data = []
     for n, f in enumerate(faces):
         problem = None
@@ -706,15 +728,23 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
                 remeshed.add(n)
             row = alone
         if progress:
-            print(f'cad: trims of face {n} {f.geomType()} {time.perf_counter() - checked:.1f} s'
-                  + (f' (remeshed: {problem or "trim error"})' if n in remeshed else ''), file=sys.stderr, flush=True)
+            print(
+                f'cad: trims of face {n} {f.geomType()} {time.perf_counter() - checked:.1f} s'
+                + (f' (remeshed: {problem or "trim error"})' if n in remeshed else ''),
+                file=sys.stderr,
+                flush=True,
+            )
         data.append(row)
     result = []
     face_reports = []
     max_error = 0.0
     evaluations = 0
     if progress:
-        print(f'cad: meshed {len(faces)} faces in {time.perf_counter() - started:.1f} s, remeshed {sorted(remeshed)}', file=sys.stderr, flush=True)
+        print(
+            f'cad: meshed {len(faces)} faces in {time.perf_counter() - started:.1f} s, remeshed {sorted(remeshed)}',
+            file=sys.stderr,
+            flush=True,
+        )
     for n, (face, (adaptor, bounds, uv, indices, trim_error, trim_segments)) in enumerate(zip(faces, data)):
         face_started = time.perf_counter()
         if progress:
@@ -778,7 +808,11 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         achieved = max_interior + trim_error + regularization + fixed_error
         max_error = max(max_error, achieved)
         if progress:
-            print(f'cad: face {n} {face.geomType()} {count} facets {time.perf_counter() - face_started:.1f} s', file=sys.stderr, flush=True)
+            print(
+                f'cad: face {n} {face.geomType()} {count} facets {time.perf_counter() - face_started:.1f} s',
+                file=sys.stderr,
+                flush=True,
+            )
         face_reports.append(
             dict(
                 kind=face.geomType(),

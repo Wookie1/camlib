@@ -299,7 +299,12 @@ class SplineSurfaceTest(unittest.TestCase):
         from OCP.BRepAdaptor import BRepAdaptor_Surface
         from camlib._cad_surface import _PatchBounds
 
-        shapes = (nurbs(cq.Solid.makeCylinder(3, 5)), nurbs(cq.Solid.makeSphere(4)), nurbs(cq.Solid.makeTorus(5, 1)), lofted())
+        shapes = (
+            nurbs(cq.Solid.makeCylinder(3, 5)),
+            nurbs(cq.Solid.makeSphere(4)),
+            nurbs(cq.Solid.makeTorus(5, 1)),
+            lofted(),
+        )
         checked = 0
         for shape in shapes:
             shape = shape.rotate((0, 0, 0), (1, 2, 3), 31).translate((200, -50, 17))
@@ -376,9 +381,15 @@ class SplineSurfaceTest(unittest.TestCase):
         import cadquery as cq
 
         cases = (
-            (nurbs(cq.Solid.makeCylinder(3, 5)), lambda p: abs(math.hypot(p[0], p[1]) - 3) if 1e-6 < p[2] < 5 - 1e-6 else 0.0),
+            (
+                nurbs(cq.Solid.makeCylinder(3, 5)),
+                lambda p: abs(math.hypot(p[0], p[1]) - 3) if 1e-6 < p[2] < 5 - 1e-6 else 0.0,
+            ),
             # makeSphere is a hemisphere over a flat cap at z = 0.
-            (nurbs(cq.Solid.makeSphere(4)), lambda p: abs(math.sqrt(sum(v * v for v in p)) - 4) if p[2] > 1e-6 else 0.0),
+            (
+                nurbs(cq.Solid.makeSphere(4)),
+                lambda p: abs(math.sqrt(sum(v * v for v in p)) - 4) if p[2] > 1e-6 else 0.0,
+            ),
         )
         for shape, distance in cases:
             mesh = export_surface_mesh(shape, max_error_mm=0.01)
@@ -410,7 +421,9 @@ class SplineSurfaceTest(unittest.TestCase):
         self.assertTrue(flags[0])
         self.assertLessEqual(mesh.surface_error_mm, 0.01)
         self.assertEqual(sum(f['facets'] for f in mesh.source['face_bounds']), len(mesh.triangles))
-        with mock.patch.object(cad, '_face_data', side_effect=ValueError('CAD trim chains do not cover mesh boundary exactly once')):
+        with mock.patch.object(
+            cad, '_face_data', side_effect=ValueError('CAD trim chains do not cover mesh boundary exactly once')
+        ):
             with self.assertRaisesRegex(ValueError, 'cannot triangulate face 0'):
                 export_surface_mesh(lofted(), max_error_mm=0.01)
 
