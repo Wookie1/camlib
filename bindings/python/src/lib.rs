@@ -2414,14 +2414,17 @@ impl DefaultMotionPost {
                 values.extend([offsets[u], offsets[v]]);
             } else {
                 // A straight vertical move keeps the controller's current XY
-                // when that is within the output tolerance of the source XY
-                // (an arc's representable end may differ by a word): writing
+                // when the block stays within the output tolerance of the
+                // source, its XY offset plus half a word of Z rounding (an
+                // arc's representable end may differ by a few words): writing
                 // the source XY instead would add a sideways step to a move
                 // leaving the surface it touches. The check still compares
                 // the decoded block with the source motion.
                 let vertical = matches!(m.curve, Curve::Line { start, end }
                     if start[0] == end[0] && start[1] == end[1])
-                    && (0..2).all(|k| (position[k] - end[k]).abs() <= self.output_tolerance / 2.);
+                    && (position[0] - end[0]).hypot(position[1] - end[1])
+                        + 0.5 * self.unit * 10f64.powi(-(self.decimals as i32))
+                        <= self.output_tolerance;
                 for &i in &axes {
                     addresses.push_str(&self.axes[i]);
                     values.push(if vertical && i < 2 {
