@@ -4519,7 +4519,12 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
         &|| false,
     )
     .unwrap();
+    let mut cut_at = std::collections::HashMap::<u64, f64>::new();
     while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        if motion.kind == MoveKind::Cut {
+            let (a, b) = (motion.curve.start(), motion.curve.end());
+            *cut_at.entry(a[2].to_bits()).or_default() += (b[0] - a[0]).hypot(b[1] - a[1]);
+        }
         let delta = stock
             .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
             .unwrap();
@@ -4537,11 +4542,18 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
         "expected several step-ups: {}",
         layers.len()
     );
+    // On the old planner every step-up here was empty. On the proven
+    // planner a step-up may take a stroke at a real sliver (its contact is
+    // proven against the exact sweeps), but none runs along the walls: the
+    // bug ran passes the length of every wall (tens of mm per step-up).
     for l in &ups {
-        assert_eq!(
-            l["clearing"]["passes"], 0,
-            "step-up at Z{} cut beside vertical walls: {}",
-            l["tip_z_mm"], l["clearing"]
+        let z = l["tip_z_mm"].as_f64().unwrap();
+        let cut = cut_at.get(&z.to_bits()).copied().unwrap_or(0.);
+        eprintln!("step-up Z{z:.3}: cut {cut:.2} mm, {}", l["clearing"]["passes"]);
+        assert!(
+            cut <= 1.,
+            "step-up at Z{z} cut {cut:.2} mm beside vertical walls: {}",
+            l["clearing"]
         );
     }
 }
