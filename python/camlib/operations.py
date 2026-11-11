@@ -1379,6 +1379,13 @@ class Roughing:
     # prove clear for the whole tool is rapid down to this far above the
     # proven height, then fed. None: rapid descent stops at feed_z_mm.
     rapid_descent_clearance_mm: float | None = None
+    # engagement_front only: a rapid between passes travels this far above
+    # the whole-cell stock bounds any tool section can meet over the
+    # rectangle its two ends span (straight route and both axis-first
+    # doglegs), when that is below retract_z_mm. Stock only: fixtures are
+    # not seen by the planner (the run's verification still checks them).
+    # None: rapids travel at retract_z_mm.
+    travel_clearance_mm: float | None = None
     # engagement_front only: each helical entry starts this far above the
     # material its bore meets (never above feed_z_mm), so it is already
     # ramping when it reaches stock. None: the helix starts at that material.
@@ -1433,6 +1440,7 @@ class Roughing:
             'feed_z_mm',
             'stepup_mm',
             'rapid_descent_clearance_mm',
+            'travel_clearance_mm',
             'ramp_clearance_mm',
             'link_feed_mm_min',
             'rapid_mm_min',

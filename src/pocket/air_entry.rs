@@ -54,6 +54,51 @@ impl PocketPlan {
         }
         height
     }
+    /// `cell_entry_height` for every tool position in the axis-aligned
+    /// rectangle spanned by `a` and `b`: the lowest tip height above which
+    /// no whole-cell stock upper bound meets any tool section anywhere in
+    /// that rectangle. The rectangle, not just the segment `a`-`b`, so a
+    /// horizontal rapid at that height is clear whichever route the
+    /// controller takes between its ends: the straight line or either
+    /// axis-first dogleg (G0 interpolation is controller-dependent; see
+    /// LinuxCNC G0 and FANUC non-linear positioning, parameter LRP).
+    pub(crate) fn cell_route_height(&self, stock: &Stock, a: Point, b: Point) -> f64 {
+        let [nx, ny] = stock.dimensions();
+        let [wx, wy] = stock.cell_widths_mm();
+        let min = stock.spec().min_mm;
+        let cells = stock.cells();
+        let guard = 32. * self.operation.tolerance_mm;
+        let (lo, hi) = (
+            [a[0].min(b[0]), a[1].min(b[1])],
+            [a[0].max(b[0]), a[1].max(b[1])],
+        );
+        let mut height = f64::NEG_INFINITY;
+        for &(radius, bottom) in &self.air_entry_parts {
+            let reach = radius + guard;
+            let span = |l: f64, h: f64, o: f64, w: f64, n: usize| {
+                let first = ((l - reach - o) / w).floor().max(0.);
+                let last = ((h + reach - o) / w).floor().min(n as f64 - 1.);
+                (first as usize, last)
+            };
+            let (i0, i1) = span(lo[0], hi[0], min[0], wx, nx);
+            let (j0, j1) = span(lo[1], hi[1], min[1], wy, ny);
+            if i1 < 0. || j1 < 0. {
+                continue;
+            }
+            for j in j0..=j1 as usize {
+                for i in i0..=i1 as usize {
+                    let (x0, y0) = (min[0] + i as f64 * wx, min[1] + j as f64 * wy);
+                    // Gap between the cell and the rectangle, per axis.
+                    let dx = (x0 - hi[0]).max(lo[0] - x0 - wx).max(0.);
+                    let dy = (y0 - hi[1]).max(lo[1] - y0 - wy).max(0.);
+                    if dx.hypot(dy) <= reach {
+                        height = height.max(cells[j * nx + i].upper_mm - bottom);
+                    }
+                }
+            }
+        }
+        height
+    }
     /// Use `cache` for committed-clearance entry queries (shared across plans).
     pub(crate) fn share_entry_scene(&mut self, cache: &EntrySceneCache) {
         self.entry_scene = cache.clone();
