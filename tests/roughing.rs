@@ -4328,6 +4328,11 @@ fn certify_bar(c: &Curve) {
 /// clearing at 0.6 mm width, stepdown 6, floor 1. Both side strips run the
 /// stock's whole 60 mm length.
 fn spiral_bar_manifest(spiral: bool, top_z: f64, ends: bool) -> StreamManifest {
+    serde_json::from_value(spiral_bar_input(spiral, top_z, ends)).unwrap()
+}
+
+/// The bar job's manifest JSON, for tests that change it before parsing.
+fn spiral_bar_input(spiral: bool, top_z: f64, ends: bool) -> serde_json::Value {
     // `top_z` is the stock and part height; above 12 the first layer still
     // cuts at Z6 (one deep stepdown) and the tool is lengthened to reach.
     let saved: serde_json::Value =
@@ -4392,7 +4397,7 @@ fn spiral_bar_manifest(spiral: bool, top_z: f64, ends: bool) -> StreamManifest {
         op.insert("spiral".into(), true.into());
         op.insert("rapid_mm_min".into(), 10000.0.into());
     }
-    serde_json::from_value(input).unwrap()
+    input
 }
 
 /// Run the bar job to completion, committing every motion to stock, and
@@ -4485,6 +4490,60 @@ fn run_spiral_bar(spiral: bool, top_z: f64, ends: bool) -> (f64, serde_json::Val
     }
     assert!(first_passes > 0, "no first-layer passes planned");
     (first_cut / first_passes as f64, report)
+}
+
+/// Step-ups beside vertical walls find nothing to cut: the full layer below
+/// already cut every wall down to its allowance. Each layer hands its
+/// cleared-height memory to the next; an empty step-up (no motion) used to
+/// drop it, so the step-up after it steered from whole-cell stock bounds,
+/// saw material along every wall the full layer had cut, and ran passes in
+/// air there (on alternate step-ups).
+#[test]
+fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
+    let mut input = spiral_bar_input(false, 12., false);
+    // Walls off the 0.4 mm stock cells, so whole-cell bounds overlap them.
+    input["operations"][0]["target"]["triangles"] =
+        serde_json::to_value(closed_box(0., 12.15, 0., 60., 27.85, 12.)).unwrap();
+    input["operations"][0]["stepdown_mm"] = 11.0.into();
+    input["operations"][0]["stepup_mm"] = 2.0.into();
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+    }
+    plan.finish_report(&|| false).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    let layers = report["layers"].as_array().unwrap();
+    let ups: Vec<_> = layers
+        .iter()
+        .filter(|l| l["step_up_of_z_mm"].is_number())
+        .collect();
+    assert!(
+        ups.len() >= 3,
+        "expected several step-ups: {}",
+        layers.len()
+    );
+    for l in &ups {
+        assert_eq!(
+            l["clearing"]["passes"], 0,
+            "step-up at Z{} cut beside vertical walls: {}",
+            l["tip_z_mm"], l["clearing"]
+        );
+    }
 }
 
 /// The strips closed by end walls (so later passes start beside the stock,

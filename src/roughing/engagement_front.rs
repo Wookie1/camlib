@@ -629,6 +629,10 @@ pub(crate) struct EngagementFrontPlan {
     spec: StockSpec,
     layer: Option<Layer>,
     memory: Option<FrontMemory>,
+    /// The stock generation of the memory this layer was built from, when
+    /// it carried one: a layer that commits no motion hands that memory on
+    /// unchanged (see `take_memory`).
+    carried_generation: Option<u64>,
     pending: VecDeque<Pending>,
     position: Vec3,
     next_id: u64,
@@ -708,6 +712,7 @@ impl EngagementFrontPlan {
             spec: spec.clone(),
             layer: None,
             memory: None,
+            carried_generation: None,
             pending: VecDeque::new(),
             position: initial,
             next_id: 1,
@@ -762,7 +767,26 @@ impl EngagementFrontPlan {
     pub(crate) fn give_memory(&mut self, memory: FrontMemory) {
         self.memory = Some(memory);
     }
+    /// The cleared-height memory to hand to the next layer. A layer that
+    /// committed motions hands its own, valid for the stock generation after
+    /// its last motion. A layer that committed none changed no stock, so the
+    /// memory it was given (used or not) is handed on with its original
+    /// generation; the next layer still accepts it only if the stock is at
+    /// that generation. Dropping it here made the layer after every empty
+    /// step-up steer from whole-cell stock bounds, which see material along
+    /// walls that earlier layers had cut, and run passes in air.
     pub(crate) fn take_memory(&mut self) -> Option<FrontMemory> {
+        if self.generation.is_none() {
+            if let Some(memory) = self.memory.take() {
+                return Some(memory);
+            }
+            let layer = self.layer.take()?;
+            return Some(FrontMemory {
+                grid: layer.g,
+                cleared: layer.cleared,
+                generation: self.carried_generation?,
+            });
+        }
         let layer = self.layer.take()?;
         Some(FrontMemory {
             grid: layer.g,
@@ -940,6 +964,7 @@ impl EngagementFrontPlan {
         let cleared = match self.memory.take() {
             Some(m) if m.grid == g && Some(m.generation) == Some(stock.generation()) => {
                 self.report.stock_top_carried = true;
+                self.carried_generation = Some(m.generation);
                 m.cleared
             }
             Some(_) => {
