@@ -1,6 +1,6 @@
 """Differential declared-dialect semantics, not controller/hardware qualification."""
 
-from camlib.postprocessor import GCodeDialect
+from camlib.postprocessor import GCodeDialect, arc_radii
 
 from dataclasses import asdict, replace
 import json
@@ -300,6 +300,80 @@ class MotionDecoder(unittest.TestCase):
             self.assertEqual(moves[0].kind, 'rapid')
             self.assertIsNone(moves[0].feed_mm_min)
             self.assertEqual(moves[0].curve.end, (10, 0, 3))
+
+    def test_equal_radius_words_are_decided_exactly_at_zero_tolerance(self):
+        # Issue #169: from (9.995, 20), X29.999 Y20 I10.002 J0.006 has exactly
+        # equal radii. Rebuilt in binary64 the two radius vectors differ in the
+        # last bit, and glibc's hypot rejected the arc at zero tolerance while
+        # macOS's accepted it. Decided on the words, every platform accepts it
+        # and still refuses a one-unit mismatch.
+        machine = self.machine()
+        machine = replace(machine, dialect=replace(machine.dialect, radius_tolerance_mm=0, radius_relative_tolerance=0))
+        for cls in (GCodeDecoder, NativeGCodeDecoder):
+            for line, accepted in (
+                ('G2 X29.999 Y20 I10.002 J0.006 F100', True),
+                ('G2 X29.999 Y20.001 I10.002 J0.006 F100', False),
+            ):
+                with self.subTest(cls=cls.__name__, line=line):
+                    decoder = self.setup_decoder(machine, cls)
+                    decoder.position = (9.995, 20.0, decoder.position[2])
+                    decoder.plane = 'xy'
+                    context = dict(id=1, operation='case', kind='cut')
+                    if accepted:
+                        moves = decoder.read_line(line, context)
+                        self.assertEqual(moves[0].curve.end[:2], (29.999, 20.0))
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'radius mismatch'):
+                            decoder.read_line(line, context)
+
+    def test_python_and_native_decoders_decide_arc_radii_alike(self):
+        # Each decoder has its own implementation of the radius rule (#169);
+        # at zero tolerance they must accept and refuse the same words. Ends
+        # are the start rotated about the centre (exactly equal radii), then
+        # nudged by -1, 0 or +1 in the last decimal.
+        machine = self.machine()
+        machine = replace(machine, dialect=replace(machine.dialect, radius_tolerance_mm=0, radius_relative_tolerance=0))
+        rng = random.Random(169)
+        outcomes = []
+
+        def word(n):
+            return f'{n / 1000:.3f}'
+
+        for _ in range(300):
+            s = [rng.randint(-50000, 50000) for _ in range(2)]
+            i = [rng.randint(-20000, 20000) or 1 for _ in range(2)]
+            c = [s[0] + i[0], s[1] + i[1]]
+            x, y = s[0] - c[0], s[1] - c[1]
+            x, y = rng.choice([(-y, x), (-x, -y), (y, -x)])
+            e = [c[0] + x + rng.randint(-1, 1), c[1] + y + rng.randint(-1, 1)]
+            line = f'G2 X{word(e[0])} Y{word(e[1])} I{word(i[0])} J{word(i[1])} F100'
+            accepted = []
+            for cls in (GCodeDecoder, NativeGCodeDecoder):
+                decoder = self.setup_decoder(machine, cls)
+                decoder.position = (float(word(s[0])), float(word(s[1])), decoder.position[2])
+                decoder.plane = 'xy'
+                try:
+                    decoder.read_line(line, dict(id=1, operation='case', kind='cut'))
+                    accepted.append(True)
+                except ValueError as error:
+                    self.assertIn('radius mismatch', str(error))
+                    accepted.append(False)
+            self.assertEqual(accepted[0], accepted[1], line)
+            outcomes.append(accepted[0])
+        self.assertTrue(any(outcomes) and not all(outcomes))
+
+    def test_arc_radii_are_exact_on_the_word_grid_and_match_the_engine(self):
+        r1, r2, error = arc_radii((9.995, 20.0), (29.999, 20.0), (10.002, 0.006), 1.0)
+        self.assertEqual((error, r1), (0.0, r2))
+        inch = [w * 25.4 for w in (9.995, 20.0, 29.999, 20.0, 10.002, 0.006)]
+        self.assertEqual(arc_radii(inch[0:2], inch[2:4], inch[4:6], 25.4)[2], 0.0)
+        # A start no word wrote: binary64 with correctly rounded operations.
+        start = (0.1 + 0.2, 20.0)
+        r1, r2, error = arc_radii(start, (10.3, 20.0), (5.0, 0.0), 1.0)
+        center = start[0] + 5.0
+        x, ex = start[0] - center, 10.3 - center
+        self.assertEqual((r1, r2), (math.sqrt(x * x), math.sqrt(ex * ex)))
+        self.assertEqual(error, abs(r1 - r2))
 
     def test_compiled_decoder_config_and_physical_block_caps_are_checked(self):
         dialect = asdict(self.machine().dialect)
