@@ -153,6 +153,10 @@ pub struct EngagementFrontReport {
     /// material (where the cell bounds proved the rapid could come lower)
     /// and feeding across at depth.
     pub offset_descents: usize,
+    /// Rapids between passes that travelled below `retract_z_mm`, at
+    /// `travel_clearance_mm` above the whole-cell stock bounds under every
+    /// tool section over the rectangle their ends span.
+    pub lowered_travels: usize,
     /// Passes that cleared a remnant too thin for a full step (a sliver
     /// left between passes) from beside it at depth, instead of a helix.
     pub remnant_passes: usize,
@@ -221,6 +225,7 @@ impl Default for EngagementFrontReport {
             entry_turns: 0,
             air_entries: 0,
             offset_descents: 0,
+            lowered_travels: 0,
             remnant_passes: 0,
             fast_links: 0,
             fast_link_mm: 0.,
@@ -588,6 +593,8 @@ pub(crate) struct EngagementFrontPlan {
     heights: Heights,
     /// See `RoughingOperation::rapid_descent_clearance_mm`.
     rapid_descent: Option<f64>,
+    /// See `RoughingOperation::travel_clearance_mm`.
+    travel_clearance: Option<f64>,
     /// See `RoughingOperation::ramp_clearance_mm`.
     ramp_clearance: Option<f64>,
     /// See `RoughingOperation::link_feed_mm_min`.
@@ -680,6 +687,7 @@ impl EngagementFrontPlan {
             entry,
             heights,
             rapid_descent: None,
+            travel_clearance: None,
             ramp_clearance: None,
             link_feed: None,
             chip_thinning: false,
@@ -727,6 +735,11 @@ impl EngagementFrontPlan {
     }
     pub(crate) fn with_rapid_descent(mut self, clearance: Option<f64>) -> Self {
         self.rapid_descent = clearance;
+        self
+    }
+    /// See `RoughingOperation::travel_clearance_mm` (validated there).
+    pub(crate) fn with_travel_clearance(mut self, clearance: Option<f64>) -> Self {
+        self.travel_clearance = clearance;
         self
     }
     pub(crate) fn construction_error_mm(&self) -> f64 {
@@ -1665,15 +1678,34 @@ impl EngagementFrontPlan {
     /// Rapid from `from` up to the retract height, across to `to`, and down
     /// to the feed height (or the proven rapid-descent stop below it), never
     /// below `at_least`: the caller's next motion starts there, so the rapid
-    /// ends at or above it and every endpoint connects.
-    fn travel(&mut self, from: Vec3, to: Point, proven: Option<f64>, at_least: f64) -> Vec3 {
-        let up = if (from[2] - self.heights.retract).abs() < 1e-12 || from[2] >= self.heights.feed {
-            let up = [from[0], from[1], from[2].max(self.heights.retract)];
+    /// ends at or above it and every endpoint connects. With
+    /// `travel_clearance_mm`, the rapid across runs lower when the
+    /// whole-cell stock bounds allow: see `travel_height`.
+    fn travel(
+        &mut self,
+        stock: &Stock,
+        from: Vec3,
+        to: Point,
+        proven: Option<f64>,
+        at_least: f64,
+    ) -> Vec3 {
+        let height = self.travel_height(stock, from, to, at_least);
+        let up = if height < self.heights.feed {
+            // Below the feed height: straight up, then across.
+            let up = [from[0], from[1], height];
+            self.line(from, up, MoveKind::Retract);
+            self.report.lowered_travels += 1;
+            up
+        } else if (from[2] - height).abs() < 1e-12 || from[2] >= self.heights.feed {
+            let up = [from[0], from[1], from[2].max(height)];
             self.line(from, up, MoveKind::Rapid);
             up
         } else {
-            self.lift(from, self.heights.retract)
+            self.lift(from, height)
         };
+        if height < self.heights.retract && height >= self.heights.feed {
+            self.report.lowered_travels += 1;
+        }
         let across = [to[0], to[1], up[2]];
         self.line(up, across, MoveKind::Rapid);
         let stop = match (self.rapid_descent, proven) {
@@ -1685,6 +1717,25 @@ impl EngagementFrontPlan {
         let above = [to[0], to[1], stop];
         self.line(across, above, MoveKind::Rapid);
         above
+    }
+
+    /// The height of the rapid across from `from` to above `to`: the retract
+    /// height, or with `travel_clearance_mm` that far above the highest
+    /// whole-cell stock upper bound any tool section can meet anywhere in
+    /// the rectangle spanned by the two ends (so either axis-first dogleg is
+    /// clear too), when that is lower. Never below `from` or `at_least`.
+    /// Stock only loses material, so bounds of the committed stock stay
+    /// upper bounds while queued cuts are still to be committed.
+    fn travel_height(&self, stock: &Stock, from: Vec3, to: Point, at_least: f64) -> f64 {
+        let retract = self.heights.retract;
+        let Some(clearance) = self.travel_clearance else {
+            return retract;
+        };
+        let bound = self.guides.cell_route_height(stock, [from[0], from[1]], to);
+        if !bound.is_finite() {
+            return retract;
+        }
+        (bound + clearance).max(from[2]).max(at_least).min(retract)
     }
 
     /// A vertical entry at `q` sits beside the material it is about to cut,
@@ -1885,7 +1936,7 @@ impl EngagementFrontPlan {
             } else if let Some((p, proven_p, samples)) = descent {
                 // Plunge beside the entry, where the stock bounds let the
                 // rapid come down, then feed across to it at depth.
-                let above = self.travel(here, p, proven_p, z);
+                let above = self.travel(stock, here, p, proven_p, z);
                 self.line(above, [p[0], p[1], z], MoveKind::Plunge);
                 let layer = self.layer.as_mut().unwrap();
                 for s in samples {
@@ -1897,7 +1948,7 @@ impl EngagementFrontPlan {
                 self.report.stock_edge_entries += 1;
                 self.report.offset_descents += 1;
             } else {
-                let above = self.travel(here, q, proven, z);
+                let above = self.travel(stock, here, q, proven, z);
                 self.line(above, [q[0], q[1], z], MoveKind::Plunge);
                 self.report.lifts += 1;
                 self.report.stock_edge_entries += 1;
@@ -2449,7 +2500,7 @@ impl EngagementFrontPlan {
             // A rapid-descent stop below the helix start (rapid clearance
             // under the ramp clearance) ends at the start instead: higher
             // than the proven stop, so no less safe, and continuous.
-            let above = self.travel(here, [start[0], start[1]], proven, start[2]);
+            let above = self.travel(stock, here, [start[0], start[1]], proven, start[2]);
             if above[2] > start[2] {
                 self.line(above, start, MoveKind::Plunge);
             } else if above[2] < start[2] {

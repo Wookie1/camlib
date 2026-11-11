@@ -4466,6 +4466,126 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
     }
 }
 
+/// Run the bar job (end walls, a high retract) with `travel_clearance_mm`
+/// set or not, committing every motion. Every rapid that runs across below
+/// the retract height is checked against the exact stock left by the cuts
+/// before it (from the cut curves, not the stock model): over the whole
+/// rectangle its ends span, grown by the cutter radius, so the straight
+/// route and both axis-first doglegs clear the stock and the bar. Returns
+/// (rapid and retract length mm, report).
+fn run_bar_travel(clearance: Option<f64>) -> (f64, serde_json::Value) {
+    let mut input = spiral_bar_input(true, 12., true);
+    input["initial_position_mm"] = serde_json::json!([0.0, 0.0, 30.0]);
+    let op = &mut input["operations"][0];
+    op["clearance_z_mm"] = 30.0.into();
+    op["retract_z_mm"] = 30.0.into();
+    if let Some(c) = clearance {
+        op["travel_clearance_mm"] = c.into();
+    }
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let mut history: Vec<camlib::motion::Motion> = Vec::new();
+    let mut current = m.initial_position_mm;
+    let mut travel = 0.;
+    let (r, top) = (3., 12.);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(history.len() < 60000, "unbounded engagement_front path");
+        assert_eq!(motion.curve.start(), current);
+        current = motion.curve.end();
+        certify_bar(&motion.curve);
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        if matches!(motion.kind, MoveKind::Rapid | MoveKind::Retract) {
+            travel += ((b[0] - a[0]).hypot(b[1] - a[1])).hypot(b[2] - a[2]);
+        }
+        let across = (b[0] - a[0]).hypot(b[1] - a[1]) > 1e-9;
+        if motion.kind == MoveKind::Rapid && across && a[2] < 30. - 1e-9 {
+            assert!(
+                (a[2] - b[2]).abs() < 1e-12,
+                "rapid across changes Z: {motion:?}"
+            );
+            let (x0, x1) = (a[0].min(b[0]) - r, a[0].max(b[0]) + r);
+            let (y0, y1) = (a[1].min(b[1]) - r, a[1].max(b[1]) + r);
+            let step = 0.2;
+            let (nx, ny) = (
+                ((x1 - x0) / step).ceil() as usize,
+                ((y1 - y0) / step).ceil() as usize,
+            );
+            for i in 0..=nx {
+                for j in 0..=ny {
+                    let p = [x0 + i as f64 * step, y0 + j as f64 * step];
+                    if p[0] < 0. || p[0] > 60. || p[1] < 0. || p[1] > 40. {
+                        continue;
+                    }
+                    // The bar and the end walls are never cut.
+                    let kept = (12. ..=28.).contains(&p[1]) || p[0] <= 4. || p[0] >= 56.;
+                    let height = if kept {
+                        top
+                    } else {
+                        history
+                            .iter()
+                            .filter(|old| old.kind != MoveKind::Rapid)
+                            .map(|old| exact_height_for(&old.curve, p, r, top))
+                            .fold(top, f64::min)
+                    };
+                    assert!(
+                        a[2] > height + 0.5,
+                        "rapid across at Z{} over stock at {p:?} (Z{height}): {motion:?}",
+                        a[2]
+                    );
+                }
+            }
+        }
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        if matches!(motion.kind, MoveKind::Rapid | MoveKind::Retract) {
+            assert!(
+                delta.changes().iter().all(|c| c.after == c.before),
+                "rapid removes stock: {motion:?}"
+            );
+        }
+        stock.apply_delta(&delta).unwrap();
+        history.push(motion);
+    }
+    plan.finish_report(&|| false).unwrap();
+    (travel, serde_json::to_value(plan.report()).unwrap())
+}
+
+/// With `travel_clearance_mm`, rapids between passes run just above the
+/// stock their route can meet instead of climbing to the retract height,
+/// proven clear over the whole rectangle of each route (dogleg-safe).
+#[test]
+fn engagement_front_travel_clearance_lowers_rapids_over_cut_stock() {
+    let lowered = |report: &serde_json::Value| -> u64 {
+        report["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["clearing"]["lowered_travels"].as_u64().unwrap())
+            .sum()
+    };
+    let (high, high_report) = run_bar_travel(None);
+    let (low, low_report) = run_bar_travel(Some(1.));
+    eprintln!(
+        "rapid travel {high:.0} mm at retract, {low:.0} mm lowered ({} lowered)",
+        lowered(&low_report)
+    );
+    assert_eq!(lowered(&high_report), 0);
+    assert!(lowered(&low_report) > 0, "no rapid was lowered");
+    assert!(low < 0.8 * high, "lowered rapids did not shorten travel");
+}
+
 /// The strips closed by end walls (so later passes start beside the stock,
 /// proven only by the committed sweeps), with the operation's top 48 mm
 /// above the Z6 layer (a deep layer, as under a tall part). A vertical entry into cut stock is
