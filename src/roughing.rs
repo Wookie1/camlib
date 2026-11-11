@@ -706,6 +706,16 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// cut. None: rapid descent stops at `feed_z_mm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rapid_descent_clearance_mm: Option<f64>,
+    /// engagement_front only. A rapid between passes travels this far above
+    /// the highest whole-cell stock upper bound that any tool-assembly
+    /// section can meet anywhere in the rectangle spanned by its two ends
+    /// (so the straight route and both axis-first doglegs are clear), when
+    /// that is below `retract_z_mm`; it leaves at the cut straight up to
+    /// that height. Only stock is considered: the planner does not see
+    /// fixtures, which the run's verification still checks on every move.
+    /// None: rapids travel at `retract_z_mm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub travel_clearance_mm: Option<f64>,
     /// engagement_front only. Each helical entry starts this far above the
     /// material its bore meets (proven by the committed sweeps or the stock
     /// cell bounds, and never above `feed_z_mm`), so the cutter is already
@@ -799,6 +809,7 @@ impl<G> RoughingOperation<G> {
             clearing_tolerance_mm: self.clearing_tolerance_mm,
             contour_tolerance_mm: self.contour_tolerance_mm,
             rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
+            travel_clearance_mm: self.travel_clearance_mm,
             ramp_clearance_mm: self.ramp_clearance_mm,
             link_feed_mm_min: self.link_feed_mm_min,
             link_chip_thinning: self.link_chip_thinning,
@@ -1291,6 +1302,7 @@ impl RoughingPlan {
         template.validate_authoring(tool, prepared_tool.cutter().definition(), initial, r)?;
         for (name, value) in [
             ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
+            ("travel_clearance_mm", op.travel_clearance_mm),
             ("ramp_clearance_mm", op.ramp_clearance_mm),
             ("link_feed_mm_min", op.link_feed_mm_min),
             ("rapid_mm_min", op.rapid_mm_min),
@@ -1564,6 +1576,7 @@ impl RoughingPlan {
                                 &cancel,
                             )?
                             .with_rapid_descent(op.rapid_descent_clearance_mm)
+                            .with_travel_clearance(op.travel_clearance_mm)
                             .with_ramp_clearance(op.ramp_clearance_mm)
                             .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning)
                             .with_spiral(op.spiral, op.rapid_mm_min),

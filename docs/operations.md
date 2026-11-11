@@ -238,7 +238,16 @@ make its topology ambiguous. It only adds protection, and each layer reports it
   down from `feed_z_mm` through material already cut. An entry beside the
   material it cuts (where the whole-cell stock bounds still hold that
   material) then plunges a few stock cells back, where the bounds let the
-  rapid come lower, and feeds across at depth. A helical entry ramps only
+  rapid come lower, and feeds across at depth. With `travel_clearance_mm`
+  (opt-in, on `Roughing`), a rapid between passes leaves the cut straight up
+  and travels that far above the highest whole-cell stock upper bound any
+  tool-assembly section can meet over the rectangle its two ends span,
+  when that is below `retract_z_mm`. The rectangle covers the straight
+  route and both axis-first doglegs, since how a controller interpolates
+  G0 varies. Only stock is considered: the planner does not see fixtures
+  (the run's verification still checks every move against them), so leave
+  it off when clamps rise above the stock inside the work area. Reported
+  per layer as `lowered_travels`. A helical entry ramps only
   through material: above the height the committed cuts or the stock cell
   bounds prove clear over its whole bore it descends straight down, and a
   bore that is clear to the layer gets a straight plunge (reported as
