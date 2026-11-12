@@ -3957,45 +3957,85 @@ fn separately_tessellated_boss(wall: f64) -> Vec<[[f64; 3]; 3]> {
 #[test]
 fn separately_tessellated_faces_give_a_shadow_for_the_cutter() {
     let cancel = AtomicBool::new(false);
+    // A mesh that claims to be exact (error 0): without a cutter the exact
+    // union keeps slivers between the two faces' edges; one touches another
+    // boundary within the tolerance, and the refusal says where and why.
+    let exact = PreparedRoughingTarget::prepare(
+        mesh(separately_tessellated_boss(11.), 0.),
+        1e-5,
+        &cancel,
+    )
+    .unwrap();
+    let refused = exact.shadow(11., 0.2, &mut 0, &cancel).err().unwrap();
+    assert!(refused.contains("intersect or touch near ("), "{refused}");
+    assert!(refused.contains("not watertight"), "{refused}");
+    // For a 12 mm cutter the slivers are filled: no cutter disk fits in one.
+    let filled = exact
+        .shadow_for_cutter(11., 0.2, 6., &mut 0, &cancel)
+        .unwrap();
+    assert!(filled.report.filled_holes > 0);
+    assert!(filled.report.seam_closing.is_none());
+    // Lenses between the two faces' chords along the radius 3 circle only.
+    assert!(
+        filled.report.filled_hole_area_mm2 < 0.5,
+        "{:?}",
+        filled.report
+    );
+    // The same mesh declaring the 0.01 mm it is good for (#241): its seams
+    // (the chords' sagitta, 0.0092) are below that error and are closed, with
+    // or without a cutter. This was the refusal above before; a seam below
+    // the mesh's own declared error says nothing about the part.
     let target = PreparedRoughingTarget::prepare(
         mesh(separately_tessellated_boss(11.), 0.01),
         1e-5,
         &cancel,
     )
     .unwrap();
-    // Without a cutter the exact union keeps slivers between the two faces'
-    // edges; one touches another boundary within the tolerance, and the
-    // refusal says where and why.
-    let refused = target.shadow(11., 0.2, &mut 0, &cancel).err().unwrap();
-    assert!(refused.contains("intersect or touch near ("), "{refused}");
-    assert!(refused.contains("not watertight"), "{refused}");
-    // For a 12 mm cutter the slivers are filled: no cutter disk fits in one.
-    let shadow = target
-        .shadow_for_cutter(11., 0.2, 6., &mut 0, &cancel)
-        .unwrap();
-    assert!(shadow.report.filled_holes > 0);
-    // Lenses between the two faces' chords along the radius 3 circle only.
-    assert!(
-        shadow.report.filled_hole_area_mm2 < 0.5,
-        "{:?}",
-        shadow.report
-    );
-    let region = shadow
-        .region
-        .prepare(ConstructionOptions::default())
-        .unwrap();
-    assert_eq!(
-        (region.summary().components, region.summary().holes),
-        (1, 0)
-    );
-    // Every projected facet point stays protected (filling only adds area).
-    for triangle in separately_tessellated_boss(11.) {
-        for p in triangle {
-            assert!(signed(&region, [p[0], p[1]]) > -1e-4, "{p:?}");
+    for (shadow, cutter) in [
+        (filled, 6.),
+        (target.shadow(11., 0.2, &mut 0, &cancel).unwrap(), 0.),
+        (
+            target
+                .shadow_for_cutter(11., 0.2, 6., &mut 0, &cancel)
+                .unwrap(),
+            6.,
+        ),
+    ] {
+        // With a cutter the slivers are filled as holes too small for it and
+        // the exact union stands; without one the union is not a valid
+        // region and is closed by the declared error.
+        if shadow.report.source_error_mm > 0. {
+            if cutter == 0. {
+                assert!(shadow.report.seam_closing.is_some(), "{:?}", shadow.report);
+            }
+            let added = shadow.report.seam_closing.map_or(0., |closing| {
+                assert_eq!(closing.distance_mm, 0.01);
+                closing.added_area_mm2
+            });
+            assert!(
+                added + shadow.report.filled_hole_area_mm2 < 0.5,
+                "{:?}",
+                shadow.report
+            );
         }
+        let region = shadow
+            .region
+            .prepare(ConstructionOptions::default())
+            .unwrap();
+        assert_eq!(
+            (region.summary().components, region.summary().holes),
+            (1, 0)
+        );
+        // Every projected facet point stays protected (filling and closing
+        // only add area).
+        for triangle in separately_tessellated_boss(11.) {
+            for p in triangle {
+                assert!(signed(&region, [p[0], p[1]]) > -1e-4, "{p:?}");
+            }
+        }
+        assert!(signed(&region, [0., 0.]) > 1.);
+        assert!(signed(&region, [3.2, 0.]) < 0.);
     }
-    assert!(signed(&region, [0., 0.]) > 1.);
-    assert!(signed(&region, [3.2, 0.]) < 0.);
 }
 
 #[test]
