@@ -656,91 +656,78 @@ def _rectangle_face_data(face, cancel):
 
 
 def _refine_conforming(triangles, bounds, remaining, check_budget, check_cancel, locate=lambda p: p):
-    """Refine a face's UV triangles until each interpolates within `remaining`.
+    """Refine a face's UV triangles until each interpolates within `remaining`,
+    and close the T-junctions the refinement leaves.
 
-    Splitting a triangle's edge splits every triangle on that edge too, so the
-    refined mesh has no T-junctions: a vertex lies on a neighbour's edge only
-    when that edge is split there as well. (A lone split leaves the vertex
-    inside the neighbour's edge, a gap as large as the interpolation error;
-    the verification then sees a leaky solid.) Edges are matched by where their
-    ends are in space (`locate` maps a UV point to coordinates), so the two
-    sides of a periodic seam, which are far apart in UV, split together. An
-    edge collapsed to a point (a pole) has no neighbour. Returns
-    (triangle, error) pairs.
+    A triangle is bisected on its own, so a finer neighbour's new vertex lies
+    inside the coarser triangle's edge: in space a gap as large as the
+    interpolation error, and the solid is no longer closed. After refining,
+    each triangle whose edge has such a vertex at its UV midpoint (looked up
+    by where it is in space, `locate` maps a UV point to coordinates, so the
+    two sides of a periodic seam match) is cut through that vertex. No new
+    vertex is made, so this adds no further hanging vertex, and a piece is
+    never larger than its parent, so its bound still holds (it is checked
+    again anyway). Returns (triangle, error) pairs.
     """
-    tris, depth, edges = [], [], {}
+    places = {}
 
     def place(p):
-        return tuple(round(v * 1e7) for v in locate(p))
+        if p not in places:
+            places[p] = tuple(round(v * 1e7) for v in locate(p))
+        return places[p]
 
-    def key(p, q):
-        p, q = place(p), place(q)
-        return None if p == q else (p, q) if p <= q else (q, p)
+    done = []
+    while True:
+        pending = [(piece, 0) for piece in triangles]
+        refined = []
+        count = 0
+        while pending:
+            count += 1
+            if count % 1024 == 0:
+                check_cancel()
+                check_budget(len(refined) + len(pending))
+            triangle, depth = pending.pop()
+            error = _interpolation_error(triangle, bounds)
+            if error <= remaining:
+                refined.append((triangle, error))
+                continue
+            if depth >= 24:
+                raise ValueError('CAD surface interpolation exceeds refinement depth')
+            local = _local_bounds(bounds, triangle)
 
-    def add(triangle, d):
-        tris.append(triangle)
-        depth.append(d)
-        for i in range(3):
-            k = key(triangle[i], triangle[(i + 1) % 3])
-            if k is not None:
-                edges.setdefault(k, []).append(len(tris) - 1)
-        return len(tris) - 1
+            def edge_cost(pair):
+                a, b = (triangle[i] for i in pair)
+                du, dv = abs(a[0] - b[0]), abs(a[1] - b[1])
+                if len(local) > 5 and local[5]:
+                    return local[0] * du
+                return local[2] * du * du + 2 * local[3] * du * dv + local[4] * dv * dv
 
-    def remove(t):
-        triangle = tris[t]
-        tris[t] = None
-        for i in range(3):
-            k = key(triangle[i], triangle[(i + 1) % 3])
-            if k is not None:
-                edges[k].remove(t)
-
-    def split(t, i, stack):
-        # Bisect triangle `t` across its edge i (vertex i to i + 1).
-        triangle, d = tris[t], depth[t]
-        if d >= 24:
-            raise ValueError('CAD surface interpolation exceeds refinement depth')
-        p, q, c = triangle[i], triangle[(i + 1) % 3], triangle[(i + 2) % 3]
-        middle = tuple((x + y) / 2 for x, y in zip(p, q))
-        remove(t)
-        accepted.pop(t, None)
-        stack.extend((add((p, middle, c), d + 1), add((middle, q, c), d + 1)))
-
-    stack = [add(triangle, 0) for triangle in triangles]
-    accepted = {}
-    steps = 0
-    while stack:
-        steps += 1
-        if steps % 1024 == 0:
-            check_cancel()
-            check_budget(sum(1 for x in tris if x is not None))
-        t = stack.pop()
-        triangle = tris[t]
-        if triangle is None or t in accepted:
-            continue
-        error = _interpolation_error(triangle, bounds)
-        if error <= remaining:
-            accepted[t] = error
-            continue
-        local = _local_bounds(bounds, triangle)
-
-        def edge_cost(pair):
-            a, b = (triangle[i] for i in pair)
-            du, dv = abs(a[0] - b[0]), abs(a[1] - b[1])
-            if len(local) > 5 and local[5]:
-                return local[0] * du
-            return local[2] * du * du + 2 * local[3] * du * dv + local[4] * dv * dv
-
-        i, j = max(((0, 1), (1, 2), (2, 0)), key=edge_cost)
-        k = key(triangle[i], triangle[j])
-        if k is None:
-            split(t, i, stack)
-            continue
-        for user in list(edges[k]):
-            corners = tris[user]
-            side = next(m for m in range(3) if key(corners[m], corners[(m + 1) % 3]) == k)
-            split(user, side, stack)
-    check_budget(sum(1 for x in tris if x is not None))
-    return [(tris[t], error) for t, error in accepted.items()]
+            i, j = max(((0, 1), (1, 2), (2, 0)), key=edge_cost)
+            a, b, c = triangle[i], triangle[j], triangle[3 - i - j]
+            middle = tuple((x + y) / 2 for x, y in zip(a, b))
+            pending.extend(((t, depth + 1) for t in ((a, middle, c), (middle, b, c))))
+        check_budget(len(refined))
+        vertices = {place(p) for t, _ in refined for p in t}
+        closed, stack, bad = [], [t for t, _ in refined], []
+        while stack:
+            triangle = stack.pop()
+            for i in range(3):
+                a, b, c = triangle[i], triangle[(i + 1) % 3], triangle[(i + 2) % 3]
+                middle = tuple((x + y) / 2 for x, y in zip(a, b))
+                at = place(middle)
+                if at != place(a) and at != place(b) and at in vertices:
+                    stack.extend(((a, middle, c), (middle, b, c)))
+                    break
+            else:
+                error = _interpolation_error(triangle, bounds)
+                (closed if error <= remaining else bad).append((triangle, error))
+        if not bad:
+            done = closed
+            break
+        # A piece over the bound (not expected: pieces are never larger than
+        # their parent): refine the whole face again from these.
+        triangles = [t for t, _ in closed] + [t for t, _ in bad]
+    return done
 
 
 def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):

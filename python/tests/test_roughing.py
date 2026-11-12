@@ -355,10 +355,25 @@ class RoughingTest(unittest.TestCase):
         )
         self.assertLessEqual(spline.target.surface_error_mm, 0.005)
         self.assertTrue(any(f['kind'] == 'BSPLINE' for f in spline.target.source['face_bounds']))
-        # The imported ellipsoid is a closed mesh (no T-junctions between
-        # refined triangles), so roughing it plans end to end.
-        with Simulation(**dict(c, operations=(spline,))) as sim:
+        # The imported ellipsoid has no T-junctions between refined triangles,
+        # so roughing it, placed in the stock, plans and runs end to end.
+        placed = Roughing.from_solid(
+            'ellipsoid-in-stock',
+            c['tools'][0],
+            ellipsoid.moved(cq.Location(cq.Vector(16, 14, 5))),
+            **{
+                'feed_mm_min': 600,
+                'plunge_mm_min': 150,
+                'spindle_rpm': 12000,
+                'tool_number': 1,
+                'length_register': 1,
+                'coolant': "flood",
+                **dict(parameters, floor_z_mm=1),
+            },
+        )
+        with Simulation(**dict(c, operations=(placed,))) as sim:
             self.assertGreater(len(list(sim.run_operations())), 0)
+            self.assertTrue(sim.state.finished)
         revolved = (
             cq.Workplane('XZ')
             .moveTo(0, 0)
