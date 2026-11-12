@@ -1034,7 +1034,7 @@ impl PreparedRegion {
     /// another boundary within the construction tolerance (for example
     /// between facets of a mesh whose faces were tessellated separately).
     /// With `close` = (grow, bridge) the union is then closed protectively
-    /// (`close_protectively`, round joins): every gap, notch or hole
+    /// (`close_protectively`): every gap, notch or hole
     /// narrower than twice `bridge` bridged, then grown by `grow`, so sub-tolerance
     /// slivers, needles and near-touching boundaries left by separately
     /// tessellated faces become constructible. `grow` is charged to the
@@ -1066,7 +1066,7 @@ impl PreparedRegion {
         }
         let mut grown = 0.;
         if let Some((grow, bridge)) = close {
-            closed = close_protectively(&closed, grid, 0., bridge, grow, JoinType::Round)?;
+            closed = close_protectively(&closed, grid, 0., bridge, grow)?;
             // Miter growth (limit 2) moves the boundary at most twice `grow`.
             grown = 2. * grow;
         }
@@ -1119,12 +1119,10 @@ impl PreparedRegion {
             0.,
         );
         if bridge_mm > 0. {
-            // Miter erosion by b may cut up to 2b (limit 2): grow by b + 32
-            // tolerances first so the result still contains the square
-            // growth, and by 8 more after the closing to thicken its walls.
+            // The closing contains the square growth (miter dilation, round
+            // erosion); 8 tolerances more after it thicken its walls.
             let tol = self.options.tolerance_mm;
-            let grow = bridge_mm + 32. * tol;
-            closed = close_protectively(&closed, grid, grow, bridge_mm, 8. * tol, JoinType::Miter)?;
+            closed = close_protectively(&closed, grid, 0., bridge_mm, 8. * tol)?;
         }
         let filled = fill_small_holes(&mut closed, grid, fill_holes_below_mm2);
         let error = self.definition.boundary_error_mm + self.options.tolerance_mm;
@@ -1140,8 +1138,9 @@ impl PreparedRegion {
 }
 
 /// Protective closing of integer paths (`grid` mm per unit): grown by
-/// `pre_mm + bridge_mm`, shrunk by `bridge_mm` (both with `join`), then grown
-/// by `post_mm` with miter joins (limit 2, so at most twice `post_mm`).
+/// `pre_mm + bridge_mm` with miter joins, shrunk by `bridge_mm` with round
+/// joins, then grown by `post_mm` with miter joins (limit 2, so at most
+/// twice `post_mm`).
 /// Morphological closing with a disc keeps everything and fills every gap,
 /// notch or hole narrower than twice the disc (Serra, Image Analysis and
 /// Mathematical Morphology, 1982, ch. 2). A closing can still leave walls
@@ -1150,20 +1149,22 @@ impl PreparedRegion {
 /// then grown by `post_mm`: walls become at least twice `post_mm` wide and
 /// the gaps left are unions of discs of `bridge_mm - post_mm`, with
 /// needles at least that wide. The result contains the paths grown by
-/// `pre_mm + post_mm` less the join error.
-/// Join error: round joins put chord vertices on the circle (sag at most
-/// 0.2 % of the distance plus a rounding unit; outward offsets only lose
-/// it, and the erosion after an under-grown dilation can cut that sag into
-/// the original); miter joins (limit 2) contain the round growth and their
-/// erosion stays within twice the distance. The caller sizes the growth to
-/// exceed that error: refused here when it does not.
+/// `pre_mm + post_mm`, less integer rounding.
+/// Why the joins are chosen so: a dilation must never fall short of the
+/// exact one, and an erosion never cut deeper. A miter join (limit 2) on a
+/// convex corner contains the round growth, where a round join's chords sit
+/// inside it (cutting the tip of a sharp convex corner by up to its sag, then
+/// the erosion cannot restore it). A round join on the erosion
+/// (a reflex corner of the shape) has its chord vertices on the circle, so
+/// it removes less than the exact erosion; a miter there would remove up to
+/// twice the distance. So the closing contains the shape up to a few grid
+/// units of rounding, and the caller needs no allowance for join sag.
 fn close_protectively(
     paths: &Paths64,
     grid: f64,
     pre_mm: f64,
     bridge_mm: f64,
     post_mm: f64,
-    join: JoinType,
 ) -> Result<Paths64, String> {
     let (pre, bridge, post) = (pre_mm / grid, bridge_mm / grid, post_mm / grid);
     if !([pre, bridge, post]
@@ -1179,25 +1180,20 @@ fn close_protectively(
              bridge ({bridge_mm} mm)"
         ));
     }
-    // The final growth uses miter joins whatever `join` is: it contains the
-    // round growth with no sag and adds no arc vertices, so it cannot leave
-    // the sub-tolerance arc edges that a round growth puts beside nearly
-    // touching gaps. Only the closing contributes join error.
-    let error = match join {
-        JoinType::Round => 0.002 * (pre + bridge) + 3.,
-        _ => bridge + 2.,
-    };
+    // Integer rounding of the three offsets (a unit each, plus a unit of
+    // slack) is the only join error left.
+    let error = 4.;
     if pre + post <= error {
         return Err(format!(
-            "protective closing growth {} mm does not cover its join error {} mm",
+            "protective closing growth {} mm does not cover its rounding error {} mm",
             pre_mm + post_mm,
             error * grid
         ));
     }
     let mut out = paths.clone();
     for (delta, join) in [
-        (pre + bridge, join),
-        (-bridge, join),
+        (pre + bridge, JoinType::Miter),
+        (-bridge, JoinType::Round),
         (post, JoinType::Miter),
     ] {
         if delta != 0. {
@@ -1370,5 +1366,86 @@ mod fill_tests {
         let mut kept: Paths64 = vec![square(0, 0, 1000, true), square(100, 100, 100, false)];
         fill_small_holes(&mut kept, grid, 0.001);
         assert_eq!(kept.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod closing_tests {
+    use super::*;
+
+    fn polygon(points: &[(i64, i64)]) -> clipper2_rust::Path64 {
+        points.iter().map(|&(x, y)| Point64::new(x, y)).collect()
+    }
+
+    /// What of `paths` is outside `closed`, thinned by 3 grid units: empty when
+    /// `closed` contains `paths` up to integer rounding.
+    fn lost(paths: &Paths64, closed: &Paths64) -> Paths64 {
+        let mut clipper = Clipper64::new();
+        clipper.add_subject(paths);
+        clipper.add_clip(closed);
+        let mut difference = vec![];
+        assert!(clipper.execute(
+            ClipType::Difference,
+            FillRule::NonZero,
+            &mut difference,
+            None
+        ));
+        clipper2_rust::inflate_paths_64(&difference, -3., JoinType::Miter, EndType::Polygon, 2., 0.)
+    }
+
+    /// The closing contains the shape at sharp convex corners, where a round
+    /// join's chords cut inside the exact growth and an erosion with miter
+    /// joins cuts further still (it keeps what it must: a superset of the
+    /// shape, Serra 1982 ch. 2, up to integer rounding).
+    #[test]
+    fn the_closing_contains_the_shape_at_sharp_corners_and_spikes() {
+        // 1 unit = 1 nm, as the engine's integer grid is at fine tolerances.
+        let grid = 1e-6;
+        // Acute wedges, a thin spike, a notched square and a rotated slab,
+        // in micrometres, scaled to grid units below; the bridge is 1 mm.
+        let shapes: Vec<Paths64> = vec![
+            vec![polygon(&[(0, 0), (20_000, 0), (20_000, 1_500)])],
+            vec![polygon(&[(0, 0), (30_000, 400), (0, 800)])],
+            vec![polygon(&[
+                (0, 0),
+                (8_000, 0),
+                (8_000, 8_000),
+                (4_100, 8_000),
+                (4_100, 3_000),
+                (3_900, 3_000),
+                (3_900, 8_000),
+                (0, 8_000),
+            ])],
+            vec![polygon(&[
+                (0, 5_000),
+                (10_000, 0),
+                (10_700, 1_300),
+                (700, 6_300),
+            ])],
+            vec![
+                polygon(&[(0, 0), (6_000, 0), (6_000, 6_000), (0, 6_000)]),
+                polygon(&[(6_500, 0), (12_500, 0), (12_500, 6_000), (6_500, 6_000)]),
+            ],
+        ];
+        for (n, paths) in shapes.iter().enumerate() {
+            let paths: Paths64 = paths
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .map(|q| Point64::new(q.x * 1000, q.y * 1000))
+                        .collect()
+                })
+                .collect();
+            let paths = &paths;
+            for (pre, bridge, post) in [(0., 1., 0.00205), (1.00032, 1., 0.00205), (0., 1., 8e-5)] {
+                let closed = close_protectively(paths, grid, pre, bridge, post).unwrap();
+                let missing = lost(paths, &closed);
+                assert!(
+                    missing.is_empty(),
+                    "shape {n}, growth {pre}+{post}: closing lost {} piece(s) of the shape",
+                    missing.len()
+                );
+            }
+        }
     }
 }
