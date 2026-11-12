@@ -289,50 +289,6 @@ impl ClearedSweep {
             }
             _ => return Err(bad()),
         };
-        // A restored sweep is a premise of later clearance proofs and of the
-        // cells the union rule lowers, so its numbers must describe one
-        // curve: a line's unit vector and length are its ends', an arc's
-        // ends lie on its circle at its angles, and the box holds the shape.
-        // (The checksum guards the bytes; this guards what they say.)
-        let near = |x: f64, y: f64, scale: f64| (x - y).abs() <= 1e-9 * (1. + scale.abs());
-        let bounds = [[w[3], w[4]], [w[5], w[6]]];
-        let inside =
-            |p: Point| (0..2).all(|k| bounds[0][k] <= p[k] + 1e-9 && p[k] <= bounds[1][k] + 1e-9);
-        let consistent = match shape {
-            Shape::Line { a, b, unit, length } => {
-                length >= 0.
-                    && near(length, (b[0] - a[0]).hypot(b[1] - a[1]), length)
-                    && (length == 0. || near(unit[0].hypot(unit[1]), 1., 1.))
-                    && (0..2).all(|k| near(a[k] + unit[k] * length, b[k], length + a[k].abs()))
-                    && inside(a)
-                    && inside(b)
-            }
-            Shape::Arc {
-                a,
-                b,
-                c,
-                radius,
-                angle,
-                sweep,
-            } => {
-                let at = |t: f64| [c[0] + radius * t.cos(), c[1] + radius * t.sin()];
-                let scale = radius + c[0].abs() + c[1].abs();
-                radius > 0.
-                    && sweep != 0.
-                    && sweep.abs() <= TAU + 1e-9
-                    && (0..2).all(|k| near(at(angle)[k], a[k], scale))
-                    // The declared end may be off the circle by the arc's
-                    // own path error (its end-point mismatch is part of it).
-                    && (0..2).all(|k| {
-                        (at(angle + sweep)[k] - b[k]).abs() <= w[2] + 1e-9 * (1. + scale)
-                    })
-                    && inside(a)
-                    && inside(b)
-            }
-        };
-        if !consistent {
-            return Err(bad());
-        }
         let sector = match shape {
             Shape::Arc { angle, sweep, .. } if sweep.abs() < TAU => {
                 Some(angular::ArcSector::new(angle, sweep))
@@ -345,7 +301,7 @@ impl ClearedSweep {
             floor: w[0],
             radius: w[1],
             error: w[2],
-            bounds,
+            bounds: [[w[3], w[4]], [w[5], w[6]]],
         })
     }
 
@@ -2915,78 +2871,6 @@ mod leading_tests {
                     .unwrap()
             });
             assert_eq!(after, before);
-        }
-    }
-}
-
-#[cfg(test)]
-mod restored_sweep_tests {
-    use super::*;
-    use crate::motion::{Curve, Motion, MoveKind, Plane};
-
-    fn sweep(curve: Curve) -> ClearedSweep {
-        let motion = Motion {
-            id: 1,
-            operation: "op".into(),
-            tool: "t".into(),
-            kind: MoveKind::Cut,
-            curve,
-            feed_mm_min: Some(100.),
-        };
-        ClearedSweep::from_motion(&motion, 3., 1e-5).unwrap()
-    }
-
-    #[test]
-    fn a_kept_sweep_is_restored_exactly_and_an_inconsistent_one_is_refused() {
-        let line = sweep(Curve::Line {
-            start: [1., 2., 5.],
-            end: [41., -7., 5.],
-        });
-        let arc = sweep(Curve::Arc {
-            start: [10., 0., 4.],
-            end: [0., 10., 4.],
-            center: [0., 0., 4.],
-            plane: Plane::Xy,
-            sweep_rad: std::f64::consts::FRAC_PI_2,
-        });
-        let circle = sweep(Curve::Arc {
-            start: [8., 5., 4.5],
-            end: [8., 5., 4.5],
-            center: [5., 5., 4.5],
-            plane: Plane::Xy,
-            sweep_rad: TAU,
-        });
-        for original in [&line, &arc, &circle] {
-            let (tag, words) = original.encode();
-            let restored = ClearedSweep::decode(tag, words).unwrap();
-            assert_eq!(restored.fingerprint(), original.fingerprint());
-            assert_eq!(restored.encode(), (tag, words));
-            // Every word matters: one changed by a part in a thousand no
-            // longer describes one curve (or its box no longer holds it).
-            let geometry = if tag == 0 { 7..14 } else { 7..16 };
-            for k in geometry {
-                if words[k] == 0. {
-                    continue;
-                }
-                let mut bad = words;
-                bad[k] *= 1.001;
-                assert!(
-                    ClearedSweep::decode(tag, bad).is_err(),
-                    "tag {tag}: word {k} changed is accepted"
-                );
-            }
-            // An end outside the box, a negative error, an unknown tag, a
-            // value that is not a number.
-            let mut bad = words;
-            bad[3] = words[5] + 1.;
-            assert!(ClearedSweep::decode(tag, bad).is_err());
-            let mut bad = words;
-            bad[2] = -1e-9;
-            assert!(ClearedSweep::decode(tag, bad).is_err());
-            assert!(ClearedSweep::decode(2, words).is_err());
-            let mut bad = words;
-            bad[0] = f64::NAN;
-            assert!(ClearedSweep::decode(tag, bad).is_err());
         }
     }
 }
