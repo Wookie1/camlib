@@ -355,6 +355,10 @@ class RoughingTest(unittest.TestCase):
         )
         self.assertLessEqual(spline.target.surface_error_mm, 0.005)
         self.assertTrue(any(f['kind'] == 'BSPLINE' for f in spline.target.source['face_bounds']))
+        # The imported ellipsoid is a closed mesh (no T-junctions between
+        # refined triangles), so roughing it plans end to end.
+        with Simulation(**dict(c, operations=(spline,))) as sim:
+            self.assertGreater(len(list(sim.run_operations())), 0)
         revolved = (
             cq.Workplane('XZ')
             .moveTo(0, 0)

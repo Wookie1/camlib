@@ -3,6 +3,13 @@
 The CAD kernel supplies valid trimmed-face topology. Requested mesher deflection
 is only a seed: surface Hessians and trimming-curve derivative bounds determine
 acceptance. No sampled distance is used as an error certificate.
+
+The interpolation bound is the classical one from bounds on derivatives: a
+triangle's linear interpolant of a surface differs from it by at most the
+second-derivative bound times the squared UV edge length, and trimming curves
+are bounded the same way. See R. Filip, D. Magedson and R. Markot, "Surface
+algorithms using bounds on derivatives", Computer Aided Geometric Design 3
+(1986) 295-311.
 """
 
 from collections import Counter
@@ -648,6 +655,94 @@ def _rectangle_face_data(face, cancel):
     return adaptor, bounds, uv, [(1, 2, 3), (1, 3, 4)], 0.0, segments
 
 
+def _refine_conforming(triangles, bounds, remaining, check_budget, check_cancel, locate=lambda p: p):
+    """Refine a face's UV triangles until each interpolates within `remaining`.
+
+    Splitting a triangle's edge splits every triangle on that edge too, so the
+    refined mesh has no T-junctions: a vertex lies on a neighbour's edge only
+    when that edge is split there as well. (A lone split leaves the vertex
+    inside the neighbour's edge, a gap as large as the interpolation error;
+    the verification then sees a leaky solid.) Edges are matched by where their
+    ends are in space (`locate` maps a UV point to coordinates), so the two
+    sides of a periodic seam, which are far apart in UV, split together. An
+    edge collapsed to a point (a pole) has no neighbour. Returns
+    (triangle, error) pairs.
+    """
+    tris, depth, edges = [], [], {}
+
+    def place(p):
+        return tuple(round(v * 1e7) for v in locate(p))
+
+    def key(p, q):
+        p, q = place(p), place(q)
+        return None if p == q else (p, q) if p <= q else (q, p)
+
+    def add(triangle, d):
+        tris.append(triangle)
+        depth.append(d)
+        for i in range(3):
+            k = key(triangle[i], triangle[(i + 1) % 3])
+            if k is not None:
+                edges.setdefault(k, []).append(len(tris) - 1)
+        return len(tris) - 1
+
+    def remove(t):
+        triangle = tris[t]
+        tris[t] = None
+        for i in range(3):
+            k = key(triangle[i], triangle[(i + 1) % 3])
+            if k is not None:
+                edges[k].remove(t)
+
+    def split(t, i, stack):
+        # Bisect triangle `t` across its edge i (vertex i to i + 1).
+        triangle, d = tris[t], depth[t]
+        if d >= 24:
+            raise ValueError('CAD surface interpolation exceeds refinement depth')
+        p, q, c = triangle[i], triangle[(i + 1) % 3], triangle[(i + 2) % 3]
+        middle = tuple((x + y) / 2 for x, y in zip(p, q))
+        remove(t)
+        accepted.pop(t, None)
+        stack.extend((add((p, middle, c), d + 1), add((middle, q, c), d + 1)))
+
+    stack = [add(triangle, 0) for triangle in triangles]
+    accepted = {}
+    steps = 0
+    while stack:
+        steps += 1
+        if steps % 1024 == 0:
+            check_cancel()
+            check_budget(sum(1 for x in tris if x is not None))
+        t = stack.pop()
+        triangle = tris[t]
+        if triangle is None or t in accepted:
+            continue
+        error = _interpolation_error(triangle, bounds)
+        if error <= remaining:
+            accepted[t] = error
+            continue
+        local = _local_bounds(bounds, triangle)
+
+        def edge_cost(pair):
+            a, b = (triangle[i] for i in pair)
+            du, dv = abs(a[0] - b[0]), abs(a[1] - b[1])
+            if len(local) > 5 and local[5]:
+                return local[0] * du
+            return local[2] * du * du + 2 * local[3] * du * dv + local[4] * dv * dv
+
+        i, j = max(((0, 1), (1, 2), (2, 0)), key=edge_cost)
+        k = key(triangle[i], triangle[j])
+        if k is None:
+            split(t, i, stack)
+            continue
+        for user in list(edges[k]):
+            corners = tris[user]
+            side = next(m for m in range(3) if key(corners[m], corners[(m + 1) % 3]) == k)
+            split(user, side, stack)
+    check_budget(sum(1 for x in tris if x is not None))
+    return [(tris[t], error) for t, error in accepted.items()]
+
+
 def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
     import cadquery as cq
     import OCP
@@ -752,7 +847,6 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
         _check_cancel(cancel)
         reserve = min(1e-4, (budget - trim_error) / 4)
         remaining = budget - trim_error - reserve
-        pending = [(piece, 0) for tri in indices for piece in _cut_at_c0(tuple(uv[i] for i in tri), bounds)]
         count = 0
         max_interior = 0.0
         regularization = 0.0
@@ -765,34 +859,24 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
                 evaluations += 1
             return point_cache[p]
 
-        while pending:
-            if max_facets is not None and len(result) + len(pending) > max_facets:
+        def check_budget(live):
+            if max_facets is not None and len(result) + live > max_facets:
                 raise ValueError(
                     f'CAD surface exceeds max_facets {max_facets} at requested error, on face {n} '
                     f'({face.geomType()}, {face.Area():.3f} mm2, {count} facets of it so far)'
                 )
+
+        refined = _refine_conforming(
+            [piece for tri in indices for piece in _cut_at_c0(tuple(uv[i] for i in tri), bounds)],
+            bounds,
+            remaining,
+            check_budget,
+            lambda: _check_cancel(cancel),
+            point,
+        )
+        for triangle, error in refined:
             if count % 1024 == 0:
                 _check_cancel(cancel)
-            triangle, depth = pending.pop()
-            error = _interpolation_error(triangle, bounds)
-            if error > remaining:
-                if depth >= 24:
-                    raise ValueError('CAD surface interpolation exceeds refinement depth')
-
-                local = _local_bounds(bounds, triangle)
-
-                def edge_cost(pair):
-                    a, b = (triangle[i] for i in pair)
-                    du, dv = abs(a[0] - b[0]), abs(a[1] - b[1])
-                    if len(local) > 5 and local[5]:
-                        return local[0] * du
-                    return local[2] * du * du + 2 * local[3] * du * dv + local[4] * dv * dv
-
-                i, j = max(((0, 1), (1, 2), (2, 0)), key=edge_cost)
-                a, b, c = triangle[i], triangle[j], triangle[3 - i - j]
-                middle = tuple((x + y) / 2 for x, y in zip(a, b))
-                pending.extend(((t, depth + 1) for t in ((a, middle, c), (middle, b, c))))
-                continue
             xyz = tuple(point(p) for p in triangle)
             if any(not all(math.isfinite(v) and abs(v) <= 1e6 for v in p) for p in xyz):
                 raise ValueError('CAD surface exceeds bounded coordinates')
