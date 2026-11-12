@@ -128,6 +128,7 @@ _EXPORTS = {
             "ReachRefusal",
             "ReachRefused",
             "CamWarning",
+            "ToolChangeInPlace",
             "ToolChangePosition",
             "ToolChangeTable",
         ),

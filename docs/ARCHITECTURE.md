@@ -62,7 +62,7 @@ CRC-32), then the payload. Kinds (`src/stream.rs`):
 | Kind | Name | Holds |
 |---|---|---|
 | 1 | Chunk | One milling or thermal move and its height-field cell changes |
-| 2 | Checkpoint | The full committed stock and cursor; a producer's also ends with its material checks' per-move proof states (`CAMPRF01` section, #108) |
+| 2 | Checkpoint | The full committed stock and cursor, with the tool in the spindle at that position (#168: a tool change in place is measured from exactly it; a checkpoint written before it was recorded still restores, and such a change is then refused); a producer's also ends with its material checks' per-move proof states (`CAMPRF01` section, #108) |
 | 3 | Manifest | The canonical manifest (its SHA-256 binds every later frame) |
 | 4 | End | The run finished; final cursor and position |
 | 5 | Preview | A partial move's stock (not committed) |
@@ -302,4 +302,5 @@ whose old value doesn't match its own stock.
 | Intent session | The native posting state machine that tracks modal state and source moves |
 | Wear compensation | Controller cutter compensation (G41/G42) carrying only the wear; camlib still plans the exact tool-centre path |
 | Turret pose | A lathe's tool-change position; every tool's controlled point starts there |
+| Tool change in place | A mill's tool change that moves no axis (`tool_change_position_mode="preserve_spindle"`, `ToolChangeInPlace`): the spindle gauge line stays, so the tip moves along Z by the old gauge length minus the new one |
 | Export gate | Refusing to write a program while unaccepted check results remain |

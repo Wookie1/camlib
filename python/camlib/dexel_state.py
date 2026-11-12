@@ -162,7 +162,10 @@ class DexelStockState(DexelView):
         # receiver accepts the next tool's first move from there itself.
         value = tuple(value)
         if value != tuple(self._receiver.position) and not any(
-            self.tool_change_tip(tool, self._receiver.position) == value for tool in self._tools
+            # A change in place measures from the tool in the spindle (the
+            # receiver's, which also checks the next move itself).
+            self.tool_change_tip(tool, self._receiver.position, previous=self._receiver.last_tool) == value
+            for tool in self._tools
         ):
             raise ProtocolError("position change is neither the cursor nor a declared tool-change pose")
 
@@ -190,14 +193,21 @@ class DexelStockState(DexelView):
     def control_cursor(self):
         return None
 
-    def tool_change_tip(self, tool, position=None):
+    def tool_change_tip(self, tool, position=None, previous=None):
         """The tip position after a change to ``tool`` (the manifest's
-        tool-change pose), or None when the tip stays where it is."""
+        tool-change pose), or None when the tip stays where it is.
+        ``previous``: the tool in the spindle before the change, which a
+        change in place measures from (None: the run's first tool)."""
         if tool not in self._tools:
             raise ProtocolError("tool change to an undeclared tool")
         change = self._tool_change
         if change is None:
             return None
+        if "in_place" in change:
+            position = tuple(self.position if position is None else position)
+            if previous is None:
+                return position
+            return (position[0], position[1], position[2] + (self._gauges[previous] - self._gauges[tool]))
         if "tips_mm" in change:
             if tool not in change["tips_mm"]:
                 raise ProtocolError(f"the tool-change table declares no position after a change to tool {tool}")

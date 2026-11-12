@@ -63,6 +63,13 @@ class ProtocolError(ValueError):
     pass
 
 
+# Why a tool change in place is refused after an old checkpoint (as the engine says).
+_UNKNOWN_SPINDLE_TOOL = (
+    "the restored checkpoint does not record the tool in the spindle (it was written by an older camlib), "
+    "so a tool change in place cannot be placed; replay the run from its start"
+)
+
+
 class CamWarning(UserWarning):
     """A plan that is valid but probably not what was intended.
 
@@ -436,6 +443,21 @@ class ToolChangePosition:
         if self.xy_mm is not None:
             data["xy_mm"] = [float(v) for v in self.xy_mm]
         return data
+
+
+@dataclass(frozen=True)
+class ToolChangeInPlace:
+    """The machine changes the tool where the spindle stands: no axis moves
+    at the tool change. The spindle gauge line stays, so the new tool's tip
+    is the old tip moved along Z by the old gauge length minus the new one (a
+    longer tool reaches further down, and is checked there against stock and
+    fixtures). The first tool starts at the setup's initial position.
+    Declare it only for a machine that behaves so (for LinuxCNC: an M6 with
+    no configured tool-change move); posts must declare the same
+    (``Machine(tool_change_position_mode="preserve_spindle")``)."""
+
+    def to_dict(self):
+        return {"in_place": True}
 
 
 @dataclass(frozen=True)
@@ -957,7 +979,9 @@ class StockState:
         self._gauges = {t["id"]: t["gauge_length_mm"] for t in m["tools"]}
         change = m.get("tool_change")
         if change is not None and (
-            m["version"] != 1
+            (m["version"] != 1 or change != {"in_place": True})
+            if "in_place" in change
+            else m["version"] != 1
             or (
                 set(change) != {"tips_mm"}
                 or not change["tips_mm"]
@@ -969,16 +993,36 @@ class StockState:
         ):
             raise ProtocolError("invalid tool change pose")
         self._tool_change = change
+        # False only after restoring a checkpoint that does not record the
+        # tool in the spindle (written before #168).
+        self._last_tool_known = True
         # Fresh native-initialized cells match the manifest's initial premise.
         # Restoring any checkpoint resets this flag, even at move zero.
         self._token, self._initial_full_stock = object(), True
 
-    def tool_change_tip(self, tool, position=None):
+    def _in_place_known(self, tool):
+        """A change in place is measured from exactly the tool in the
+        spindle: refuse it after a checkpoint that does not record that tool."""
+        if not self._last_tool_known and self._tool_change is not None and "in_place" in self._tool_change:
+            raise ProtocolError(f"tool {tool} starts away from the last position: {_UNKNOWN_SPINDLE_TOOL}")
+        return True
+
+    def tool_change_tip(self, tool, position=None, previous=None):
         """The tip position after a change to ``tool`` (the manifest's
-        tool-change pose), or None when the tip stays where it is."""
+        tool-change pose), or None when the tip stays where it is.
+        ``previous``: the tool in the spindle before the change, which a
+        change in place measures from (default: the last move's tool)."""
         change = self._tool_change
         if change is None:
             return None
+        if "in_place" in change:
+            # The spindle stays: the tip moves along Z by the old gauge
+            # length minus the new one. The first tool starts where the run does.
+            position = tuple(self.position if position is None else position)
+            previous = self._last_tool if previous is None else previous
+            if previous is None:
+                return position
+            return (position[0], position[1], position[2] + (self._gauges[previous] - self._gauges[tool]))
         if "tips_mm" in change:
             if tool not in change["tips_mm"]:
                 raise ProtocolError(f"the tool-change table declares no position after a change to tool {tool}")
@@ -1066,6 +1110,7 @@ class StockState:
         if (
             start != self.position
             and motion["tool"] != self._last_tool
+            and self._in_place_known(motion["tool"])
             and start == self.tool_change_tip(motion["tool"])
         ):
             # The first motion with a new tool: the declared tool-change pose.
@@ -1203,7 +1248,7 @@ class StockState:
                 last_motion,
                 limit,
                 None
-                if self._tool_change is None or "tips_mm" in self._tool_change
+                if self._tool_change is None or "tips_mm" in self._tool_change or "in_place" in self._tool_change
                 else (
                     float(self._tool_change["gauge_z_mm"]),
                     None if self._tool_change.get("xy_mm") is None else tuple(self._tool_change["xy_mm"]),
@@ -1213,6 +1258,9 @@ class StockState:
                 None
                 if self._tool_change is None or "tips_mm" not in self._tool_change
                 else {k: tuple(map(float, v)) for k, v in self._tool_change["tips_mm"].items()},
+                None
+                if self._tool_change is None or "in_place" not in self._tool_change
+                else (self._gauges, not self._last_tool_known),
             )
         except (ValueError, TypeError) as error:
             raise ProtocolError(str(error)) from error
@@ -1304,7 +1352,8 @@ class StockState:
                 "<Q3dBQQI",
                 self.completed,
                 *self.position,
-                int(self.last_motion_id is not None),
+                # Flags: a last motion ID; the spindle tool is recorded.
+                int(self.last_motion_id is not None) | 2 * self._last_tool_known,
                 self.last_motion_id or 0,
                 self.completed,
                 self.nx * self.ny,
@@ -1314,6 +1363,11 @@ class StockState:
             state = self._control_context.state_bytes()
             prefix.extend(struct.pack('<I', len(state)))
             prefix.extend(state)
+        if self._last_tool_known:
+            # The tool in the spindle at this position (#168): its index in
+            # the manifest's tools, or 0xFFFFFFFF when no tool has moved.
+            ids = [t["id"] for t in self._manifest["tools"]]
+            prefix.extend(struct.pack("<I", 0xFFFFFFFF if self._last_tool is None else ids.index(self._last_tool)))
         heights = self._heights
         if sys.byteorder != "little":
             heights = array("d", heights)
@@ -1368,8 +1422,9 @@ class StockState:
             prefix = b"".join(pieces)
             d = _Decoder(prefix)
             self._identity(d)
-            complete, x, y, z, has_last, last, generation, count = d.unpack("<Q3dBQQI")
+            complete, x, y, z, flags, last, generation, count = d.unpack("<Q3dBQQI")
             d.finish()
+            has_last = flags & 1
             candidate = self._control_context
             if candidate is not None:
                 size = _read_exact(f, 4)
@@ -1382,9 +1437,20 @@ class StockState:
                     candidate = candidate.restored(raw, complete, (x, y, z))
                 except (ValueError, TypeError, OverflowError) as error:
                     raise ProtocolError(str(error)) from error
+            # (the tool in the spindle, whether the checkpoint records it):
+            # a run that has not moved has no tool to forget.
+            spindle = (None, complete == 0)
+            if flags & 2:
+                raw = _read_exact(f, 4)
+                prefix += raw
+                (index,) = struct.unpack("<I", raw)
+                tools = [t["id"] for t in self._manifest["tools"]]
+                if flags > 3 or (complete != 0 if index == 0xFFFFFFFF else index >= len(tools)):
+                    raise ProtocolError("invalid checkpoint cursor/grid")
+                spindle = (None if index == 0xFFFFFFFF else tools[index], True)
             if (
                 generation != complete
-                or has_last not in (0, 1)
+                or flags > 3
                 or (has_last == 0) != (complete == 0)
                 or not _point((x, y, z))
                 or count != self.nx * self.ny
@@ -1427,6 +1493,8 @@ class StockState:
         self._heights, self.completed, self.position = heights, complete, (x, y, z)
         self._control_context, self._control_wire = candidate, wire
         self.last_motion_id, self.fraction, self.finished = last if has_last else None, 0.0, False
+        # The tool in the spindle is the one the checkpoint records.
+        self._last_tool, self._last_tool_known = spindle
         self._token, self._initial_full_stock = object(), False
 
 
@@ -1979,7 +2047,7 @@ class Simulation:
                     if tool != active_tool:
                         # The declared tool-change pose (recomputed here); the
                         # operation's tool change must state the same.
-                        tip = self.state.tool_change_tip(tool)
+                        tip = self.state.tool_change_tip(tool, previous=active_tool)
                         if tip is not None:
                             stated = [
                                 tuple(e["position_after_mm"]) for e in data["events"] if e["kind"] == "tool_change"
