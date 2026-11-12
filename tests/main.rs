@@ -72,6 +72,7 @@ modules! {
     surface_validation,
     tapping,
     thermal,
+    thermal_common_line,
     thermal_mark,
     thread_mill,
     trace,
