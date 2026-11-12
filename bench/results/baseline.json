@@ -1847,7 +1847,7 @@
      "removed_mm3": 249.055,
      "cycle_seconds_exact_stop": 171.478,
      "cycle_seconds_tangent": 168.058,
-     "engine_seconds": 0.0694
+     "engine_seconds": 0.3919
     },
     "finish-shallow": {
      "toolpath": "Steep-and-shallow",
@@ -1861,7 +1861,7 @@
      "removed_mm3": 1255.632,
      "cycle_seconds_exact_stop": 156.623,
      "cycle_seconds_tangent": 152.923,
-     "engine_seconds": 0.0169
+     "engine_seconds": 0.0803
     }
    },
    "toolpath": {
@@ -1896,13 +1896,13 @@
     }
    },
    "engine": {
-    "run_seconds": 0.0952,
-    "first_move_seconds": 0.0719,
-    "post_seconds": 0.0325,
+    "run_seconds": 0.4815,
+    "first_move_seconds": 0.3787,
+    "post_seconds": 0.1072,
     "repeats": 3,
     "peak_rss_kib": {
-     "python": 507552.0,
-     "native": 49472.0
+     "python": 405388.0,
+     "native": 397452.0
     }
    }
   },
