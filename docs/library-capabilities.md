@@ -26,6 +26,7 @@ See [Operations](operations.md) for parameters. Summary:
 | Adaptive pocket | Engagement-limited clearing of the same regions |
 | 3D roughing / rest roughing | Layered clearing above a mesh part: raster, offset, adaptive; air passes can be omitted |
 | Contour | Outer walls and/or hole walls of a part: climb (default) or conventional, tangent leads, wear compensation (G41/G42), holding tabs (triangle or rectangle; spread evenly or at given points), ramp entry around the loop |
+| Silhouette of a mesh part | `Engine.silhouette_region`: the part's plan-view outline at or above a depth as a planar region with a stated error bound, for `Contour` and the other 2D operations |
 | 3D finishing cutters | Ball (all patterns, certified error), flat and bull-nose (raster, spiral, radial, project, waterline; exact contacts, proven no-gouge moves, sampled error) |
 | Parallel / spiral / radial / project / pencil / scallop finishing | Mesh surfaces; zigzag or one-way parallel rows; slope (contact-angle) limits; rest finishing from the stock model |
 | Waterline, ramp finishing | Constant-Z contours, or one continuous descent per level (`ramp=True`); steep-and-shallow pairs waterline with parallel or spiral |
@@ -43,10 +44,11 @@ See [Operations](operations.md) for parameters. Summary:
 | Deburr | Horizontal edges of a finished part (every upward-facing face's boundary) and straight sloped edges (ball-end mill), every convex edge accounted for in the report; chamfer mill (chamfer break) or ball-end/bull-nose mill (arc break sized by leg or by the fillet it stays inside); next to vertical or drafted walls (chamfer mill), tangent fillets reported as already broken; the rest of the part proven untouched (whole tool assembly); unreachable and concave stretches reported |
 | Trace / engrave | Open or closed line/arc paths at depth, no radius offset; or the cutter beside an open path (left/right side offset) |
 | Undercut | T-slot, keyseat, lollipop and dovetail cutters along paths at one depth under material, entering and leaving through proven-open columns; tri-dexel stock |
+| Supplied toolpath | `SuppliedToolpath`: the caller's own line/arc/helix moves with their feeds, run unchanged between planned operations through the same stream (stock handed on, per-move checks, material check, export gate, posting and decoding); camlib adds only the rapid travel to the first point; malformed moves refused by index; stock contact checking required; three-axis milling only |
 | Feeds and speeds | `cutting_data`: rpm and feed from surface speed and feed per tooth, chip thinning, ball effective diameter |
 | Probing, tool setting | Surface, outside and inside corner, bore, boss, pocket and web cycles that correct a work offset, and tool length and diameter on a declared tool setter, with a `ProbeTool` (stylus ball, stem, body); protected positioning, measuring moves checked clear until `search_mm` before the expected contact; stock never changed; what is stored recorded as a premise |
 | Plasma and laser cutting | Sheet parts with holes: kerf compensation (computed or G41/G42 wear), arc/line leads from the scrap, overcut or negative overburn, pierce clearance (center pierce in small holes), inner features and nested parts first, small-hole feed and THC off, micro-joints, fixed or programmed pierce/cut heights; every lead, kerf path and pierce proven clear of the parts; sheet simulated cut through |
-| Turning (lathe) | Facing, outside roughing (axial passes, every diameter left at its allowance), finishing, external, internal and face grooving, parting off, external and internal single-point threading, drilling on the axis (pecks), inside roughing and finishing (boring bars) of a turned profile and bore with insert/holder/bar geometry; every move checked against the part, its bore, the stock and the chuck; axisymmetric stock with outer and inner bounds; constant surface speed (G96 with its G50/D limit) and feed per revolution (G95/G99); G18 output, finishing arcs (fillets, ball ends, the nose rolling round corners) as native G2/G3, radius or diameter X, T0101 words; a lathe setup is an ordinary `Setup` streamed like every run (per-move stock, playback with partial moves, cancellation, posted replay on the stock) with a material check (leftover material against the part) after each operation |
+| Turning (lathe) | Facing, outside roughing (axial passes, every diameter left at its allowance), finishing, external, internal and face grooving, parting off, external and internal single-point threading, drilling on the axis (pecks), inside roughing and finishing (boring bars) of a turned profile and bore with insert/holder/bar geometry, the holder's body also from a supplied model (`TurningToolModel`: a mesh with its error, a declared placement and a cross-check against the declared insert); every move checked against the part, its bore, the stock and the chuck; axisymmetric stock with outer and inner bounds; constant surface speed (G96 with its G50/D limit) and feed per revolution (G95/G99); G18 output, finishing arcs (fillets, ball ends, the nose rolling round corners) as native G2/G3, radius or diameter X, T0101 words; a lathe setup is an ordinary `Setup` streamed like every run (per-move stock, playback with partial moves, cancellation, posted replay on the stock) with a material check (leftover material against the part) after each operation |
 
 Not supported: undercuts,
 4th/5th axis. Unsupported tool/operation
@@ -240,8 +242,15 @@ decoded G-code.
   finishing.
 - `turning_section(solid)`: the turned profile and bore of a solid of
   revolution about Z for a lathe setup (`TurningSetup.from_section`), proven axisymmetric by its volume.
+- `tool_body_from_step(path, max_error_mm=, placement=, ...)` /
+  `tool_body_from_shape(...)`: a turning tool's body from its maker's model
+  (`TurningToolModel`), tessellated to a stated error, with a declared
+  placement and a cross-check of the model's insert against the declared
+  one; `step_mesh(path, max_error_mm=)` for a milling holder's envelope
+  (`camlib.tools.holder_sections_from_mesh`). See
+  [Tool bodies from a model](operations.md#tool-bodies-from-a-model).
 - The host application (any CadQuery program) supplies solids and persistent references;
-  camlib never parses STEP itself.
+  the engine never parses STEP itself (the CadQuery adapter reads it).
 
 ## Size, memory and time
 

@@ -47,20 +47,21 @@ and writes G-code through a postprocessor you can read and change.
 | Pocket, rest pocket | Line/arc regions with islands; plunge, helical, ramp or stock-edge entry; links kept at depth only through cleared stock |
 | Adaptive pocket | Engagement-limited clearing |
 | 3D roughing, rest roughing | Layered clearing above a triangle-mesh part (raster, offset or adaptive) |
-| Contour | Outer walls / holes of a part: climb or conventional, leads, wear compensation (G41/G42), holding tabs, ramp entry |
+| Contour | Outer walls / holes of a part: climb or conventional, leads, wear compensation (G41/G42), holding tabs, ramp entry; a mesh part's outline at a depth as its region (`Engine.silhouette_region`) |
 | Drilling, peck drilling, spot/counterbore dwell | Canned cycles (G81/G82/G83/G73) where the machine declares them, explicit moves elsewhere |
 | Reaming, boring, fine boring, bore milling | G85/G89/G86 from proven pilot holes; G76 or M19 fine boring with an oriented stop and shift proven inside the bore; helical bore milling |
 | Trochoidal slot, chamfer, V-carve | Straight or curved slots; chamfer on top edges; deburring of horizontal and sloped edges; sharp-cornered V-carving of letters and logos |
 | Thread milling, tapping | Internal and external thread milling; rigid right- and left-hand tapping (G33.1, or G84/G74 where declared) |
 | Trace / engrave | Open or closed line/arc paths at depth, no radius offset; or the cutter beside an open path (left/right side offset) |
 | Undercut | T-slot, keyseat, lollipop and dovetail cutters under material, on tri-dexel stock (3D stock that holds undercuts) |
+| Supplied toolpath | Moves planned elsewhere, run unchanged as one operation of the job: same stock simulation, checks, export gate and posting; malformed moves refused by index |
 | Flat-area finishing | Horizontal faces at their exact heights, flat end mills |
 | Parallel, spiral, radial, project, pencil, scallop, waterline, ramp, steep-and-shallow, morph, flow finishing | Triangle-mesh surfaces: ball (certified error), flat and bull-nose end mills; slope limits; rest finishing from the stock |
 | Machining limits | Avoid areas (clamps) and containment regions for every operation, rapids and links |
 | Plasma and laser cutting | Kerf-compensated sheet parts: leads, pierce clearance, inner features first, small holes, micro-joints, torch height control, programmed or controller heights |
 | Feeds and speeds | rpm and feed from cutting data (chip thinning, ball effective diameter) |
 | Probing, tool setting | Work-offset probing of surfaces, corners, bores, bosses, pockets and webs, tool length and diameter on a tool setter; LinuxCNC G38 or Renishaw Inspection Plus macros, decoded back and checked |
-| Turning (lathe) | Facing, outside and inside roughing and finishing (boring), grooving, parting off, external and internal threading, drilling on the axis, constant surface speed and feed per revolution; finishing follows fillets, ball ends and corner rounding with native G2/G3 arcs; insert, holder and boring-bar checks against the part, bore, stock and chuck; a lathe setup is an ordinary `Setup` (`turning=TurningSetup(...)`), streamed, played back and posted like any other, with a material check after each operation |
+| Turning (lathe) | Facing, outside and inside roughing and finishing (boring), grooving, parting off, external and internal threading, drilling on the axis, constant surface speed and feed per revolution; finishing follows fillets, ball ends and corner rounding with native G2/G3 arcs; insert, holder and boring-bar checks against the part, bore, stock and chuck, solid (one-piece) boring bars checked as their ground round head, the holder also from its maker's model (a mesh with a declared placement; STEP through the CadQuery adapter); a lathe setup is an ordinary `Setup` (`turning=TurningSetup(...)`), streamed, played back and posted like any other, with a material check after each operation |
 
 Every setup (milling, plasma/laser and lathe) runs as one stream: each move
 arrives with the stock it removes, and playback can pause, seek (also

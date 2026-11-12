@@ -301,12 +301,29 @@ class Holder:
     # The outline's extent across the centre plane, (low, high) mm: the
     # cutting face at 0, the insert body toward negative (#103). Required.
     y_mm: tuple | None = None
+    # The body away from the cut from a supplied model (#110): checked in
+    # place of the outline's body (``Holder.from_model``).
+    model: "ToolModel | None" = None
 
     def to_dict(self):
         data = dict(outline=self.outline.to_dict())
         if self.bar is not None:
             data["bar"] = self.bar.to_dict()
         return data
+
+    @classmethod
+    def from_model(cls, model):
+        """The holder as its maker's model (a ``ToolModel``: a mesh with its
+        error, its declared placement and its insert cross-check): every
+        check uses the model's body in place of an outline's. The
+        ``outline`` and ``y_mm`` kept here are only the model's enclosing
+        rectangle about the nose centre in the lathe's X and Z and its
+        extent in Y (the tool format requires them); no check reads them."""
+        if not isinstance(model, ToolModel):
+            raise TypeError("Holder.from_model takes a ToolModel (camlib.TurningToolModel)")
+        (x0, x1), (y0, y1), (z0, z1) = model.bounds_mm()
+        outline = Outline((x0, z0), (Line((x1, z0)), Line((x1, z1)), Line((x0, z1)), Line((x0, z0))))
+        return cls(outline, y_mm=(y0, y1), model=model)
 
     @classmethod
     def rectangle(cls, *, insert, nose_radius_mm, side, width_mm, length_mm, offset_mm, y_mm):
@@ -332,10 +349,152 @@ class Holder:
         return cls(Outline.from_dict(data["outline"]), y_mm=tuple(float(v) for v in _pair(y_mm, "y_mm")))
 
 
+# Tool bodies from supplied models (#110).
+
+
+def _triple(value, what):
+    triple = tuple(float(v) for v in value)
+    if len(triple) != 3:
+        raise ValueError(f"{what} must be three coordinates (x, y, z)")
+    return triple
+
+
+@dataclass(frozen=True, kw_only=True)
+class ModelPlacement:
+    """Where a tool model sits on the lathe, as the tool is mounted (camlib
+    assumes nothing and fits nothing): ``nose_center_mm``, the model point
+    that is the insert's nose centre on its cutting face (the theoretical
+    tip a maker's frame may give is one nose radius from it along X and
+    along Z; a drill: its tip on the axis); ``x_axis`` and ``z_axis``, the
+    model directions of the lathe's +X (radial, away from the spindle axis
+    on the tool's side) and +Z, unit and perpendicular. Y completes the
+    right-handed frame (Y = Z x X): the cutting face toward +Y."""
+
+    nose_center_mm: tuple
+    x_axis: tuple
+    z_axis: tuple
+
+    def to_dict(self):
+        return dict(
+            nose_center_mm=list(_triple(self.nose_center_mm, "ModelPlacement.nose_center_mm")),
+            x_axis=list(_triple(self.x_axis, "ModelPlacement.x_axis")),
+            z_axis=list(_triple(self.z_axis, "ModelPlacement.z_axis")),
+        )
+
+    def place(self, point):
+        """A model point in the lathe's (X, Y, Z) from the nose centre."""
+        o, x, z = (_triple(v, "ModelPlacement") for v in (self.nose_center_mm, self.x_axis, self.z_axis))
+        y = (z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0])
+        d = tuple(float(point[k]) - o[k] for k in range(3))
+        return tuple(sum(d[k] * axis[k] for k in range(3)) for axis in (x, y, z))
+
+
+@dataclass(frozen=True, kw_only=True)
+class ModelInsertCheck:
+    """The model's insert (``insert``: a ``SurfaceMesh`` in the model's
+    coordinates, placed like its body) and how closely its cutting corner
+    must agree with the declared insert, compared within
+    ``corner_region_mm`` of the nose centre along X and Z (at least two nose
+    radii; inside the holder's reach, so only the insert is in it):
+    ``position_tolerance_mm`` (the corner, along the cutting face and in
+    height), ``nose_radius_tolerance_mm`` and ``edge_angle_tolerance_deg``
+    (each straight edge at the corner). They must cover the insert mesh's
+    own error. A model outside one is refused before any move, as misplaced
+    or as a different insert; it is never fitted. No value has a default."""
+
+    insert: object
+    corner_region_mm: float
+    position_tolerance_mm: float
+    nose_radius_tolerance_mm: float
+    edge_angle_tolerance_deg: float
+
+    def to_dict(self):
+        return dict(
+            kind="model",
+            insert=self.insert.to_dict(),
+            corner_region_mm=float(self.corner_region_mm),
+            position_tolerance_mm=float(self.position_tolerance_mm),
+            nose_radius_tolerance_mm=float(self.nose_radius_tolerance_mm),
+            edge_angle_tolerance_deg=float(self.edge_angle_tolerance_deg),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class ModelWithoutInsert:
+    """A model that has no insert: its placement cannot be compared with
+    the declared insert and rests on ``reason``, the caller's statement of
+    where the placement comes from (e.g. the maker's cutting-point frame)."""
+
+    reason: str
+
+    def to_dict(self):
+        return dict(kind="not_modelled", reason=str(self.reason))
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolModel:
+    """A turning tool's body from its maker's model (#110).
+
+    ``body``: a ``SurfaceMesh`` of the tool away from the cut (holder, bar,
+    shim, clamp, coolant block), without the insert, in the model's own
+    coordinates: a closed surface, every point of the real one within its
+    ``surface_error_mm``, which is grown onto the body.
+    ``camlib.cadquery.tool_body_from_step`` builds one from a STEP file.
+    ``placement``: a ``ModelPlacement``. ``axial_resolution_mm``: the width
+    of the slices across Z the body is checked in (it is over-estimated
+    along Z by less than one slice). ``insert_check``: a
+    ``ModelInsertCheck`` (the model's insert, cross-checked against the
+    declared one) or a ``ModelWithoutInsert``.
+
+    The insert stays the declared one (ISO code or outline, thickness,
+    clearance, seat): it is what cuts. Use it as a tool's holder with
+    ``Holder.from_model(model)``."""
+
+    body: object
+    placement: ModelPlacement
+    axial_resolution_mm: float
+    insert_check: object
+
+    def __post_init__(self):
+        if not isinstance(self.placement, ModelPlacement):
+            raise TypeError("ToolModel.placement must be a ModelPlacement: camlib assumes no placement")
+        if not isinstance(self.insert_check, (ModelInsertCheck, ModelWithoutInsert)):
+            raise TypeError(
+                "ToolModel.insert_check must be a ModelInsertCheck (the model's insert and its tolerances) "
+                "or a ModelWithoutInsert (the reason the placement is right)"
+            )
+
+    def to_dict(self):
+        return dict(
+            body=self.body.to_dict(),
+            placement=self.placement.to_dict(),
+            axial_resolution_mm=float(self.axial_resolution_mm),
+            insert_check=self.insert_check.to_dict(),
+        )
+
+    def bounds_mm(self):
+        """The placed body's extent along the lathe's X, Y and Z from the
+        nose centre (its mesh error included), as ((x0, x1), (y0, y1),
+        (z0, z1))."""
+        low, high = [float("inf")] * 3, [float("-inf")] * 3
+        for triangle in self.body.triangles:
+            for point in triangle:
+                placed = self.placement.place(point)
+                for k in range(3):
+                    low[k] = min(low[k], placed[k])
+                    high[k] = max(high[k], placed[k])
+        error = float(self.body.surface_error_mm)
+        return tuple((low[k] - error, high[k] + error) for k in range(3))
+
+
 # Top-level names (camlib.TurningHolder, camlib.TurningBar; camlib.BoringBar
 # is the milling boring bar).
 TurningHolder = Holder
 TurningBar = Bar
+TurningToolModel = ToolModel
+TurningModelPlacement = ModelPlacement
+TurningModelInsertCheck = ModelInsertCheck
+TurningModelWithoutInsert = ModelWithoutInsert
 
 _REMOVED = ("holder_width_mm", "holder_length_mm", "holder_offset_mm")
 
@@ -355,6 +514,59 @@ class Seat:
 
 
 TurningSeat = Seat
+
+
+@dataclass(frozen=True)
+class SolidBarHead:
+    """The ground head of a solid (one-piece) boring bar (#114): a solid
+    carbide boring bar, a brazed tool or a ground HSS bar. Such a tool has no
+    insert and no seat: its tip is ground into the end of a round bar, so
+    its body below the cutting face is the bar's cylinder cut by the ground
+    faces, which narrows toward the bottom. The tool's ``insert`` is an
+    ``InsertOutline``, the head's (convex) outline at its cutting face.
+
+    Every value is required, from the tool's catalogue or drawing:
+
+    - ``diameter_mm``: the diameter of the round the head is ground from:
+      the bar's, where the head keeps the bar's surface (the catalogue's
+      shank diameter), or of any cylinder along the bar that contains the
+      head below its cutting face.
+    - ``axis_x_mm``, ``axis_y_mm``: that cylinder's axis in the outline's
+      frame: its x (the catalogue's f or WF is the distance from the bar's
+      centreline to the cutting edge) and its offset across the centre plane
+      (the cutting face at 0; minus the catalogue's cutting edge height
+      above the bar's centre).
+    - ``clearance_deg``: one angle per segment of the outline, at which the
+      ground face below that side recedes under the cutting face: the end
+      clearance below the end cutting edge, the side clearance below the
+      side cutting edge, at most the lesser of the two below the nose
+      between them, 0 where the head is not relieved (the cylinder alone
+      bounds it there). Catalogue tables do not list them: an angle not
+      known is declared 0, which contains the real head.
+    - ``min_bore_diameter_mm``: the catalogue's minimum bore diameter
+      (Dmin). No cut in a smaller bore, and a head that cannot itself enter
+      it is refused as a contradiction.
+    - ``max_bore_depth_mm``: the catalogue's maximum bore depth (the usable
+      length), from the head's front end. No move deeper into the stock.
+
+    The geometry is checked whatever the catalogue values say."""
+
+    diameter_mm: float
+    axis_x_mm: float
+    axis_y_mm: float
+    clearance_deg: tuple
+    min_bore_diameter_mm: float
+    max_bore_depth_mm: float
+
+    def to_dict(self):
+        return dict(
+            diameter_mm=float(self.diameter_mm),
+            axis_x_mm=float(self.axis_x_mm),
+            axis_y_mm=float(self.axis_y_mm),
+            clearance_deg=[float(a) for a in self.clearance_deg],
+            min_bore_diameter_mm=float(self.min_bore_diameter_mm),
+            max_bore_depth_mm=float(self.max_bore_depth_mm),
+        )
 
 
 class TurningTool:
@@ -377,13 +589,31 @@ class TurningTool:
       ``TurningInsert.iso_code`` they are the code's worst case (the largest
       thickness its symbol and tolerance class allow); give them to use the
       insert's real values. Not for a drill.
+    - ``insert_front_clearance_deg``, ``insert_side_clearance_deg``: a
+      grooving blade's (``GrooveInsert``, ``FaceGrooveInsert``) own
+      clearance below its front edge and below its sides, from its maker's
+      catalogue (they differ: e.g. 10 degrees at the front, 3 at the
+      sides). The side value is one angle for both sides or a pair: for a
+      ``GrooveInsert`` (the side at its leading corner, the other side),
+      for a ``FaceGrooveInsert`` (the inner side, toward the axis; the
+      outer side). Given together, instead of ``insert_clearance_deg``
+      (which is then their least and applies to the corners between them);
+      an ``insert_clearance_deg`` that is not their least is refused. Other
+      inserts have one normal clearance (ISO 1832) and take only
+      ``insert_clearance_deg``.
     - ``edge_deg``: the major cutting edge's direction in the tool frame,
       for an ``InsertOutline`` not built by ``TurningInsert`` (grooving,
       threading and face grooving inserts know theirs).
     - ``curved_for_diameter_mm``: a face grooving blade curved to follow
       the groove, its maker's (min, max) diameter range; without it the
       blade is checked as straight.
-    - the holder's ``y_mm`` (and a ``Bar``'s ``axis_y_mm``)."""
+    - the holder's ``y_mm`` (and a ``Bar``'s ``axis_y_mm``), or the holder
+      as its maker's model: ``Holder.from_model(ToolModel(...))`` (#110).
+
+    A solid (one-piece) boring bar (#114) has no insert and no seat: give
+    ``solid_bar=SolidBarHead(...)`` instead of the seat and insert values,
+    with ``insert`` the head's outline at its cutting face and
+    ``side="inner"``."""
 
     __slots__ = (
         "id",
@@ -397,6 +627,9 @@ class TurningTool:
         "insert_clearance_deg",
         "edge_deg",
         "curved_for_diameter_mm",
+        "insert_front_clearance_deg",
+        "insert_side_clearance_deg",
+        "solid_bar",
     )
 
     def __init__(
@@ -413,6 +646,9 @@ class TurningTool:
         insert_clearance_deg=None,
         edge_deg=None,
         curved_for_diameter_mm=None,
+        insert_front_clearance_deg=None,
+        insert_side_clearance_deg=None,
+        solid_bar=None,
         **removed,
     ):
         if removed:
@@ -434,7 +670,72 @@ class TurningTool:
         elif nose_radius_mm is None:
             missing.append("nose_radius_mm")
         drill = isinstance(insert, DrillInsert)
-        if not drill and insert is not None:
+        if solid_bar is not None:
+            # A solid boring bar's ground head (#114): the whole body below
+            # the cutting face, with no insert and no seat.
+            if not isinstance(solid_bar, SolidBarHead) or not isinstance(insert, InsertOutline):
+                raise TypeError(
+                    f"TurningTool {id!r}: solid_bar is a SolidBarHead, for a boring head drawn as an InsertOutline "
+                    "(the head's outline at its cutting face); solid grooving and threading bars are not modelled "
+                    "as solid heads (give such a blade as a GrooveInsert or ThreadInsert with its insert body)"
+                )
+            given = [
+                name
+                for name, value in (
+                    ("seat", seat),
+                    ("insert_thickness_mm", insert_thickness_mm),
+                    ("insert_clearance_deg", insert_clearance_deg),
+                    ("edge_deg", edge_deg),
+                    ("curved_for_diameter_mm", curved_for_diameter_mm),
+                    ("insert_front_clearance_deg", insert_front_clearance_deg),
+                    ("insert_side_clearance_deg", insert_side_clearance_deg),
+                )
+                if value is not None
+            ]
+            if given:
+                raise TypeError(
+                    f"TurningTool {id!r}: a solid boring bar has no insert and no seat: its head (solid_bar) is its "
+                    f"whole body below the cutting face; leave out {', '.join(given)}"
+                )
+        if insert_front_clearance_deg is not None or insert_side_clearance_deg is not None:
+            # A grooving blade's own front and side clearance (#170).
+            if not isinstance(insert, (GrooveInsert, FaceGrooveInsert)):
+                raise TypeError(
+                    f"TurningTool {id!r}: insert_front_clearance_deg and insert_side_clearance_deg are a grooving "
+                    "blade's (GrooveInsert, FaceGrooveInsert) only: other inserts have one normal clearance "
+                    "(ISO 1832: insert_clearance_deg alone), a drill none"
+                )
+            if insert_front_clearance_deg is None or insert_side_clearance_deg is None:
+                given, other = (
+                    ("insert_side_clearance_deg", "insert_front_clearance_deg")
+                    if insert_front_clearance_deg is None
+                    else ("insert_front_clearance_deg", "insert_side_clearance_deg")
+                )
+                raise TypeError(
+                    f"TurningTool {id!r}: {given} needs {other} too (a blade's front and side clearance are "
+                    "declared together; for one angle on every side give insert_clearance_deg alone)"
+                )
+            insert_front_clearance_deg = float(insert_front_clearance_deg)
+            if isinstance(insert_side_clearance_deg, (int, float)):
+                insert_side_clearance_deg = (float(insert_side_clearance_deg),) * 2
+            else:
+                insert_side_clearance_deg = tuple(float(v) for v in insert_side_clearance_deg)
+                if len(insert_side_clearance_deg) != 2:
+                    raise TypeError(
+                        f"TurningTool {id!r}: insert_side_clearance_deg is one angle for both sides or a pair "
+                        "(the side at the blade's reference corner, the other side)"
+                    )
+            least = min(insert_front_clearance_deg, *insert_side_clearance_deg)
+            if insert_clearance_deg is None:
+                insert_clearance_deg = least
+            elif float(insert_clearance_deg) != least:
+                raise ValueError(
+                    f"TurningTool {id!r}: insert_clearance_deg={insert_clearance_deg!r} contradicts "
+                    f"insert_front_clearance_deg={insert_front_clearance_deg!r} and "
+                    f"insert_side_clearance_deg={insert_side_clearance_deg!r}: it is the insert's least clearance "
+                    f"({least!r} here); leave it out or give {least!r}"
+                )
+        if not drill and insert is not None and solid_bar is None:
             if isinstance(insert, InsertOutline):
                 insert_thickness_mm = insert.thickness_mm if insert_thickness_mm is None else insert_thickness_mm
                 insert_clearance_deg = insert.clearance_deg if insert_clearance_deg is None else insert_clearance_deg
@@ -474,6 +775,9 @@ class TurningTool:
             ("insert_clearance_deg", insert_clearance_deg),
             ("edge_deg", edge_deg),
             ("curved_for_diameter_mm", None if curved_for_diameter_mm is None else tuple(curved_for_diameter_mm)),
+            ("insert_front_clearance_deg", insert_front_clearance_deg),
+            ("insert_side_clearance_deg", insert_side_clearance_deg),
+            ("solid_bar", solid_bar),
         ):
             object.__setattr__(self, name, value)
 
@@ -491,7 +795,10 @@ class TurningTool:
             f"TurningTool({self.id!r}, insert={self.insert!r}, nose_radius_mm={self.nose_radius_mm!r}, "
             f"side={self.side!r}, hand={self.hand!r}, holder={self.holder!r}, seat={self.seat!r}, "
             f"insert_thickness_mm={self.insert_thickness_mm!r}, insert_clearance_deg={self.insert_clearance_deg!r}, "
-            f"edge_deg={self.edge_deg!r}, curved_for_diameter_mm={self.curved_for_diameter_mm!r})"
+            f"edge_deg={self.edge_deg!r}, curved_for_diameter_mm={self.curved_for_diameter_mm!r}, "
+            f"insert_front_clearance_deg={self.insert_front_clearance_deg!r}, "
+            f"insert_side_clearance_deg={self.insert_side_clearance_deg!r}"
+            + (f", solid_bar={self.solid_bar!r})" if self.solid_bar is not None else ")")
         )
 
     def to_dict(self):
@@ -499,6 +806,8 @@ class TurningTool:
             holder_y_mm=[float(v) for v in self.holder.y_mm],
             bar_axis_y_mm=float(self.holder.bar.axis_y_mm) if self.holder.bar is not None else 0.0,
         )
+        if getattr(self.holder, "model", None) is not None:
+            body["model"] = self.holder.model.to_dict()
         if self.seat is not None:
             insert = dict(
                 insert_thickness_mm=float(self.insert_thickness_mm),
@@ -509,7 +818,13 @@ class TurningTool:
             )
             if self.curved_for_diameter_mm is not None:
                 insert["curved_for_diameter_mm"] = [float(v) for v in self.curved_for_diameter_mm]
+            if self.insert_front_clearance_deg is not None:
+                insert["blade_clearance"] = dict(
+                    front_deg=self.insert_front_clearance_deg, side_deg=list(self.insert_side_clearance_deg)
+                )
             body["insert"] = insert
+        if self.solid_bar is not None:
+            body["solid_bar"] = self.solid_bar.to_dict()
         return dict(
             id=self.id,
             insert=self.insert.to_dict(),

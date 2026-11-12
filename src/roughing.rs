@@ -23,8 +23,8 @@ use std::{collections::VecDeque, sync::OnceLock};
 
 mod engagement_front;
 pub(crate) mod parallel;
-pub(crate) use engagement_front::EngagementFrontPlan;
 pub use engagement_front::EngagementFrontReport;
+pub(crate) use engagement_front::{EngagementFrontPlan, FrontMotionOptions};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ShadowReport {
@@ -112,7 +112,15 @@ fn hull(mut points: Vec<Point>) -> Vec<Point> {
     a.extend(b);
     a
 }
-fn clipped(triangle: [Vec3; 3], z: f64) -> Vec<Point> {
+/// The part of a facet at or above `z`, projected. A crossing of the level
+/// within `snap` of an end of its edge (in plan) is that end itself: the
+/// planar kernel takes no shorter edge, and the facets around a vertex that
+/// is on the level or a hair off it must agree on where they end there.
+/// Collapsing such an edge in each facet separately (the kernel's cleanup of
+/// generated boundaries) moves them apart and leaves a slit between
+/// neighbours. Snapping to the lower end grows the piece; to the upper end it
+/// shrinks it by at most `snap`, which the shadow's numerical reserve covers.
+fn clipped(triangle: [Vec3; 3], z: f64, snap: f64) -> Vec<Point> {
     let mut points = Vec::with_capacity(4);
     for i in 0..3 {
         let a = triangle[i];
@@ -122,7 +130,14 @@ fn clipped(triangle: [Vec3; 3], z: f64) -> Vec<Point> {
         }
         if (a[2] >= z) != (b[2] >= z) {
             let t = ((z - a[2]) / (b[2] - a[2])).clamp(0., 1.);
-            points.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            points.push(if t * length <= snap {
+                [a[0], a[1]]
+            } else if (1. - t) * length <= snap {
+                [b[0], b[1]]
+            } else {
+                [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]
+            });
         }
     }
     hull(points)
@@ -416,6 +431,9 @@ impl PreparedRoughingTarget {
         let options = ConstructionOptions {
             tolerance_mm: self.tolerance,
         };
+        // The planar kernel's shortest edge (`planar::constructed::normalize`),
+        // within the numerical reserve for every admitted tolerance.
+        let snap = 1e-6_f64.max(self.tolerance / 4.) * 1.001;
         let mut regions: Vec<PreparedRegion> = vec![];
         let mut vertices = 0;
         let mut projected = 0;
@@ -425,7 +443,7 @@ impl PreparedRoughingTarget {
             *work = work
                 .checked_add(1)
                 .ok_or("roughing clipping work overflow")?;
-            let mut points = clipped(triangle, level);
+            let points = clipped(triangle, level, snap);
             if points.is_empty() {
                 continue;
             }
@@ -436,43 +454,61 @@ impl PreparedRoughingTarget {
             } else {
                 0.
             };
-            if area <= (64. * self.tolerance).powi(2) {
-                // A small Minkowski box preserves even vertical walls/points.
-                // This is explicit overprotection, not a mesh or point sample.
-                let pad = 32. * self.tolerance;
-                points = hull(
-                    points
-                        .iter()
-                        .flat_map(|p| {
-                            [-pad, pad].into_iter().flat_map(move |x| {
-                                [-pad, pad].into_iter().map(move |y| [p[0] + x, p[1] + y])
+            // A small Minkowski box preserves even vertical walls/points.
+            // This is explicit overprotection, not a mesh or point sample.
+            let pad = 32. * self.tolerance;
+            let piece = |points: &[Point], enclosed: bool| {
+                let points = if enclosed {
+                    hull(
+                        points
+                            .iter()
+                            .flat_map(|p| {
+                                [-pad, pad].into_iter().flat_map(move |x| {
+                                    [-pad, pad].into_iter().map(move |y| [p[0] + x, p[1] + y])
+                                })
                             })
-                        })
-                        .collect(),
-                );
+                            .collect(),
+                    )
+                } else {
+                    points.to_vec()
+                };
+                let count = points.len();
+                PlanarRegion {
+                    version: 1,
+                    units: "mm".into(),
+                    name: "retained-column-shadow".into(),
+                    components: vec![Component {
+                        outer: Boundary {
+                            vertices: points.into_iter().map(|p| [p[0], p[1], 0.]).collect(),
+                        },
+                        holes: vec![],
+                    }],
+                    boundary_error_mm: self.mesh.surface_error_mm
+                        + self.numerical
+                        + if enclosed { pad * 2f64.sqrt() } else { 0. },
+                    source: serde_json::Value::Null,
+                }
+                .prepare_generated(options)
+                .map(|region| (region, count))
+            };
+            let (region, count) = if area <= (64. * self.tolerance).powi(2) {
                 degenerate += 1;
-            }
-            vertices += points.len();
-            let region = PlanarRegion {
-                version: 1,
-                units: "mm".into(),
-                name: "retained-column-shadow".into(),
-                components: vec![Component {
-                    outer: Boundary {
-                        vertices: points.into_iter().map(|p| [p[0], p[1], 0.]).collect(),
-                    },
-                    holes: vec![],
-                }],
-                boundary_error_mm: self.mesh.surface_error_mm
-                    + self.numerical
-                    + if area <= (64. * self.tolerance).powi(2) {
-                        32. * self.tolerance * 2f64.sqrt()
-                    } else {
-                        0.
-                    },
-                source: serde_json::Value::Null,
-            }
-            .prepare_generated(options)?;
+                piece(&points, true)?
+            } else {
+                match piece(&points, false) {
+                    Ok(piece) => piece,
+                    // A needle: its area is real, but the planar kernel
+                    // cannot take it as a polygon (an edge below its
+                    // resolution that cannot be collapsed). Enclosed like an
+                    // edge-on facet, never dropped; a facet the kernel cannot
+                    // take even enclosed is a refusal.
+                    Err(_) => {
+                        degenerate += 1;
+                        piece(&points, true)?
+                    }
+                }
+            };
+            vertices += count;
             regions.push(region);
             projected += 1;
         }
@@ -899,11 +935,6 @@ pub struct RoughingPlan {
     /// The per-move reach check for the sections above the flutes, when the
     /// stock stands higher above the floor than the cutting length.
     move_depth: Option<crate::reach::MoveDepth>,
-    /// Committed cleared sweeps, for `swept_clear`.
-    clearance: Option<(
-        crate::engagement::EngagementScene,
-        crate::stock::ClearanceCursor,
-    )>,
     no_op_stock_identity: Option<u64>,
     part_depth_limit: Option<f64>,
     depth_policy_checked: bool,
@@ -1206,29 +1237,23 @@ impl RoughingPlan {
             feed_z_mm: op.feed_z_mm,
         };
         template.validate_authoring(tool, prepared_tool.cutter().definition(), initial, r)?;
-        for (name, value) in [
-            ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
-            ("ramp_clearance_mm", op.ramp_clearance_mm),
-            ("link_feed_mm_min", op.link_feed_mm_min),
-        ] {
-            let Some(d) = value else { continue };
-            if !matches!(
+        let front = FrontMotionOptions {
+            rapid_descent_clearance_mm: op.rapid_descent_clearance_mm,
+            ramp_clearance_mm: op.ramp_clearance_mm,
+            link_feed_mm_min: op.link_feed_mm_min,
+            link_chip_thinning: op.link_chip_thinning,
+        };
+        front.validate(
+            "roughing",
+            (!matches!(
                 op.clearing,
                 RoughingClearing::Adaptive {
                     path_strategy: AdaptivePathStrategy::EngagementFront,
                     ..
                 }
-            ) {
-                return Err(format!("{name} applies to engagement_front clearing only"));
-            }
-            let max = if name == "link_feed_mm_min" { 1e6 } else { 1e3 };
-            if !d.is_finite() || d <= 0. || d > max {
-                return Err(format!("roughing {name} {d} must be positive and finite"));
-            }
-        }
-        if op.link_chip_thinning && op.link_feed_mm_min.is_none() {
-            return Err("link_chip_thinning needs link_feed_mm_min: the thinned link feed is capped at the declared link feed".into());
-        }
+            ))
+            .then_some(""),
+        )?;
         match op.clearing {
             RoughingClearing::Offset {
                 coverage_margin_mm, ..
@@ -1287,6 +1312,10 @@ impl RoughingPlan {
                     boundary_tolerance_mm,
                     max_engagement_deg: engagement.unwrap(),
                     clockwise: op.clockwise,
+                    rapid_descent_clearance_mm: None,
+                    ramp_clearance_mm: None,
+                    link_feed_mm_min: None,
+                    link_chip_thinning: false,
                 }
                 .validate_parameters(r)?;
             }
@@ -1474,9 +1503,7 @@ impl RoughingPlan {
                                 cutting_sense.unwrap_or(CuttingSense::Climb) == CuttingSense::Climb,
                                 &cancel,
                             )?
-                            .with_rapid_descent(op.rapid_descent_clearance_mm)
-                            .with_ramp_clearance(op.ramp_clearance_mm)
-                            .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning),
+                            .with_motion_options(front),
                         )),
                         RoughingClearing::Adaptive {
                             path_strategy,
@@ -1497,6 +1524,10 @@ impl RoughingPlan {
                                 boundary_tolerance_mm,
                                 max_engagement_deg: engagement.unwrap(),
                                 clockwise: op.clockwise,
+                                rapid_descent_clearance_mm: None,
+                                ramp_clearance_mm: None,
+                                link_feed_mm_min: None,
+                                link_chip_thinning: false,
                             },
                             tool,
                             &layer_spec,
@@ -1634,7 +1665,6 @@ impl RoughingPlan {
             } else {
                 vec![]
             },
-            clearance: None,
             move_depth: (material_spec.max_mm[2] - floor > tool.cutter.cutting_length_mm)
                 .then(|| crate::reach::MoveDepth::new(&op.id, tool, op.tolerance_mm))
                 .transpose()?,
@@ -1762,19 +1792,12 @@ impl RoughingPlan {
                     // stands as high as this section.
                     let floor = bounds.min[2] + height - self.height_guard_mm;
                     if stock.bounds_clear(rect, floor, &mut clearance_work, cancel)?
-                        // One earlier sweep the move repeats exactly.
-                        || stock.repeated_clearance(&m, radius, height, &mut clearance_work, cancel)?
-                        // The union of every committed sweep, along the
-                        // move's own path (#160).
-                        || Self::swept_clear(
-                            &mut self.clearance,
-                            self.height_guard_mm,
-                            stock,
-                            &m,
-                            radius,
-                            floor,
-                            cancel,
-                        )?
+                        // The sweeps already committed hold the section's
+                        // whole sweep along the move's own path (#160): one
+                        // it repeats, or the union of those it runs between
+                        // (#200). The stock sweep's cutting-length check and
+                        // stock-contact verification ask the same question.
+                        || stock.history_clearance(&m, radius, height, &mut clearance_work, cancel)?
                     {
                         continue;
                     }
@@ -1825,67 +1848,6 @@ impl RoughingPlan {
                 next.give_memory(memory);
             }
             self.activated = false;
-        }
-    }
-    /// Whether the committed sweeps prove everything within `radius` of the
-    /// move's path empty from `floor` up (`EngagementScene::clear_path`).
-    /// Work exhaustion or any uncertainty proves nothing.
-    fn swept_clear(
-        clearance: &mut Option<(
-            crate::engagement::EngagementScene,
-            crate::stock::ClearanceCursor,
-        )>,
-        guard: f64,
-        stock: &Stock,
-        motion: &Motion,
-        radius: f64,
-        floor: f64,
-        cancel: &impl CancelSignal,
-    ) -> Result<bool, String> {
-        if floor > stock.spec().max_mm[2] {
-            return Ok(true);
-        }
-        let tolerance = guard / 16.;
-        let (mut scene, mut cursor) = match clearance.take() {
-            Some(held) if held.0.stock_spec() == stock.spec() => held,
-            _ => (
-                crate::engagement::EngagementScene::new_with_cancel(
-                    stock.spec().clone(),
-                    vec![],
-                    cancel,
-                )?,
-                crate::stock::ClearanceCursor::default(),
-            ),
-        };
-        let (rebuild, sweeps) = stock.committed_clearance_since(&mut cursor, tolerance, cancel)?;
-        if rebuild {
-            scene = crate::engagement::EngagementScene::new_with_cancel(
-                stock.spec().clone(),
-                sweeps,
-                cancel,
-            )?;
-        } else {
-            for sweep in sweeps {
-                scene.append(sweep)?;
-            }
-        }
-        // Enough for a section with any real margin; one with none is
-        // left to the checks that follow.
-        let mut work = 50_000;
-        let proven = scene.clear_path(
-            motion,
-            radius,
-            floor,
-            2. * guard,
-            tolerance,
-            &mut work,
-            cancel,
-        );
-        *clearance = Some((scene, cursor));
-        match proven {
-            Ok(clear) => Ok(clear),
-            Err(_) if !cancel.is_cancelled() => Ok(false),
-            Err(error) => Err(error),
         }
     }
     pub fn finish_report(&mut self, cancel: &impl CancelSignal) -> Result<(), String> {

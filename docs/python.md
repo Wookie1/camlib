@@ -9,10 +9,10 @@ level `Setup` is the job setup (`camlib.jobs.Setup`).
 | --- | --- |
 | `camlib.machine` | Required physical `MachineModel`, `Axis`, `MachineBody`, `Box`, `ConvexMesh`, `ToolCalibration`, `ToolChangeRoute`, `AllowedContact`, `MachineCheckOptions`; [coverage and required inputs](machine.md) |
 | `camlib.jobs` | `Job(id, revision, setups)`, `Setup`, `PostedProgram` (result of `job.post_nc`: text, line/motion counts, findings, accepted kinds, unchecked checks, and a lathe setup's `material` check; a program with unaccepted violation/uncertain results raises `camlib.export.ExportRefused` instead, see `accept=`), `OperationNode(op, sources=, depends_on=, limits=)`, `RegenerationCache(directory, max_entry_bytes=, max_total_bytes=)`, `CadSource` (document id, revision, geometry hash and CadQuery/OCP versions of a CAD input) |
-| `camlib.operations` | Operations and entry/clearing strategies ([Operations](operations.md)), `Tabs`, `FineBore`, `ThermalCut`, `Lead`, `SmallHoles`, `MicroJoints`, `steep_and_shallow` |
+| `camlib.operations` | Operations and entry/clearing strategies ([Operations](operations.md)), `Tabs`, `FineBore`, `ThermalCut`, `Lead`, `SmallHoles`, `MicroJoints`, `steep_and_shallow`, `SuppliedToolpath` and `ToolpathMove` (a toolpath planned elsewhere, run unchanged: [supplied toolpath](operations.md#supplied-toolpath-suppliedtoolpath)) |
 | `camlib.limits` | `Limits(contain=, avoid=)`, `AvoidArea(region, top_z_mm)` |
 | `camlib.cutting` | `cutting_data` → `CuttingData`: spindle speed and feed from surface speed and feed per tooth (chip thinning, ball effective diameter, rpm cap) |
-| `camlib.tools` | `EndMill`, `BallEndMill`, `BullEndMill`, `Drill`, `ChamferMill`, `ThreadMill`, `TSlotCutter`, `KeyseatCutter`, `LollipopCutter`, `DovetailCutter`, `Tap`, `BoringBar`, `Torch`, `LaserHead`, `Neck`, `ToolAssembly`, `HolderSection` |
+| `camlib.tools` | `EndMill`, `BallEndMill`, `BullEndMill`, `Drill`, `ChamferMill`, `ThreadMill`, `TSlotCutter`, `KeyseatCutter`, `LollipopCutter`, `DovetailCutter`, `Tap`, `BoringBar`, `Torch`, `LaserHead`, `Neck`, `ToolAssembly`, `HolderSection`, `holder_sections_from_mesh` |
 | `camlib.planar` | `PlanarRegion` (`components`, reported `boundary_error_mm`), `Component`, `Boundary` (line/arc regions) |
 | `camlib.surface` | `SurfaceMesh` (triangle surfaces with a finite stated `surface_error_mm` in the inclusive range 0–0.1 mm; checked at construction) |
 | `camlib.simulation` | `StockSpec(min, max, cell_size, max_cells=, mesh=)` and `StockSpec.from_mesh(mesh, cell_size)`, `InitialStock` (declared whole-cell blank bounds, [preparation](preparation.md)), `StockMesh` (closed stock solid: `from_triangles`, `transformed`; `StockState.stock_mesh()` returns the finished stock), `DexelStockSpec(min, max, cell_size, max_rays=, max_intervals=)` (tri-dexel stock: undercuts), `SweepOptions` (chord error, tip step and work budgets of the stock sweep), `Simulation`, `ToolChangePosition`, `ToolChangeTable`, `SimulationError`, `ReachRefused` and its typed `ReachRefusal` ([reach refusals](operations.md#pocket-pocket-restpocket)), `CamWarning`, low-level streaming |
@@ -23,8 +23,8 @@ level `Setup` is the job setup (`camlib.jobs.Setup`).
 | `camlib.posted` | `PostedRun`: replays a posted program from its decoded G-code (what the controller will do), with stock and checks |
 | `camlib.dynamics` | `MotionPolicy` (acceleration, rapid feed, junction mode) and feed scheduling / time estimates |
 | `camlib.motion` | Typed motion and events (`Motion`, `Line`, `Arc`, `Helix`, `Dwell`, `Cycle`, `SpindleOrient`, `CutterCompensation`, `Beam`, `HeightControl`, `SurfaceSpeed`, `FeedPerRev`, ...), `WorkFrame(origin_mm, x, y, z)` |
-| `camlib.turning` | Lathe setups (`Setup(turning=...)`): `TurningSetup`, `TurnStockSpec`, `TurningTool`, `TurningInsert` (`iso`, `iso_code` constructors), `InsertOutline`, `TurningHolder` (`rectangle`), `TurningBar`, `Outline`/`Line`/`Arc`, `GrooveInsert`, `ThreadInsert`, `TurnToolSetting`, `TurnFace`, `TurnRough`, `TurnFinish`, `TurnGroove`, `TurnPartOff`, `TurnThread`, `DrillInsert`, `TurnDrill`, `TurnBoreRough`, `TurnBoreFinish`, `FaceGroove`, `FaceGrooveInsert`, `TurnFaceGroove` |
-| `camlib.cadquery` | Optional CadQuery adapter (`export_floor_region`, `export_surface_mesh`, `flow_paths`, `turning_section`) |
+| `camlib.turning` | Lathe setups (`Setup(turning=...)`): `TurningSetup`, `TurnStockSpec`, `TurningTool`, `TurningInsert` (`iso`, `iso_code` constructors), `InsertOutline`, `TurningHolder` (`rectangle`, `from_model`), `TurningToolModel`, `TurningModelPlacement`, `TurningModelInsertCheck`, `TurningModelWithoutInsert`, `TurningBar`, `Outline`/`Line`/`Arc`, `GrooveInsert`, `ThreadInsert`, `TurnToolSetting`, `TurnFace`, `TurnRough`, `TurnFinish`, `TurnGroove`, `TurnPartOff`, `TurnThread`, `DrillInsert`, `TurnDrill`, `TurnBoreRough`, `TurnBoreFinish`, `FaceGroove`, `FaceGrooveInsert`, `TurnFaceGroove` |
+| `camlib.cadquery` | Optional CadQuery adapter (`export_floor_region`, `export_surface_mesh`, `flow_paths`, `turning_section`, `tool_body_from_step`, `tool_body_from_shape`, `step_solids`, `step_mesh`) |
 
 Typical flow, as in [Getting started](getting-started.md):
 
@@ -53,6 +53,14 @@ where the spindle stands: the tip moves along Z by the old gauge length minus
 the new one. Without any of them, each tool's tip starts where the previous
 operation ended. See
 [Posts](posts.md) for the matching machine setting.
+
+`SuppliedToolpath(id, tool, motions, clearance_z_mm, ...)` puts moves planned
+outside camlib into a job between planned operations: `motions` are
+`ToolpathMove(kind, curve, feed_mm_min)` with `camlib.motion.Line`/`Arc`/`Helix`
+curves, or `camlib.motion.Motion` objects. They are serialised once
+(`to_dict()` returns the same move list each time) and are part of the
+operation's input digest and cache key. See
+[Operations](operations.md#supplied-toolpath-suppliedtoolpath) for the rules.
 
 `job.regenerate(cache)` yields motion, stock and operation updates as they are
 computed. A `RegenerationCache` reuses operations whose inputs did not change
