@@ -4689,9 +4689,10 @@ fn engagement_front_travel_clearance_lowers_rapids_over_cut_stock() {
     );
     assert_eq!(lowered(&high_report), 0);
     assert!(lowered(&low_report) > 0, "no rapid was lowered");
-    // Each lowered rapid must save travel. (A 20% overall saving held only
-    // while closed_box left a phantom hole in the bar's top that cost the
-    // job extra lifts; the solid bar needs four lifts, two of them lowered.)
+    // Each lowered rapid must save travel. (A 20% overall saving held while
+    // the planner lifted 72 times on this job; since it refreshes its start
+    // list before leaving an area it lifts 4 times, two of them lowered, so
+    // the overall share no longer measures this feature.)
     assert!(low < high, "lowered rapids did not shorten travel");
     assert!(
         high - low >= 10. * lowered(&low_report) as f64,
