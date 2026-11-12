@@ -469,3 +469,98 @@ impl PocketPlan {
         })
     }
 }
+
+#[cfg(test)]
+mod route_height_tests {
+    use super::*;
+    use crate::stock::{HeightBounds, StockSnapshot};
+
+    /// A floor at Z2 with one pillar to Z80 in the cell at (16, 12), and the
+    /// fixture's tool: cutter and shank of radius 2, holder of radius 4 from
+    /// 30 mm above the tip.
+    fn pillar() -> (PocketPlan, Stock, [f64; 2]) {
+        let manifest: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+            "../../fixtures/operations/helical-pocket.json"
+        ))
+        .unwrap();
+        let Operation::Pocket(operation) = manifest.operations[0].clone() else {
+            panic!("pocket fixture")
+        };
+        let plan = PocketPlan::prepare(
+            operation,
+            &manifest.tools[0],
+            manifest.stock.height().unwrap(),
+            manifest.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .unwrap();
+        let mut spec = manifest.stock.height().unwrap().clone();
+        spec.max_mm[2] = 100.;
+        let blank = Stock::new(spec.clone()).unwrap();
+        let [nx, ny] = blank.dimensions();
+        let [wx, wy] = blank.cell_widths_mm();
+        let (i, j) = ((16. / wx) as usize, (12. / wy) as usize);
+        let mut cells = vec![
+            HeightBounds {
+                lower_mm: 2.,
+                upper_mm: 2.,
+            };
+            nx * ny
+        ];
+        cells[j * nx + i] = HeightBounds {
+            lower_mm: 80.,
+            upper_mm: 80.,
+        };
+        let stock = Stock::from_snapshot(StockSnapshot {
+            spec,
+            generation: 0,
+            cells,
+        })
+        .unwrap();
+        // The pillar cell's far corner from the origin side.
+        (plan, stock, [(i + 1) as f64 * wx, (j + 1) as f64 * wy])
+    }
+
+    #[test]
+    fn a_route_is_as_high_as_every_tool_section_needs() {
+        let (plan, stock, corner) = pillar();
+        let radii: Vec<f64> = plan.air_entry_parts.iter().map(|p| p.0).collect();
+        let (narrow, wide) = (
+            radii.iter().copied().fold(f64::INFINITY, f64::min),
+            radii.iter().copied().fold(0., f64::max),
+        );
+        assert!(
+            wide > narrow + 1.,
+            "the fixture's holder is wider: {radii:?}"
+        );
+        // A route parallel to x, `gap` beyond the pillar in y: what each
+        // section needs there, from the sections themselves.
+        for gap in [0.5 * narrow, (narrow + wide) / 2., wide + 1.] {
+            let y = corner[1] + gap;
+            let (a, b) = ([4., y], [28., y + 0.3]);
+            let needed = plan
+                .air_entry_parts
+                .iter()
+                .map(|&(radius, bottom)| if gap <= radius { 80. } else { 2. } - bottom)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let height = plan.cell_route_height(&stock, a, b);
+            assert!(
+                (height - needed).abs() < 1e-9,
+                "gap {gap}: the route is at {height}, the sections need {needed}"
+            );
+        }
+        // Between the cutter's reach and the holder's, it is the holder over
+        // the pillar that sets the height, not the cutter over the floor.
+        let y = corner[1] + (narrow + wide) / 2.;
+        assert!(plan.cell_route_height(&stock, [4., y], [28., y]) > 2. + 1.);
+        // A dogleg: the pillar inside the rectangle of two ends whose
+        // straight line passes well clear of it.
+        let height = plan.cell_route_height(
+            &stock,
+            [corner[0] - 8., corner[1] - 8.],
+            [corner[0] + 2., corner[1] + 2.],
+        );
+        assert!((height - 80.).abs() < 1e-9, "{height}");
+    }
+}
