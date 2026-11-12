@@ -736,6 +736,15 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// radial engagement, capped at `link_feed_mm_min`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub link_chip_thinning: bool,
+    /// engagement_front only. Steer on a grid about twice as fine (target
+    /// cell cutter radius / 40 and width / 10 instead of / 20 and / 5,
+    /// rounded down to divide the stock cell): the steering gives
+    /// away half as much width to grid resolution, so passes run closer to
+    /// the declared engagement and the cut is shorter, at about 1.5-4x the
+    /// planning time. Every stroke is still proven exactly; only the
+    /// estimate it is steered from changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fine_steering: bool,
     /// Opt-in for targets tessellated face by face (CAD meshers that do not
     /// share edge vertices between faces): each layer's shadow is closed
     /// protectively, bridging gaps, notches and holes narrower than twice
@@ -799,6 +808,7 @@ impl<G> RoughingOperation<G> {
             ramp_clearance_mm: self.ramp_clearance_mm,
             link_feed_mm_min: self.link_feed_mm_min,
             link_chip_thinning: self.link_chip_thinning,
+            fine_steering: self.fine_steering,
             seam_bridge_mm: self.seam_bridge_mm,
             id: self.id,
             tool: self.tool,
@@ -1313,6 +1323,17 @@ impl RoughingPlan {
                 return Err(format!("roughing {name} {d} must be positive and finite"));
             }
         }
+        if op.fine_steering
+            && !matches!(
+                op.clearing,
+                RoughingClearing::Adaptive {
+                    path_strategy: AdaptivePathStrategy::EngagementFront,
+                    ..
+                }
+            )
+        {
+            return Err("fine_steering applies to engagement_front clearing only".into());
+        }
         if op.link_chip_thinning && op.link_feed_mm_min.is_none() {
             return Err("link_chip_thinning needs link_feed_mm_min: the thinned link feed is capped at the declared link feed".into());
         }
@@ -1569,7 +1590,8 @@ impl RoughingPlan {
                             .with_rapid_descent(op.rapid_descent_clearance_mm)
                             .with_travel_clearance(op.travel_clearance_mm)
                             .with_ramp_clearance(op.ramp_clearance_mm)
-                            .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning),
+                            .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning)
+                            .with_fine_steering(op.fine_steering),
                         )),
                         RoughingClearing::Adaptive {
                             path_strategy,

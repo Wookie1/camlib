@@ -586,6 +586,8 @@ pub(crate) struct EngagementFrontPlan {
     rapid_descent: Option<f64>,
     /// See `RoughingOperation::travel_clearance_mm`.
     travel_clearance: Option<f64>,
+    /// See `RoughingOperation::fine_steering`.
+    fine_steering: bool,
     /// See `RoughingOperation::ramp_clearance_mm`.
     ramp_clearance: Option<f64>,
     /// See `RoughingOperation::link_feed_mm_min`.
@@ -671,6 +673,7 @@ impl EngagementFrontPlan {
             heights,
             rapid_descent: None,
             travel_clearance: None,
+            fine_steering: false,
             ramp_clearance: None,
             link_feed: None,
             chip_thinning: false,
@@ -711,6 +714,11 @@ impl EngagementFrontPlan {
     /// See `RoughingOperation::travel_clearance_mm` (validated there).
     pub(crate) fn with_travel_clearance(mut self, clearance: Option<f64>) -> Self {
         self.travel_clearance = clearance;
+        self
+    }
+    /// See `RoughingOperation::fine_steering`.
+    pub(crate) fn with_fine_steering(mut self, fine: bool) -> Self {
+        self.fine_steering = fine;
         self
     }
     pub(crate) fn construction_error_mm(&self) -> f64 {
@@ -796,8 +804,10 @@ impl EngagementFrontPlan {
 
     fn grid_for(&self, stock: &Stock) -> Result<Grid, String> {
         let step = stock.cell_widths_mm();
-        // Steering resolution: fine enough to resolve the target width.
-        let want = (self.r / 20.).min(self.width / 5.);
+        // Steering resolution: fine enough to resolve the target width;
+        // twice as fine with `fine_steering`.
+        let fine = if self.fine_steering { 2. } else { 1. };
+        let want = (self.r / (20. * fine)).min(self.width / (5. * fine));
         let c = step[0] / (step[0] / want).ceil();
         let margin = 3. * self.r + self.op.radial_allowance_mm + 24. * c;
         let x0 = self.spec.min_mm[0] - (margin / c).ceil() * c;

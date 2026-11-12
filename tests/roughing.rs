@@ -4287,8 +4287,8 @@ fn closed_box(x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> Vec<[[f64
     ];
     let quad = |a, b, c, d| vec![[p[a], p[b], p[c]], [p[a], p[c], p[d]]];
     [
-        quad(4, 6, 5, 7), // top (+z)
-        quad(0, 2, 1, 3), // bottom (-z)
+        quad(4, 5, 6, 7), // top (+z)
+        quad(0, 3, 2, 1), // bottom (-z)
         quad(0, 1, 5, 4), // y0 face (-y)
         quad(3, 7, 6, 2), // y1 face (+y)
         quad(0, 4, 7, 3), // x0 face (-x)
@@ -4326,12 +4326,8 @@ fn certify_bar(c: &Curve) {
 /// The bar job: stock (0,0,0)-(60,40,12) at cell 0.4, a full-length bar
 /// x 0..60, y 12..28, z 0..12 retained, a flat 6 mm tool, engagement_front
 /// clearing at 0.6 mm width, stepdown 6, floor 1. Both side strips run the
-/// stock's whole 60 mm length.
-fn bar_manifest(top_z: f64, ends: bool) -> StreamManifest {
-    serde_json::from_value(bar_input(top_z, ends)).unwrap()
-}
-
-/// The bar job's manifest JSON, for tests that change it before parsing.
+/// stock's whole 60 mm length. Returned as manifest JSON, for tests that
+/// change it before parsing.
 fn bar_input(top_z: f64, ends: bool) -> serde_json::Value {
     // `top_z` is the stock and part height; above 12 the first layer still
     // cuts at Z6 (one deep stepdown) and the tool is lengthened to reach.
@@ -4400,7 +4396,13 @@ fn bar_input(top_z: f64, ends: bool) -> serde_json::Value {
 /// is certified against the bar, and every vertical entry is checked to
 /// descend only through cut stock or air (the frustum test's check).
 fn run_bar(top_z: f64, ends: bool) -> (f64, serde_json::Value) {
-    let m = bar_manifest(top_z, ends);
+    run_bar_input(bar_input(top_z, ends))
+}
+
+/// `run_bar` for a bar job input a test has changed.
+fn run_bar_input(input: serde_json::Value) -> (f64, serde_json::Value) {
+    let top_z = input["operations"][0]["top_z_mm"].as_f64().unwrap();
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
     m.validate().unwrap();
     let tool = m.tools[0].prepare().unwrap();
     let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
@@ -4416,6 +4418,7 @@ fn run_bar(top_z: f64, ends: bool) -> (f64, serde_json::Value) {
     let mut history: Vec<camlib::motion::Motion> = Vec::new();
     let mut current = m.initial_position_mm;
     let (mut first_cut, mut first_passes) = (0f64, 0usize);
+    let mut total_cut = 0f64;
     let mut in_cut = false;
     while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
         assert!(history.len() < 60000, "unbounded engagement_front path");
@@ -4456,6 +4459,9 @@ fn run_bar(top_z: f64, ends: bool) -> (f64, serde_json::Value) {
         let first_layer = motion.kind == MoveKind::Cut
             && (motion.curve.start()[2] - 6.).abs() < 1e-6
             && (motion.curve.end()[2] - 6.).abs() < 1e-6;
+        if motion.kind == MoveKind::Cut {
+            total_cut += length;
+        }
         if first_layer {
             first_passes += usize::from(!in_cut);
             in_cut = true;
@@ -4484,6 +4490,9 @@ fn run_bar(top_z: f64, ends: bool) -> (f64, serde_json::Value) {
         );
     }
     assert!(first_passes > 0, "no first-layer passes planned");
+    let mut report = report;
+    // Not a report field: the test's own sum of every cutting motion.
+    report["test_cut_mm"] = total_cut.into();
     (first_cut / first_passes as f64, report)
 }
 
@@ -4664,9 +4673,19 @@ fn engagement_front_travel_clearance_lowers_rapids_over_cut_stock() {
     };
     let (high, high_report) = run_bar_travel(None);
     let (low, low_report) = run_bar_travel(Some(1.));
+    let lifts = |report: &serde_json::Value| -> u64 {
+        report["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["clearing"]["lifts"].as_u64().unwrap())
+            .sum()
+    };
     eprintln!(
-        "rapid travel {high:.0} mm at retract, {low:.0} mm lowered ({} lowered)",
-        lowered(&low_report)
+        "rapid travel {high:.0} mm at retract, {low:.0} mm lowered ({} lowered, lifts {} / {})",
+        lowered(&low_report),
+        lifts(&high_report),
+        lifts(&low_report)
     );
     assert_eq!(lowered(&high_report), 0);
     assert!(lowered(&low_report) > 0, "no rapid was lowered");
@@ -4716,6 +4735,59 @@ fn engagement_front_deep_layer_entries_are_proven() {
 /// passes, not short crosswise ones; the strips are 60 mm long), while every
 /// certification, entry proof and engagement rule still holds. The planner
 /// starts each pass at the upstream end of its material.
+/// `fine_steering` halves the steering grid on every layer; every stroke
+/// is still certified and proven (`run_bar_input` checks each motion and
+/// the engagement bound), and the bar is cleared with less cutting: the
+/// steering gives away half as much width to grid resolution.
+#[test]
+fn engagement_front_fine_steering_refines_the_grid_and_cuts_less() {
+    let cut_m = |report: &serde_json::Value| report["test_cut_mm"].as_f64().unwrap();
+    let grids = |report: &serde_json::Value| {
+        report["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["clearing"]["engagement_grid_mm"].as_f64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let (_, plain) = run_bar(12., false);
+    let mut input = bar_input(12., false);
+    input["operations"][0]["fine_steering"] = true.into();
+    let (_, fine) = run_bar_input(input);
+    let (g0, g1) = (grids(&plain), grids(&fine));
+    assert_eq!(g0.len(), g1.len());
+    // The target cell halves (min(r/20, w/5) -> min(r/40, w/10)); both are
+    // rounded down to divide the 0.4 mm stock cell: 0.12 -> 0.4/4 and
+    // 0.06 -> 0.4/7 for r 3, w 0.6.
+    for (a, b) in g0.iter().zip(&g1) {
+        assert!((a - 0.4 / 4.).abs() < 1e-12, "plain grid {a}");
+        assert!((b - 0.4 / 7.).abs() < 1e-12, "fine grid {b}");
+    }
+    eprintln!("cut length plain {:.1} mm, fine {:.1} mm", cut_m(&plain), cut_m(&fine));
+    assert!(cut_m(&fine) < cut_m(&plain));
+}
+
+#[test]
+fn engagement_front_fine_steering_is_engagement_front_only() {
+    let mut input = bar_input(12., false);
+    input["operations"][0]["fine_steering"] = true.into();
+    input["operations"][0]["clearing"] =
+        serde_json::json!({"kind": "raster", "stepover_mm": 2.0});
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
+    let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let error = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .err()
+    .expect("fine_steering on raster clearing must be refused");
+    assert!(error.contains("fine_steering applies to engagement_front"), "{error}");
+}
+
 #[test]
 fn engagement_front_cuts_open_strips_lengthwise() {
     let (mean, _) = run_bar(12., false);

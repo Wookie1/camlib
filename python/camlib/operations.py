@@ -1400,6 +1400,11 @@ class Roughing:
     # the one at feed_mm_min and the clearing's radial engagement; capped at
     # link_feed_mm_min.
     link_chip_thinning: bool = False
+    # engagement_front only: steer on a grid twice as fine (cutter radius / 40
+    # and width / 10 instead of / 20 and / 5). Passes run closer to the
+    # declared engagement and the cut is shorter, at about 1.5-4x the planning
+    # time. Every stroke is still proven exactly.
+    fine_steering: bool = False
     # Opt-in for targets tessellated face by face: each layer's shadow is
     # closed protectively, bridging gaps narrower than twice this (at most half
     # the cutter radius). About the mesh's surface error. None: off.
@@ -1440,6 +1445,10 @@ class Roughing:
                 result.pop(key)
         if not self.link_chip_thinning:
             result.pop('link_chip_thinning')
+        if type(self.fine_steering) is not bool:
+            raise ValueError('fine_steering must be a boolean')
+        if not self.fine_steering:
+            result.pop('fine_steering')
         for key in ("target", "clearing", "entry"):
             if hasattr(result[key], "to_dict"):
                 result[key] = result[key].to_dict()

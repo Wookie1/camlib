@@ -280,6 +280,14 @@ make its topology ambiguous. It only adds protection, and each layer reports it
   bore that is clear to the layer gets a straight plunge (reported as
   `air_entries`). `ramp_clearance_mm` (opt-in, on `Roughing`) starts each
   helix that far above the material it meets, never above `feed_z_mm`.
+  `fine_steering` (opt-in, on `Roughing`) steers on a grid about twice as
+  fine (target cell cutter radius / 40 and width / 10 instead of / 20 and
+  / 5, rounded down to divide the stock cell; reported per layer as
+  `engagement_grid_mm`). The steering gives away about 0.75 grid
+  cells of width to its own resolution, so passes run closer to the
+  declared engagement and the cut is shorter (about 6% less cutting time on
+  most measured parts), at about 1.5-4x the planning time. Every stroke is
+  still proven exactly against the committed sweeps.
   `link_feed_mm_min` (opt-in, on `Roughing`) feeds the stay-down links at
   that rate wherever the committed stock's whole-cell upper bounds prove the
   cutter's footprint clear of stock (checked in stretches of at most 2 mm);
