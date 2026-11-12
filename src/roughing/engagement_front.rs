@@ -1830,7 +1830,7 @@ impl EngagementFrontPlan {
                     })
                     .min_by(|a, b| a.2.total_cmp(&b.2));
                 let Some((i, k, d)) = best else { break };
-                if d > 2. * r && !rechecked {
+                if d > 4. * r && !rechecked {
                     // The cache holds the fronts as they were at the last
                     // refresh, so the front this pass just advanced is not
                     // in it: the nearest cached start can lie in another
