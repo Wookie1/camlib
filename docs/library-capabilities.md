@@ -23,8 +23,8 @@ See [Operations](operations.md) for parameters. Summary:
 | --- | --- |
 | Facing | Rectangular stock top; flat mills; zig-zag or one-way |
 | Pocket / rest pocket | Line/arc regions with islands; plunge, helical, ramp (zigzag along the path) or stock-edge entry; rest pocket cuts only what the simulated stock still holds |
-| Adaptive pocket | Engagement-limited clearing of the same regions |
-| 3D roughing / rest roughing | Layered clearing above a mesh part: raster, offset, adaptive; air passes can be omitted |
+| Adaptive pocket | Engagement-limited clearing of the same regions; helical or ramp entry into enclosed material |
+| 3D roughing / rest roughing | Layered clearing above a mesh part: raster, offset, adaptive (stock-edge, helical or ramp entry); air passes can be omitted |
 | Contour | Outer walls and/or hole walls of a part: climb (default) or conventional, tangent leads, wear compensation (G41/G42), holding tabs (triangle or rectangle; spread evenly or at given points), ramp entry around the loop |
 | Silhouette of a mesh part | `Engine.silhouette_region`: the part's plan-view outline at or above a depth as a planar region with a stated error bound, for `Contour` and the other 2D operations |
 | 3D finishing cutters | Ball (all patterns, certified error), flat and bull-nose (raster, spiral, radial, project, waterline; exact contacts, proven no-gouge moves, sampled error) |
@@ -47,7 +47,7 @@ See [Operations](operations.md) for parameters. Summary:
 | Supplied toolpath | `SuppliedToolpath`: the caller's own line/arc/helix moves with their feeds, run unchanged between planned operations through the same stream (stock handed on, per-move checks, material check, export gate, posting and decoding); camlib adds only the rapid travel to the first point; malformed moves refused by index; stock contact checking required; three-axis milling only |
 | Feeds and speeds | `cutting_data`: rpm and feed from surface speed and feed per tooth, chip thinning, ball effective diameter |
 | Probing, tool setting | Surface, outside and inside corner, bore, boss, pocket and web cycles that correct a work offset, and tool length and diameter on a declared tool setter, with a `ProbeTool` (stylus ball, stem, body); protected positioning, measuring moves checked clear until `search_mm` before the expected contact; stock never changed; what is stored recorded as a premise |
-| Plasma and laser cutting | Sheet parts with holes: kerf compensation (computed or G41/G42 wear), arc/line leads from the scrap, overcut or negative overburn, pierce clearance (center pierce in small holes), inner features and nested parts first, small-hole feed and THC off, micro-joints, fixed or programmed pierce/cut heights; every lead, kerf path and pierce proven clear of the parts; sheet simulated cut through |
+| Plasma and laser cutting | Sheet parts with holes: kerf compensation (computed or G41/G42 wear), arc/line leads from the scrap, overcut or negative overburn, pierce clearance (center pierce in small holes), inner features and nested parts first, small-hole feed and THC off, micro-joints, common-line cutting of parts one kerf path apart (pairs and rows, opt-in), fixed or programmed pierce/cut heights; every lead, kerf path and pierce proven clear of the parts; sheet simulated cut through |
 | Turning (lathe) | Facing, outside roughing (axial passes, every diameter left at its allowance), finishing, external, internal and face grooving, parting off, external and internal single-point threading, drilling on the axis (pecks), inside roughing and finishing (boring bars) of a turned profile and bore with insert/holder/bar geometry, the holder's body also from a supplied model (`TurningToolModel`: a mesh with its error, a declared placement and a cross-check against the declared insert); every move checked against the part, its bore, the stock and the chuck; axisymmetric stock with outer and inner bounds; constant surface speed (G96 with its G50/D limit) and feed per revolution (G95/G99); G18 output, finishing arcs (fillets, ball ends, the nose rolling round corners) as native G2/G3, radius or diameter X, T0101 words; a lathe setup is an ordinary `Setup` streamed like every run (per-move stock, playback with partial moves, cancellation, posted replay on the stock) with a material check (leftover material against the part) after each operation |
 
 Not supported: undercuts,
@@ -126,7 +126,10 @@ endpoints) against:
   (`Prism(role="protected_target")`),
 - cutter, shank and holder geometry,
 - declared machine travel (one tip box, or the gauge line's travel with each
-  tool checked at its own gauge length) and feed limits.
+  tool checked at its own gauge length) and feed limits. Planned moves and
+  the decoded words of the posted program are compared with travel by
+  [one rule](python.md#the-travel-rule): a position on a limit is inside, a
+  declared end is exact.
 
 Also available:
 
@@ -202,11 +205,13 @@ controller parameters, real offsets) is outside what camlib can check.
 | Drilling and boring cycles | G81/G82/G83/G73, G85/G89/G86, G76 (with G98, G80); decoded back into moves and checked |
 | Rigid tapping | G33.1 (M3 right, M4 left), or G84 / G74 with feed or lead word; SINUMERIK 808D native `CYCLE84` (signed lead) |
 | Lathe threading | G33 K<lead> or G32 F<lead> (spindle-synchronized), decoded back |
+| Plasma and laser marking | `ThermalMark`: caller-supplied lines and arcs (part numbers, bend lines) traced with the beam in the machine's marking process, before the cut; marking feed, height, power and line width declared by the caller; every mark proven inside its part (or explicitly allowed on the scrap), parts with marks not yet cut, sheet left whole under a mark (the stock refuses a mark over cut sheet) |
 | Lathe spindle and feed modes | G96 S (with G50 S or D limit) / G97, G95 or G99 F per revolution / G94 or G98, decoded back; per-move feed bounds checked |
 | Cutter compensation | G41/G42 with the tool's D register (wear), G40: on their own line (LinuxCNC, Centroid) or in the lead move's block (FANUC, Haas) |
 | Oriented spindle stop | M19 (declared per machine) for fine boring |
 | Probing | LinuxCNC `G38.3` (protected, with a trip check) and `G38.2` with `#5061`-`#5063` into `G10 L2`/`L10`/`L1`; or Renishaw Inspection Plus `G65 P9810`/`P9811`/`P9812`/`P9814`/`P9815` (FANUC); decoded back into moves and checked |
 | Beam on/off, power | Plasma `M3 S1`/`M5`, laser `M4 S<power>` (GRBL laser mode) or `M3 S`, from the declared S at full power |
+| Beam marking | Only as the machine declares it (`beam_mark`): the beam word at the marking power (lasers, GRBL laser mode), or the controller's declared marking and cutting process codes; QtPlasmaC: the machine's declared marking and cutting materials (`M190 P`/`M66 P3 L3 Q`). Decoded back, with the cutting process or power proven stated again before every cut |
 | Torch height control | Declared on/off codes (e.g. `M63 P2`/`M62 P2`) |
 | Tool changes | Table poses, preserved tip, preserved spindle position (the tip moves by the gauge-length difference), or Z home |
 | Redundant codes | Omitted only where the tracked state proves them redundant |

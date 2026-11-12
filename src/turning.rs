@@ -4,5 +4,7 @@ pub mod body;
 pub mod model;
 pub mod ops;
 pub mod profile;
+mod rub;
+pub mod size;
 pub mod stock;
 pub mod tool;

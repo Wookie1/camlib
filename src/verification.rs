@@ -84,12 +84,9 @@ pub struct MachineLimits {
 /// The travel of one tool's tip in machine coordinates: the declared tip box,
 /// or the gauge-line box lowered by the tool's gauge length.
 struct TipTravel<'a> {
-    min: Vec3,
-    max: Vec3,
+    travel: crate::travel::Travel,
     /// `Some` when derived from the gauge line: the tool and its gauge length.
     gauge: Option<(&'a str, f64)>,
-    /// Magnitudes entering the derived limit, for its representation error.
-    scale: f64,
 }
 
 impl MachineLimits {
@@ -110,10 +107,8 @@ impl MachineLimits {
         let (min, max, gauge_line) = self.travel()?;
         if !gauge_line {
             return Ok(TipTravel {
-                min,
-                max,
+                travel: crate::travel::Travel::tip(min, max),
                 gauge: None,
-                scale: 0.,
             });
         }
         if tool.cutter.shape == CutterShape::Beam {
@@ -124,49 +119,30 @@ impl MachineLimits {
         }
         let length = tool.gauge_length_mm;
         Ok(TipTravel {
-            min: [min[0], min[1], min[2] - length],
-            max: [max[0], max[1], max[2] - length],
+            travel: crate::travel::Travel::gauge_line(min, max, length),
             gauge: Some((&tool.id, length)),
-            scale: length + min[2].abs().max(max[2].abs()),
         })
     }
 }
 
 impl TipTravel<'_> {
-    /// How far `q` (machine coordinates) is outside, and on which axis.
-    fn outside(&self, q: Vec3) -> (f64, usize) {
-        (0..3)
-            .map(|k| ((self.min[k] - q[k]).max(q[k] - self.max[k]), k))
-            .fold((f64::NEG_INFINITY, 0), |a, b| if b.0 > a.0 { b } else { a })
-    }
-    fn violation(&self, q: Vec3) -> String {
+    fn violation(&self, found: &crate::travel::Outside) -> String {
         let Some((tool, length)) = self.gauge else {
             return "Tip exceeds configured travel after rigid work-to-machine transform".into();
         };
-        let (_, k) = self.outside(q);
-        let low = self.min[k] - q[k] > q[k] - self.max[k];
-        let limit = if low { self.min[k] } else { self.max[k] };
+        let k = found.axis;
         format!(
             "Tool {tool} (gauge length {length} mm) tip at machine {axis} {at:.6} mm is {side} its travel limit {limit:.6} mm: the gauge line's {axis} limit{offset}",
             axis = ["X", "Y", "Z"][k],
-            at = q[k],
-            side = if low { "below" } else { "above" },
+            at = found.machine_mm[k],
+            limit = found.limit_mm,
+            side = if found.low { "below" } else { "above" },
             offset = if k == 2 {
                 " less the tool's gauge length"
             } else {
                 ""
             },
         )
-    }
-    fn unresolved(&self) -> String {
-        match self.gauge {
-            None => {
-                "Travel separation unresolved at configured bounds/resolution/work budget".into()
-            }
-            Some((tool, _)) => format!(
-                "Tool {tool} travel separation unresolved at configured bounds/resolution/work budget"
-            ),
-        }
     }
 }
 
@@ -507,6 +483,7 @@ pub(crate) fn motion_identity(m: &crate::motion::Motion) -> String {
         MoveKind::ProbeMeasure => 10,
         MoveKind::ProbeTouch => 11,
         MoveKind::ProbeReturn => 12,
+        MoveKind::Mark => 13,
     }]);
     match m.feed_mm_min {
         Some(f) => {
@@ -1211,155 +1188,43 @@ fn check_body<C: CancelSignal>(
     }))
 }
 
-/// Travel decided without subdivision where the geometry allows it (#166).
+/// Machine travel of one move, decided in closed form (#166, #212) by the
+/// one travel rule (`crate::travel`, #246), which the posted-output check
+/// applies to the decoded moves too: the travel box is closed, a declared end
+/// is exact (only the binary64 evaluation of the work-to-machine transform is
+/// allowed for) and a point of a planned arc's nominal circle keeps the arc's
+/// own endpoint gap (none when the declared end is on the circle). The motion
+/// tolerance is not a travel allowance.
 ///
-/// The travel box is closed: a machine at home sits on its limit. The limit,
-/// the work offset and the tip position are binary64 values, each carrying
-/// representation error of the order of `guard`, so a tip within `guard` of a
-/// limit is on it, and only a tip more than `guard` beyond is outside (no
-/// controller commands a sub-picometre step).
-///
-/// - A line is inside the convex box exactly when both endpoints are: the
-///   rigid work-to-machine transform keeps it a segment.
-/// - A circular move uses its analytic bounds (endpoints, the tolerated
-///   terminal point and every swept axis extreme) when the work frame is a
-///   pure translation, so the machine bounds are those bounds plus the origin.
-///
-/// Returns `None` when neither applies (curves in a rotated frame, or curve
-/// bounds that cross a limit): subdivision then finds the violation or
-/// reports what it cannot resolve.
-fn travel_decided(
+/// Every point tested is a point of the move, so one outside is a violation
+/// with that point as the witness (the earliest along the move), and a move
+/// with none is inside. Nothing is left to subdivide: a move that starts on,
+/// touches or runs along a limit is decided like any other.
+fn check_travel(
     scene: &Scene,
     limits: &TipTravel<'_>,
     path: &PreparedCurve,
-    error: f64,
-) -> Result<Option<Option<Finding>>, String> {
-    let frame = &scene.work_to_machine;
-    let factor = (0..3)
-        .map(|k| frame.x[k].hypot(frame.y[k]).hypot(frame.z[k]))
-        .fold(1., f64::max);
-    let guard = |p: Vec3| {
-        let scale = p
-            .into_iter()
-            .chain(frame.origin_mm)
-            .map(f64::abs)
-            .sum::<f64>()
-            .max(1.)
-            + limits.scale;
-        error * factor + 256. * f64::EPSILON * scale
-    };
-    if matches!(path.curve(), crate::motion::Curve::Line { .. }) {
-        for fraction in [0., 1.] {
-            let p = path.position(fraction)?;
-            let q = frame.to_design(p);
-            let (margin, g) = (limits.outside(q).0, guard(p));
-            if margin > g {
-                return Ok(Some(Some(Finding {
-                    status: Status::Violation,
-                    kind: FindingKind::MachineTravel,
-                    object_id: "machine".into(),
-                    part: None,
-                    holder_section: None,
-                    fraction_interval: [fraction, fraction],
-                    witness: Some(Witness {
-                        fraction,
-                        tip_mm: p,
-                        section_height_mm: None,
-                        margin_lower_mm: margin - g,
-                    }),
-                    detail: limits.violation(q),
-                })));
-            }
-        }
-        return Ok(Some(None));
-    }
-    let translation = frame.x == [1., 0., 0.] && frame.y == [0., 1., 0.] && frame.z == [0., 0., 1.];
-    if translation {
-        let b = path.bounds();
-        let corner: Vec3 = std::array::from_fn(|k| b.min[k].abs().max(b.max[k].abs()));
-        let g = guard(corner);
-        if (0..3).all(|k| {
-            frame.origin_mm[k] + b.min[k] >= limits.min[k] - g
-                && frame.origin_mm[k] + b.max[k] <= limits.max[k] + g
-        }) {
-            return Ok(Some(None));
-        }
-    }
-    Ok(None)
-}
-
-fn check_travel<C: CancelSignal>(
-    scene: &Scene,
-    limits: &TipTravel<'_>,
-    path: &PreparedCurve,
-    error: f64,
-    work: &mut Work<'_, C>,
 ) -> Result<Option<Finding>, String> {
-    if let Some(decided) = travel_decided(scene, limits, path, error)? {
-        return Ok(decided);
-    }
-    let mut stack = vec![(0., 1., 0u8)];
-    let mut uncertain = None;
-    while let Some((a, b, depth)) = stack.pop() {
-        work.stats.max_stack_nodes = work.stats.max_stack_nodes.max(stack.len() + 1);
-        if !work.charge(0)? {
-            uncertain.get_or_insert([a, b]);
-            break;
-        }
-        let t = (a + b) / 2.;
-        let p = path.position(t)?;
-        let q = scene.work_to_machine.to_design(p);
-        let frame = &scene.work_to_machine;
-        let scale = p
-            .into_iter()
-            .chain(frame.origin_mm)
-            .map(f64::abs)
-            .sum::<f64>()
-            .max(1.)
-            + limits.scale;
-        let factor = (0..3)
-            .map(|k| frame.x[k].hypot(frame.y[k]).hypot(frame.z[k]))
-            .fold(1., f64::max);
-        let guard = error * factor + 256. * f64::EPSILON * scale;
-        let reach = path.length_mm() * factor * (b - a) / 2. + guard;
-        if (0..3).all(|k| q[k] - reach > limits.min[k] && q[k] + reach < limits.max[k]) {
-            work.stats.pruned_intervals += 1;
-            continue;
-        }
-        let outside = limits.outside(q).0;
-        if outside > guard {
-            return Ok(Some(Finding {
-                status: Status::Violation,
-                kind: FindingKind::MachineTravel,
-                object_id: "machine".into(),
-                part: None,
-                holder_section: None,
-                fraction_interval: [a, b],
-                witness: Some(Witness {
-                    fraction: t,
-                    tip_mm: p,
-                    section_height_mm: None,
-                    margin_lower_mm: outside - guard,
-                }),
-                detail: limits.violation(q),
-            }));
-        }
-        if depth == 48 || path.length_mm() * (b - a) <= work.options.spatial_resolution_mm {
-            uncertain.get_or_insert([a, b]);
-        } else {
-            stack.push((t, b, depth + 1));
-            stack.push((a, t, depth + 1));
-        }
-    }
-    Ok(uncertain.map(|span| Finding {
-        status: Status::Uncertain,
+    let found = crate::travel::curve_outside(
+        &scene.work_to_machine,
+        &limits.travel,
+        path,
+        crate::travel::ArcGap::Planned,
+    )?;
+    Ok(found.map(|found| Finding {
+        status: Status::Violation,
         kind: FindingKind::MachineTravel,
         object_id: "machine".into(),
         part: None,
         holder_section: None,
-        fraction_interval: span,
-        witness: None,
-        detail: limits.unresolved(),
+        fraction_interval: [found.fraction, found.fraction],
+        witness: Some(Witness {
+            fraction: found.fraction,
+            tip_mm: found.point_mm,
+            section_height_mm: None,
+            margin_lower_mm: found.beyond_mm - found.guard_mm,
+        }),
+        detail: limits.violation(&found),
     }))
 }
 
@@ -1521,7 +1386,7 @@ impl PreparedScene {
             && findings.len() < self.options.max_findings
         {
             travel_examined = true;
-            if let Some(f) = check_travel(&self.definition, travel, &path, error, &mut work)? {
+            if let Some(f) = check_travel(&self.definition, travel, &path)? {
                 findings.push(f);
             }
             work.stats.pairs_checked += 1;

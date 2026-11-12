@@ -122,6 +122,14 @@ pub struct InsertBody {
     /// to the corners between the flanks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blade_clearance: Option<BladeClearance>,
+    /// The insert's in-plane size tolerance (#113): ± on its inscribed
+    /// circle d and its corner dimension m (its ISO 1832 tolerance class,
+    /// or its maker's values), for an outline insert of the ISO form. With
+    /// it the body is everything an insert of that tolerance can occupy
+    /// relative to its measured nose (`size.rs`). None: the insert is its
+    /// outline exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_tolerance: Option<super::size::SizeTolerance>,
 }
 
 /// A grooving blade's clearance per flank (degrees), from its maker's
@@ -163,6 +171,10 @@ pub struct Body {
     pub insert: Pieces3,
     pub holder: Pieces3,
     pub flanks: Vec<FlankPiece>,
+    /// With a size tolerance (#113): the insert's body at its nominal
+    /// size (`insert` is then the body of the largest insert the tolerance
+    /// allows), for telling a refusal the tolerance causes.
+    pub nominal_insert: Option<Pieces3>,
 }
 
 impl ToolBody {
@@ -255,15 +267,16 @@ pub fn iso_insert_body(code: &str) -> Result<(f64, f64), String> {
             ));
         }
     };
-    let tolerance = match c[2] {
-        'A' | 'F' | 'C' | 'H' | 'E' | 'J' | 'K' | 'L' | 'N' => 0.025,
-        'G' | 'M' | 'U' => 0.13,
-        other => {
-            return Err(format!(
-                "insert code {code:?}: tolerance class {other:?} is not an ISO 1832 class: declare insert_thickness_mm"
-            ));
-        }
-    };
+    // The class's tolerance on s (the class table is with the size
+    // tolerances it also gives: `size::class`).
+    let tolerance = super::size::class(c[2])
+        .ok_or_else(|| {
+            format!(
+                "insert code {code:?}: tolerance class {:?} is not an ISO 1832 class: declare insert_thickness_mm",
+                c[2]
+            )
+        })?
+        .s_mm;
     let symbol: String = c[6..8].iter().collect();
     // [n, n + 1) mm by the symbol rule; T1/T3 are 1.98 and 3.97 mm.
     let below = match symbol.as_str() {
@@ -589,6 +602,7 @@ pub fn body(tool: &TurningTool) -> Result<Body, String> {
             insert: vec![vertices],
             holder: holder_pieces(tool, &shape, tool_body),
             flanks: vec![],
+            nominal_insert: None,
         });
     }
     let blade = matches!(
@@ -610,12 +624,10 @@ pub fn body(tool: &TurningTool) -> Result<Body, String> {
             .is_some_and(|b| b.curved_for_diameter_mm.is_some());
     let shape = tool.shape()?;
     let polygon = &shape.insert;
-    let pieces = convex_pieces(polygon);
-    let mut insert: Vec<Vec<[f64; 3]>>;
     let Some(body) = tool_body.insert.as_ref().filter(|_| !curved) else {
         // A drill: its outline is its radial section. A curved face
         // grooving blade: it follows the groove's radius off the plane.
-        insert = pieces
+        let insert = convex_pieces(polygon)
             .iter()
             .map(|piece| piece.iter().map(|p| [p[0], p[1], 0.]).collect())
             .collect();
@@ -623,8 +635,32 @@ pub fn body(tool: &TurningTool) -> Result<Body, String> {
             insert,
             holder: holder_pieces(tool, &shape, tool_body),
             flanks: vec![],
+            nominal_insert: None,
         });
     };
+    let (insert, flanks) = insert_pieces(tool, body, &shape.insert, blade)?;
+    let nominal_insert = match &shape.nominal {
+        Some(nominal) => Some(insert_pieces(tool, body, nominal, blade)?.0),
+        None => None,
+    };
+    Ok(Body {
+        insert,
+        holder: holder_pieces(tool, &shape, tool_body),
+        flanks,
+        nominal_insert,
+    })
+}
+
+/// The insert's body below the face polygon `polygon`, seated: its convex
+/// 3D pieces and, for a straight grooving blade, its flanks.
+fn insert_pieces(
+    tool: &TurningTool,
+    body: &InsertBody,
+    polygon: &[[f64; 2]],
+    blade: bool,
+) -> Result<(Pieces3, Vec<FlankPiece>), String> {
+    let pieces = convex_pieces(polygon);
+    let mut insert: Vec<Vec<[f64; 3]>>;
     let s = body.insert_thickness_mm;
     // A blade's sides by their outward direction in its frame: the front
     // toward -x, the top (where the blade goes on into its holder) toward
@@ -738,11 +774,20 @@ pub fn body(tool: &TurningTool) -> Result<Body, String> {
         body.edge_deg.to_radians().cos(),
         body.edge_deg.to_radians().sin(),
     ];
-    let centroid = polygon
-        .iter()
-        .fold([0., 0.], |c, p| [c[0] + p[0], c[1] + p[1]]);
+    // Across the edge, into the insert: beyond its major edge (tangent to
+    // the nose) an insert reaches only its nose radius from the nose
+    // center, into itself farther. (Not the side of its vertices' mean: a
+    // circumscribed nose arc has some fifty vertices, which pull the mean
+    // of a wedge with two far corners past the nose center, and the rake
+    // then turned the wrong way.)
+    let reach = |d: [f64; 2]| {
+        polygon
+            .iter()
+            .map(|p| d[0] * p[0] + d[1] * p[1])
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
     let mut q = [-e[1], e[0]];
-    if q[0] * centroid[0] + q[1] * centroid[1] < 0. {
+    if reach([-q[0], -q[1]]) > reach(q) {
         q = [-q[0], -q[1]];
     }
     let lambda = body.inclination_deg.to_radians();
@@ -767,11 +812,7 @@ pub fn body(tool: &TurningTool) -> Result<Body, String> {
     for flank in &mut flanks {
         flank.points.iter_mut().for_each(seat);
     }
-    Ok(Body {
-        insert,
-        holder: holder_pieces(tool, &shape, tool_body),
-        flanks,
-    })
+    Ok((insert, flanks))
 }
 
 fn holder_pieces(
@@ -1543,6 +1584,7 @@ mod tests {
                 edge_deg: edge,
                 curved_for_diameter_mm: None,
                 blade_clearance: None,
+                size_tolerance: None,
             }),
             holder_y_mm: [-10., 0.],
             bar_axis_y_mm: 0.,
@@ -1617,6 +1659,35 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn rake_turns_a_wedge_the_same_way_whatever_its_nose_radius() {
+        // `InsertBody::rake_deg`: "negative rake tilts the face up away from
+        // the edge (the flank below the edge backs off)". A wedge insert
+        // (`Insert::iso_turning`: a nose and two far corners) on a 95
+        // degree holder, its major edge leading toward -z: with -6 degrees
+        // of rake its far side rises above the centre plane (12 mm from the
+        // edge: 1.25 mm) and the bottom of its straight sides, 3 mm below,
+        // stands 3·sin 6° = 0.31 mm behind the edge's line (z = -rn at the
+        // nose), for a small nose radius as for a large one.
+        for rn in [0.1, 0.4, 0.8, 1.6] {
+            let insert = Insert::iso_turning(80., 95., 12., rn).unwrap();
+            let t = tool(insert, rn, TurnSide::Outer, body(3., 0., -6., 0., 5.));
+            let (pieces, _) = body_pieces(&t).unwrap();
+            let vertices: Vec<[f64; 3]> = pieces.into_iter().flatten().collect();
+            let highest = vertices
+                .iter()
+                .map(|v| v[2])
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!((1.0..1.5).contains(&highest), "rn {rn}: {highest}");
+            let front = vertices
+                .iter()
+                .filter(|v| v[2] < -2.5)
+                .map(|v| v[1])
+                .fold(f64::INFINITY, f64::min);
+            assert!(front > -rn + 0.25, "rn {rn}: {front}");
+        }
     }
 
     #[test]

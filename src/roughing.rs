@@ -1193,14 +1193,28 @@ impl RoughingPlan {
         let options = ConstructionOptions {
             tolerance_mm: op.tolerance_mm,
         };
-        // Roughing layers enter beside the stock or on a fitted helix: offset
-        // and scheduled raster clearing link their passes through those
-        // fitted entry routes, and engagement_front proves its engagement
-        // from them. A ramp along the path is not modelled for layers.
-        op.entry.refuse_ramp(
-            &format!("roughing {}", op.id),
-            "roughing layers enter beside the stock or on a fitted helix, which their pass linking and engagement proofs rely on",
-        )?;
+        // A ramp entry belongs to adaptive clearing's engagement front,
+        // which enters from air or cleared stock wherever it can and ramps
+        // only into enclosed material, from the material top the stock
+        // proves (#219). Offset and raster layers are pockets open to the
+        // stock's edge whose entries are fitted places (beside the stock, or
+        // a helix) that the order and the links of their passes are built
+        // on; a ramp along each pass has no such place, and would ramp
+        // through the air beside the stock and the air the layers above cut
+        // (a layer's pocket starts at the stock top while the flutes span
+        // it). They refuse it.
+        if !matches!(
+            op.clearing,
+            RoughingClearing::Adaptive {
+                path_strategy: AdaptivePathStrategy::EngagementFront,
+                ..
+            }
+        ) {
+            op.entry.refuse_ramp(
+                &format!("roughing {}", op.id),
+                "offset and raster layers (and the disk_front and stock_front strategies) enter beside the stock or on a fitted helix, which the order and links of their passes are built on; AdaptiveClearing (path_strategy engagement_front) ramps into enclosed material",
+            )?;
+        }
         let expanded = stock_region.prepare(options)?;
         // A no-op still validates the selected tool/setup/entry/strategy. Use
         // the same scalar policies as actual layers, without inventing a layer.
@@ -1697,6 +1711,19 @@ impl RoughingPlan {
             progress.apply(&mut report.layers[report.active_layer].clearing);
             report
         })
+    }
+    /// Planning progress (#198): depth levels done of those planned, and for
+    /// engagement-front clearing the active level's reachable material area.
+    pub fn progress(&self) -> crate::progress::Planned {
+        let (done, total) = (self.report.completed_layers, self.report.layers.len());
+        match self.plans.front() {
+            Some(LayerPlan::Engagement(front)) => crate::progress::Planned::Area {
+                layers_done: done,
+                layers: total,
+                area_mm2: front.area_mm2(),
+            },
+            _ => crate::progress::Planned::Layers { done, total },
+        }
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         self.prefix.clone()

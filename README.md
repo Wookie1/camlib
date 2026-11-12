@@ -45,7 +45,7 @@ and writes G-code through a postprocessor you can read and change.
 | --- | --- |
 | Facing | Rectangular stock, zig-zag or one-way passes |
 | Pocket, rest pocket | Line/arc regions with islands; plunge, helical, ramp or stock-edge entry; links kept at depth only through cleared stock |
-| Adaptive pocket | Engagement-limited clearing |
+| Adaptive pocket | Engagement-limited clearing; helical or ramp entry |
 | 3D roughing, rest roughing | Layered clearing above a triangle-mesh part (raster, offset or adaptive) |
 | Contour | Outer walls / holes of a part: climb or conventional, leads, wear compensation (G41/G42), holding tabs, ramp entry; a mesh part's outline at a depth as its region (`Engine.silhouette_region`) |
 | Drilling, peck drilling, spot/counterbore dwell | Canned cycles (G81/G82/G83/G73) where the machine declares them, explicit moves elsewhere |
@@ -58,14 +58,17 @@ and writes G-code through a postprocessor you can read and change.
 | Flat-area finishing | Horizontal faces at their exact heights, flat end mills |
 | Parallel, spiral, radial, project, pencil, scallop, waterline, ramp, steep-and-shallow, morph, flow finishing | Triangle-mesh surfaces: ball (certified error), flat and bull-nose end mills; slope limits; rest finishing from the stock |
 | Machining limits | Avoid areas (clamps) and containment regions for every operation, rapids and links |
-| Plasma and laser cutting | Kerf-compensated sheet parts: leads, pierce clearance, inner features first, small holes, micro-joints, torch height control, programmed or controller heights |
+| Plasma and laser cutting | Kerf-compensated sheet parts: leads, pierce clearance, inner features first, small holes, micro-joints, common-line cutting, torch height control, programmed or controller heights |
+| Plasma and laser marking | Part numbers and lines marked before the cut, in the marking process the machine declares; marks proven on their parts, the sheet left whole under them |
 | Feeds and speeds | rpm and feed from cutting data (chip thinning, ball effective diameter) |
 | Probing, tool setting | Work-offset probing of surfaces, corners, bores, bosses, pockets and webs, tool length and diameter on a tool setter; LinuxCNC G38 or Renishaw Inspection Plus macros, decoded back and checked |
 | Turning (lathe) | Facing, outside and inside roughing and finishing (boring), grooving, parting off, external and internal threading, drilling on the axis, constant surface speed and feed per revolution; finishing follows fillets, ball ends and corner rounding with native G2/G3 arcs; insert, holder and boring-bar checks against the part, bore, stock and chuck, solid (one-piece) boring bars checked as their ground round head, the holder also from its maker's model (a mesh with a declared placement; STEP through the CadQuery adapter); a lathe setup is an ordinary `Setup` (`turning=TurningSetup(...)`), streamed, played back and posted like any other, with a material check after each operation |
 
 Every setup (milling, plasma/laser and lathe) runs as one stream: each move
 arrives with the stock it removes, and playback can pause, seek (also
-partway through a move), cancel, and save and reopen a run. Every move can be
+partway through a move), cancel, and save and reopen a run. While it plans, a
+run can report which operation it is on and how far along
+([planning progress](docs/python.md#planning-progress)). Every move can be
 checked continuously against the evolving stock, fixtures, protected parts,
 the tool holder and machine limits (lathe moves always are, against the part,
 bore, chuck and stock), and the stock against the target part; posted G-code

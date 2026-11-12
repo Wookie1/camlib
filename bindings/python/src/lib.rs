@@ -140,7 +140,7 @@ fn decode_committed_chunk<'py>(
     let (feed_flag, feed) = (d.u8()?, d.f64()?);
     let curve_kind = d.u8()?;
     let (a, b) = (d.point()?, d.point()?);
-    if kind > 12 || curve_kind > 2 || feed_flag > 1 || (feed_flag == 0 && feed != 0.) {
+    if kind > 13 || curve_kind > 2 || feed_flag > 1 || (feed_flag == 0 && feed != 0.) {
         return Err(PyValueError::new_err(
             "invalid motion/curve/feed discriminator",
         ));
@@ -211,6 +211,7 @@ fn decode_committed_chunk<'py>(
             "probe_measure",
             "probe_touch",
             "probe_return",
+            "mark",
         ][kind as usize],
     )?;
     motion.set_item("feed_mm_min", (feed_flag == 1).then_some(feed))?;
@@ -548,6 +549,15 @@ fn turning_iso_code(code: &str, approach_angle_deg: f64) -> PyResult<(String, f6
 #[pyfunction]
 fn turning_iso_insert_body(code: &str) -> PyResult<(f64, f64)> {
     camlib::turning::body::iso_insert_body(code).map_err(PyValueError::new_err)
+}
+
+/// An ISO 1832 insert's in-plane size tolerance (#113): ± on d and on m
+/// (mm), from its tolerance class, shape and size; None for a round insert.
+#[pyfunction]
+fn turning_iso_size_tolerance(code: &str) -> PyResult<Option<(f64, f64)>> {
+    camlib::turning::size::iso_size_tolerance(code)
+        .map(|t| t.map(|t| (t.d_mm, t.m_mm)))
+        .map_err(PyValueError::new_err)
 }
 
 /// The approach angle of an ISO 5608 holder designation.
@@ -2397,6 +2407,14 @@ impl DefaultMotionPost {
         use camlib::motion::{Curve, MoveKind, Plane};
         let names = ["xy", "xz", "yz"];
         let mut plane = plane;
+        // The plane the program has selected: the decoder's on entry (what
+        // the blocks written so far select), then each plane code written
+        // here. Plane selection is modal (G17/G18/G19, modal group 2:
+        // LinuxCNC G-code reference, "Modal Groups"), so a code is written
+        // only for a change (#204). The decoding below keeps its own plane
+        // from the blocks it reads; the session checks each decoded arc
+        // against its source, so a missing code is refused.
+        let mut selected = plane;
         let mut position = position;
         let declared = |code: &Option<String>, effect: &str| {
             code.clone()
@@ -2435,10 +2453,13 @@ impl DefaultMotionPost {
                         Plane::Xz => 1,
                         Plane::Yz => 2,
                     };
-                    lines.push(declared(
-                        &self.planes[index],
-                        &format!("plane_{}", names[index]),
-                    )?);
+                    if selected != Some(index) {
+                        lines.push(declared(
+                            &self.planes[index],
+                            &format!("plane_{}", names[index]),
+                        )?);
+                        selected = Some(index);
+                    }
                     let [u, v, normal] = p.axes();
                     let axes = if matches!(m.curve, Curve::Helix { .. }) {
                         vec![0, 1, 2]
@@ -2719,6 +2740,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(turning_iso_code, module)?)?;
     module.add_function(wrap_pyfunction!(turning_holder_approach, module)?)?;
     module.add_function(wrap_pyfunction!(turning_iso_insert_body, module)?)?;
+    module.add_function(wrap_pyfunction!(turning_iso_size_tolerance, module)?)?;
     module.add_function(wrap_pyfunction!(turning_rectangle_holder, module)?)?;
     module.add_function(wrap_pyfunction!(turning_validate_tool, module)?)?;
     module.add_function(wrap_pyfunction!(holder_envelope_from_mesh, module)?)?;

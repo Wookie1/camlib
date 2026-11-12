@@ -328,6 +328,88 @@ impl PreparedCurve {
             (peak[i], state)
         }))
     }
+    /// Where the nominal circular move ends: its centre, radius and sweep
+    /// place it within the preparation tolerance of the declared end, which
+    /// `position(1.)` returns. A line ends at its declared end.
+    pub(crate) fn nominal_end(&self) -> Vec3 {
+        let end = self.curve.end();
+        match self.curve {
+            Curve::Line { .. } => end,
+            Curve::Arc {
+                center,
+                plane,
+                sweep_rad,
+                ..
+            }
+            | Curve::Helix {
+                center,
+                plane,
+                sweep_rad,
+                ..
+            } => {
+                let [u, v, _] = plane.axes();
+                let (sin, cos) = (self.angle + sweep_rad).sin_cos();
+                let mut p = end;
+                p[u] = center[u] + self.radius * cos;
+                p[v] = center[v] + self.radius * sin;
+                p
+            }
+        }
+    }
+    /// Fractions in [0, 1] where the nominal curve's coordinate along
+    /// `direction` is stationary: with the two ends, every place that
+    /// coordinate can be extreme. `direction` is any vector (a row of a
+    /// work-to-machine rotation gives a machine axis).
+    ///
+    /// A line has none. On an arc or helix of radius r, with in-plane axes
+    /// u, v and axial axis w, the coordinate at fraction t is
+    /// `K + a cos(psi) + d t`, where `psi = angle - phase + t sweep`,
+    /// `a = r hypot(direction[u], direction[v])`,
+    /// `phase = atan2(direction[v], direction[u])` and
+    /// `d = direction[w] (end[w] - start[w])`. Its derivative vanishes where
+    /// `sin(psi) = d / (a sweep)`: two angles a turn, or none when the axial
+    /// drift outruns the circle. A helix repeats them every turn with a
+    /// constant drift, so its extremes are among the first and the last
+    /// occurrence of each.
+    pub(crate) fn stationary_fractions(&self, direction: Vec3) -> Vec<f64> {
+        let (Curve::Arc {
+            plane, sweep_rad, ..
+        }
+        | Curve::Helix {
+            plane, sweep_rad, ..
+        }) = self.curve
+        else {
+            return Vec::new();
+        };
+        let [u, v, w] = plane.axes();
+        let slope = self.radius * direction[u].hypot(direction[v]) * sweep_rad;
+        let drift = direction[w] * (self.curve.end()[w] - self.curve.start()[w]);
+        let sine = drift / slope;
+        // No in-plane part (slope 0), or a monotone coordinate. A ratio one
+        // rounding step past 1 is the two angles merged into one: keep it.
+        if sine.is_nan() || sine.abs() > 1. + 1e-12 {
+            return Vec::new();
+        }
+        let root = sine.clamp(-1., 1.).asin();
+        let start = self.angle - direction[v].atan2(direction[u]);
+        let span = sweep_rad.abs();
+        let mut fractions = Vec::new();
+        for target in [root, std::f64::consts::PI - root] {
+            let travel = if sweep_rad > 0. {
+                (target - start).rem_euclid(TAU)
+            } else {
+                (start - target).rem_euclid(TAU)
+            };
+            if travel <= span {
+                fractions.push(travel / span);
+                let last = travel + TAU * ((span - travel) / TAU).floor();
+                if last > travel {
+                    fractions.push((last / span).min(1.));
+                }
+            }
+        }
+        fractions
+    }
     /// Bounds include declared endpoints; callers must add construction/error
     /// guards when using them for collision pruning.
     pub fn bounds(&self) -> Bounds3 {
@@ -418,6 +500,12 @@ pub enum MoveKind {
     /// started. The ball starts touching, so only the other parts are
     /// checked. Never removes stock.
     ProbeReturn,
+    /// A fed move of a beam tool (plasma torch, laser head) with the beam on
+    /// in the machine's marking process (after `Event::BeamMark`): it traces
+    /// a line on the sheet surface and does not cut through. A line or an
+    /// XY arc at one height. Never removes stock; the sheet under it must
+    /// still be whole (`Stock::preview_sweep` refuses a mark over a through cut).
+    Mark,
 }
 
 impl MoveKind {
@@ -436,10 +524,11 @@ impl MoveKind {
         )
     }
     /// Whether the move may remove material: every fed move except a
-    /// probing move. Rapids, oriented shifts and probing moves never cut,
-    /// so no removal certificate may be drawn from them.
+    /// probing move and a beam's marking move. Rapids, oriented shifts,
+    /// probing moves and marking moves never cut, so no removal certificate
+    /// may be drawn from them.
     pub fn cuts(self) -> bool {
-        !self.is_rapid() && !self.is_probe()
+        !self.is_rapid() && !self.is_probe() && self != MoveKind::Mark
     }
     /// A probing move on which the stylus (or the measured cutter) is
     /// expected to be in contact: only the other assembly parts are checked.
@@ -586,6 +675,17 @@ pub enum Event {
     /// Torch height control (THC) on or off, while the beam is on.
     HeightControl {
         on: bool,
+    },
+    /// Plasma arc or laser beam on in the machine's marking process at
+    /// `power_percent` (laser power; a plasma torch fires at the marking
+    /// current its controller's marking process sets): it marks the sheet
+    /// surface and does not cut through. Only from the beam off;
+    /// `Beam { power_percent: 0 }` turns it off. Only `MoveKind::Mark`
+    /// moves are fed while it is on, and no cutting move: a cut needs the
+    /// cutting beam fired again (`Beam`), so a post states the cutting
+    /// process before every cut that follows a mark.
+    BeamMark {
+        power_percent: f64,
     },
     /// Spindle on at constant surface speed (lathe G96): at radius r = |x|
     /// it turns 1000 x `m_min` / (2 pi r) rpm, never above `max_rpm` (G50 or
@@ -897,6 +997,8 @@ pub struct ProgramValidator {
     /// Beam tools (plasma torches, laser heads), and beam/THC state.
     beams: HashSet<String>,
     beam_on: bool,
+    /// The beam is on in the marking process (`Event::BeamMark`).
+    beam_marking: bool,
     height_control: bool,
     /// Probe tools, and every tool's cutter radius (a probe's ball).
     probes: HashSet<String>,
@@ -963,6 +1065,7 @@ impl ProgramValidator {
                 .map(|t| t.id.clone())
                 .collect(),
             beam_on: false,
+            beam_marking: false,
             height_control: false,
             probes: program
                 .tools
@@ -1013,6 +1116,7 @@ impl ProgramValidator {
         let mut compensation_plane = self.compensation_plane;
         let mut oriented = self.oriented;
         let mut beam_on = self.beam_on;
+        let mut beam_marking = self.beam_marking;
         let mut height_control = self.height_control;
         let mut css = self.css;
         let mut feed_rev = self.feed_rev;
@@ -1192,7 +1296,32 @@ impl ProgramValidator {
                     if *power_percent == 0. && height_control {
                         return Err(error("turn torch height control off before the beam"));
                     }
+                    if *power_percent > 0. && beam_marking {
+                        return Err(error(
+                            "the beam is on in the marking process: turn it off before firing the cutting beam",
+                        ));
+                    }
                     beam_on = *power_percent > 0.;
+                    beam_marking = false;
+                }
+                Event::BeamMark { power_percent } => {
+                    if !power_percent.is_finite() || *power_percent <= 0. || *power_percent > 100. {
+                        return Err(error(
+                            "marking beam power must be above 0, at most 100 percent",
+                        ));
+                    }
+                    if !beam_tool(&active_tool) {
+                        return Err(error(
+                            "the beam needs an active beam tool (torch or laser head)",
+                        ));
+                    }
+                    if beam_on {
+                        return Err(error(
+                            "turn the beam off before firing it in the marking process",
+                        ));
+                    }
+                    beam_on = true;
+                    beam_marking = true;
                 }
                 Event::HeightControl { on } => {
                     if *on && !beam_on {
@@ -1540,6 +1669,35 @@ impl ProgramValidator {
                         if m.kind == MoveKind::Thread && !matches!(m.curve, Curve::Line { .. }) {
                             return Err(m_error("a threading move is a straight line"));
                         }
+                        if m.kind == MoveKind::Mark {
+                            if !beam_tool(&active_tool) || !beam_on || !beam_marking {
+                                return Err(m_error(
+                                    "a marking motion requires a beam tool with its beam on in the marking process (Event::BeamMark)",
+                                ));
+                            }
+                            let (start, end) = (m.curve.start(), m.curve.end());
+                            if start[2] != end[2]
+                                || !matches!(
+                                    m.curve,
+                                    Curve::Line { .. }
+                                        | Curve::Arc {
+                                            plane: Plane::Xy,
+                                            ..
+                                        }
+                                )
+                            {
+                                return Err(m_error(
+                                    "a marking motion is a line or an XY arc at one height",
+                                ));
+                            }
+                        } else if beam_marking {
+                            // Links, plunges and cuts alike: with the marking
+                            // beam on, any other fed move would mark (or fail
+                            // to cut) where none is planned.
+                            return Err(m_error(
+                                "the beam is on in the marking process: only marking motions are fed until it is off, and a cut needs the cutting beam fired again",
+                            ));
+                        }
                         if matches!(
                             m.kind,
                             MoveKind::Cut | MoveKind::Plunge | MoveKind::Lead | MoveKind::Thread
@@ -1597,6 +1755,7 @@ impl ProgramValidator {
         self.compensation_plane = compensation_plane;
         self.oriented = oriented;
         self.beam_on = beam_on;
+        self.beam_marking = beam_marking;
         self.height_control = height_control;
         self.css = css;
         self.feed_rev = feed_rev;

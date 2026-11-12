@@ -1278,6 +1278,25 @@ class RampEntry:
     set, and refused on a pass shorter than it. Contour: one continuous descent
     around each closed loop from the stock top to the floor (a profile ramp),
     no lap deeper than the stepdown, then one lap flat at the floor.
+
+    A ramp entry does not lift the need for a center-cutting cutter: every
+    ramp ends by turning back along the slope it has just cut, which a
+    cutter that is not center cutting cannot do without a lift camlib has no
+    data for.
+
+    RestPocket: each run of leftover pieces is entered along itself, from the
+    lowest height the committed stock proves clear along that path (usually
+    a zigzag: leftover pieces are short, so set ``min_length_mm``).
+
+    AdaptivePocket and Roughing with AdaptiveClearing (engagement_front):
+    entries from air or cleared stock come first; enclosed material is
+    entered by a ramp along the longest straight path through its most open
+    point (no longer than one leg needs), from the material top the stock
+    proves, then one flat pass along it. The ramp and that pass are entry
+    moves at the entry feed, a full-width slot like a helix's bore, and are
+    not bounded by the engagement limit; every cutting pass after them is.
+    Roughing with offset or raster clearing, and the disk_front and
+    stock_front strategies, refuse a ramp entry.
     """
 
     angle_deg: float
@@ -1402,7 +1421,8 @@ class Roughing:
     length_register: int = field(kw_only=True)
     coolant: str = field(kw_only=True)
     clockwise: bool = True
-    entry: StockEdgeEntry | HelicalEntry = StockEdgeEntry()
+    # RampEntry: with AdaptiveClearing (engagement_front) only.
+    entry: StockEdgeEntry | HelicalEntry | RampEntry = StockEdgeEntry()
     clearing_tolerance_mm: float | None = None
     require_part_at_first_depth: bool = False
     omit_empty_cuts: bool = False
@@ -1561,7 +1581,9 @@ class AdaptivePocket(Pocket):
     stepover_mm is the radial width of each pass (at most the cutter radius);
     max_engagement_deg below acos(1 - stepover/r) narrows it further. Each
     level enters by a helix into uncut material (entry's helix, or
-    HelicalEntry's default) and every cutting stroke is proven within that
+    HelicalEntry's default), or with entry=RampEntry(angle_deg) by a ramp
+    along a straight path (for a pocket too narrow for a helix), and every
+    cutting stroke is proven within that
     contact angle against the committed cleared sweeps. Nothing is cut twice.
     Orbit options, max_stay_down_mm and rest_tolerance_mm do not apply; the
     direction is cutting_sense ('climb' by default, or 'conventional').
@@ -1771,6 +1793,17 @@ class MicroJoints:
 
 
 @dataclass(frozen=True)
+class CommonLine:
+    """Common-line cutting for ``ThermalCut``: two parts whose facing straight
+    edges are exactly ``ThermalCut.common_line_spacing_mm()`` apart (one kerf
+    path between them) share a single cut along that edge. The shared edge
+    must be a complete edge of both parts, at least ``min_length_mm`` long,
+    with the parts flush at both ends (pairs and rows)."""
+
+    min_length_mm: float
+
+
+@dataclass(frozen=True)
 class ThermalCut:
     """Plasma or laser profile cutting of sheet parts (``parts``: a
     PlanarRegion whose components are the parts to keep, each with holes)
@@ -1790,7 +1823,13 @@ class ThermalCut:
     ``pierce_height_mm`` and ``cut_height_mm`` above the sheet top itself.
     ``height_control`` turns torch height control on for each loop (not over
     leads, nor in ``small_holes``). ``compensation="wear"`` posts G41/G42 so
-    the kerf can be trimmed at the controller."""
+    the kerf can be trimmed at the controller.
+
+    ``common_line=CommonLine(min_length_mm)`` cuts the shared straight edge
+    of parts placed ``common_line_spacing_mm()`` apart once: holes first,
+    then each common line (pierced in the scrap on its extension), then the
+    one outline of the group. Parts whose kerf paths coincide in any other
+    way are refused; the report lists the ``common_lines``."""
 
     id: str
     tool: object
@@ -1817,6 +1856,14 @@ class ThermalCut:
     work_offset: int = 1
     tool_number: int = field(kw_only=True)
     length_register: int = field(kw_only=True)
+    common_line: CommonLine | None = field(default=None, kw_only=True)
+
+    def common_line_spacing_mm(self):
+        """The gap between two parts whose facing edges are a common line:
+        twice the applied offset, so that the one kerf path between them is
+        the compensated path of both (the kerf width plus the boundary
+        allowance the cut leaves on each part)."""
+        return self.tool.cutter.diameter_mm + 2 * self.parts.boundary_error_mm + self.boundary_tolerance_mm
 
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -1841,6 +1888,8 @@ class ThermalCut:
                 for k, v in dict(width_mm=m.width_mm, count=m.count, spacing_mm=m.spacing_mm, holes=m.holes).items()
                 if v is not None
             }
+        if self.common_line is not None:
+            result["common_line"] = dict(min_length_mm=self.common_line.min_length_mm)
         for key in (
             "pierce_height_mm",
             "travel_height_mm",
@@ -1848,9 +1897,70 @@ class ThermalCut:
             "pierce_clearance_mm",
             "small_holes",
             "micro_joints",
+            "common_line",
         ):
             if result[key] is None:
                 result.pop(key)
+        return result
+
+
+@dataclass(frozen=True)
+class ThermalMark:
+    """Plasma or laser marking: lines traced on the sheet surface with the
+    beam in the machine's marking process, without cutting through (part
+    numbers, bend lines, layout marks). The beam centre follows ``paths``
+    (``TracePath`` values, in the order given) with no kerf compensation,
+    one beam-on per path.
+
+    Nothing is assumed about the machine: ``feed_mm_min``,
+    ``mark_height_mm`` (nozzle above the sheet top), ``power_percent`` (a
+    laser's marking power; a plasma torch marks at the current its
+    controller's marking process sets) and ``mark_width_mm`` (the width of
+    the marked line on this material) are the caller's, and the machine must
+    declare how it marks (``GCodeDialect(beam_mark=...)``, or its controller
+    post's setting) or the post refuses the program.
+
+    Marking runs before cutting, while each part is still held by the sheet:
+    put the ``ThermalMark`` before the ``ThermalCut``. ``parts`` is the
+    cut's ``parts``. Every mark's width, with ``edge_clearance_mm`` around
+    it, is proven inside one part (``allow_off_part=True`` skips that proof,
+    for marks on the scrap, and the report says so); a part with a mark must
+    not have been cut; and a marking move removes no stock and is refused
+    over sheet that is cut through.
+
+    ``height_mode="fixed"`` (default) keeps one Z (the controller owns the
+    height); ``"program"`` travels between paths at ``travel_height_mm``."""
+
+    id: str
+    tool: object
+    parts: object
+    paths: tuple
+    feed_mm_min: float
+    mark_height_mm: float
+    height_mode: str = "fixed"
+    travel_height_mm: float | None = None
+    power_percent: float = field(kw_only=True)
+    mark_width_mm: float = field(kw_only=True)
+    edge_clearance_mm: float = 0
+    allow_off_part: bool = False
+    tolerance_mm: float = 1e-5
+    work_offset: int = 1
+    tool_number: int = field(kw_only=True)
+    length_register: int = field(kw_only=True)
+
+    def __post_init__(self):
+        object.__setattr__(self, "paths", tuple(self.paths))
+
+    def to_dict(self):
+        result = {field: getattr(self, field) for field in self.__dataclass_fields__}
+        result.update(
+            kind="thermal_mark",
+            tool=getattr(self.tool, "id", self.tool),
+            parts=self.parts.to_dict() if hasattr(self.parts, "to_dict") else self.parts,
+            paths=[path.to_dict() if hasattr(path, "to_dict") else path for path in self.paths],
+        )
+        if result["travel_height_mm"] is None:
+            result.pop("travel_height_mm")
         return result
 
 
