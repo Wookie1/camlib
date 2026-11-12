@@ -4845,15 +4845,26 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
     // planner a step-up may take a stroke at a real sliver (its contact is
     // proven against the exact sweeps), but none runs along the walls: the
     // bug ran passes the length of every wall (tens of mm per step-up).
-    for l in &ups {
+    // The lowest step-up takes one stroke of under half a millimetre at a
+    // real sliver (with or without the memory: it is not this defect). Every
+    // step-up above it cuts nothing at all, where the defect ran passes the
+    // length of the walls (124 mm at Z6.5).
+    for (i, l) in ups.iter().enumerate() {
         let z = l["tip_z_mm"].as_f64().unwrap();
         let cut = cut_at.get(&z.to_bits()).copied().unwrap_or(0.);
-        eprintln!("step-up Z{z:.3}: cut {cut:.2} mm, {}", l["clearing"]["passes"]);
-        assert!(
-            cut <= 1.,
-            "step-up at Z{z} cut {cut:.2} mm beside vertical walls: {}",
-            l["clearing"]
-        );
+        if i == 0 {
+            assert!(cut < 0.5, "step-up at Z{z} cut {cut:.2} mm: {}", l["clearing"]);
+        } else {
+            assert_eq!(
+                (cut, l["clearing"]["passes"].as_u64()),
+                (0., Some(0)),
+                "step-up at Z{z} beside vertical walls: {}",
+                l["clearing"]
+            );
+            // It steered from the cleared memory handed through the empty
+            // step-up before it, not from whole-cell stock bounds.
+            assert_eq!(l["clearing"]["stock_top_carried"], true, "{}", l["clearing"]);
+        }
     }
 }
 
@@ -4879,18 +4890,18 @@ fn engagement_front_deep_layer_entries_are_proven() {
     let (deep_mean, deep) = run_bar(54., true);
     let (shallow, deep) = (z6(&shallow), z6(&deep));
     let count = |c: &serde_json::Value, key: &str| c[key].as_u64().unwrap();
-    eprintln!(
-        "Z6 top 12 / top 54: mean pass {shallow_mean:.2} / {deep_mean:.2} mm, unproven entries {} / {}, helixes {} / {}",
-        count(&shallow, "unproven_air_starts"),
-        count(&deep, "unproven_air_starts"),
-        count(&shallow, "helical_entries"),
-        count(&deep, "helical_entries"),
-    );
     // The same strips, only deeper: entries beside the cut stock are proven
     // as on the shallow layer, not refused and replaced by helixes.
-    assert!(
-        count(&deep, "unproven_air_starts") <= count(&shallow, "unproven_air_starts") + 4,
+    // The same strips, only deeper: exactly the entries the shallow layer
+    // proves, no more refused and none replaced by a helix.
+    assert_eq!(
+        count(&deep, "unproven_air_starts"),
+        count(&shallow, "unproven_air_starts"),
         "deep layer refused entries the shallow one proves: {deep}"
     );
-    assert!(count(&deep, "helical_entries") <= count(&shallow, "helical_entries"));
+    assert_eq!(
+        count(&deep, "helical_entries"),
+        count(&shallow, "helical_entries")
+    );
+    assert!((deep_mean - shallow_mean).abs() < 0.5, "{deep_mean} {shallow_mean}");
 }

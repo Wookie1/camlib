@@ -1762,7 +1762,7 @@ impl EngagementFrontPlan {
     /// A height `cleared_entry_start` returned, when it is a proof: it
     /// returns the operation top unexamined when nothing is committed yet.
     fn proven(&self, height: f64) -> Option<f64> {
-        (height < self.op.top_z_mm - 0.01_f64.max(64. * self.op.tolerance_mm)).then_some(height)
+        (height < self.op.top_z_mm - crate::entry::skin(self.op.tolerance_mm)).then_some(height)
     }
     /// Rapid from `from` up to the retract height, across to `to`, and down
     /// to the feed height (or the proven rapid-descent stop below it), never
@@ -1819,7 +1819,7 @@ impl EngagementFrontPlan {
         }
         let [wx, wy] = stock.cell_widths_mm();
         let w = wx.max(wy);
-        let guard = 0.01_f64.max(64. * self.op.tolerance_mm);
+        let guard = crate::entry::skin(self.op.tolerance_mm);
         for n in [2., 4., 8.] {
             let back = (n * w).min(self.r);
             let p = [q[0] - back * toward[0], q[1] - back * toward[1]];
@@ -1958,7 +1958,7 @@ impl EngagementFrontPlan {
                 let (height, _) = self
                     .guides
                     .cleared_entry_start(q, 0., z, Some(stock), cancel)?;
-                if height - z > 0.01_f64.max(64. * self.op.tolerance_mm) {
+                if height - z > crate::entry::skin(self.op.tolerance_mm) {
                     self.report.unproven_air_starts += 1;
                     self.mark_dead(q, 1);
                     continue;
@@ -2380,7 +2380,7 @@ impl EngagementFrontPlan {
                     let (height, _) =
                         self.guides
                             .cleared_entry_start(q, 0., z, Some(stock), cancel)?;
-                    if height - z <= 0.01_f64.max(64. * self.op.tolerance_mm) {
+                    if height - z <= crate::entry::skin(self.op.tolerance_mm) {
                         entry = Some((k, arc, height, first, second));
                         break 'search;
                     }
@@ -2600,7 +2600,7 @@ impl EngagementFrontPlan {
         };
         let q = layer.g.center(k);
         let tolerance = self.op.tolerance_mm;
-        let skin = 0.01_f64.max(64. * tolerance);
+        let skin = crate::entry::skin(tolerance);
         if self.slot_side_entry(q, stock, cancel)? {
             return Ok(true);
         }
@@ -2761,7 +2761,7 @@ impl EngagementFrontPlan {
     ) -> Result<bool, String> {
         let (r, z) = (self.r, self.z);
         let c = self.layer.as_ref().unwrap().g.c;
-        let skin = 0.01_f64.max(64. * self.op.tolerance_mm);
+        let skin = crate::entry::skin(self.op.tolerance_mm);
         for index in 0..self.ramp_slots.len() {
             let (a, b) = self.ramp_slots[index];
             let d = [b[0] - a[0], b[1] - a[1]];
@@ -2892,7 +2892,10 @@ impl EngagementFrontPlan {
             let top = swept
                 .min(self.guides.cell_sweep_height(stock, q, rh))
                 .max(z);
-            let air = top <= z + 64. * self.op.tolerance_mm;
+            // Within the skin a proven entry start may stop short of the
+            // level (`entry::skin`): a helix through less would be a few
+            // micrometres tall.
+            let air = top <= z + crate::entry::skin(self.op.tolerance_mm);
             // The ramp starts `ramp_clearance` above the material it found
             // (never above the feed height), so the helix is already turning
             // when the cutter reaches stock.
