@@ -49,7 +49,9 @@ while the Rust side does the planning and the checking.
    - `Update`: one move and its stock change;
    - `OperationUpdate`: an operation's begin, mid-operation events and end,
      with its report;
-   - `VerificationUpdate`: per-move check results.
+   - `VerificationUpdate`: per-move check results;
+   - `ProgressUpdate`, only when asked (`progress_interval_s`): planning
+     progress, see *Planning progress* below.
 6. **Keep and replay.** `camlib.playback.RecordedRun` records frames and
    checkpoints to a directory. `Player` seeks by restoring the nearest
    checkpoint and replaying, including partway through a move. A run can be
@@ -76,9 +78,41 @@ CRC-32), then the payload. Kinds (`src/stream.rs`):
 | 9 | Control | Typed control events (version 2 runs) |
 | 10 | Turn chunk | One lathe move and its turning stock change |
 | 11 | Dexel chunk | One milling move on tri-dexel stock and the rays it changed |
+| 12 | Progress | Planning progress (JSON); sent only when asked, never stored (#198) |
 
 Every frame carries the run id, revision and manifest digest. A frame from
 another run or revision is refused.
+
+## Planning progress
+
+`src/progress.rs` (#198). The `operations` command's `progress_ms` asks
+`regeneration::run_with_progress` for kind 12 frames: which operation is being
+planned, and a fraction with its basis where the planner can count one
+(`OperationPlan::progress`: levels, passes, or the engagement front's
+reachable area), else none.
+
+- **Not part of the run.** A progress frame carries no cursor and changes no
+  motion id, stock, checkpoint or cache entry. Receivers hand it to the
+  application and store nothing: `Frame.parse` (stored frames) refuses kind
+  12, so a journal can never hold one. Dropping the progress frames of a run
+  leaves exactly the frames of the same run without progress
+  (`tests/progress.rs`).
+- **A timer thread sends the updates.** The run's `Meter` owns the output.
+  With progress at an interval, a scoped thread sends the operation's
+  current update at each interval while the planning thread plans, so an
+  update is due however long one planner call takes and whether or not it
+  polls for cancellation (`python/tests/test_planning_progress.py` measures
+  the gaps on slow plans). Both threads write whole frames under one lock,
+  and an operation's updates all precede its end control. `cam-sim-stream`
+  therefore locks stdout per frame, not for the run.
+- **The planners are not involved.** They take no new parameter and keep
+  the caller's own cancel signal: the driver reads `OperationPlan::progress`
+  after `prepare` and after each move. So a run instantiates the engine for
+  exactly the signal types it did before (#194), and a run without progress
+  starts no thread and takes no lock.
+- **Monotonic in one place.** `Meter::report` keeps the largest fraction seen
+  in the operation; `Meter::end` sends 1. The Python reader checks the same
+  independently and refuses a stream whose fraction goes backwards.
 
 ## Stock models
 
@@ -100,15 +134,34 @@ can say clear, violation or uncertain honestly.
   become possible material. `Stock::finished_mesh` returns the closed mesh of
   each cell's upper bound, without T-junctions, which reads back on the same
   grid as the same bounds; it is approximate (`HEIGHT_FIELD_APPROXIMATION`).
+  Beside the cells, a natively committed flat cut leaves a record of the
+  column it emptied (path, cutter radius, floor). Whole cells cannot show
+  that a tool body as wide as the cutter fits where the cutter has been, so
+  `Stock::history_clearance` proves it from those records: the body's sweep
+  along a move lies inside the union of the emptied columns
+  (`src/engagement/cover.rs` states the claim and the proof; exact where the
+  move runs on earlier paths, otherwise with the sweeps' own path error and
+  no other allowance). The roughing planner's shank check, the sweep's
+  cutting-length check and stock contact all use this one proof (#200).
 - **Turning** (`src/turning/stock.rs`, `TurnStock`): per z bin, bounds of the
   outer radius and of the bore radius, plus rings certainly removed inside the
   material (face grooves). Lathe moves carry their changes computed by the
   turning planner's move kernel (`Planner::emit` for a line, `emit_arc` for
   an XZ arc), which also checks the insert against the part, bore and chuck,
-  and the holder and rapids against the stock. An arc is checked in pieces
+  and the holder and rapids against the stock. During a cutting move every
+  part of the tool but its cutting face is held to the stock as it is at
+  each instant: the stock the move found, less what the face has swept by
+  then, so a part ahead of or beside the face cannot pass through material
+  the same move removes later (`src/turning/rub.rs` states the condition
+  and its closed form for a straight move). An arc is checked in pieces
   (each inside the triangle of its ends and their tangents' corner, within a
   quarter of the tolerance), each against the stock the pieces before it
-  leave, and committed as one move.
+  leave, and committed as one move. The insert that is checked is its body
+  off the centre plane (`src/turning/body.rs`) and, where the tool declares
+  its insert's size tolerance (ISO 1832 d and m), everything an insert of
+  that tolerance can occupy relative to its measured nose
+  (`src/turning/size.rs`): the nose and the two cutting edges at it are
+  fixed, so the cut and the program do not change with it.
 
 - **Tri-dexel** (`src/dexel.rs`, `DexelStock`; issue #1): three grids of rays
   along X, Y and Z, each ray a prism (its cell's rectangle times its line)
@@ -130,6 +183,13 @@ can say clear, violation or uncertain honestly.
 
 Stock only loses material. A receiver refuses any change that adds material, or
 whose old value doesn't match its own stock.
+
+A beam's marking move (`MoveKind::Mark`, after `Event::BeamMark`; #18) is a
+fed move that removes nothing (`MoveKind::cuts` is false for it). The height
+field does not record the mark; the run carries the move. `Stock::preview_sweep`
+refuses a mark over a cell that is or may be cut through, or beyond the
+sheet, so a mark after the cut around it fails in the planned run and in the
+replay of the decoded program.
 
 ## Verification
 

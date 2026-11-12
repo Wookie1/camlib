@@ -140,7 +140,7 @@ fn decode_committed_chunk<'py>(
     let (feed_flag, feed) = (d.u8()?, d.f64()?);
     let curve_kind = d.u8()?;
     let (a, b) = (d.point()?, d.point()?);
-    if kind > 12 || curve_kind > 2 || feed_flag > 1 || (feed_flag == 0 && feed != 0.) {
+    if kind > 13 || curve_kind > 2 || feed_flag > 1 || (feed_flag == 0 && feed != 0.) {
         return Err(PyValueError::new_err(
             "invalid motion/curve/feed discriminator",
         ));
@@ -211,6 +211,7 @@ fn decode_committed_chunk<'py>(
             "probe_measure",
             "probe_touch",
             "probe_return",
+            "mark",
         ][kind as usize],
     )?;
     motion.set_item("feed_mm_min", (feed_flag == 1).then_some(feed))?;
@@ -550,6 +551,15 @@ fn turning_iso_insert_body(code: &str) -> PyResult<(f64, f64)> {
     camlib::turning::body::iso_insert_body(code).map_err(PyValueError::new_err)
 }
 
+/// An ISO 1832 insert's in-plane size tolerance (#113): ± on d and on m
+/// (mm), from its tolerance class, shape and size; None for a round insert.
+#[pyfunction]
+fn turning_iso_size_tolerance(code: &str) -> PyResult<Option<(f64, f64)>> {
+    camlib::turning::size::iso_size_tolerance(code)
+        .map(|t| t.map(|t| (t.d_mm, t.m_mm)))
+        .map_err(PyValueError::new_err)
+}
+
 /// The approach angle of an ISO 5608 holder designation.
 #[pyfunction]
 fn turning_holder_approach(code: &str) -> PyResult<f64> {
@@ -583,12 +593,39 @@ fn turning_rectangle_holder(
     serde_json::to_string(&holder).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Check a turning tool (JSON): its outlines, corner, holder and values.
+/// Check a turning tool (JSON): its outlines, corner, holder and values;
+/// with a supplied model (#110), its mesh, placement and insert cross-check.
 #[pyfunction]
-fn turning_validate_tool(tool: &str) -> PyResult<()> {
+fn turning_validate_tool(py: Python<'_>, tool: &str) -> PyResult<()> {
     let tool: camlib::turning::tool::TurningTool =
         serde_json::from_str(tool).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    tool.validate().map_err(PyValueError::new_err)
+    py.detach(|| camlib::turning::ops::validate_tool(&tool))
+        .map_err(PyValueError::new_err)
+}
+
+/// The envelope of a holder model turning about the tool axis (#110):
+/// (z0, z1, radius) cylinders from a mesh (JSON) and its declared placement.
+#[pyfunction]
+fn holder_envelope_from_mesh(
+    py: Python<'_>,
+    mesh: &str,
+    tip_mm: [f64; 3],
+    axis: [f64; 3],
+    z_range_mm: [f64; 2],
+    axial_resolution_mm: f64,
+) -> PyResult<Vec<[f64; 3]>> {
+    let mesh: camlib::surface::SurfaceMesh =
+        serde_json::from_str(mesh).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    py.detach(|| {
+        camlib::turning::model::revolved_envelope(
+            &mesh,
+            tip_mm,
+            axis,
+            z_range_mm,
+            axial_resolution_mm,
+        )
+    })
+    .map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
@@ -2370,6 +2407,14 @@ impl DefaultMotionPost {
         use camlib::motion::{Curve, MoveKind, Plane};
         let names = ["xy", "xz", "yz"];
         let mut plane = plane;
+        // The plane the program has selected: the decoder's on entry (what
+        // the blocks written so far select), then each plane code written
+        // here. Plane selection is modal (G17/G18/G19, modal group 2:
+        // LinuxCNC G-code reference, "Modal Groups"), so a code is written
+        // only for a change (#204). The decoding below keeps its own plane
+        // from the blocks it reads; the session checks each decoded arc
+        // against its source, so a missing code is refused.
+        let mut selected = plane;
         let mut position = position;
         let declared = |code: &Option<String>, effect: &str| {
             code.clone()
@@ -2408,10 +2453,13 @@ impl DefaultMotionPost {
                         Plane::Xz => 1,
                         Plane::Yz => 2,
                     };
-                    lines.push(declared(
-                        &self.planes[index],
-                        &format!("plane_{}", names[index]),
-                    )?);
+                    if selected != Some(index) {
+                        lines.push(declared(
+                            &self.planes[index],
+                            &format!("plane_{}", names[index]),
+                        )?);
+                        selected = Some(index);
+                    }
                     let [u, v, normal] = p.axes();
                     let axes = if matches!(m.curve, Curve::Helix { .. }) {
                         vec![0, 1, 2]
@@ -2456,14 +2504,17 @@ impl DefaultMotionPost {
                 values.extend([offsets[u], offsets[v]]);
             } else {
                 // A straight vertical move keeps the controller's current XY
-                // when that is within the output tolerance of the source XY
-                // (an arc's representable end may differ by a word): writing
+                // when the block stays within the output tolerance of the
+                // source, its XY offset plus half a word of Z rounding (an
+                // arc's representable end may differ by a few words): writing
                 // the source XY instead would add a sideways step to a move
                 // leaving the surface it touches. The check still compares
                 // the decoded block with the source motion.
                 let vertical = matches!(m.curve, Curve::Line { start, end }
                     if start[0] == end[0] && start[1] == end[1])
-                    && (0..2).all(|k| (position[k] - end[k]).abs() <= self.output_tolerance / 2.);
+                    && (position[0] - end[0]).hypot(position[1] - end[1])
+                        + 0.5 * self.unit * 10f64.powi(-(self.decimals as i32))
+                        <= self.output_tolerance;
                 for &i in &axes {
                     addresses.push_str(&self.axes[i]);
                     values.push(if vertical && i < 2 {
@@ -2689,8 +2740,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(turning_iso_code, module)?)?;
     module.add_function(wrap_pyfunction!(turning_holder_approach, module)?)?;
     module.add_function(wrap_pyfunction!(turning_iso_insert_body, module)?)?;
+    module.add_function(wrap_pyfunction!(turning_iso_size_tolerance, module)?)?;
     module.add_function(wrap_pyfunction!(turning_rectangle_holder, module)?)?;
     module.add_function(wrap_pyfunction!(turning_validate_tool, module)?)?;
+    module.add_function(wrap_pyfunction!(holder_envelope_from_mesh, module)?)?;
     module.add_function(wrap_pyfunction!(schedule_motion, module)?)?;
     module.add_function(wrap_pyfunction!(schedule_engagement, module)?)?;
     module.add_function(wrap_pyfunction!(validate_heights, module)?)?;

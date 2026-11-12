@@ -53,6 +53,17 @@ gauge length, and `Machine.verification_limits()` gives the planned-move
 checks the same limits. See
 [Machine travel with tools of different lengths](python.md).
 
+The decoded words are compared with the travel by the same rule as the
+planned moves ([the travel rule](python.md#the-travel-rule)): a position on a
+limit is inside, a decoded position beyond one is refused however small the
+step. Words are rounded to `decimals`, so a planned position on a limit is
+written exactly only when the work offset and the limit are multiples of the
+output step; otherwise it can round beyond the limit and the post refuses,
+naming the axis, the decoded position and the limit.
+An arc whose rounded words leave its end off the circle drawn from the start
+about the centre (an endpoint gap) must be inside the limit by that gap: an
+arc tangent to a travel limit posts only when its words are exact.
+
 Key settings:
 
 - **`tools`**: the machine tool table. `position_after_mm` is where the tool
@@ -130,6 +141,7 @@ Key settings:
 | `compensation_register` | False for lathes: G41/G42 written without a register word (the T offset holds the nose radius and tip direction) |
 | `feed_per_rev` | Feed per revolution (`FeedPerRev` events): `G95 F<mm/rev>` (Centroid/FANUC lathes `G99`, with `feed_per_minute="G98"` and `cycle_return_initial=None`), back to `G94` at 0. The written F must keep the feed within `feed_tolerance_mm_min` at `max_spindle_rpm`, otherwise the post refuses (e.g. a metric feed in inch output) |
 | `beam_s_max`, `beam_effect` | Plasma/laser: S at full power and the spindle code that fires the beam (`spindle_cw` M3, `spindle_ccw` M4); M5 turns it off. None refuses beam tools |
+| `beam_mark` | How the machine marks with its beam ([`ThermalMark`](operations.md#plasma-and-laser-marking-thermalmark), `BeamMark` events), declared by its owner. `None` (default): a marking program is refused. `"power"`: the beam word at the marking power (a laser; GRBL v1.1 laser mode scales the laser power with S). `"mode"`: the controller has a marking process; its codes are declared with `with_commands(mark_mode="M..", cut_mode="M..")` and written with the beam off before the program's first marking beam, before its first cutting beam, and at every change. camlib knows no such code. See [Beam marking](#beam-marking) |
 | `height_control_word` | Word after the `height_control_on`/`off` codes (e.g. `P2` for QtPlasmaC `M63 P2`/`M62 P2`) |
 | `probing` | Probing back end: `None` (probing cycles are refused), `"g38"` (LinuxCNC G38.x) or `"inspection_plus"` (Renishaw Inspection Plus macros); see [Probing](#probing) |
 | `probe_fast_feed_mm_min`, `probe_switching` | Inspection Plus: the installed fast feed #119, and whether each cycle switches the probe on and off (`G65 P9832`/`P9833`) |
@@ -200,6 +212,38 @@ moves are not taken from a source here; post them with `probing="g38"`.
 Premises: the macros installed (some controls embed them behind an M code),
 the probe calibrated with `O9801`-`O9804`, and the macros restoring the modal
 state they change.
+
+## Beam marking
+
+A `ThermalMark` fires the beam with `BeamMark(power_percent)` and feeds
+`mark` moves under it. How a controller marks is not something camlib knows:
+the machine declares it, and without a declaration the post refuses.
+
+```python
+# A laser: marking is the beam word at the marking power.
+laser = GCodeDialect(beam_s_max=1000, beam_mark="power")           # M3 S120 ... M5
+# A controller with a marking process: its own codes, declared.
+plasma = GCodeDialect(beam_s_max=1, beam_mark="mode").with_commands(mark_mode="M..", cut_mode="M..")
+```
+
+| Declared | Written | Decoded |
+| --- | --- | --- |
+| `"mode"` | `mark_mode`, then the beam word; `cut_mode` before the next cutting beam (and before the program's first cut: the controller may have been left in its marking process) | The decoder tracks the process from `mark_mode`/`cut_mode` alone (only with the beam off). A beam word under the marking process decodes as a marking beam, under the cutting process as a cutting beam, and before any selection is refused |
+| `"power"` | The beam word with S at the marking power; every cut's beam word states the cutting power again | The power word is decoded and compared (within 0.5 %). No word tells a marking beam from a cutting one, so its role is the source event's, as a fed move's kind is |
+
+The decoded program then goes through the same typed checks as the plan: a
+`mark` move needs the marking beam, a cutting move the cutting beam, fired
+again after the marks. So a post that leaves the marking process selected
+for a cut, selects the wrong process, or writes the wrong power is refused
+(`python/tests/test_thermal_mark.py` posts with such broken posts). The
+decoded program is also replayed on the stock, which refuses a mark over cut
+sheet.
+
+A marking current, gas or consumable is the controller's (its process or
+material table); the program only selects the process. Controllers whose
+marking needs more than one code per selection get their own post:
+[QtPlasmaC](qtplasmac-post.md) selects the machine's declared marking and
+cutting materials.
 
 ## Arcs that cannot be written exactly
 
@@ -277,9 +321,21 @@ class MyShopPost(GCodePost):
 Hooks: `on_begin(program)`, `on_work_offset`, `on_tool_change`,
 `on_spindle`, `on_coolant`, `on_stop`, `on_dwell`, `on_motion(motion)`,
 `on_cycle`, `on_cutter_compensation`, `on_spindle_orient`, `on_beam`,
-`on_height_control`, `on_surface_speed`, `on_feed_per_rev`, `on_finish()`. The default `on_dwell` writes the dialect's `dwell` code (G4)
+`on_beam_mark`, `on_height_control`, `on_surface_speed`, `on_feed_per_rev`, `on_finish()`. The default `on_dwell` writes the dialect's `dwell` code (G4)
 with the time in seconds in `dwell_word` (P), rounded up to
 `dwell_resolution_s` and limited to `dwell_max_s`.
+
+Plane selection is modal (G17/G18/G19, modal group 2 in the LinuxCNC G-code
+reference; FANUC, Haas and Centroid read it the same way), so the program
+selects a plane once, in its header, and again only where an arc or a canned
+cycle needs another one: a lathe program has one `G18`, and a mill program
+with XY arcs only has one `G17`. A post that writes arcs itself calls
+`self.select_plane("xy" | "xz" | "yz")` before the arc block; it writes the
+dialect's code only when another plane is active (a block that is a plane
+code alone, written by any hook, sets the active plane). The decoder keeps
+its own plane from the blocks it reads and decodes every arc in it, so a
+plane code that was needed and is missing gives an arc that differs from the
+plan, and the program is refused.
 
 Arc words come from `circular_values(curve)`: with the standard `number` and
 `word` it searches the representable end and centre words for ones whose
@@ -326,7 +382,7 @@ them against your machine before use:
 | File | Controller | Notes |
 | --- | --- | --- |
 | `GCodeDialect.linuxcnc()` | LinuxCNC 2.9 | `GCodeDialect.linuxcnc(beam_s_max=...)` writes a beam as `M3 S`/`M5`; `probing="g38"` writes probing cycles |
-| `grbl_post.py` | GRBL 1.1h | Lines only (arcs as checked segments), one preloaded tool, checked with GRBL's own binary32 arithmetic; vertical moves are written with Z only. `define_machine(..., beam_s_max=1000)` (= `$30`) writes a laser as `M4 S` (laser mode `$32=1`). `grbl_linear.py` is a complete example |
+| `grbl_post.py` | GRBL 1.1h | Lines only (arcs as checked segments), one preloaded tool, checked with GRBL's own binary32 arithmetic; vertical moves are written with Z only. `define_machine(..., beam_s_max=1000)` (= `$30`) writes a laser as `M4 S` (laser mode `$32=1`); with `beam_mark="power"` it also marks, as `M4 S<marking power>`. `grbl_linear.py` is a complete example |
 | `carvera_post.py` | Makera Carvera (metric milling) | Python and Rust named pair; [setup and retract premises](carvera-post.md) |
 | `haas_ngc_post.py` | Haas NGC (2020 manual) | [setup notes](haas-ngc-post.md) |
 | `fanuc_0imb_post.py` | FANUC 0i-MB | [setup notes](fanuc-0imb-post.md); `inspection_plus_fast_feed_mm_min=` posts probing as Renishaw Inspection Plus macros |

@@ -227,10 +227,95 @@ will remain as such"): it refuses.
   reversal, so `min_length_mm` does not apply, and the tool never comes
   straight down into material. With `compensation="wear"` G41/G42 goes on over
   the lead-in at the stock top and stays on down the whole descent.
-- Ramp moves are `plunge` moves at the entry feed, swept through the stock like
-  any other move.
+- In `Pocket` and `Contour`, ramp moves are `plunge` moves at the entry feed,
+  swept through the stock like any other move.
 - The pocket report gives `ramp_entries` and `max_ramp_angle_deg` (the steepest
   ramp made, never above `angle_deg`).
+- **`RestPocket`** (`Pocket` with `rest_tolerance_mm`): what a rest pass cuts
+  is known only from the stock, so each ramp is planned when its piece is
+  about to be cut. It follows that run of leftover pieces only (a
+  cutter-centre path proven inside the region), one leg or a zigzag as
+  above: the guide beyond it may already be clear, and a ramp over it would
+  run through air. It starts at the lowest height at which the committed
+  stock proves the whole tool clear along that path (the committed cuts, or
+  the stock's whole-cell bounds): the straight descent to it is through
+  air, and the ramp starts no higher than the highest material under it. A
+  piece whose path is proven clear down to the level is entered straight
+  down. Where nothing is proven the ramp starts at the pocket top. Leftover
+  pieces are often short (a corner a larger cutter left), so a rest pocket
+  usually needs `min_length_mm`.
+- **`AdaptivePocket`, and `Roughing` with `AdaptiveClearing`**
+  (`path_strategy="engagement_front"`): the entries from air or from stock
+  already cleared come first, as without a ramp. Material that is enclosed,
+  which a `HelicalEntry` would bore into, is entered by a ramp instead:
+  - along the longest straight path through the most open point of that
+    material that keeps the cutter inside the region (directions a degree
+    apart are tried; the path is then certified exactly against the region),
+    no longer than one leg at the angle needs;
+  - from the lowest height at which the committed stock proves the whole
+    tool clear along the path, so the straight descent is through air and
+    the ramp starts no higher than the highest material under its path: a
+    level below one already cut starts on that level's floor, not at the
+    pocket top (`ramp_clearance_mm` starts it that far higher, as it does a
+    helix); a path proven clear to the level gets a straight descent
+    (`air_entries`);
+  - one leg where the path is long enough, a zigzag over the whole path
+    where it is not (needs `min_length_mm`);
+  - then one pass along the path flat at depth, which removes the sloped
+    floor;
+  - with the tool's sections above the flutes (neck, shank, holder) proven
+    clear of the stock along the path at depth: above the stock, under no
+    stock cell they could meet, or inside what the committed cuts emptied (a
+    shank as wide as the cutter in what the levels above cut);
+  - in a pocket barely wider than the cutter, what the pass after the ramp
+    leaves beside the slot is cut from the slot at depth (a straight descent
+    in the slot, proven clear, and a stroke across no longer than the cutter
+    radius and four grid cells), not ramped into again through the air the
+    slot left (`slot_side_entries`).
+
+  The ramp and that flat pass are a full-width slot. They are entry moves
+  (`lead`) at the entry feed, like a helix and the floor circle under it, and
+  are **not** bounded by the engagement limit; the level's report counts
+  them (`ramp_entries`, `ramp_legs`, `ramp_slot_mm`, `max_ramp_angle_deg`).
+  Every cutting pass after them is proven within the limit, starting from
+  the slot. A helix cuts less at full width (Sandvik, same page: "Circular
+  ramping is always preferred to linear ramping (full slotting)"), so use a
+  ramp where a helix does not fit: a pocket barely wider than the cutter. In
+  Fusion's
+  [2D Adaptive Clearing](https://help.autodesk.com/cloudhelp/ENU/Fusion-CAM/files/GUIDA73542E9-ED9C-4BD9-A87D-3A0ECA8BEB41.htm)
+  the "Ramp Type" ("Specifies how the cutter moves down for each depth
+  cut") likewise offers "Zig-Zag" beside "Helix".
+
+Decisions (#219), with the reason:
+
+- **A ramp entry does not lift the need for a center-cutting cutter**, on
+  `Pocket` or anywhere else. No move of a ramped pocket comes straight down
+  into material, but every ramp ends by turning back along the slope it has
+  just cut: the flat pass after it, and each reversal of a zigzag. Sandvik
+  Coromant,
+  [Ramping: two axis linear and circular](https://www.sandvik.coromant.com/en-gb/knowledge/milling/milling-holes-cavities-pockets/ramping):
+  "When feeding the cutter at the maximum ramping angle, it must be lifted
+  distance h before changing direction. This prevents damage to the central
+  part of the cutter body." That distance belongs to the cutter, and camlib
+  has no data for it and assumes none. A flat cutter with
+  `center_cutting=False` is refused with a `RampEntry` as it is without one,
+  and the message says why.
+- **`Roughing` with `OffsetClearing` or `RasterClearing` refuses a ramp
+  entry.** Their layers are pockets open to the stock's edge: they enter at
+  fitted places (beside the stock, or on a helix) that the order and the
+  links of their passes are built on. A ramp along each pass has no such
+  place, and it would ramp through the air beside the stock and through the
+  air the layers above have cut (a layer's pocket starts at the stock top
+  while the flutes span it). Use `AdaptiveClearing` for a ramp.
+- **`path_strategy="disk_front"` and `"stock_front"` refuse it**: they start
+  every pass from a fitted seed circle, which a helix opens.
+- **A `Contour` ramp with holding tabs stays refused.** A tab is a lift whose
+  far side comes back down into the uncut loop at the tab's own slope (45
+  degrees for a triangle, straight down for a rectangle). A tool that needs a
+  ramp entry has a ramping limit, and those descents would break it; a tab
+  with sides at the ramp angle would be far longer than its width (a 3 mm high
+  tab at 3 degrees: 57 mm a side). The same holds for limits that block part
+  of a loop.
 
 Refused, before any motion:
 
@@ -240,18 +325,25 @@ Refused, before any motion:
   `HelicalEntry`, `entry=None` (plunge), a smaller cutter, or declare
   `min_length_mm` for the tool.
 - More than 1000 zigzag legs or laps (an angle far too small for the path).
-- `RampEntry` on a `Pocket` with `rest_tolerance_mm` (`RestPocket`): rest
-  passes are short leftover pieces a ramp does not fit.
+- A `RampEntry` with a cutter that is not center cutting (see the decisions
+  above).
 - `RampEntry` on a `Contour` with holding tabs, or with limits that block part
   of a loop: the tool comes back down from a tab or a lift steeper than the
   ramp angle. A `Contour` accepts no other entry type.
-- `RampEntry` on `Roughing` and `AdaptivePocket`: their passes are linked and
-  their engagement proven from stock-edge and helical entries, and a ramp along
-  the first pass is a full-width slot outside that model.
+- `RampEntry` on `Roughing` with offset or raster clearing, and with the
+  `disk_front` and `stock_front` strategies (see the decisions above).
 
-Refused while running, as a planner defect, should it ever happen: a ramp whose
-start the simulated stock does not show cut by the level above. The planner
-stops rather than descend straight into material.
+Refused while running (the run stops and no program is written):
+
+- A rest piece, or enclosed material in adaptive clearing, where no ramp
+  fits: the path is shorter than the ramp needs and `min_length_mm` is not
+  set, or is longer than the path; or, in adaptive clearing, the tool above
+  its flutes is not proven clear along the path. The message names the place
+  and the level. These cannot be refused earlier: where they are depends on
+  the stock the run has cut by then.
+- As a planner defect, should it ever happen: a `Pocket` ramp whose start the
+  simulated stock does not show cut by the level above. The planner stops
+  rather than descend straight into material.
 
 ## Adaptive pocket: `AdaptivePocket`
 
@@ -271,9 +363,42 @@ no full-width slotting, for hard materials and high-speed toolpaths.
   angle narrows the width further.
 - **Entry:** each level enters by a helix into uncut material, with `entry`'s
   helix (`HelicalEntry`) or `HelicalEntry`'s defaults when none is given, and
-  straight down only through stock the committed cuts prove is gone.
+  straight down only through stock the committed cuts prove is gone. With
+  `entry=RampEntry(angle_deg)` it ramps in along a straight path instead (see
+  [Ramp entry](#ramp-entry-rampentry)): the entry for a pocket too narrow for
+  a helix.
 - `cutting_sense`: `"climb"` (default) or `"conventional"` with a clockwise
   spindle.
+- **Links and entries** take the options `Roughing`'s adaptive clearing has
+  (described with their proofs under
+  [3D roughing](#3d-roughing-roughing-restroughing)). All four are unset by
+  default. The link options change feeds only: the path is the same, move
+  for move. The entry options change how the cutter comes down, never a
+  cutting pass.
+  - `link_feed_mm_min`: between passes the cutter returns at depth across
+    stock it has already cut (a stay-down link). Without this option those
+    links run at `feed_mm_min`. With it, each stretch of a link (at most
+    2 mm) whose whole cutter footprint the committed stock's cell bounds
+    prove clear of stock runs at this feed; a stretch that may touch stock
+    (beside a wall's skin, or entering the next pass) keeps `feed_mm_min`.
+    There is no default: declare the feed your machine should reposition at.
+    On a 50 x 30 x 8 mm pocket (10 mm cutter, 3 mm stepover, 600 mm/min) the
+    links are 705 mm against 1,333 mm of cutting; see
+    [benchmarks](benchmarks.md) for measured cycle times.
+  - `link_chip_thinning` (needs `link_feed_mm_min`): stretches that may touch
+    stock lightly feed between the two rates, by radial chip thinning from a
+    proven bound.
+  - `rapid_descent_clearance_mm`: a level below one already cut is entered
+    by a rapid down to this far above the height the committed cuts prove
+    clear for the whole tool (and above every stock cell bound under it),
+    then the plunge feed. Without it every descent feeds from `feed_z_mm`.
+    An entry beside the material it cuts comes down a few stock cells back
+    from it and feeds across at depth, which adds a short link.
+  - `ramp_clearance_mm`: each helix starts this far above the material it
+    meets, never above `feed_z_mm`.
+  The wall pass is entered by a plunge and its lead-in arc at `feed_mm_min`;
+  it has no stay-down link. `path_strategy="disk_front"` and `"stock_front"`
+  refuse all four by name.
 - Orbit options, `max_stay_down_mm` and `rest_tolerance_mm` do not apply and
   are refused. Corners the cutter cannot reach are left and reported as the
   level's residual area.
@@ -352,13 +477,19 @@ location. `clearing` is one of:
     declared width are cut as lead moves at the entry feed (the helix feed,
     else the plunge feed) and counted (`confined_strokes`,
     `confined_stroke_mm`, `confined_max_engagement_deg`). This needs an entry
-    that allows a helix; with `StockEdgeEntry(helix=None)` the operation
-    stops and names the place.
+    that allows a helix or a ramp; with `StockEdgeEntry(helix=None)` the
+    operation stops and names the place.
   - Every cutting and link move is also checked exactly against the layer
     region before it is emitted, and the run fails rather than emit one that
     does not fit. Orbit options and `omit_empty_cuts` do not apply, the entry
-    must be `StockEdgeEntry`, and the direction is `cutting_sense` (`"climb"`
-    by default, `"conventional"`); `clockwise` does not apply.
+    must be `StockEdgeEntry` or `RampEntry`, and the direction is
+    `cutting_sense` (`"climb"` by default, `"conventional"`); `clockwise` does
+    not apply.
+  - **`entry=RampEntry(angle_deg)`** enters enclosed material by a ramp along
+    a straight path instead of a helix (see
+    [Ramp entry](#ramp-entry-rampentry)); entries from beside the stock or
+    from cleared stock are used first, as with `StockEdgeEntry`. Offset and
+    raster clearing refuse a ramp entry.
   - `path_strategy="disk_front"` is refused in `Roughing`. It covers a region
     it takes to be solid with small orbits and never reads the stock;
     `Roughing`'s region is the stock grown by a margin, so it orbited through
@@ -396,7 +527,8 @@ location. `clearing` is one of:
   and the clearing's radial engagement. Reported as `thinned_links` and
   `thinned_link_mm`.
 
-Default entry is `StockEdgeEntry()`. `retract_z_mm`/`feed_z_mm` work for raster,
+Default entry is `StockEdgeEntry()` (`RampEntry` with `AdaptiveClearing`
+only). `retract_z_mm`/`feed_z_mm` work for raster,
 offset and engagement_front clearing. `RestRoughing` machines only what earlier operations left
 (`rest_tolerance_mm`, 0.01, is ignored), never repeating strokes proven already
 cleared. Further options:
@@ -419,14 +551,48 @@ cleared. Further options:
 Total roughing depth may exceed the flute length: each deeper layer is
 prepared for its actual increment below the preceding layer, with a reserve
 for conservative stock bounds. Above the flutes, every emitted move must keep
-the declared shank and holder clear of committed stock. An exactly repeated
-path can reuse a native committed cutter footprint above its cleared floor,
-including a shank of the same radius. This proof requires exact path
-containment; it does not infer clearance from nearby paths, samples or decoded
-cell heights. Otherwise whole-cell bounds must prove clearance. An unresolved
-assembly check refuses the move, naming the layer, tool part and tip height
-needed to keep that part above the original stock. A wider shank or low holder
-can therefore still prevent reaching the requested floor.
+the declared shank and holder clear of committed stock. A move is admitted
+when one of these proves each section above the flutes clear over the whole
+move:
+
+- whole-cell stock bounds (nothing in reach stands as high as the section);
+- the cutter sweeps already committed. The section's sweep, everything within
+  its radius of the move's path, must lie inside the union of the sweeps cut
+  at or below the section's bottom, or outside the stock. A straight-shank
+  end mill (shank as wide as the cutter) is therefore clear wherever the
+  layers above cut: on a path that repeats theirs, exactly, with no margin
+  (a line may run along several collinear earlier moves; an arc must be the
+  same arc), and anywhere between their passes, as on a drafted or stepped
+  wall where each layer's passes lie inside those above. Apart from exact
+  repeats, the section is grown by the move's path error and every sweep is
+  shrunk by its own (both of the order of the stock sweep's `tolerance_mm`);
+  no other allowance is made, and nothing is inferred from samples.
+
+A near-repeat is still refused when it cannot be proven by those certificates
+(#228). A deeper pass offset by even one nanometre from an earlier path is
+not that path: with a shank as wide as the cutter, its outer edge can extend
+past the earlier nominal sweep. An offset smaller than the two paths' combined
+error does not supply physical clearance. No tolerance is added to admit it,
+and the planner does not silently snap or change the requested path.
+`engagement::cover::tests::a_path_on_several_collinear_sweeps_is_proven_without_margin`
+pins this limitation: R6 cuts at Z5 on Y = `0.1 + 0.2`, with a section on the
+deeper Z1 pass whose bottom is Z5.1. The exact repeated line passes; the same
+section offset by one ulp or +/-0.000001 mm is an expected refusal. Resolving
+such a job needs a proven path/assembly change, not acceptance of unproven
+clearance.
+
+The same proof decides the stock sweep's cutting-length check and the
+stock-contact verification of the shank, so a move the planner admits is not
+flagged afterwards. A move whose shank or holder would enter stock that no
+layer above removed is refused with a typed reach refusal naming the layer,
+the tool part, the stock it would meet and the tip height. A wider shank or
+low holder can therefore still prevent reaching the requested floor. In the
+terms of Autodesk Fusion's shaft and holder modes (Fusion help, "Shaft and
+Holder Modes reference": separate shaft and holder clearances; "Fail on
+collision" aborts the toolpath when the safe distance is violated), this is
+fail-on-collision with no added clearance, judged against the stock as the
+run has cut it: the tool body may pass exactly where the cutter has been, and
+nowhere else.
 
 ## Contour: `Contour`
 
@@ -1455,8 +1621,137 @@ cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=
 Every lead and kerf path is proven not to touch any part, and every pierce
 crater to stay clear of them, before any motion is produced. The simulated
 sheet is cut through wherever the kerf passes. Not modeled: tipped-up parts
-after they are cut free (plan travel heights accordingly), bevel, marking and
-common-line cutting.
+after they are cut free (plan travel heights accordingly) and bevel cutting.
+
+### Common-line cutting
+
+`common_line=camlib.CommonLine(min_length_mm=...)` cuts the shared straight
+edge of two parts once instead of twice. It is off unless set.
+
+```python
+cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=1.5,
+                        lead_in=camlib.Lead(length_mm=3, radius_mm=3),
+                        common_line=camlib.CommonLine(min_length_mm=10), ...)
+gap = cut.common_line_spacing_mm()   # place the parts this far apart
+```
+
+- **Spacing**: a common line is one cut between two parts placed a kerf apart
+  (Autodesk Fabrication CAMduct, *Common Line Cutting*: the margin between
+  parts is the kerf, along straight edges; Hypertherm ProNest, *Common Line
+  Cutting*). In camlib the kerf path runs the applied offset (half a kerf plus
+  the boundary allowance) outside every part, so the spacing is exactly twice
+  that: `common_line_spacing_mm()` (the kerf plus `boundary_tolerance_mm`, plus
+  twice the parts' `boundary_error_mm`). The one cut is then the ordinary
+  compensated path of both parts, and the kerf proof covers both sides of it.
+- **Detection is exact**: the kerf paths of the two parts must coincide, to
+  the operation's `tolerance_mm`, along a complete straight edge of both, at
+  least `min_length_mm` long, ending at outside corners where the two parts
+  are flush (their neighbouring edges in line). That covers pairs and rows of
+  parts.
+- **Refused, never cut twice**: kerf paths that coincide in any other way
+  (part of an edge, parts not flush, a shorter edge than `min_length_mm`,
+  common lines meeting at a corner as in a grid, a part against a hole wall,
+  arcs), and facing edges closer than the spacing. The message names the parts
+  and the spacing. Facing edges further apart are cut separately as always;
+  where their kerfs overlap this is reported. With no common line at all the
+  operation plans exactly as without the option, and says so in the report.
+- **Order**: the holes of the parts first, then each common line, then the one
+  outline of the group, so every part is held by the sheet until its last edge
+  (Kinetic PrimeCut, *Common Line and Common Crop Cutting*: "Holes in the
+  parts are always cut before the common lines"). The outline runs straight
+  across each end of a common line as one move.
+- **Pierce and lead**: each common line is pierced in the scrap on its own
+  extension, `lead_in.length_mm` beyond the outline, and entered straight along
+  the line (no arc); it ends on the outline without a lead-out. The pierce
+  keeps `pierce_clearance_mm` from both parts and the lead is proven clear of
+  them, or the operation refuses and asks for a longer lead. The outline is
+  pierced and led as any outline. It crosses the
+  lead-in kerf of each common line, which suits plasma and laser (PrimeCut
+  advises against cuts that cross gaps for flame cutting only).
+- **Kerf paths apart**: parts with common lines are offset one by one, so
+  what the offset of the whole sheet proves in an ordinary job is proven here
+  by exact line and arc distances: outside the declared common lines no two
+  parts' kerf paths touch or cross, and none runs inside another part's
+  applied offset (a curved stretch closer than the spacing is refused).
+- **Leads and earlier kerfs**: in a job with common lines every pierce lies
+  in uncut sheet and every lead-in and lead-out keeps a full kerf width from
+  the center of every kerf cut before it, so no lead runs over an open slot;
+  otherwise the operation refuses, naming the lead. Only the group's outline
+  meets earlier kerfs, at the ends of its common lines.
+- **Kerf side**: a common line has a part on both sides, so one of the two is
+  on the poorer side of a plasma arc ("it is impossible to preserve the kerf
+  side", PrimeCut) and the controller cannot trim the kerf: `compensation="wear"`
+  is refused with `common_line`. So are `micro_joints`.
+- **Report**: `common_lines` lists each one in cutting order (`parts`,
+  `start_mm`, `end_mm`, `shared_length_mm`); `pierces` counts them, `loops` and
+  `order` the closed loops (a group's outline is listed under its first part).
+
+## Plasma and laser marking: `ThermalMark`
+
+Lines traced on the sheet surface with the beam in the machine's marking
+process, without cutting through: part numbers, bend lines, layout marks.
+Required: the `parts` of the sheet (the cut's `parts`), the `paths` to mark
+(`TracePath` values of `TraceLine`/`TraceArc`, as for [`Trace`](#trace--engrave-trace);
+camlib has no fonts: text arrives as its strokes), and the marking values of
+this machine and material. None of them has a default.
+
+```python
+torch = camlib.Torch("torch", kerf_width=1.5)
+seven = camlib.TracePath((26, 92), (camlib.TraceLine((34, 92)), camlib.TraceLine((29, 80))))
+mark = camlib.ThermalMark("numbers", torch, parts, (seven,), feed_mm_min=4000, mark_height_mm=2.5,
+                          power_percent=100, mark_width_mm=0.8, tool_number=1, length_register=1)
+cut = camlib.ThermalCut("plasma", torch, parts, ...)
+setup = camlib.Setup("sheet", stock=sheet, tools=(torch,), operations=(mark, cut), ...)
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `feed_mm_min`, `mark_height_mm` | Marking feed, and the nozzle (or focus) height above the sheet top |
+| `power_percent` | A laser's marking power (posted as S). A plasma torch fires at the current its controller's marking process sets: give 100 |
+| `mark_width_mm` | The width of the marked line on this material: that width must stay inside the part |
+| `edge_clearance_mm` | Extra distance kept between a mark's edge and its part's edges (default 0) |
+| `allow_off_part` | Marks may lie on the scrap or cross parts (remnant labels, layout lines); default False |
+| `height_mode`, `travel_height_mm` | `"fixed"` (default): one Z, the marking height (the controller owns Z). `"program"`: travel between paths at `travel_height_mm` |
+
+What sets a mark's depth and width belongs to the machine ("You can vary the
+depth and width of marks by varying torch speed, output current, and
+torch-to-workpiece height": Hypertherm Powermax45 SYNC Operator Manual,
+*Marking process guidelines*), so camlib takes all of it from the caller.
+
+- **Path**: the beam centre follows each path, with no kerf compensation, one
+  beam-on per path, in the order given. A marking move is a line or an XY arc
+  at the marking height; its kind is `mark`.
+- **Marks run before cuts**, while each part is still held by the sheet and
+  has not moved (ProNest sequences scribing with its "Punch/Scribe first"
+  setting): put the `ThermalMark` before the `ThermalCut`. A part with a mark
+  must not have been cut: read from the stock when the operation is planned,
+  no cell at or inside its outline may be cut through. Refused otherwise,
+  also with `allow_off_part`.
+- **On its part**: every mark's width, with `edge_clearance_mm`, is proven
+  inside one part (not on the scrap, in a hole, across an edge or from one
+  part to another) before any motion is produced, by the same proof as the
+  containment limits. `allow_off_part=True` skips this proof, and the report
+  then says `containment: "not_checked"` instead of `"proven"`.
+- **Stock**: a marking move removes no material. The stock model itself
+  refuses one that passes (with the beam's width, the tool's kerf) over a
+  cell that is or may be cut through, or beyond the sheet: in the planned run
+  and again when the posted program is replayed. The run still carries every
+  marking move (kind `mark`), so an application can draw the marks.
+- **Typed motion**: a path's beam is `BeamMark(power_percent)`, turned off
+  with `Beam(0)`. Only `mark` moves are fed while it is on; a cutting move
+  under it, a `mark` move under the cutting beam, and firing either beam
+  while the other is on are all refused, in the plan and in the decoded
+  program.
+- **Posts**: the machine declares how it marks, or the post refuses the
+  program ([Posts](posts.md): `beam_mark`). Declared: generic G-code
+  (`beam_mark="power"` or `"mode"`), GRBL laser (`define_machine(...,
+  beam_mark="power")`) and [QtPlasmaC](qtplasmac-post.md) (declared marking
+  and cutting materials). Centroid CNC12 plasma and WinCNC plasma refuse:
+  no marking method is declared for them.
+
+Not modeled: the marked line's depth or appearance, a separate scribe or
+marker tool with its own offsets (QtPlasmaC tool 1), spotting (a timed torch
+pulse) and powder marking.
 
 ## Turning (lathe): a lathe `Setup`
 
@@ -1586,7 +1881,9 @@ roughing setup its allowance.
   `thread_lead_word`; dialects without them refuse it.
 - `TurnFinish(allowance_mm)`: the profile from the front face, the nose
   center a nose radius (plus allowance) outside it: rounded at convex
-  corners, trimmed at concave ones. A feature too small for the nose is
+  corners, trimmed at concave ones. Tangent offset segments share one
+  represented endpoint, so rounding at their join does not introduce a tiny
+  connecting move (#242). A feature too small for the nose is
   refused (a concave arc no larger than the nose radius plus allowance
   included). Arcs of that path are planned as arcs and posted as one G2/G3
   block each (G18): the profile's own arcs, offset by the nose radius (a
@@ -1640,13 +1937,15 @@ roughing setup its allowance.
     outside, a shank behind the insert's reach; boring, an axial bar
     `width_mm` across, its top `offset_mm` under the nose center,
     `length_mm` out of the bore.
+  - Holders from the maker's model (#110): `TurningHolder.from_model(model)`
+    with a `TurningToolModel`; see [Tool bodies from a model](#tool-bodies-from-a-model).
   - The body off the centre plane (#103), required for every tool: a
     point of the tool at x out and y across the plane lies at radius
     √(x² + y²), so in a bore a thick insert's heel reaches past its
     outline. `TurningTool(..., seat=TurningSeat(rake_deg, inclination_deg),
     insert_thickness_mm=, insert_clearance_deg=, edge_deg=,
     curved_for_diameter_mm=, insert_front_clearance_deg=,
-    insert_side_clearance_deg=)`:
+    insert_side_clearance_deg=, insert_size_tolerance_mm=)`:
     - `seat`: the holder seat's orthogonal rake and inclination (ISO 3002-1,
       about the major cutting edge), from the holder maker (ISO 5608 codes
       do not carry them; ISO 5610 gives only recommended values).
@@ -1705,11 +2004,261 @@ roughing setup its allowance.
     material outside the tool's radius (outside turning: a point's radius
     is at least its |x|), and the radial image (z, √(x² + y²)) of their
     vertices against material beyond it (in a bore; the radius is convex, so
-    exact at the vertices and never under-reporting). The insert's body
-    must also reach the stock left by a cut no farther than its cutting
-    face does: a heel rubbing the wall just cut is refused. The insert's
-    in-plane size tolerance (ISO 1832 d and m) is not yet applied (issue
-    #113).
+    exact at the vertices and never under-reporting).
+
+    During a cutting move only the insert's cutting face (its nose and
+    edges, on the centre plane) may be where stock is. Every other part of
+    the tool, the insert's body below its face, the holder and the bar,
+    must at every instant of the move be clear of the stock as it is at
+    that instant: the stock the move found, less what the cutting face has
+    swept by then (#220). Material the same move cuts later is still there
+    when another part of the tool arrives first. So a part may be where
+    the move found stock only while it is in the space the face has
+    cleared: where the face is or has been on this move, and from there
+    toward the open side (outward outside; toward the axis in a bore),
+    because turning stock is a radius over z. Everything else must be out
+    of the stock the move found, within `tolerance_mm`. A straight move is
+    decided exactly, in closed form, with nothing sampled along it. On an
+    arc piece and on a threading pass only the space under the face where
+    it is at that instant counts as cleared. Refused, for example:
+    - a heel ahead of or beside its cutting edge (a seat whose rake or
+      inclination swings the body past the insert's clearance): "the
+      insert's body below its cutting face would rub the stock";
+    - a head or bar ahead of or beside the insert, lower than the uncut
+      stock: "the holder would hit stock the cutting edge has not yet cut
+      away", however completely the pass removes that stock afterwards;
+    - a solid boring bar's head away from its cutting edge, where the hole
+      is not yet open.
+
+    Each refusal names the part and the move (`moving to r, z`: the nose
+    center's end) and gives the depth in the stock as the move found it.
+    A bar or shank that follows its insert through what the pass has
+    already cut is admitted. The stock a move finds keeps, per z bin
+    (`cell_mm`), the most material the bin can still hold: where an
+    earlier move ended inside a bin, a part of the tool beside the face
+    there is still checked against that bin's material.
+  - The insert's in-plane size tolerance (#113). An insert is not exactly
+    its nominal size: its ISO 1832 tolerance class (the code's third
+    letter) bounds its inscribed circle d and its corner dimension m, as
+    well as its thickness. `TurningInsert.iso_code` reads the class and
+    the tool is then checked as **the largest insert the tolerance allows,
+    relative to its measured nose**; `insert_size_tolerance_mm=(d, m)` on
+    the `TurningTool` (or `size_tolerance_mm=` on `iso_code`) states the ±
+    tolerances instead (the insert maker's values; `(0, 0)` for an insert
+    measured to be exactly its outline).
+    - What d and m are (ISO 1832:2017, 5.3, figures 1 and 2): d is the
+      diameter of the inscribed circle; m, for an insert with an odd number
+      of sides (triangle), is the distance from a corner's tip to the side
+      opposite it, and for an even number of sides (square, rhombic, the
+      80 degree hexagon W) the distance along the corner's bisector from
+      the inscribed circle to the corner's tip. The class does not
+      tolerance the corner radius or the corner angles: the nose radius is
+      the tool's declared value, and the sides keep their directions.
+    - The values (ISO 1832:2017 tables 3, 4 and 5, ± mm on d / m):
+      classes A 0.025 / 0.005, F 0.013 / 0.005, C 0.025 / 0.013,
+      H 0.013 / 0.013, E and G 0.025 / 0.025; J, K, L: d by size, m 0.005,
+      0.013, 0.025; M and N: d and m by size; U: d and m by size. By
+      inscribed circle, for shapes S, T, C, W (table 4; d for J to N, d
+      for U, m for M and N, m for U): 4.76 to 10 mm 0.05, 0.08, 0.08,
+      0.13; 12.7 mm 0.08, 0.13, 0.13, 0.2; 15.875 and 19.05 mm 0.1, 0.18,
+      0.15, 0.27; 25.4 mm 0.13, 0.25, 0.18, 0.38; 31.75 mm 0.15, 0.25,
+      0.2, 0.38. For classes M and N of shape D (table 5; d, m): 5.56 to
+      9.525 mm 0.05, 0.11; 12.7 mm 0.08, 0.15; 15.875 and 19.05 mm 0.1,
+      0.18; of shape V: 6.35 to 9.525 mm 0.05, 0.16; 12.7 mm 0.08, 0.25.
+      Where the standard gives no value (D and V in classes J, K, L and U;
+      a size not in its table), the code is refused, naming
+      `size_tolerance_mm`: camlib does not guess one.
+    - Why the tolerance is not a growth of the outline. The tool is
+      measured at its nose (presetting, touch-off): the program moves the
+      nose's imaginary tip (or its centre, `controlled_point`), and the
+      operator's offsets put the real nose there whatever the insert's
+      size. The seat locates the insert by its flanks, so the two cutting
+      edges at the nose keep their lines. Relative to the measured nose,
+      the nose arc and the two edge lines are therefore fixed, and a
+      larger insert reaches farther back along those lines: only the far
+      sides and far corners move. The cut (the nose, the edges, the
+      material they remove, the posted program) is the same as without the
+      tolerance; a finishing pass with the edge along the profile is
+      accepted as before.
+    - How m is measured, and what that leaves open. ISO 1832's figures
+      draw an insert of perfect form, whose inscribed circle touches every
+      side. ISO 883:1985 annex B (triangular and square inserts) gives the
+      method: a triangular insert lies on a surface plate on the side
+      opposite the corner, and a dial gauge reads the corner's tip (B.1);
+      a square insert rests in a 90 degree vee-block on the two sides of
+      the corner opposite, and the dial gauge, zeroed on a precision roller
+      of the nominal d lying in the same vee, reads the corner's tip
+      (B.2). For rhombic and hexagonal inserts no such annex was read. On
+      a real insert, then, figure 2's circle can be the insert's own
+      largest circle or a nominal roller against the two opposite sides,
+      and the two give different bounds. The envelope must never be
+      smaller than the real insert, so it is the **union of every
+      reading**, for every shape; it may be tightened only with a source
+      that settles the measurement for the shape in question.
+    - The envelope (derivation and tests in `src/turning/size.rs`). With u
+      the nose's bisector into the insert, ε its corner angle, a = n·u for
+      a far side of outward normal n and c = b·u for a far corner of
+      bisector b, three readings are taken:
+      - (A) Size: a true-to-form insert of inscribed circle d ± Δd is the
+        nominal one scaled about the point where the edge lines meet, so
+        the side moves out Δd (a / sin(ε/2) + 1)/2 (Δd for a rhombic or
+        square insert's far sides, whose distance from the edge lines is
+        d; 1.5 Δd for a triangle's). The scaled inserts are nested: their
+        union is the largest.
+      - (B) m from the insert's own inscribed circle (for the triangle:
+        from the opposite side, exactly ISO 883 B.1). The nose is a corner
+        m checks and is where the tool is measured, so a nose standing Δm
+        farther from its datum puts the insert's body Δm farther back.
+        Even number of sides (the far sides tangent to the circle): the
+        side moves out up to |a| Δm + (1 + a) Δd/2, and a far corner like
+        the nose has its tip up to (|c| + 1) Δm + (1 + c) Δd/2 beyond
+        nominal (never beyond the sharp corner of its sides). Triangle:
+        the far side moves out up to Δm, and each far corner's tip,
+        measured from the fixed edge line opposite it, up to Δm.
+      - (C) m by vee-block and roller (ISO 883 B.2; applied to rhombic and
+        hexagonal inserts by analogy, a vee of the opposite corner's
+        angle). Each far side has its own displacement (a rhombic insert's
+        two widths need not be equal: d moves a far side, and m at the
+        corners moves it further). The inscribed circle is at least
+        d - Δd, and at every corner like the nose the dial reads within
+        ±Δm: the corner's tip less the roller's top, each moving with the
+        two sides it touches. These conditions are linear in the
+        displacements, and the largest displacement of each side and tip
+        is found exactly. For a rhombic or square insert: one far side up
+        to 2 Δm sin(ε/2) + Δd out (the other Δd in), the far corner's tip
+        up to Δm.
+      - The union: each far side is moved out by the largest of the three;
+        far corners unlike the nose keep their rounding between the moved
+        sides; a far corner like the nose is the sharp corner of its moved
+        sides cut off square at the farthest its tip can be under any
+        reading (m locates the tip, not the corner's form). For a CNMG1204
+        of class M (d ±0.08, m ±0.13): far sides (A) 0.08, (B) 0.149, (C)
+        0.247 mm, so 0.247; the far 80 degree corner's tip (A) 0.124, (B)
+        0.34, (C) 0.13 mm, so 0.34. The tests sample inserts admissible
+        under each reading, built from the shape's angles and the
+        definitions above alone, and compare: every one lies inside the
+        envelope, and each far side and checked corner of the envelope is
+        reached by one.
+      - Not bounded by d and m, and so assumed: the sides keep their
+        directions (the class does not tolerance the corner angles; a side
+        that tilts about an obtuse corner of a rhombic insert, which m
+        does not check, has no bound from the designation), and the
+        corner radius is the code's.
+    - What uses it. The insert's body (its taper, thickness and seat as
+      above) is built on the envelope and checked against the part, the
+      bore, the chuck and the stock; a refusal that the nominal insert
+      would not have caused says so and names the tolerance. An insert at
+      the small end of its tolerance has its far corner nearer the nose:
+      the bands the far sides and corners can lie in, between the least
+      and the largest insert, must be clear of the stock where they lead
+      (the depth of cut must end short of where the least insert's cutting
+      edge ends). The stock model follows: material is certainly cut only
+      by what every insert of the tolerance has (the nose, and the two
+      edges at it as far as the least insert's reach), and may be cut
+      wherever the largest insert's sides sweep.
+    - Covered: outlines of the ISO form (straight sides each tangent to
+      the inscribed circle, rounded corners) with three, four or six
+      sides: C, D, V, S, T and W from `iso_code`, and a drawn
+      `InsertOutline` of that form (the 75 and 86 degree rhombic E and M,
+      the hexagon H) with a declared tolerance. Not covered, and refused
+      by name when a tolerance is declared for them: the pentagon (P) and
+      the octagon (O), outlines with a side that is not tangent to the
+      inscribed circle (parallelograms A, B, K, rectangles L, wiper edges,
+      `TurningInsert.iso`'s wedge), and round inserts (R): a round
+      insert's d is its nose diameter, so its tolerance is a nose radius
+      error, which changes the cut itself and is not a matter of the far
+      side of the body; `iso_code` gives a round insert no size tolerance.
+      A drawn outline, a grooving, face grooving or threading blade and a
+      drill have no class: they are checked as declared, so state the
+      largest outline (width, diameter) the tool can have.
+    - Sources: the tolerance tables and the figures defining m, ISO
+      1832:2017 5.3 as shown in the standard's public preview
+      (standards.iteh.ai, "ISO 1832:2017" sample; the ISO 1832:1991
+      preview, 4.3, gives the same values, without shape V); the method
+      of measuring m, ISO 883:1985 annex B with its figures 2 and 3, as
+      shown in that standard's public preview (standards.iteh.ai, "ISO
+      883:1985" sample); the same
+      class table and class M values by shape and inscribed circle in
+      Mitsubishi Materials' technical information "3. Symbol for
+      Tolerance Class" (turning insert identification); the same class
+      table in Kyocera's general catalogue, section B "Turning Indexable
+      Inserts Identification System".
+  - Solid (one-piece) boring bars (#114): a solid carbide boring bar, a
+    brazed tool or a ground HSS bar has no insert and no seat; its tip is
+    ground into the end of a round bar. Declared as an insert body (a prism
+    of the head's outline as deep as the head, clearance 0) it is sound but
+    keeps its full-width corners at full depth, and is refused in the small
+    bores these tools are made for. Declare the head instead:
+    `TurningTool(id, insert=InsertOutline(...), side="inner", hand=,
+    holder=, solid_bar=SolidBarHead(diameter_mm=, axis_x_mm=, axis_y_mm=,
+    clearance_deg=, min_bore_diameter_mm=, max_bore_depth_mm=))`, with no
+    seat and no insert thickness or clearance. `insert` is the head's
+    outline at its cutting face (convex: the head only; its nose arc, the
+    side and end cutting edges in `cutting`), and the holder is what lies
+    behind the head (the plain bar as a `TurningBar`, the sleeve as the
+    outline).
+    - The body below the cutting face is the cylinder of `diameter_mm`
+      about the axis (`axis_x_mm` in the outline's frame, `axis_y_mm`
+      across the centre plane, the cutting face at 0), cut by the cutting
+      face and by the ground face below each segment of the outline, which
+      recedes under the face at that segment's `clearance_deg` (each angle
+      declares that the whole head lies behind that plane; a rounded
+      corner's angle applies to every tangent plane of the corner, so it
+      must be at most that of the two straight sides it joins, or 0, and
+      anything else is refused). It is
+      convex, so the checks above apply unchanged. They need vertices, so
+      the cylinder is checked as the prism of a polygon circumscribed about
+      its circle in 2 degree steps (every side tangent, the corners
+      1 / cos 1° = 1.00015 radii out: it contains the cylinder and stands
+      at most 0.000076 x the diameter outside it), like the round bar of a
+      holder and the nose arcs of every insert.
+    - Catalogue values (KYOCERA, "EZ Bar: Series for Small Internal
+      Machining" catalogue, 2022: p. 12 "EZ Bar Dimensions" tabulates DMIN,
+      DCON, H, LF, LU, WF, WF2 and RE per bar, e.g. EZBR 055050ST-008H:
+      5.5, 5.0, 4.80, 58.2, 25.0, 2.44, 0.33, 0.08 mm; p. 8 "Bar
+      Tolerances" gives the offset (WF), the cutting edge height (Y, e.g.
+      "+0.06 / 0 mm") and "Min. Bore Dia.: Same as Shank Dia." for the HP
+      bars, "Different from Shank Dia." for the ST bars):
+
+      | Catalogue | Declared as |
+      |---|---|
+      | Minimum bore diameter (DMIN) | `min_bore_diameter_mm` |
+      | Usable length, maximum bore depth (LU) | `max_bore_depth_mm`, from the head's front end |
+      | Offset from the bar's centreline to the cutting edge (WF, f) | `axis_x_mm` = the edge's x in the outline + WF |
+      | Cutting edge height above the bar's centre (Y) | `axis_y_mm` = -Y (its tolerance's worst case) |
+      | Shank diameter (DCON) | the holder's `TurningBar`; `diameter_mm` where the head keeps the bar's surface |
+      | Corner radius (RE) | the outline's corner arc |
+
+      The tables give neither the head's outline nor the clearance angles
+      of its ground faces (the drawings show them, e.g. a 5 degree end
+      cutting edge angle): they are declared, from the tool's drawing or by
+      measuring. An angle that is not known is declared 0, and a head whose
+      section is not known is declared as the catalogue's promise itself:
+      `diameter_mm` = DMIN, the axis DMIN / 2 from the cutting edge at the
+      cutting face's height, every clearance 0 (the head enters a bore of
+      DMIN with its edge on the wall, so it lies in that cylinder). Both
+      contain the real head.
+    - The catalogue's premises are held besides the geometry: a cutting
+      move that leaves a bore below `min_bore_diameter_mm` where the corner
+      cuts, and any move with the head's front end more than
+      `max_bore_depth_mm` behind the front of the stock, are refused. A
+      declaration that contradicts itself is refused too: an outline that
+      reaches off the bar's section at the cutting face, and a minimum
+      bore the declared head cannot enter with its edge on the wall (the
+      message gives the least bore it does enter). A body point `a` behind
+      the edge and `y` below the face enters a bore of diameter
+      (a² + y²) / a, so a face receding at the angle α clears the bore's
+      curvature only down to (bore radius) x sin 2α below the face: the
+      rest must be the bar's own round or a steeper face.
+    - The polygon stands outside the true cylinder by up to 0.000076 x its
+      diameter: a head declared exactly tangent to the bore it cuts (no
+      relief, the edge on the bar's surface, a bore of the bar's own
+      diameter) is planned only with a `tolerance_mm` of at least that.
+    - Boring only (`TurnBoreRough`, `TurnBoreFinish`, and any operation
+      that takes a boring tool with an `InsertOutline`): solid grooving,
+      face grooving and threading bars are refused as solid heads; declare
+      such a blade as a `GrooveInsert`, `FaceGrooveInsert` or `ThreadInsert`
+      with its insert body.
   - ISO values: shapes and corner angles from ISO 1832:1991 section 4.1
     table 1; size codes (inscribed circle per shape) and corner radius codes
     from the Sumitomo Electric Hardmetal general catalog, section B
@@ -1736,6 +2285,133 @@ roughing setup its allowance.
   move then carries the per-revolution feed times the highest spindle speed
   along it (the move's least radius), which the program validator
   recomputes. Threading and drilling run at a fixed rpm.
+
+#### Tool bodies from a model
+
+A grooving blade's carrier, a modified boring bar, a holder with a clamp or
+a coolant block that sticks out: no outline or code describes them, and
+their maker's 3D model is the body to check. `TurningToolModel` is that
+body; the tool takes it as its holder (`TurningHolder.from_model(model)`),
+and every check that used the holder outline's body (against the part, its
+bore, the chuck and the stock left after each cut) uses the model's.
+
+```python
+import camlib
+from camlib.cadquery import step_solids, tool_body_from_step
+
+# Which solids of the file are the insert? (order of step_solids(path))
+model = tool_body_from_step(
+    "holder.step",
+    max_error_mm=0.005,
+    placement=camlib.TurningModelPlacement(
+        nose_center_mm=(100, 50, 20),   # the model point of the nose centre
+        x_axis=(0, -1, 0),              # the lathe's +X in the model
+        z_axis=(1, 0, 0),               # the lathe's +Z in the model
+    ),
+    axial_resolution_mm=0.25,
+    insert_solids=(2,),
+    corner_region_mm=1.0,
+    position_tolerance_mm=0.02,
+    nose_radius_tolerance_mm=0.02,
+    edge_angle_tolerance_deg=0.25,
+)
+tool = camlib.TurningTool("groove2", insert=camlib.GrooveInsert(2, 22), nose_radius_mm=0.2,
+                          side="outer", hand="right",
+                          holder=camlib.TurningHolder.from_model(model),
+                          seat=camlib.TurningSeat(0, 0), insert_thickness_mm=3,
+                          insert_clearance_deg=7)
+tool.validate()   # the meshes, the placement and the insert cross-check
+```
+
+- **The engine takes a mesh, never STEP.** `TurningToolModel(body=,
+  placement=, axial_resolution_mm=, insert_check=)`: `body` is a
+  `SurfaceMesh` (the input type of parts) in the model's own coordinates.
+  `camlib.cadquery.tool_body_from_step` (and `tool_body_from_shape` for
+  CadQuery solids) reads the file with CadQuery/OpenCascade and tessellates
+  each solid within `max_error_mm`; a mesh from any other kernel works the
+  same way.
+- **What the model is.** `body` is the tool away from the cut: holder, bar,
+  shim, clamp, coolant block, without the insert. The insert stays the
+  declared one (ISO code, outline or blade, with its thickness, clearance
+  and seat): its exact outline is what cuts, and a mesh known only to its
+  error cannot certify a contact at the cutting edge more closely than that
+  error. Insert material left in `body` meets the stock at the edge and is
+  refused there ("the holder would hit the stock"): name the insert's
+  solids in `insert_solids`. An insert fused with its holder in one solid
+  cannot be told apart; split the solid in CAD.
+- **Placing a model.** A maker's model has its origin and axes anywhere, so
+  the placement is declared and nothing is assumed or fitted:
+  `TurningModelPlacement(nose_center_mm=, x_axis=, z_axis=)` gives the
+  model point that is the nose centre on the cutting face (a drill: its tip
+  on the axis) and the model's unit directions of the lathe's +X (radial,
+  away from the spindle axis on the tool's side) and +Z, as the tool is
+  mounted. Y completes the right-handed frame (Y = Z x X): the cutting face
+  looks toward +Y. A frame given at the theoretical tip (the sharp corner
+  the offsets are touched off with) is one nose radius from the nose centre
+  along X and along Z. A left-hand or boring tool is placed as it really
+  sits: no mirroring is applied to a model.
+- **The cross-check.** A model placed wrongly is checked in the wrong
+  place. Where the model has the insert (`insert_solids`, or
+  `TurningModelInsertCheck(insert=mesh, ...)`), its cutting corner must
+  agree with the declared insert's body, both measured the same way within
+  `corner_region_mm` of the nose centre along X and Z (at least two nose
+  radii; small enough that only the insert is in it), on the declared
+  insert's cutting face as its seat tilts it (so the model must be drawn
+  on its seat, and the comparison does not depend on the insert's thickness
+  or clearance below the face):
+  - the nose radius, from three supports across the nose arc, within
+    `nose_radius_tolerance_mm`;
+  - the direction of each straight edge at the corner, from the model's
+    reach across the edge at two stations along it, within
+    `edge_angle_tolerance_deg`;
+  - the position of the corner, from its reach in every direction in which
+    the declared corner is outermost, along the cutting face and raised 45
+    degrees from it (the centre height), within `position_tolerance_mm`.
+
+  A model outside one is refused before any move, with what was measured
+  ("its model's cutting corner is 0.5000 mm beyond the declared insert's
+  toward (X ..., Y ..., Z ...)"): it is misplaced or a different insert,
+  and camlib does not align it. The tolerances have no defaults and must
+  cover the insert mesh's own error. A model without its insert cannot be
+  compared: `without_insert_reason=` (`TurningModelWithoutInsert(reason=)`)
+  states where its placement comes from, and the check is then the
+  caller's.
+- **The errors a model adds**, all on the safe side (the checked body
+  contains the real one; a tight fit may be refused, never passed):
+  - `surface_error_mm`: every point of the real surface lies within it of
+    the mesh. The body is grown by a cube of that half-size, so it reaches
+    up to that much farther along X, Y and Z (up to √3 times it at a
+    corner).
+  - `axial_resolution_mm`: the body is checked in slices across Z of this
+    width. In a bore each slice is as large across as the body gets
+    anywhere in it (its convex section, which loses nothing: only the
+    largest radius can meet a bore wall); outside, each slice is the convex
+    hull of its projection on XZ. The body is over-estimated along Z by
+    less than one slice (inside), or by the hollows of its underside within
+    one slice (outside). A neck, a relief behind the head or a block far
+    along the bar stay as they are: the model is not replaced by its hull.
+  - The mesh must be a closed surface. Faces tessellated separately need
+    not share vertices: an edge with no face on its other side within
+    twice the mesh's error is refused as open; camlib does not repair it.
+  - The stated error is the caller's: `export_surface_mesh` bounds it for
+    planar and analytic faces and refuses surfaces it cannot bound.
+- The checks run on the slices, not the triangles. A model is reduced once
+  (and kept: a run asks for a tool's body at every operation); consecutive
+  slices of one section are one prism, so a straight bar is a single piece
+  however many triangles run along it. A move's work then grows with the
+  prisms' vertices: the facets round each distinct section. A coarser
+  `axial_resolution_mm` or tessellation gives fewer.
+
+Milling holders have the same need. A holder turns with the spindle, so the
+body to check is what its model sweeps about the tool axis:
+`camlib.tools.holder_sections_from_mesh(mesh, tip_mm=, axis=, stickout_mm=,
+gauge_length_mm=, axial_resolution_mm=)` returns the `HolderSection`
+cylinders of a `ToolAssembly` (per slice along the axis, the largest radius
+the model reaches, the mesh's error added), from a mesh such as
+`camlib.cadquery.step_mesh(path, max_error_mm=)` with its declared
+placement (the model point of the tool tip and the unit direction of the
+axis toward the spindle). A model that starts below the declared stickout,
+does not span the range, or is open is refused.
 
 A lathe setup posts (`job.post_nc`, `job.post`) with any `Machine` whose `planes` include `"xz"`: arcs
 are written in G18. `GCodeDialect(x_diameter=True)` writes X as a diameter
