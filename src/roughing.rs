@@ -557,14 +557,26 @@ impl PreparedRoughingTarget {
         // cutter-centre region unchanged ((X closed by B_b) grown by B_r
         // equals X grown by B_r for b <= r), so only the small extra growth
         // (charged to the boundary error) reaches the toolpath.
-        let close = self.seam_bridge.filter(|_| cutter_radius_mm > 0.).map(|b| {
-            let bridge = b.min(cutter_radius_mm / 2.);
-            let grid = (self.tolerance / 128.).max(1e-8);
-            // Rounding, and 4 tolerances more: needles come out at least 8
-            // tolerances wide. (The closing's joins add no sag: its dilation
-            // is mitred and its erosion round, `close_protectively`.)
-            ((4. * self.tolerance + 4. * grid) / 0.998, bridge)
-        });
+        let close = match self.seam_bridge.filter(|_| cutter_radius_mm > 0.) {
+            Some(b) if b > cutter_radius_mm / 2. => {
+                // The reachable region is only unchanged up to half the
+                // cutter radius: refuse above it instead of clamping.
+                return Err(format!(
+                    "roughing seam_bridge_mm {b} exceeds half this cutter's radius \
+                     ({} mm): use a smaller bridge (about the mesh's surface error)",
+                    cutter_radius_mm / 2.
+                ));
+            }
+            Some(bridge) => {
+                let grid = (self.tolerance / 128.).max(1e-8);
+                // Rounding, and 4 tolerances more: needles come out at least
+                // 8 tolerances wide. (The closing's joins add no sag: its
+                // dilation is mitred and its erosion round,
+                // `close_protectively`.)
+                Some(((4. * self.tolerance + 4. * grid) / 0.998, bridge))
+            }
+            None => None,
+        };
         let mut filled = FilledHoles::default();
         let mut region = if regions.len() > 1 {
             let (union, holes) =

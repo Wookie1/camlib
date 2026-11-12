@@ -4258,10 +4258,20 @@ fn seam_bridge_closes_a_crossing_seam_between_separately_tessellated_faces() {
         assert!(signed(&region, [0., -0.4]) < 0.);
     }
     // Out of range: refused, not clamped.
-    assert!(
-        PreparedRoughingTarget::prepare(mesh(triangles.clone(), 0.0272), 1e-5, &cancel)
-            .unwrap()
-            .with_seam_bridge(Some(0.))
-            .is_err()
-    );
+    for bad in [0., -0.01, 1.5, f64::NAN, f64::INFINITY] {
+        assert!(
+            PreparedRoughingTarget::prepare(mesh(triangles.clone(), 0.0272), 1e-5, &cancel)
+                .unwrap()
+                .with_seam_bridge(Some(bad))
+                .is_err(),
+            "{bad}"
+        );
+    }
+    // Above half the cutter's radius (the reachable region is no longer
+    // unchanged): refused with that radius named, not silently reduced.
+    let message = target(Some(0.0272))
+        .shadow_simplified(0., allowance, 0.05, contour, &mut 0, &cancel)
+        .err()
+        .expect("a bridge above half the cutter radius is refused");
+    assert!(message.contains("half this cutter's radius"), "{message}");
 }
