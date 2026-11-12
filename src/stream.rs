@@ -2073,18 +2073,16 @@ impl StreamReceiver {
         // Kept proof states describe the stock they were computed with: for
         // any other cells they are discarded, and the resumed history is
         // unseen (reported, never decided).
-        let restored_proofs = kept
-            .filter(|(digest, _)| *digest == cells_digest(&cells))
-            .map(|(_, states)| states);
+        let restored_proofs = kept_for(kept, &cells);
         // Likewise the kept cleared columns: for other cells they are
         // dropped, and the resumed stock lowers only what it can prove alone.
-        let columns = columns.filter(|(digest, _)| *digest == cells_digest(&cells));
+        let columns = kept_for(columns, &cells);
         let mut stock = Stock::from_snapshot(StockSnapshot {
             spec: manifest.stock.height()?.clone(),
             generation: fields.generation,
             cells,
         })?;
-        if let Some((_, state)) = columns {
+        if let Some(state) = columns {
             stock.restore_clearance(state)?;
         }
         if let Some(initial) = &manifest.initial_stock {
@@ -3052,6 +3050,12 @@ fn column_section(stock: &Stock, cells: &[u8; 32]) -> Vec<u8> {
     }
     out
 }
+/// What a checkpoint kept beside its cells, if it was kept for exactly these
+/// cells (by their digest): anything kept for other cells is dropped.
+fn kept_for<T>(kept: Option<([u8; 32], T)>, cells: &[HeightBounds]) -> Option<T> {
+    kept.filter(|(digest, _)| *digest == cells_digest(cells))
+        .map(|(_, value)| value)
+}
 /// A checkpoint's trailing sections, each optional, in order: proof states
 /// (`CAMPRF01`), then cleared columns (`CAMCOL01`).
 fn read_trailing_sections(
@@ -3377,6 +3381,72 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checkpoints_cleared_columns_round_trip_and_a_damaged_section_is_refused() {
+        let manifest: StreamManifest =
+            serde_json::from_str(include_str!("../fixtures/operations/adaptive-pocket.json"))
+                .unwrap();
+        let (stock, _) =
+            crate::stock::front_coverage_tests::passes(&[(4., 22., 13., 5.), (4., 22., 16.8, 5.)]);
+        let cells = stock.cells().len();
+        let digest = [7u8; 32];
+        let bytes = column_section(&stock, &digest);
+        let (proofs, columns) = read_trailing_sections(&bytes, &manifest, cells).unwrap();
+        assert!(proofs.is_none());
+        let (kept, state) = columns.unwrap();
+        let original = stock.clearance_state();
+        assert_eq!(kept, digest);
+        assert!(original.columns.len() >= 2);
+        assert_eq!(
+            (
+                state.unproven,
+                &state.operation,
+                state.union_from,
+                state.columns.len()
+            ),
+            (
+                original.unproven,
+                &original.operation,
+                original.union_from,
+                original.columns.len()
+            )
+        );
+        for ((t, s), (u, o)) in state.columns.iter().zip(&original.columns) {
+            assert_eq!(t.to_bits(), u.to_bits());
+            assert_eq!(s.encode(), o.encode());
+        }
+        // Columns kept for these cells are restored; for any others they
+        // are dropped.
+        let own = cells_digest(stock.cells());
+        assert_eq!(kept_for(Some((own, 1)), stock.cells()), Some(1));
+        assert_eq!(kept_for(Some((digest, 1)), stock.cells()), None);
+        assert_eq!(kept_for(None::<([u8; 32], i32)>, stock.cells()), None);
+        // A checkpoint written before the section existed has none.
+        let (proofs, columns) = read_trailing_sections(&[], &manifest, cells).unwrap();
+        assert!(proofs.is_none() && columns.is_none());
+        // Cut short anywhere, one byte too long, another magic, a flag that
+        // is not one, a sweep that does not describe a curve: refused.
+        for n in 1..bytes.len() {
+            assert!(
+                read_trailing_sections(&bytes[..n], &manifest, cells).is_err(),
+                "{n}"
+            );
+        }
+        let mut bad = bytes.clone();
+        bad.push(0);
+        assert!(read_trailing_sections(&bad, &manifest, cells).is_err());
+        let mut bad = bytes.clone();
+        bad[7] = b'2';
+        assert!(read_trailing_sections(&bad, &manifest, cells).is_err());
+        let mut bad = bytes.clone();
+        bad[COLUMN_SECTION.len() + 32] = 2;
+        assert!(read_trailing_sections(&bad, &manifest, cells).is_err());
+        let mut bad = bytes.clone();
+        let last = bad.len() - 8 * crate::engagement::SWEEP_WORDS + 8 * 13;
+        bad[last..last + 8].copy_from_slice(&1e6f64.to_le_bytes());
+        assert!(read_trailing_sections(&bad, &manifest, cells).is_err());
+    }
 
     #[test]
     fn public_cached_motion_does_not_acquire_verified_cache_column_authority() {

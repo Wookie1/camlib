@@ -135,7 +135,13 @@ can say clear, violation or uncertain honestly.
   operation's own passes count, so an operation's stock changes depend on
   its starting cells and its own moves (the regeneration cache key); a
   producer checkpoint keeps the columns, so a resumed run lowers the same
-  cells. A run starts from the whole box, or from a closed mesh
+  cells. A checkpoint without them (one written by a consumer, such as
+  `StockState.write_checkpoint`, or before the section existed, or whose
+  columns were kept for other cells) restores the cells alone: the resumed
+  stock then lowers only what a single move covers, never less material
+  than is there, so its upper bounds can be higher than an uninterrupted
+  run's until the operation's own later passes cover those cells. A run
+  starts from the whole box, or from a closed mesh
   (`src/stock_mesh.rs`, manifest `stock` with a `mesh`; always build a run's
   starting stock with `RunStockSpec::initial_stock`, since the grid alone is
   the box). The mesh is converted conservatively: a cell's upper bound is the

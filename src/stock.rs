@@ -2567,7 +2567,7 @@ mod undercut_diagnostic_tests {
 }
 
 #[cfg(test)]
-mod front_coverage_tests {
+pub(crate) mod front_coverage_tests {
     use super::*;
     use crate::engagement::EngagementScene;
 
@@ -2648,7 +2648,7 @@ mod front_coverage_tests {
 
     /// Apply flat cutting lines (x0, x1, y, z) of the fixture's 4 mm end mill
     /// in order; returns the stock and the sum of `union_cells`.
-    fn passes(lines: &[(f64, f64, f64, f64)]) -> (Stock, u64) {
+    pub(crate) fn passes(lines: &[(f64, f64, f64, f64)]) -> (Stock, u64) {
         let (mut stock, tool, motion) = native_fixture();
         let tool = tool.prepare().unwrap();
         let mut union = 0;
@@ -2667,6 +2667,59 @@ mod front_coverage_tests {
         }
         (stock, union)
     }
+    #[test]
+    fn restored_columns_lower_the_same_cells_as_an_uninterrupted_run() {
+        // Two passes, the state kept and put back onto a stock rebuilt from
+        // the cells alone, then a third pass: the same cells as when the
+        // run never stopped. Without the columns the rebuilt stock proves
+        // nothing by union.
+        let lines = [(4., 22., 13., 5.), (4., 22., 16.8, 5.), (4., 22., 20.6, 5.)];
+        let (whole, lowered) = passes(&lines);
+        assert!(lowered > 0);
+        let (first, _) = passes(&lines[..2]);
+        let third = |mut stock: Stock| {
+            let (_, tool, motion) = native_fixture();
+            let tool = tool.prepare().unwrap();
+            let mut m = motion.clone();
+            let (x0, x1, y, z) = lines[2];
+            m.curve = Curve::Line {
+                start: [x0, y, z],
+                end: [x1, y, z],
+            };
+            let d = stock
+                .preview_sweep(&tool, &m, 1., SweepOptions::default(), &|| false)
+                .unwrap();
+            stock.apply_delta(&d).unwrap();
+            stock
+        };
+        let rebuilt = || {
+            Stock::from_snapshot(StockSnapshot {
+                spec: first.spec().clone(),
+                generation: first.generation(),
+                cells: first.cells().to_vec(),
+            })
+            .unwrap()
+        };
+        let mut resumed = rebuilt();
+        resumed.restore_clearance(first.clearance_state()).unwrap();
+        assert_eq!(third(resumed).cells(), whole.cells());
+        let bare = third(rebuilt());
+        assert_ne!(bare.cells(), whole.cells());
+        for (a, b) in bare.cells().iter().zip(whole.cells()) {
+            assert!(a.upper_mm >= b.upper_mm && a.lower_mm == b.lower_mm);
+        }
+        // A state that does not describe a history is refused.
+        let mut bad = first.clearance_state();
+        bad.union_from = bad.columns.len() + 1;
+        assert!(rebuilt().restore_clearance(bad).is_err());
+        let mut bad = first.clearance_state();
+        bad.columns[0].0 = 1.;
+        assert!(rebuilt().restore_clearance(bad).is_err());
+        let mut bad = first.clearance_state();
+        bad.operation = Some("not an id".into());
+        assert!(rebuilt().restore_clearance(bad).is_err());
+    }
+
     fn upper_at(stock: &Stock, p: [f64; 2]) -> f64 {
         let [nx, _] = stock.dimensions();
         let [w, h] = stock.cell_widths_mm();
