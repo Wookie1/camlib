@@ -49,7 +49,9 @@ while the Rust side does the planning and the checking.
    - `Update`: one move and its stock change;
    - `OperationUpdate`: an operation's begin, mid-operation events and end,
      with its report;
-   - `VerificationUpdate`: per-move check results.
+   - `VerificationUpdate`: per-move check results;
+   - `ProgressUpdate`, only when asked (`progress_interval_s`): planning
+     progress, see *Planning progress* below.
 6. **Keep and replay.** `camlib.playback.RecordedRun` records frames and
    checkpoints to a directory. `Player` seeks by restoring the nearest
    checkpoint and replaying, including partway through a move. A run can be
@@ -76,9 +78,41 @@ CRC-32), then the payload. Kinds (`src/stream.rs`):
 | 9 | Control | Typed control events (version 2 runs) |
 | 10 | Turn chunk | One lathe move and its turning stock change |
 | 11 | Dexel chunk | One milling move on tri-dexel stock and the rays it changed |
+| 12 | Progress | Planning progress (JSON); sent only when asked, never stored (#198) |
 
 Every frame carries the run id, revision and manifest digest. A frame from
 another run or revision is refused.
+
+## Planning progress
+
+`src/progress.rs` (#198). The `operations` command's `progress_ms` asks
+`regeneration::run_with_progress` for kind 12 frames: which operation is being
+planned, and a fraction with its basis where the planner can count one
+(`OperationPlan::progress`: levels, passes, or the engagement front's
+reachable area), else none.
+
+- **Not part of the run.** A progress frame carries no cursor and changes no
+  motion id, stock, checkpoint or cache entry. Receivers hand it to the
+  application and store nothing: `Frame.parse` (stored frames) refuses kind
+  12, so a journal can never hold one. Dropping the progress frames of a run
+  leaves exactly the frames of the same run without progress
+  (`tests/progress.rs`).
+- **A timer thread sends the updates.** The run's `Meter` owns the output.
+  With progress at an interval, a scoped thread sends the operation's
+  current update at each interval while the planning thread plans, so an
+  update is due however long one planner call takes and whether or not it
+  polls for cancellation (`python/tests/test_planning_progress.py` measures
+  the gaps on slow plans). Both threads write whole frames under one lock,
+  and an operation's updates all precede its end control. `cam-sim-stream`
+  therefore locks stdout per frame, not for the run.
+- **The planners are not involved.** They take no new parameter and keep
+  the caller's own cancel signal: the driver reads `OperationPlan::progress`
+  after `prepare` and after each move. So a run instantiates the engine for
+  exactly the signal types it did before (#194), and a run without progress
+  starts no thread and takes no lock.
+- **Monotonic in one place.** `Meter::report` keeps the largest fraction seen
+  in the operation; `Meter::end` sends 1. The Python reader checks the same
+  independently and refuses a stream whose fraction goes backwards.
 
 ## Stock models
 

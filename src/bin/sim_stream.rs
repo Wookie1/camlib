@@ -38,6 +38,11 @@ enum Command {
     Operations {
         #[serde(default)]
         cache: Option<camlib::regeneration::CacheOptions>,
+        /// Planning progress frames (#198): at this interval in
+        /// milliseconds, or 0 for whenever the planner's counts change.
+        /// Absent: none, and the output is the run's frames only.
+        #[serde(default)]
+        progress_ms: Option<u64>,
     },
     Finish,
 }
@@ -95,8 +100,11 @@ fn run() -> Result<(), String> {
         StreamProducer::new(manifest.clone())?
     };
     let mut producer = Some(producer);
-    let mut output = io::stdout().lock();
-    let mut send = |bytes: &[u8]| -> Result<(), String> {
+    // Locked for each frame, not for the run: a run that reports planning
+    // progress writes those frames from its timer thread.
+    let output = io::stdout();
+    let send = |bytes: &[u8]| -> Result<(), String> {
+        let mut output = output.lock();
         output
             .write_all(bytes)
             .and_then(|()| output.flush())
@@ -242,12 +250,27 @@ fn run() -> Result<(), String> {
                     return Err("material stage is not configured or already complete".into());
                 }
             }
-            Command::Operations { cache } => {
+            Command::Operations { cache, progress_ms } => {
                 if query
                     || producer.as_ref().ok_or("producer unavailable")?.completed() != 0
                     || manifest.operations.is_empty() && manifest.turning.is_none()
                 {
                     return Err("operations require an unstarted writable run with manifest-bound operations".into());
+                }
+                if let Some(ms) = progress_ms {
+                    camlib::regeneration::run_with_progress(
+                        producer.as_mut().ok_or("producer unavailable")?,
+                        cache,
+                        &cancel,
+                        match ms {
+                            0 => camlib::progress::Cadence::EveryChange,
+                            ms => camlib::progress::Cadence::Interval(
+                                std::time::Duration::from_millis(ms),
+                            ),
+                        },
+                        send,
+                    )?;
+                    return Ok(());
                 }
                 if manifest.turning.is_some() {
                     // Lathe runs are planned and streamed by their turning

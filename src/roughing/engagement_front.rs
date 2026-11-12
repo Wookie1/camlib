@@ -618,6 +618,10 @@ pub(crate) struct EngagementFrontPlan {
     /// whether this level's have been planned.
     wall_pass: bool,
     walls_done: bool,
+    /// Reachable material area of this level (left, at its start) as of the
+    /// last candidate refresh: planning progress (#198), read by nothing
+    /// that plans.
+    area_mm2: Option<(f64, f64)>,
 }
 
 /// The entry and link options of an engagement_front clearing, as `Roughing`
@@ -751,6 +755,7 @@ impl EngagementFrontPlan {
             remnant: false,
             wall_pass: false,
             walls_done: false,
+            area_mm2: None,
         })
     }
     /// See `RoughingOperation::ramp_clearance_mm` (validated there).
@@ -781,6 +786,11 @@ impl EngagementFrontPlan {
     }
     pub(crate) fn construction_error_mm(&self) -> f64 {
         self.guides.construction_error_mm()
+    }
+    /// This level's reachable material area (left, at its start) as of the
+    /// last candidate refresh; `None` before the first.
+    pub(crate) fn area_mm2(&self) -> Option<(f64, f64)> {
+        self.area_mm2
     }
     pub(crate) fn activate_layer(
         &mut self,
@@ -1816,6 +1826,11 @@ impl EngagementFrontPlan {
             // Nearest valid start among the cached candidates.
             let mut found = None;
             loop {
+                // Each turn scans every cached candidate, and a stale one is
+                // dropped and the scan repeated: seconds on a fine grid.
+                if cancel.is_cancelled() {
+                    return Err("engagement_front planning cancelled".into());
+                }
                 let layer = self.layer.as_ref().unwrap();
                 let best = layer
                     .candidates
@@ -1843,6 +1858,10 @@ impl EngagementFrontPlan {
                     return self.helix_pass(stock, cancel);
                 }
                 let left = self.refresh();
+                // Planning progress (#198): what is left against the most
+                // this level has had (a refresh may find more reachable).
+                let start = self.area_mm2.map_or(left, |(_, start)| start.max(left));
+                self.area_mm2 = Some((left, start));
                 refreshed = true;
                 if left < min_area {
                     return Ok(false);
