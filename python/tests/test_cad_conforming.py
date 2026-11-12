@@ -1,6 +1,8 @@
 """CAD import refines each face conformingly: no T-junctions, so the solid stays closed."""
 
 from collections import Counter
+import itertools
+import math
 import unittest
 from unittest import mock
 
@@ -113,7 +115,29 @@ class EllipsoidImportTest(unittest.TestCase):
         # is then shared by an even number of facets (it was thousands of
         # single-sided edges before the T-junctions were closed).
         weld = 2 * max(f['regularization_mm'] for f in mesh.source['face_bounds'])
-        triangles = [tuple(tuple(round(v / weld) for v in p) for p in t) for t in mesh.triangles]
+        # Weld by distance (buckets plus neighbours, union-find), not by
+        # rounding to a grid, which splits two copies of one vertex that
+        # straddle a cell boundary.
+        points = {tuple(p) for t in mesh.triangles for p in t}
+        buckets = {}
+        for p in points:
+            buckets.setdefault(tuple(int(v // weld) for v in p), []).append(p)
+        parent = {p: p for p in points}
+
+        def find(p):
+            while parent[p] != p:
+                parent[p] = parent[parent[p]]
+                p = parent[p]
+            return p
+
+        for cell, members in buckets.items():
+            for step in itertools.product((-1, 0, 1), repeat=3):
+                near = buckets.get(tuple(c + d for c, d in zip(cell, step)), ())
+                for p in members:
+                    for q in near:
+                        if p < q and math.dist(p, q) <= weld:
+                            parent[find(p)] = find(q)
+        triangles = [tuple(find(tuple(p)) for p in t) for t in mesh.triangles]
         triangles = [t for t in triangles if len(set(t)) == 3]
         uses = Counter(frozenset((t[i], t[(i + 1) % 3])) for t in triangles for i in range(3))
         odd = [e for e, n in uses.items() if n % 2]
