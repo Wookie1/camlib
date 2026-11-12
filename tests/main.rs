@@ -66,6 +66,7 @@ modules! {
     stock_contact,
     stock_mesh,
     stream,
+    supplied,
     surface_validation,
     tapping,
     thermal,
