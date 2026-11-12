@@ -54,6 +54,13 @@ impl PocketPlan {
         }
         height
     }
+    /// The largest radius of any tool section (cutter, neck, shank, holder).
+    pub(crate) fn widest_part_radius(&self) -> f64 {
+        self.air_entry_parts
+            .iter()
+            .map(|&(radius, _)| radius)
+            .fold(0., f64::max)
+    }
     /// `cell_entry_height` for every tool position in the axis-aligned
     /// rectangle spanned by `a` and `b`: the lowest tip height above which
     /// no whole-cell stock upper bound meets any tool section anywhere in
@@ -99,6 +106,168 @@ impl PocketPlan {
         }
         height
     }
+    /// `cell_entry_height` for every tool position on the straight paths
+    /// `path` (each within `pad` of the true path: a flattened arc's chord
+    /// error): the lowest tip height above which no whole-cell stock upper
+    /// bound meets any tool section anywhere along them. A cell counts when
+    /// its centre is within reach plus its half diagonal of a path, so no
+    /// cell a section overlaps is missed.
+    pub(crate) fn cell_path_height(&self, stock: &Stock, path: &[(Point, Point)], pad: f64) -> f64 {
+        self.air_entry_parts
+            .iter()
+            .map(|&(radius, bottom)| self.part_path_top(stock, path, radius + pad) - bottom)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+    /// The highest whole-cell stock upper bound a disk of `radius` (plus a
+    /// guard) can meet anywhere along the straight paths `path`.
+    fn part_path_top(&self, stock: &Stock, path: &[(Point, Point)], radius: f64) -> f64 {
+        let [nx, ny] = stock.dimensions();
+        let [wx, wy] = stock.cell_widths_mm();
+        let min = stock.spec().min_mm;
+        let cells = stock.cells();
+        let reach = radius + 32. * self.operation.tolerance_mm;
+        let half = wx.hypot(wy) / 2.;
+        let mut top = f64::NEG_INFINITY;
+        for &(a, b) in path {
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l2 = d[0] * d[0] + d[1] * d[1];
+            let span = |lo: f64, hi: f64, o: f64, w: f64, n: usize| {
+                let first = ((lo - reach - o) / w).floor().max(0.);
+                let last = ((hi + reach - o) / w).floor().min(n as f64 - 1.);
+                (first as usize, last)
+            };
+            let (i0, i1) = span(a[0].min(b[0]), a[0].max(b[0]), min[0], wx, nx);
+            let (j0, j1) = span(a[1].min(b[1]), a[1].max(b[1]), min[1], wy, ny);
+            if i1 < 0. || j1 < 0. {
+                continue;
+            }
+            for j in j0..=j1 as usize {
+                for i in i0..=i1 as usize {
+                    let c = [
+                        min[0] + (i as f64 + 0.5) * wx,
+                        min[1] + (j as f64 + 0.5) * wy,
+                    ];
+                    let t = if l2 > 0. {
+                        (((c[0] - a[0]) * d[0] + (c[1] - a[1]) * d[1]) / l2).clamp(0., 1.)
+                    } else {
+                        0.
+                    };
+                    let near = [a[0] + t * d[0], a[1] + t * d[1]];
+                    if (c[0] - near[0]).hypot(c[1] - near[1]) <= reach + half {
+                        top = top.max(cells[j * nx + i].upper_mm);
+                    }
+                }
+            }
+        }
+        top
+    }
+    /// Whether every tool section above the flutes (neck, shank, holder) is
+    /// proven clear of stock along the straight stroke `a`-`b` with the tip
+    /// at `z`: the section is above the stock, or under no whole-cell stock
+    /// bound it could meet, or its whole sweep lies in columns the committed
+    /// cuts emptied (`Stock::history_clearance`, #200: a shank as wide as
+    /// the cutter where the levels above cut). Unproven is `false`.
+    pub(crate) fn clear_above_flutes(
+        &self,
+        a: Point,
+        b: Point,
+        z: f64,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<bool, String> {
+        let Some(tool) = &self.rest_tool else {
+            return Ok(false);
+        };
+        let flutes = tool.cutter.cutting_length_mm;
+        let motion = Motion {
+            id: self.next_id,
+            operation: self.operation.id.clone(),
+            tool: self.operation.tool.clone(),
+            kind: MoveKind::Cut,
+            curve: Stroke::line(a, b).curve(z),
+            feed_mm_min: Some(self.operation.feed_mm_min),
+        };
+        let mut work = 1_000_000;
+        for &(radius, bottom) in &self.air_entry_parts {
+            if bottom < flutes - 1e-9
+                || z + bottom >= stock.spec().max_mm[2]
+                || self.part_path_top(stock, &[(a, b)], radius) <= z + bottom
+            {
+                continue;
+            }
+            if !stock.history_clearance(&motion, radius, bottom, &mut work, cancel)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// The lowest tip height, between `floor` and the operation's top, at
+    /// which the committed sweeps prove every tool section clear of stock
+    /// along the whole of `path` (lines and XY arcs): `cleared_entry_start`
+    /// for a path instead of a point. The tool may come straight down to
+    /// that height anywhere on the path and travel along it there in air.
+    ///
+    /// The proof is `Stock::history_clearance` (#200), section by section:
+    /// each section's exact sweep along the path lies in columns the
+    /// committed cuts emptied, with no margin beyond the path error, so a
+    /// path the same cutter has cut before is proven, right up to a wall,
+    /// and so is a shank as wide as the cutter. Returns the operation's top
+    /// when nothing is proven (out of work or uncertain proves nothing).
+    pub(crate) fn cleared_path_start(
+        &self,
+        path: &[Stroke],
+        floor: f64,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<f64, String> {
+        let top = self.operation.top_z_mm;
+        let skin = crate::entry::skin(self.operation.tolerance_mm);
+        let clear = |tip: f64| -> Result<bool, String> {
+            let mut work = 1_000_000;
+            for &stroke in path {
+                let motion = Motion {
+                    id: self.next_id,
+                    operation: self.operation.id.clone(),
+                    tool: self.operation.tool.clone(),
+                    kind: MoveKind::Cut,
+                    curve: stroke.curve(tip),
+                    feed_mm_min: Some(self.operation.feed_mm_min),
+                };
+                for &(radius, bottom) in &self.air_entry_parts {
+                    if tip + bottom > stock.spec().max_mm[2] {
+                        continue;
+                    }
+                    if !stock.history_clearance(&motion, radius, bottom, &mut work, cancel)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        };
+        let (mut low, mut high) = (floor.min(top), top);
+        // The level's own depth first: a path cut before is clear to it.
+        if high - low > skin && clear(low + skin)? {
+            return Ok(low + skin);
+        }
+        // Halve until the bracket is within the skin its callers accept:
+        // each step is a proof, and the number of steps follows from the
+        // depth instead of a fixed count.
+        while high - low > skin {
+            if cancel.is_cancelled() {
+                return Err("committed entry search cancelled".into());
+            }
+            let middle = (low + high) / 2.;
+            if !(middle > low && middle < high) {
+                break;
+            }
+            if clear(middle)? {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        Ok(high)
+    }
     /// Use `cache` for committed-clearance entry queries (shared across plans).
     pub(crate) fn share_entry_scene(&mut self, cache: &EntrySceneCache) {
         self.entry_scene = cache.clone();
@@ -138,7 +307,7 @@ impl PocketPlan {
             }
         }
         let scene = &cache.insert((scene, cursor)).0;
-        let skin = 0.01_f64.max(64. * self.operation.tolerance_mm);
+        let skin = crate::entry::skin(self.operation.tolerance_mm);
         let guard = 32. * self.operation.tolerance_mm
             + 4096.
                 * f64::EPSILON
@@ -217,22 +386,19 @@ impl PocketPlan {
             // A supported flat pocket has cylindrical cutter/neck/shank sections
             // and linear holder tapers. Maximum endpoint radius encloses every
             // section, from its lowest Z through the entire vertical descent.
-            // Bisect until the bracket is within the acceptance below: a fixed
-            // 12 halvings left (top - floor) / 4096, over 0.01 mm once the
-            // floor was ~41 mm below the top, so callers comparing the result
-            // with that same acceptance refused every deep entry. 64 halvings
-            // bound the loop; the break ends it far sooner.
-            for _ in 0..64 {
-                if cancel.is_cancelled() {
-                    return Err("committed entry search cancelled".into());
-                }
-                if high - low <= 0.01_f64.max(64. * self.operation.tolerance_mm) {
-                    break;
-                }
-                let middle = (low + high) / 2.;
-                let mut clear = true;
+            // Halve until the bracket is within the skin the callers accept
+            // (`entry::skin`, the one definition both sides use). A fixed 12
+            // halvings left (top - floor) / 4096, over that skin once the
+            // floor was ~41 mm below the top, so every deep entry was
+            // refused (#237). Each step is a proof; the bracket halves, so
+            // the loop ends, and a bracket that can no longer be halved (or
+            // is not a number) ends it too.
+            let skin = crate::entry::skin(self.operation.tolerance_mm);
+            // Whether every tool section is proven clear with the tip at
+            // `tip`; `None` when the work ran out (nothing is proven then).
+            let mut clear_at = |tip: f64| -> Result<Option<bool>, String> {
                 for &(radius, bottom) in &self.air_entry_parts {
-                    let height = middle + bottom - guard;
+                    let height = tip + bottom - guard;
                     if height > stock.spec().max_mm[2] {
                         continue;
                     }
@@ -245,18 +411,43 @@ impl PocketPlan {
                         cancel,
                     ) {
                         Ok(true) => (),
-                        Ok(false) => {
-                            clear = false;
-                            break;
-                        }
-                        Err(_) if work == 0 && !cancel.is_cancelled() => return Ok(high),
+                        Ok(false) => return Ok(Some(false)),
+                        Err(_) if work == 0 && !cancel.is_cancelled() => return Ok(None),
                         Err(e) => return Err(e),
                     }
                 }
-                if clear {
-                    high = middle;
-                } else {
-                    low = middle;
+                Ok(Some(true))
+            };
+            // The level itself first: "this start reaches the level" is one
+            // proof at one height, the skin above the floor, so the answer
+            // does not depend on where the halving below happens to land
+            // (the same column was otherwise accepted under one top and
+            // refused under another).
+            if high - low > skin {
+                // The height its callers accept: no more than the skin above
+                // the floor after rounding too.
+                let mut level = low + skin;
+                if level - low > skin {
+                    level = level.next_down();
+                }
+                match clear_at(level)? {
+                    Some(true) => return Ok(level),
+                    Some(false) => low = level,
+                    None => return Ok(high),
+                }
+            }
+            while high - low > skin {
+                if cancel.is_cancelled() {
+                    return Err("committed entry search cancelled".into());
+                }
+                let middle = (low + high) / 2.;
+                if !(middle > low && middle < high) {
+                    break;
+                }
+                match clear_at(middle)? {
+                    Some(true) => high = middle,
+                    Some(false) => low = middle,
+                    None => return Ok(high),
                 }
             }
             // High is either the unchanged authored top or a whole-assembly proof.
@@ -267,7 +458,7 @@ impl PocketPlan {
         // The fitted disk admits the complete circle, independent of phase.
         // Its +X extremity may sit on an old sweep's uncertainty band. Try the
         // opposite phase before deciding to repeat a deep cutting descent.
-        if positive - floor <= 0.01_f64.max(64. * self.operation.tolerance_mm) {
+        if positive - floor <= crate::entry::skin(self.operation.tolerance_mm) {
             return Ok((positive, false));
         }
         let negative = height([center[0] - orbit, center[1]])?;

@@ -395,6 +395,231 @@ fn deep_roughing_of_a_tapered_part_is_cleared_by_the_stock_its_upper_layers_cut(
     assert!(deep > 10, "{deep} cuts deeper than the flutes");
 }
 
+/// The #122 fixture with its 20 mm square boss drafted: `draft_mm` wider
+/// on every side at its foot (Z-78) than at its top.
+fn drafted_boss(draft_mm: f64, offset: bool) -> StreamManifest {
+    let mut m: StreamManifest = serde_json::from_str(include_str!(
+        "../fixtures/operations/roughing-layer-depth.json"
+    ))
+    .unwrap();
+    let Operation::Roughing(op) = &mut m.operations[0] else {
+        panic!("fixture")
+    };
+    if offset {
+        op.clearing = camlib::roughing::RoughingClearing::Offset {
+            stepover_mm: 6.,
+            coverage_margin_mm: 0.01,
+        };
+    }
+    op.omit_empty_cuts = false;
+    for tri in std::sync::Arc::make_mut(&mut op.target.triangles) {
+        for p in tri {
+            if (p[0] == 30. || p[0] == 50.) && (p[1] == 30. || p[1] == 50.) && p[2] != 0. {
+                p[0] += draft_mm * (p[0] - 40.).signum();
+                p[1] += draft_mm * (p[1] - 40.).signum();
+            }
+        }
+    }
+    m.validate().unwrap();
+    m
+}
+
+/// The XY distance from `p` to the path of `c`, written out here.
+fn path_distance(c: &Curve, p: [f64; 2]) -> f64 {
+    let (a, b) = (c.start(), c.end());
+    let ends = (a[0] - p[0])
+        .hypot(a[1] - p[1])
+        .min((b[0] - p[0]).hypot(b[1] - p[1]));
+    match circle(c) {
+        None => {
+            let e = [b[0] - a[0], b[1] - a[1]];
+            let w = [p[0] - a[0], p[1] - a[1]];
+            let l = e[0] * e[0] + e[1] * e[1];
+            let t = if l > 0. {
+                (w[0] * e[0] + w[1] * e[1]) / l
+            } else {
+                -1.
+            };
+            if (0. ..=1.).contains(&t) {
+                (w[0] * e[1] - w[1] * e[0]).abs() / l.sqrt()
+            } else {
+                ends
+            }
+        }
+        Some((o, sweep)) => {
+            let r = (a[0] - o[0]).hypot(a[1] - o[1]);
+            let turn = ((p[1] - o[1]).atan2(p[0] - o[0]) - (a[1] - o[1]).atan2(a[0] - o[0]))
+                .rem_euclid(TAU);
+            let on = sweep.abs() >= TAU
+                || if sweep >= 0. {
+                    turn <= sweep
+                } else {
+                    TAU - turn <= -sweep
+                };
+            if on {
+                ((p[0] - o[0]).hypot(p[1] - o[1]) - r).abs()
+            } else {
+                ends
+            }
+        }
+    }
+}
+
+/// #200: a straight-shank end mill (shank as wide as the cutter) deeper
+/// than its flutes beside a drafted wall. Each layer's passes lie a little
+/// inside those of the layers above, so the wall passes repeat no earlier
+/// move, and the shank clears the cut of the top layers by the draft across
+/// them only: about 9 um for the 0.01 mm draft and 0.09 um for the 0.0001 mm
+/// one (the sweeps' own path error is 0.01 um each). It is clear all the
+/// same, because the layers above cut everything it passes through. The
+/// planner used to refuse the first layer deeper than the flutes (0.01 mm
+/// draft, contour-parallel and raster), or admit a move that the stock
+/// sweep then refused and stock contact could not resolve (0.2 mm).
+#[test]
+fn deep_roughing_beside_a_drafted_wall_runs_with_a_shank_as_wide_as_the_cutter() {
+    let cancel = AtomicBool::new(false);
+    for (draft, offset) in [(0.01, true), (0.2, true), (0.01, false), (0.0001, true)] {
+        let m = drafted_boss(draft, offset);
+        assert_eq!(
+            m.tools[0].cutter.shank_diameter_mm,
+            m.tools[0].cutter.diameter_mm
+        );
+        let prepared = m.tools[0].prepare().unwrap();
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        stock.enable_contact_queries(&cancel).unwrap();
+        let mut plan = OperationPlan::prepare_with_stock(
+            m.operations[0].clone(),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &cancel,
+        )
+        .unwrap();
+        // Every flat move so far: the cutter (radius 6) emptied the column
+        // over its footprint from the move's Z up.
+        let mut cut: Vec<Curve> = vec![];
+        let (mut minimum_z, mut deep, mut new_paths) = (0_f64, 0, 0);
+        while let Some(motion) = plan
+            .next_motion_with_stock(&stock, &cancel)
+            .unwrap_or_else(|e| panic!("draft {draft}, offset {offset}: {e}"))
+        {
+            let (a, b) = (motion.curve.start(), motion.curve.end());
+            let z = a[2].min(b[2]);
+            minimum_z = minimum_z.min(z);
+            if z < -75. && !motion.kind.is_rapid() {
+                deep += 1;
+                // Independent of the planner and of the proof: the shank
+                // (radius 6, from 75 mm above the tip) sampled along the
+                // move; every sample inside the stock is within the cutter
+                // radius of the path of an earlier flat move at or below
+                // the shank's bottom.
+                let bottom = z + 75.;
+                // A move along one earlier move's path (to a nanometre) is a
+                // repeat; the others are the case at issue.
+                let repeat = cut.iter().any(|c| {
+                    c.start()[2] <= bottom
+                        && (0..=16).all(|i| {
+                            let p = position(&motion.curve, i as f64 / 16.);
+                            path_distance(c, [p[0], p[1]]) <= 1e-9
+                        })
+                });
+                for i in 0..=16 {
+                    let p = position(&motion.curve, i as f64 / 16.);
+                    for ring in 1..=3 {
+                        for j in 0..24 {
+                            let angle = TAU * j as f64 / 24.;
+                            let rho = 2. * ring as f64;
+                            let q = [p[0] + rho * angle.cos(), p[1] + rho * angle.sin()];
+                            assert!(
+                                q.iter().any(|v| !(0. ..=80.).contains(v))
+                                    || cut.iter().any(|c| c.start()[2] <= bottom
+                                        && path_distance(c, q) <= 6. + 1e-9),
+                                "shank at {q:?} above Z{bottom} is in uncut stock: {:?}",
+                                motion.curve
+                            );
+                        }
+                    }
+                }
+                new_paths += usize::from(!repeat);
+                // The independent stock-contact verification of the move,
+                // against the stock as committed before it.
+                let report = camlib::stock_contact::check(
+                    &stock,
+                    &prepared,
+                    &motion,
+                    camlib::stock_contact::Options::default(),
+                    &cancel,
+                )
+                .unwrap();
+                assert_eq!(
+                    report.status,
+                    camlib::verification::Status::Clear,
+                    "{:?}: {:?}",
+                    motion.curve,
+                    report.findings.first().map(|f| &f.finding.detail)
+                );
+            }
+            // The stock sweep's own cutting-length check admits it too.
+            let delta = stock
+                .preview_sweep(&prepared, &motion, 1., m.sweep, &cancel)
+                .unwrap_or_else(|e| panic!("draft {draft}: {:?}: {e}", motion.curve));
+            stock.apply_delta(&delta).unwrap();
+            if a[2] == b[2] {
+                cut.push(motion.curve);
+            }
+        }
+        assert!(
+            minimum_z < -77.,
+            "did not reach the final layer: {minimum_z}"
+        );
+        assert!(deep > 20, "{deep} moves deeper than the flutes");
+        // The case at issue: moves that lie on no earlier move's path.
+        assert!(new_paths > 0, "{new_paths} of {deep} deep moves are new");
+    }
+}
+
+/// #200: the proof gives nothing away. A shank 0.1 mm wider than the
+/// cutter does not fit where the cutter alone has been (the 0.01 mm draft
+/// leaves it 9 um, it needs 50): the first move deeper than the flutes
+/// that passes the wall is refused, with the typed refusal.
+#[test]
+fn deep_roughing_refuses_a_shank_a_hair_wider_than_the_cut_above() {
+    let cancel = AtomicBool::new(false);
+    for offset in [true, false] {
+        let mut m = drafted_boss(0.01, offset);
+        m.tools[0].cutter.shank_diameter_mm = 12.1;
+        let prepared = m.tools[0].prepare().unwrap();
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = OperationPlan::prepare_with_stock(
+            m.operations[0].clone(),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &cancel,
+        )
+        .unwrap();
+        let error = loop {
+            match plan.next_motion_with_stock(&stock, &cancel) {
+                Ok(Some(motion)) => {
+                    let delta = stock
+                        .preview_sweep(&prepared, &motion, 1., m.sweep, &cancel)
+                        .unwrap();
+                    stock.apply_delta(&delta).unwrap();
+                }
+                Ok(None) => panic!("a shank wider than the cut ran to the floor"),
+                Err(error) => break error,
+            }
+        };
+        let refusal = camlib::reach::ReachRefusal::parse(&error).expect(&error);
+        assert_eq!(refusal.limit, camlib::reach::ReachLimit::Shank);
+        assert_eq!(refusal.depth_available_mm, 75.);
+        assert!(refusal.z_mm < -75. && refusal.top_z_mm > refusal.z_mm + 75.);
+        assert!(error.contains("would meet remaining stock"), "{error}");
+    }
+}
+
 fn circle(c: &Curve) -> Option<([f64; 3], f64)> {
     match *c {
         Curve::Arc {
@@ -1318,6 +1543,172 @@ fn engagement_front_frustum_clears_every_layer_without_touching_the_part() {
         history.len()
     );
     assert!(nominal <= 2400., "nominal cycle {nominal} s");
+}
+
+/// #219: `Roughing` with adaptive clearing takes a `RampEntry`. The frustum's
+/// 4 x 4 mm opening is enclosed, with 1.8 mm of travel for a 2 mm cutter:
+/// each layer ramps into it back and forth instead of boring a helix, from
+/// the floor the layer above left (the flutes span the whole depth, so the
+/// layer's own top is the stock top, 2 to 6 mm of air higher).
+#[test]
+fn engagement_front_ramps_into_the_enclosed_opening_of_the_frustum() {
+    use camlib::pocket::RampEntry;
+    let angle = 10f64;
+    let mut m = engagement_front_frustum();
+    let Operation::Roughing(op) = &mut m.operations[0] else {
+        panic!("fixture")
+    };
+    op.entry = PocketEntry::Ramp(RampEntry {
+        angle_rad: angle.to_radians(),
+        min_length_mm: Some(1.),
+        feed_mm_min: Some(90.),
+    });
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let mut history: Vec<camlib::motion::Motion> = Vec::new();
+    let mut current = m.initial_position_mm;
+    // The exact height every earlier fed motion left at `p`.
+    let left = |history: &[camlib::motion::Motion], p: [f64; 2]| {
+        history
+            .iter()
+            .filter(|old| old.kind != MoveKind::Rapid)
+            .map(|old| exact_height(&old.curve, p))
+            .fold(10f64, f64::min)
+    };
+    let (mut legs, mut air) = (0, 0f64);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(history.len() < 60000, "unbounded engagement_front path");
+        assert_eq!(motion.curve.start(), current);
+        let start = current;
+        current = motion.curve.end();
+        assert!(!matches!(motion.curve, Curve::Helix { .. }), "{motion:?}");
+        // Independent analytic part certificate (not the planner's region).
+        certify_part(&motion.curve);
+        let travel = (current[0] - start[0]).hypot(current[1] - start[1]);
+        if current[2] < start[2] && travel == 0. {
+            // A straight descent meets nothing under the cutter. (Just
+            // inside its edge: a ramp comes down in the slot the layer
+            // above cut along the same path, whose wall is the cutter's
+            // own edge.)
+            for radial in [0., 0.5, 0.98] {
+                for i in 0..16 {
+                    let a = TAU * i as f64 / 16.;
+                    let p = [current[0] + radial * a.cos(), current[1] + radial * a.sin()];
+                    if p[0] < 0. || p[0] > 32. || p[1] < 0. || p[1] > 28. {
+                        continue;
+                    }
+                    let height = left(&history, p);
+                    assert!(
+                        height <= current[2] + 0.011,
+                        "straight descent into material at {p:?}: {height} > {}",
+                        current[2]
+                    );
+                }
+            }
+        } else if current[2] < start[2] {
+            // A ramp leg: within the angle, at the entry's own feed, inside
+            // the opening, and starting on the material under its path.
+            assert!(
+                (start[2] - current[2]) / travel <= angle.to_radians().tan() * (1. + 1e-9),
+                "{motion:?}"
+            );
+            assert_eq!(motion.kind, MoveKind::Lead);
+            assert_eq!(motion.feed_mm_min, Some(90.));
+            let mut under = f64::NEG_INFINITY;
+            for i in 0..=8 {
+                let t = i as f64 / 8.;
+                let p = [
+                    start[0] + (current[0] - start[0]) * t,
+                    start[1] + (current[1] - start[1]) * t,
+                ];
+                assert!(
+                    p[0] > 15. && p[0] < 17. && p[1] > 13. && p[1] < 15.,
+                    "{motion:?}"
+                );
+                under = under.max(left(&history, p));
+            }
+            air = air.max(start[2] - under);
+            legs += 1;
+        }
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+        history.push(motion);
+    }
+    plan.finish_report(&|| false).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    assert_eq!(report["completed_layers"], 4);
+    assert_eq!(report["helical_entries"], 0);
+    let mut reported_legs = 0;
+    for layer in report["layers"].as_array().unwrap() {
+        let clearing = &layer["clearing"];
+        assert_eq!(clearing["helical_entries"], 0);
+        // One ramp into the opening per layer. What its pass leaves beside
+        // the slot is cut from the slot at depth, not ramped into again
+        // through the air the slot left.
+        assert_eq!(clearing["ramp_entries"], 1, "{clearing}");
+        assert!(clearing["slot_side_entries"].as_u64().unwrap() >= 1);
+        // 1.8 to 2 mm at 10 degrees needs over 10 mm and the opening has
+        // under 2.6: every ramp reverses.
+        assert!(clearing["ramp_legs"].as_u64().unwrap() >= 4, "{clearing}");
+        assert!(clearing["ramp_slot_mm"].as_f64().unwrap() < 2.6);
+        reported_legs += clearing["ramp_legs"].as_u64().unwrap();
+        assert!(clearing["max_ramp_angle_deg"].as_f64().unwrap() <= angle + 1e-9);
+        let limit = clearing["engagement_limit_deg"].as_f64().unwrap();
+        assert!(clearing["proven_max_engagement_deg"].as_f64().unwrap() <= limit);
+    }
+    assert_eq!(legs, reported_legs as usize);
+    assert!(air <= 0.05, "a ramp starts {air} mm above the material");
+    // The opening's reachable floor is cut.
+    let floor = report["target_z_mm"].as_f64().unwrap();
+    for (i, _) in stock.cells().iter().enumerate() {
+        let p = stock.cell_center(i).unwrap();
+        if p[0] > 15.4 && p[0] < 16.6 && p[1] > 13.4 && p[1] < 14.6 {
+            let height = left(&history, p);
+            assert!(
+                height <= floor + 1e-6,
+                "uncut opening floor {p:?}: {height}"
+            );
+        }
+    }
+    // Offset and raster layers refuse a ramp entry, saying where one is made.
+    for clearing in [
+        serde_json::json!({"kind": "raster", "stepover_mm": 0.8}),
+        serde_json::json!({"kind": "offset", "stepover_mm": 0.8}),
+    ] {
+        let mut refused = m.clone();
+        let Operation::Roughing(op) = &mut refused.operations[0] else {
+            panic!("fixture")
+        };
+        op.clearing = serde_json::from_value(clearing).unwrap();
+        let error = OperationPlan::prepare(
+            refused.operations[0].clone(),
+            &refused.tools[0],
+            refused.stock.height().unwrap(),
+            refused.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        for part in [
+            "roughing rough: RampEntry is not supported here",
+            "AdaptiveClearing",
+        ] {
+            assert!(error.contains(part), "{error}");
+        }
+    }
 }
 
 /// Plan the frustum to the end, committing each motion; returns the motions
@@ -4454,15 +4845,26 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
     // planner a step-up may take a stroke at a real sliver (its contact is
     // proven against the exact sweeps), but none runs along the walls: the
     // bug ran passes the length of every wall (tens of mm per step-up).
-    for l in &ups {
+    // The lowest step-up takes one stroke of under half a millimetre at a
+    // real sliver (with or without the memory: it is not this defect). Every
+    // step-up above it cuts nothing at all, where the defect ran passes the
+    // length of the walls (124 mm at Z6.5).
+    for (i, l) in ups.iter().enumerate() {
         let z = l["tip_z_mm"].as_f64().unwrap();
         let cut = cut_at.get(&z.to_bits()).copied().unwrap_or(0.);
-        eprintln!("step-up Z{z:.3}: cut {cut:.2} mm, {}", l["clearing"]["passes"]);
-        assert!(
-            cut <= 1.,
-            "step-up at Z{z} cut {cut:.2} mm beside vertical walls: {}",
-            l["clearing"]
-        );
+        if i == 0 {
+            assert!(cut < 0.5, "step-up at Z{z} cut {cut:.2} mm: {}", l["clearing"]);
+        } else {
+            assert_eq!(
+                (cut, l["clearing"]["passes"].as_u64()),
+                (0., Some(0)),
+                "step-up at Z{z} beside vertical walls: {}",
+                l["clearing"]
+            );
+            // It steered from the cleared memory handed through the empty
+            // step-up before it, not from whole-cell stock bounds.
+            assert_eq!(l["clearing"]["stock_top_carried"], true, "{}", l["clearing"]);
+        }
     }
 }
 
@@ -4608,18 +5010,18 @@ fn engagement_front_deep_layer_entries_are_proven() {
     let (deep_mean, deep) = run_bar(54., true);
     let (shallow, deep) = (z6(&shallow), z6(&deep));
     let count = |c: &serde_json::Value, key: &str| c[key].as_u64().unwrap();
-    eprintln!(
-        "Z6 top 12 / top 54: mean pass {shallow_mean:.2} / {deep_mean:.2} mm, unproven entries {} / {}, helixes {} / {}",
-        count(&shallow, "unproven_air_starts"),
-        count(&deep, "unproven_air_starts"),
-        count(&shallow, "helical_entries"),
-        count(&deep, "helical_entries"),
-    );
     // The same strips, only deeper: entries beside the cut stock are proven
     // as on the shallow layer, not refused and replaced by helixes.
-    assert!(
-        count(&deep, "unproven_air_starts") <= count(&shallow, "unproven_air_starts") + 4,
+    // The same strips, only deeper: exactly the entries the shallow layer
+    // proves, no more refused and none replaced by a helix.
+    assert_eq!(
+        count(&deep, "unproven_air_starts"),
+        count(&shallow, "unproven_air_starts"),
         "deep layer refused entries the shallow one proves: {deep}"
     );
-    assert!(count(&deep, "helical_entries") <= count(&shallow, "helical_entries"));
+    assert_eq!(
+        count(&deep, "helical_entries"),
+        count(&shallow, "helical_entries")
+    );
+    assert!((deep_mean - shallow_mean).abs() < 0.5, "{deep_mean} {shallow_mean}");
 }

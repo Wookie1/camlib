@@ -431,6 +431,9 @@ enum ColumnNode {
         size: usize,
         digest: OnceLock<[u8; 32]>,
         children: [Arc<ColumnNode>; 2],
+        /// Encloses every sweep's reach below, and the lowest height any
+        /// of them proves empty from: a search hint only.
+        reach: ([[f64; 2]; 2], f64),
     },
 }
 impl ColumnNode {
@@ -438,6 +441,12 @@ impl ColumnNode {
         match self {
             Self::Leaf { .. } => 1,
             Self::Branch { size, .. } => *size,
+        }
+    }
+    fn reach(&self) -> ([[f64; 2]; 2], f64) {
+        match self {
+            Self::Leaf { column, .. } => (column.sweep.reach_bounds(), column.sweep.clear_from()),
+            Self::Branch { reach, .. } => *reach,
         }
     }
     fn digest(&self) -> &[u8; 32] {
@@ -466,6 +475,8 @@ impl ColumnNode {
 struct CommittedColumns {
     roots: Vec<Arc<ColumnNode>>,
     count: usize,
+    /// The largest tolerance any column was committed with.
+    tolerance_mm: f64,
 }
 impl CommittedColumns {
     fn append(&mut self, column: CommittedColumn) {
@@ -474,6 +485,7 @@ impl CommittedColumns {
             // premise by pretending the discarded future geometry was clear.
             return;
         }
+        let tolerance_mm = column.tolerance_mm;
         let mut node = Arc::new(ColumnNode::Leaf {
             column,
             digest: OnceLock::new(),
@@ -484,14 +496,23 @@ impl CommittedColumns {
             .is_some_and(|old| old.size() == node.size())
         {
             let left = self.roots.pop().unwrap();
+            let ((a, floor_a), (b, floor_b)) = (left.reach(), node.reach());
             node = Arc::new(ColumnNode::Branch {
                 size: node.size() * 2,
                 digest: OnceLock::new(),
+                reach: (
+                    [
+                        std::array::from_fn(|k| a[0][k].min(b[0][k])),
+                        std::array::from_fn(|k| a[1][k].max(b[1][k])),
+                    ],
+                    floor_a.min(floor_b),
+                ),
                 children: [left, node],
             });
         }
         self.roots.push(node);
         self.count += 1;
+        self.tolerance_mm = self.tolerance_mm.max(tolerance_mm);
     }
 
     fn collect(
@@ -748,9 +769,20 @@ impl Stock {
     ) -> Result<Vec<ClearedSweep>, String> {
         self.committed_columns.collect(tolerance_mm, cancel)
     }
+    /// Whether the committed cutter sweeps prove a tool section clear along
+    /// `motion`: everything within `radius` of its XY path, from `height`
+    /// above its lowest tip up, is inside columns those sweeps emptied or
+    /// outside the stock (`engagement::cover`: the claim and its proof).
+    /// One sweep the move repeats, several it runs along, or the union of
+    /// the passes it runs between: a shank as wide as the cutter is clear
+    /// where the layers above cut (#200). The planner, the stock sweep's
+    /// cutting-length check and stock-contact verification all ask this one
+    /// question, so they agree.
+    ///
     /// Native committed columns only: decoded deltas or undercut stock cannot
     /// manufacture this proof. Stock only loses material after a certificate.
-    pub(crate) fn repeated_clearance(
+    /// Unproven, or out of `work`, is `false`.
+    pub(crate) fn history_clearance(
         &self,
         motion: &Motion,
         radius: f64,
@@ -758,24 +790,75 @@ impl Stock {
         work: &mut u64,
         cancel: &impl CancelSignal,
     ) -> Result<bool, String> {
-        if self.heightfield_unproven {
+        cancelled(cancel)?;
+        if self.heightfield_unproven || self.committed_columns.count == 0 {
             return Ok(false);
         }
-        let bottom = motion.curve.start()[2].min(motion.curve.end()[2]) + height;
-        for i in (0..self.committed_columns.count).rev() {
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        let bottom = a[2].min(b[2]) + height;
+        // The move's own path error, at the tolerance the history was
+        // committed with (and this move will be).
+        let error = crate::verification::path_error(motion, self.committed_columns.tolerance_mm);
+        // A box holding the section's sweep: an arc within its circle.
+        let (mut lo, mut hi) = (
+            [a[0].min(b[0]), a[1].min(b[1])],
+            [a[0].max(b[0]), a[1].max(b[1])],
+        );
+        if let Curve::Arc { center, .. } | Curve::Helix { center, .. } = motion.curve {
+            let r = (a[0] - center[0]).hypot(a[1] - center[1]);
+            for k in 0..2 {
+                lo[k] = lo[k].min(center[k] - r);
+                hi[k] = hi[k].max(center[k] + r);
+            }
+        }
+        let pad = radius + 2. * error;
+        if !(pad.is_finite() && lo.iter().chain(&hi).all(|v| v.is_finite())) {
+            return Ok(false);
+        }
+        // Every sweep whose reach meets that box and whose floor is low
+        // enough, newest first.
+        let mut sweeps = vec![];
+        let mut stack: Vec<&ColumnNode> = self
+            .committed_columns
+            .roots
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+        while let Some(node) = stack.pop() {
             cancelled(cancel)?;
             if *work == 0 {
                 return Ok(false);
             }
             *work -= 1;
-            if let Some(ColumnNode::Leaf { column, .. }) =
-                self.committed_columns.leaf(i).map(AsRef::as_ref)
-                && column.sweep.repeats(&motion.curve, radius, bottom)
+            let (bounds, floor) = node.reach();
+            if floor > bottom
+                || (0..2).any(|k| bounds[0][k] > hi[k] + pad || bounds[1][k] < lo[k] - pad)
             {
-                return Ok(true);
+                continue;
+            }
+            match node {
+                ColumnNode::Leaf { column, .. } => sweeps.push(&column.sweep),
+                ColumnNode::Branch { children, .. } => {
+                    stack.push(&children[0]);
+                    stack.push(&children[1]);
+                }
             }
         }
-        Ok(false)
+        crate::engagement::cover::contains(
+            &sweeps,
+            crate::engagement::cover::Section {
+                curve: &motion.curve,
+                radius,
+                bottom,
+                error,
+            },
+            [
+                [self.spec.min_mm[0], self.spec.min_mm[1]],
+                [self.spec.max_mm[0], self.spec.max_mm[1]],
+            ],
+            work,
+            cancel,
+        )
     }
     /// Sweeps committed since `cursor`, and whether the consumer must rebuild
     /// (`true`: the returned sweeps are the whole history, not an extension).
@@ -1212,7 +1295,7 @@ impl Stock {
                                             .max_cell_visits
                                             .saturating_sub(stats.reach_cell_visits);
                                         let before = work;
-                                        let clear = self.repeated_clearance(
+                                        let clear = self.history_clearance(
                                             motion,
                                             radius,
                                             tool.cutter().definition().cutting_length_mm,
@@ -1302,8 +1385,12 @@ impl Stock {
                 })
             }),
         };
-        // Rapids, oriented shifts and probing moves never remove stock.
+        // Rapids, oriented shifts, probing moves and a beam's marking moves
+        // never remove stock.
         if fraction == 0. || !motion.kind.cuts() {
+            if motion.kind == MoveKind::Mark && fraction > 0. {
+                self.mark_on_sheet(tool, motion, fraction, options, cancel)?;
+            }
             return Ok(delta);
         }
         if tool.cutter().definition().shape.undercuts() {
@@ -1418,7 +1505,7 @@ impl Stock {
                                 let mut work =
                                     options.max_cell_visits.saturating_sub(reach_cell_visits);
                                 let before = work;
-                                let clear = self.repeated_clearance(
+                                let clear = self.history_clearance(
                                     motion,
                                     radius,
                                     tool.cutter().definition().cutting_length_mm,
@@ -1838,68 +1925,7 @@ impl Stock {
         cancel: &impl CancelSignal,
     ) -> Result<(), String> {
         let r = tool.cutter().definition().diameter_mm / 2.;
-        let start = motion.curve.start();
-        let distance: Box<dyn Fn([f64; 2]) -> f64> = match motion.curve {
-            Curve::Line { end, .. } => {
-                let b = [
-                    start[0] + fraction * (end[0] - start[0]),
-                    start[1] + fraction * (end[1] - start[1]),
-                ];
-                let a = [start[0], start[1]];
-                {
-                    Box::new(move |p: [f64; 2]| {
-                        let d = [b[0] - a[0], b[1] - a[1]];
-                        let l = d[0] * d[0] + d[1] * d[1];
-                        let t = if l > 0. {
-                            (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / l).clamp(0., 1.)
-                        } else {
-                            0.
-                        };
-                        (p[0] - a[0] - t * d[0]).hypot(p[1] - a[1] - t * d[1])
-                    })
-                }
-            }
-            Curve::Arc {
-                center,
-                sweep_rad,
-                plane: Plane::Xy,
-                ..
-            }
-            | Curve::Helix {
-                center,
-                sweep_rad,
-                plane: Plane::Xy,
-                ..
-            } => {
-                let c = [center[0], center[1]];
-                let radius = (start[0] - c[0]).hypot(start[1] - c[1]);
-                let a0 = (start[1] - c[1]).atan2(start[0] - c[0]);
-                let sweep = sweep_rad * fraction;
-                let end = [
-                    c[0] + radius * (a0 + sweep).cos(),
-                    c[1] + radius * (a0 + sweep).sin(),
-                ];
-                let a = [start[0], start[1]];
-                {
-                    Box::new(move |p: [f64; 2]| {
-                        let angle = (p[1] - c[1]).atan2(p[0] - c[0]) - a0;
-                        let within = if sweep >= 0. {
-                            angle.rem_euclid(std::f64::consts::TAU) <= sweep
-                        } else {
-                            (-angle).rem_euclid(std::f64::consts::TAU) <= -sweep
-                        };
-                        if within || sweep.abs() >= std::f64::consts::TAU {
-                            ((p[0] - c[0]).hypot(p[1] - c[1]) - radius).abs()
-                        } else {
-                            (p[0] - a[0])
-                                .hypot(p[1] - a[1])
-                                .min((p[0] - end[0]).hypot(p[1] - end[1]))
-                        }
-                    })
-                }
-            }
-            _ => return Err("a beam cuts with straight moves and XY arcs only".into()),
-        };
+        let distance = beam_distance(motion, fraction)?;
         let bounds = motion.curve.prepare(options.tolerance_mm)?.bounds();
         let cell_radius = self.step[0].hypot(self.step[1]) / 2.;
         let pad = r + cell_radius;
@@ -1939,6 +1965,66 @@ impl Stock {
         delta.stats.delta_bytes = delta.changes.len() * std::mem::size_of::<CellChange>();
         Ok(())
     }
+    /// A beam's marking move (`MoveKind::Mark`) removes nothing, and the
+    /// sheet under it must still be whole: the beam's width (the tool's
+    /// kerf) stays on the sheet, over cells no beam has cut through or may
+    /// have (a mark is made before the cuts around it, on sheet that has
+    /// not moved; nothing is marked across a kerf or beyond the sheet edge).
+    fn mark_on_sheet(
+        &self,
+        tool: &PreparedAssembly,
+        motion: &Motion,
+        fraction: f64,
+        options: SweepOptions,
+        cancel: &impl CancelSignal,
+    ) -> Result<(), String> {
+        if !matches!(tool.cutter().definition().shape, CutterShape::Beam) {
+            return Err(
+                "a marking move needs a beam tool (camlib.tools.Torch or LaserHead)".into(),
+            );
+        }
+        let refuse = |p: [f64; 2], why: &str| {
+            format!(
+                "marking move {} of operation {} {why} near ({:.3}, {:.3}): a mark is made on whole sheet, before the cuts around it (run the marking operation before the cutting operation, and keep its paths on the sheet)",
+                motion.id, motion.operation, p[0], p[1]
+            )
+        };
+        let r = tool.cutter().definition().diameter_mm / 2.;
+        let distance = beam_distance(motion, fraction)?;
+        let bounds = motion.curve.prepare(options.tolerance_mm)?.bounds();
+        let guard = options.tolerance_mm;
+        for k in 0..2 {
+            if bounds.min[k] - r < self.spec.min_mm[k] - guard
+                || bounds.max[k] + r > self.spec.max_mm[k] + guard
+            {
+                let s = motion.curve.start();
+                return Err(refuse([s[0], s[1]], "leaves the sheet"));
+            }
+        }
+        let cell_radius = self.step[0].hypot(self.step[1]) / 2.;
+        let pad = r + cell_radius;
+        let Some(rect) = self.rect(
+            [bounds.min[0] - pad, bounds.min[1] - pad],
+            [bounds.max[0] + pad, bounds.max[1] + pad],
+        ) else {
+            return Ok(());
+        };
+        if rect.count() > options.max_scratch_cells {
+            return Err("marking move rectangle budget exceeded".into());
+        }
+        let bottom = self.spec.min_mm[2];
+        for j in rect.y0..=rect.y1 {
+            cancelled(cancel)?;
+            for i in rect.x0..=rect.x1 {
+                let index = j * self.nx + i;
+                let p = self.cell_center(index).unwrap();
+                if distance(p) - cell_radius <= r + guard && self.cells[index].lower_mm <= bottom {
+                    return Err(refuse(p, "passes over sheet that is or may be cut through"));
+                }
+            }
+        }
+        Ok(())
+    }
     fn rect(&self, min: [f64; 2], max: [f64; 2]) -> Option<Rect> {
         if (0..2).any(|k| max[k] < self.spec.min_mm[k] || min[k] > self.spec.max_mm[k]) {
             return None;
@@ -1958,6 +2044,73 @@ impl Stock {
     }
 }
 
+/// The XY distance from a point to the first `fraction` of a beam move's
+/// path (a line or an XY arc).
+type PathDistance = Box<dyn Fn([f64; 2]) -> f64>;
+fn beam_distance(motion: &Motion, fraction: f64) -> Result<PathDistance, String> {
+    let start = motion.curve.start();
+    Ok(match motion.curve {
+        Curve::Line { end, .. } => {
+            let b = [
+                start[0] + fraction * (end[0] - start[0]),
+                start[1] + fraction * (end[1] - start[1]),
+            ];
+            let a = [start[0], start[1]];
+            {
+                Box::new(move |p: [f64; 2]| {
+                    let d = [b[0] - a[0], b[1] - a[1]];
+                    let l = d[0] * d[0] + d[1] * d[1];
+                    let t = if l > 0. {
+                        (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / l).clamp(0., 1.)
+                    } else {
+                        0.
+                    };
+                    (p[0] - a[0] - t * d[0]).hypot(p[1] - a[1] - t * d[1])
+                })
+            }
+        }
+        Curve::Arc {
+            center,
+            sweep_rad,
+            plane: Plane::Xy,
+            ..
+        }
+        | Curve::Helix {
+            center,
+            sweep_rad,
+            plane: Plane::Xy,
+            ..
+        } => {
+            let c = [center[0], center[1]];
+            let radius = (start[0] - c[0]).hypot(start[1] - c[1]);
+            let a0 = (start[1] - c[1]).atan2(start[0] - c[0]);
+            let sweep = sweep_rad * fraction;
+            let end = [
+                c[0] + radius * (a0 + sweep).cos(),
+                c[1] + radius * (a0 + sweep).sin(),
+            ];
+            let a = [start[0], start[1]];
+            {
+                Box::new(move |p: [f64; 2]| {
+                    let angle = (p[1] - c[1]).atan2(p[0] - c[0]) - a0;
+                    let within = if sweep >= 0. {
+                        angle.rem_euclid(std::f64::consts::TAU) <= sweep
+                    } else {
+                        (-angle).rem_euclid(std::f64::consts::TAU) <= -sweep
+                    };
+                    if within || sweep.abs() >= std::f64::consts::TAU {
+                        ((p[0] - c[0]).hypot(p[1] - c[1]) - radius).abs()
+                    } else {
+                        (p[0] - a[0])
+                            .hypot(p[1] - a[1])
+                            .min((p[0] - end[0]).hypot(p[1] - end[1]))
+                    }
+                })
+            }
+        }
+        _ => return Err("a beam cuts with straight moves and XY arcs only".into()),
+    })
+}
 fn height_valid(h: HeightBounds, spec: &StockSpec) -> bool {
     h.lower_mm.is_finite()
         && h.upper_mm.is_finite()
@@ -2134,19 +2287,19 @@ mod front_coverage_tests {
             end: [18., 13., 4.],
         };
         let check = |s: &Stock, m: &Motion, r, h| {
-            s.repeated_clearance(m, r, h, &mut 1000, &|| false).unwrap()
+            s.history_clearance(m, r, h, &mut 1000, &|| false).unwrap()
         };
         assert!(check(&stock, &deeper, 2., 2.));
         assert!(!check(&stock, &deeper, 2.001, 2.));
         assert!(!check(&stock, &deeper, 2., 0.));
         assert!(
             !stock
-                .repeated_clearance(&deeper, 2., 2., &mut 0, &|| false)
+                .history_clearance(&deeper, 2., 2., &mut 0, &|| false)
                 .unwrap()
         );
         assert!(
             stock
-                .repeated_clearance(&deeper, 2., 2., &mut 1000, &|| true)
+                .history_clearance(&deeper, 2., 2., &mut 1000, &|| true)
                 .is_err()
         );
         let shifted = Motion {

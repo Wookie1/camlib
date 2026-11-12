@@ -23,8 +23,8 @@ use std::{collections::VecDeque, sync::OnceLock};
 
 mod engagement_front;
 pub(crate) mod parallel;
-pub(crate) use engagement_front::EngagementFrontPlan;
 pub use engagement_front::EngagementFrontReport;
+pub(crate) use engagement_front::{EngagementFrontPlan, FrontMotionOptions};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ShadowReport {
@@ -663,16 +663,6 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// cut. None: rapid descent stops at `feed_z_mm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rapid_descent_clearance_mm: Option<f64>,
-    /// engagement_front only. A rapid between passes travels this far above
-    /// the highest whole-cell stock upper bound that any tool-assembly
-    /// section can meet anywhere in the rectangle spanned by its two ends
-    /// (so the straight route and both axis-first doglegs are clear), when
-    /// that is below `retract_z_mm`; it leaves at the cut straight up to
-    /// that height. Only stock is considered: the planner does not see
-    /// fixtures, which the run's verification still checks on every move.
-    /// None: rapids travel at `retract_z_mm`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub travel_clearance_mm: Option<f64>,
     /// engagement_front only. Each helical entry starts this far above the
     /// material its bore meets (proven by the committed sweeps or the stock
     /// cell bounds, and never above `feed_z_mm`), so the cutter is already
@@ -742,7 +732,6 @@ impl<G> RoughingOperation<G> {
             clearing_tolerance_mm: self.clearing_tolerance_mm,
             contour_tolerance_mm: self.contour_tolerance_mm,
             rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
-            travel_clearance_mm: self.travel_clearance_mm,
             ramp_clearance_mm: self.ramp_clearance_mm,
             link_feed_mm_min: self.link_feed_mm_min,
             link_chip_thinning: self.link_chip_thinning,
@@ -946,11 +935,6 @@ pub struct RoughingPlan {
     /// The per-move reach check for the sections above the flutes, when the
     /// stock stands higher above the floor than the cutting length.
     move_depth: Option<crate::reach::MoveDepth>,
-    /// Committed cleared sweeps, for `swept_clear`.
-    clearance: Option<(
-        crate::engagement::EngagementScene,
-        crate::stock::ClearanceCursor,
-    )>,
     no_op_stock_identity: Option<u64>,
     part_depth_limit: Option<f64>,
     depth_policy_checked: bool,
@@ -1209,14 +1193,28 @@ impl RoughingPlan {
         let options = ConstructionOptions {
             tolerance_mm: op.tolerance_mm,
         };
-        // Roughing layers enter beside the stock or on a fitted helix: offset
-        // and scheduled raster clearing link their passes through those
-        // fitted entry routes, and engagement_front proves its engagement
-        // from them. A ramp along the path is not modelled for layers.
-        op.entry.refuse_ramp(
-            &format!("roughing {}", op.id),
-            "roughing layers enter beside the stock or on a fitted helix, which their pass linking and engagement proofs rely on",
-        )?;
+        // A ramp entry belongs to adaptive clearing's engagement front,
+        // which enters from air or cleared stock wherever it can and ramps
+        // only into enclosed material, from the material top the stock
+        // proves (#219). Offset and raster layers are pockets open to the
+        // stock's edge whose entries are fitted places (beside the stock, or
+        // a helix) that the order and the links of their passes are built
+        // on; a ramp along each pass has no such place, and would ramp
+        // through the air beside the stock and the air the layers above cut
+        // (a layer's pocket starts at the stock top while the flutes span
+        // it). They refuse it.
+        if !matches!(
+            op.clearing,
+            RoughingClearing::Adaptive {
+                path_strategy: AdaptivePathStrategy::EngagementFront,
+                ..
+            }
+        ) {
+            op.entry.refuse_ramp(
+                &format!("roughing {}", op.id),
+                "offset and raster layers (and the disk_front and stock_front strategies) enter beside the stock or on a fitted helix, which the order and links of their passes are built on; AdaptiveClearing (path_strategy engagement_front) ramps into enclosed material",
+            )?;
+        }
         let expanded = stock_region.prepare(options)?;
         // A no-op still validates the selected tool/setup/entry/strategy. Use
         // the same scalar policies as actual layers, without inventing a layer.
@@ -1253,30 +1251,24 @@ impl RoughingPlan {
             feed_z_mm: op.feed_z_mm,
         };
         template.validate_authoring(tool, prepared_tool.cutter().definition(), initial, r)?;
-        for (name, value) in [
-            ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
-            ("travel_clearance_mm", op.travel_clearance_mm),
-            ("ramp_clearance_mm", op.ramp_clearance_mm),
-            ("link_feed_mm_min", op.link_feed_mm_min),
-        ] {
-            let Some(d) = value else { continue };
-            if !matches!(
+        let front = FrontMotionOptions {
+            rapid_descent_clearance_mm: op.rapid_descent_clearance_mm,
+            travel_clearance_mm: op.travel_clearance_mm,
+            ramp_clearance_mm: op.ramp_clearance_mm,
+            link_feed_mm_min: op.link_feed_mm_min,
+            link_chip_thinning: op.link_chip_thinning,
+        };
+        front.validate(
+            "roughing",
+            (!matches!(
                 op.clearing,
                 RoughingClearing::Adaptive {
                     path_strategy: AdaptivePathStrategy::EngagementFront,
                     ..
                 }
-            ) {
-                return Err(format!("{name} applies to engagement_front clearing only"));
-            }
-            let max = if name == "link_feed_mm_min" { 1e6 } else { 1e3 };
-            if !d.is_finite() || d <= 0. || d > max {
-                return Err(format!("roughing {name} {d} must be positive and finite"));
-            }
-        }
-        if op.link_chip_thinning && op.link_feed_mm_min.is_none() {
-            return Err("link_chip_thinning needs link_feed_mm_min: the thinned link feed is capped at the declared link feed".into());
-        }
+            ))
+            .then_some(""),
+        )?;
         match op.clearing {
             RoughingClearing::Offset {
                 coverage_margin_mm, ..
@@ -1335,6 +1327,10 @@ impl RoughingPlan {
                     boundary_tolerance_mm,
                     max_engagement_deg: engagement.unwrap(),
                     clockwise: op.clockwise,
+                    rapid_descent_clearance_mm: None,
+                    ramp_clearance_mm: None,
+                    link_feed_mm_min: None,
+                    link_chip_thinning: false,
                 }
                 .validate_parameters(r)?;
             }
@@ -1522,10 +1518,7 @@ impl RoughingPlan {
                                 cutting_sense.unwrap_or(CuttingSense::Climb) == CuttingSense::Climb,
                                 &cancel,
                             )?
-                            .with_rapid_descent(op.rapid_descent_clearance_mm)
-                            .with_travel_clearance(op.travel_clearance_mm)
-                            .with_ramp_clearance(op.ramp_clearance_mm)
-                            .with_link_feed(op.link_feed_mm_min, op.link_chip_thinning),
+                            .with_motion_options(front),
                         )),
                         RoughingClearing::Adaptive {
                             path_strategy,
@@ -1546,6 +1539,10 @@ impl RoughingPlan {
                                 boundary_tolerance_mm,
                                 max_engagement_deg: engagement.unwrap(),
                                 clockwise: op.clockwise,
+                                rapid_descent_clearance_mm: None,
+                                ramp_clearance_mm: None,
+                                link_feed_mm_min: None,
+                                link_chip_thinning: false,
                             },
                             tool,
                             &layer_spec,
@@ -1683,7 +1680,6 @@ impl RoughingPlan {
             } else {
                 vec![]
             },
-            clearance: None,
             move_depth: (material_spec.max_mm[2] - floor > tool.cutter.cutting_length_mm)
                 .then(|| crate::reach::MoveDepth::new(&op.id, tool, op.tolerance_mm))
                 .transpose()?,
@@ -1716,6 +1712,19 @@ impl RoughingPlan {
             progress.apply(&mut report.layers[report.active_layer].clearing);
             report
         })
+    }
+    /// Planning progress (#198): depth levels done of those planned, and for
+    /// engagement-front clearing the active level's reachable material area.
+    pub fn progress(&self) -> crate::progress::Planned {
+        let (done, total) = (self.report.completed_layers, self.report.layers.len());
+        match self.plans.front() {
+            Some(LayerPlan::Engagement(front)) => crate::progress::Planned::Area {
+                layers_done: done,
+                layers: total,
+                area_mm2: front.area_mm2(),
+            },
+            _ => crate::progress::Planned::Layers { done, total },
+        }
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         self.prefix.clone()
@@ -1811,19 +1820,12 @@ impl RoughingPlan {
                     // stands as high as this section.
                     let floor = bounds.min[2] + height - self.height_guard_mm;
                     if stock.bounds_clear(rect, floor, &mut clearance_work, cancel)?
-                        // One earlier sweep the move repeats exactly.
-                        || stock.repeated_clearance(&m, radius, height, &mut clearance_work, cancel)?
-                        // The union of every committed sweep, along the
-                        // move's own path (#160).
-                        || Self::swept_clear(
-                            &mut self.clearance,
-                            self.height_guard_mm,
-                            stock,
-                            &m,
-                            radius,
-                            floor,
-                            cancel,
-                        )?
+                        // The sweeps already committed hold the section's
+                        // whole sweep along the move's own path (#160): one
+                        // it repeats, or the union of those it runs between
+                        // (#200). The stock sweep's cutting-length check and
+                        // stock-contact verification ask the same question.
+                        || stock.history_clearance(&m, radius, height, &mut clearance_work, cancel)?
                     {
                         continue;
                     }
@@ -1874,67 +1876,6 @@ impl RoughingPlan {
                 next.give_memory(memory);
             }
             self.activated = false;
-        }
-    }
-    /// Whether the committed sweeps prove everything within `radius` of the
-    /// move's path empty from `floor` up (`EngagementScene::clear_path`).
-    /// Work exhaustion or any uncertainty proves nothing.
-    fn swept_clear(
-        clearance: &mut Option<(
-            crate::engagement::EngagementScene,
-            crate::stock::ClearanceCursor,
-        )>,
-        guard: f64,
-        stock: &Stock,
-        motion: &Motion,
-        radius: f64,
-        floor: f64,
-        cancel: &impl CancelSignal,
-    ) -> Result<bool, String> {
-        if floor > stock.spec().max_mm[2] {
-            return Ok(true);
-        }
-        let tolerance = guard / 16.;
-        let (mut scene, mut cursor) = match clearance.take() {
-            Some(held) if held.0.stock_spec() == stock.spec() => held,
-            _ => (
-                crate::engagement::EngagementScene::new_with_cancel(
-                    stock.spec().clone(),
-                    vec![],
-                    cancel,
-                )?,
-                crate::stock::ClearanceCursor::default(),
-            ),
-        };
-        let (rebuild, sweeps) = stock.committed_clearance_since(&mut cursor, tolerance, cancel)?;
-        if rebuild {
-            scene = crate::engagement::EngagementScene::new_with_cancel(
-                stock.spec().clone(),
-                sweeps,
-                cancel,
-            )?;
-        } else {
-            for sweep in sweeps {
-                scene.append(sweep)?;
-            }
-        }
-        // Enough for a section with any real margin; one with none is
-        // left to the checks that follow.
-        let mut work = 50_000;
-        let proven = scene.clear_path(
-            motion,
-            radius,
-            floor,
-            2. * guard,
-            tolerance,
-            &mut work,
-            cancel,
-        );
-        *clearance = Some((scene, cursor));
-        match proven {
-            Ok(clear) => Ok(clear),
-            Err(_) if !cancel.is_cancelled() => Ok(false),
-            Err(error) => Err(error),
         }
     }
     pub fn finish_report(&mut self, cancel: &impl CancelSignal) -> Result<(), String> {

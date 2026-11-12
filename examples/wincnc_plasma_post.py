@@ -145,6 +145,8 @@ class WinCNCPlasmaPost(GCodePost):
         # block, right after this header and before any motion.
         self.emit('G40')
         self.emit('G49')
+        # WinCNC arcs are XY only and it has no plane words: XY is the plane.
+        self._plane = 'xy'
         self._spindle_on = False
         self._coolant_mode = 'off'
 
@@ -163,6 +165,12 @@ class WinCNCPlasmaPost(GCodePost):
         m = self.machine
         self.emit(m.torch_off_code if event.power_percent == 0 else m.torch_on_code)
         self._spindle_on = event.power_percent != 0
+
+    def on_beam_mark(self, event):
+        raise ValueError(
+            'WinCNC plasma: this post declares no marking method (M61 fires the torch with the '
+            'cutting material setup); a ThermalMark cannot be posted for it'
+        )
 
     def on_height_control(self, event):
         raise ValueError(
@@ -184,10 +192,8 @@ class WinCNCPlasmaPost(GCodePost):
             )
         super().on_motion(motion)
         z = self.machine.dialect.axes[2]
-        # No plane words (WinCNC arcs are XY) and no Z words.
-        self._lines = [
-            ' '.join(w for w in line.split(' ') if not w.startswith(z)) for line in self._lines if line != 'G17'
-        ]
+        # No Z words.
+        self._lines = [' '.join(w for w in line.split(' ') if not w.startswith(z)) for line in self._lines]
 
     def on_finish(self):
         # As WinCNC's posts: the end macro alone (no length offset was ever

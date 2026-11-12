@@ -52,12 +52,43 @@ pub struct AdaptivePocketOperation {
     pub max_engagement_deg: f64,
     pub boundary_tolerance_mm: f64,
     pub clockwise: bool,
+    /// engagement_front only: see `RoughingOperation::rapid_descent_clearance_mm`.
+    /// The proof is per depth level: a descent into a level below one
+    /// already cut is rapid down to this far above what the committed sweeps
+    /// prove clear for the whole tool. None: rapid descent stops at `feed_z_mm`.
+    pub rapid_descent_clearance_mm: Option<f64>,
+    /// engagement_front only: see `RoughingOperation::ramp_clearance_mm`.
+    pub ramp_clearance_mm: Option<f64>,
+    /// engagement_front only: see `RoughingOperation::link_feed_mm_min`.
+    /// None: every stay-down link feeds at `feed_mm_min`.
+    pub link_feed_mm_min: Option<f64>,
+    /// engagement_front only, with `link_feed_mm_min`: see
+    /// `RoughingOperation::link_chip_thinning`.
+    pub link_chip_thinning: bool,
 }
 // Keep the public operation wire flat, like Pocket. Explicitly consume strategy
 // fields before Pocket's strict unknown-field validator; serde flatten combined
 // with deny_unknown_fields would weaken or break that validation.
 impl AdaptivePocketOperation {
+    pub(crate) fn front_motion_options(&self) -> crate::roughing::FrontMotionOptions {
+        crate::roughing::FrontMotionOptions {
+            rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
+            // Roughing only for now: a pocket's rapids stay at the retract
+            // height.
+            travel_clearance_mm: None,
+            ramp_clearance_mm: self.ramp_clearance_mm,
+            link_feed_mm_min: self.link_feed_mm_min,
+            link_chip_thinning: self.link_chip_thinning,
+        }
+    }
+    /// The orbit planners' parameters (disk_front, stock_front).
     pub(crate) fn validate_parameters(&self, r: f64) -> Result<(f64, f64, f64), String> {
+        if self.path_strategy != AdaptivePathStrategy::EngagementFront {
+            self.front_motion_options().validate(
+                "adaptive pocket",
+                Some("; leave it unset or use path_strategy engagement_front (disk_front and stock_front relink by lifted re-entries)"),
+            )?;
+        }
         if self.pocket.max_stay_down_mm.is_some() {
             return Err("max_stay_down_mm applies to pocket and rest pocket links; adaptive clearing relinks through its own proven-clear re-entries".into());
         }
@@ -149,6 +180,19 @@ impl TryFrom<serde_json::Value> for AdaptivePocketOperation {
         let clockwise =
             serde_json::from_value(fields.remove("clockwise").ok_or("missing clockwise")?)
                 .map_err(|e| e.to_string())?;
+        let mut optional = |name: &str| -> Result<Option<f64>, String> {
+            serde_json::from_value(fields.remove(name).unwrap_or(serde_json::Value::Null))
+                .map_err(|e| format!("{name}: {e}"))
+        };
+        let rapid_descent_clearance_mm = optional("rapid_descent_clearance_mm")?;
+        let ramp_clearance_mm = optional("ramp_clearance_mm")?;
+        let link_feed_mm_min = optional("link_feed_mm_min")?;
+        let link_chip_thinning = serde_json::from_value(
+            fields
+                .remove("link_chip_thinning")
+                .unwrap_or(serde_json::Value::Bool(false)),
+        )
+        .map_err(|e| format!("link_chip_thinning: {e}"))?;
         let pocket =
             serde_json::from_value(serde_json::Value::Object(fields)).map_err(|e| e.to_string())?;
         Ok(Self {
@@ -161,6 +205,10 @@ impl TryFrom<serde_json::Value> for AdaptivePocketOperation {
             max_engagement_deg,
             boundary_tolerance_mm,
             clockwise,
+            rapid_descent_clearance_mm,
+            ramp_clearance_mm,
+            link_feed_mm_min,
+            link_chip_thinning,
         })
     }
 }
@@ -192,6 +240,19 @@ impl From<AdaptivePocketOperation> for serde_json::Value {
             op.boundary_tolerance_mm.into(),
         );
         fields.insert("clockwise".into(), op.clockwise.into());
+        // Absent when unset: an operation without them serializes as before.
+        for (name, value) in [
+            ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
+            ("ramp_clearance_mm", op.ramp_clearance_mm),
+            ("link_feed_mm_min", op.link_feed_mm_min),
+        ] {
+            if let Some(v) = value {
+                fields.insert(name.into(), v.into());
+            }
+        }
+        if op.link_chip_thinning {
+            fields.insert("link_chip_thinning".into(), true.into());
+        }
         value
     }
 }
@@ -498,12 +559,12 @@ impl AdaptivePlan {
             return Err("an engagement_front adaptive pocket is planned by PocketFrontPlan (OperationPlan::prepare)".into());
         }
         if let Some(entry) = &op.pocket.entry {
-            // An adaptive pass is planned for a bounded engagement from a
-            // fitted seed circle; a ramp along the first pass is a full-width
-            // slot, which that model has no proof for.
+            // disk_front and stock_front plan every pass from a fitted seed
+            // circle, which a helix opens; a ramp has no seed circle. The
+            // engagement front ramps into enclosed material (#219).
             entry.refuse_ramp(
                 &format!("adaptive pocket {}", op.pocket.id),
-                "adaptive clearing starts from a fitted helix (or the stock edge) so that every pass keeps its bounded engagement",
+                "the disk_front and stock_front strategies start every pass from a fitted seed circle that a helix opens; path_strategy engagement_front ramps into enclosed material",
             )?;
         }
         let prepared = tool.prepare()?;
@@ -714,6 +775,13 @@ impl AdaptivePlan {
     }
     pub fn report(&self) -> &AdaptiveReport {
         &self.report
+    }
+    /// Planning progress (#198): depth passes done of those planned.
+    pub fn progress(&self) -> crate::progress::Planned {
+        crate::progress::Planned::Layers {
+            done: self.pass,
+            total: self.report.depth_passes,
+        }
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         self.guides.prefix_events()

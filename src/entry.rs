@@ -73,6 +73,14 @@ pub(crate) enum EntryPolicy {
 /// profile. This parameter allows the tool load to be constrained when
 /// doing full-width cuts during ramping".
 ///
+/// Where it is used (#219): `Pocket` and `Contour` as above; a rest pocket
+/// along each run of leftover pieces, from the material top the committed
+/// stock proves (`PocketPlan::rest_ramp_moves`); adaptive clearing's
+/// engagement front into enclosed material, in place of the helix
+/// (`EngagementFrontPlan::ramp_pass`). Roughing's offset and raster layers
+/// and the orbit strategies refuse it (`refuse_ramp`). It does not lift the
+/// need for a center-cutting cutter (`PocketOperation::validate_authoring`).
+///
 /// The angle is a fact about the tool and material, so it has no default.
 /// Neither has `min_length_mm`, the shortest span the tool may reverse a
 /// ramp on: FreeCAD has no such limit (it zigzags on any edge), and camlib
@@ -923,6 +931,16 @@ pub(crate) fn entry_line(
             feed,
         ));
     }
+}
+
+/// How close to its level a proven entry start counts as reaching it: 0.01
+/// mm, or 64 tolerances where that is more. The searches for a start
+/// (`cleared_entry_start`, `cleared_path_start`) stop within it, and every
+/// caller that asks "is this start at the level" compares with it, so the two
+/// cannot drift apart (#237: a search that stopped coarser than its callers
+/// accepted refused every entry on a deep layer).
+pub(crate) fn skin(tolerance_mm: f64) -> f64 {
+    0.01_f64.max(64. * tolerance_mm)
 }
 
 #[cfg(test)]

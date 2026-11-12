@@ -21,6 +21,9 @@ use crate::{
 use serde::Serialize;
 use std::collections::VecDeque;
 
+fn none(n: &usize) -> bool {
+    *n == 0
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct PocketFrontReport {
     pub strategy: &'static str,
@@ -39,6 +42,12 @@ pub struct PocketFrontReport {
     pub motions: usize,
     pub stock_edge_entries: usize,
     pub helical_entries: usize,
+    /// Ramp entries made (`RampEntry`) and the steepest ramp leg in degrees
+    /// (never above the entry's angle); each level's report has the rest.
+    #[serde(skip_serializing_if = "none")]
+    pub ramp_entries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ramp_angle_deg: Option<f64>,
     pub geometric_residual_status: ResidualStatus,
     pub diagnostics: Vec<String>,
 }
@@ -80,6 +89,9 @@ impl PocketFrontPlan {
         if pocket.max_stay_down_mm.is_some() || pocket.rest_tolerance_mm.is_some() {
             return Err("engagement_front links through its own proven-clear moves and plans from the committed stock; leave max_stay_down_mm and rest_tolerance_mm unset".into());
         }
+        // Entry and link options, by Roughing's rules (one validator).
+        let motion = op.front_motion_options();
+        motion.validate(&format!("adaptive pocket {}", pocket.id), None)?;
         let r = tool.prepare()?.cutter().definition().diameter_mm / 2.;
         // The radial width is the operation's stepover: how far each pass
         // steps into the material.
@@ -115,15 +127,9 @@ impl PocketFrontPlan {
         // committed cuts prove gone, which is what the planner does.
         // With no entry given, the helix is HelicalEntry's own default: an
         // adaptive pocket has no plunge into uncut material.
-        if let Some(entry) = &pocket.entry {
-            // The planner proves the engagement of every stroke from an entry
-            // made in air, in cleared stock or on a helix; a ramp along the
-            // first pass is a full-width slot, outside that proof.
-            entry.refuse_ramp(
-                &format!("adaptive pocket {}", pocket.id),
-                "adaptive clearing enters from cleared stock or on a helix so that every pass keeps its proven engagement",
-            )?;
-        }
+        // A `RampEntry` replaces the helix: where there is material the
+        // cutter ramps down along a straight path (#219,
+        // `EngagementFrontPlan::ramp_pass`).
         let entry = Some(match pocket.entry.clone() {
             Some(PocketEntry::Helix(h)) => PocketEntry::StockEdgeOrHelix(h),
             Some(other) => other,
@@ -182,7 +188,12 @@ impl PocketFrontPlan {
             )
             .map_err(|e| format!("adaptive pocket level {level} at Z{z}: {e}"))?
             // A pocket's walls are finished surfaces.
-            .with_wall_pass(true);
+            .with_wall_pass(true)
+            // Each level proves its own rapid descents and fast links from
+            // the stock committed when it plans them, as a roughing layer
+            // does: the level's operation is built the same way (its top the
+            // stock top, or just above the level before it).
+            .with_motion_options(motion);
             layers.push(PocketFrontLayer {
                 tip_z_mm: z,
                 clearing: serde_json::to_value(plan.report()).unwrap(),
@@ -213,6 +224,8 @@ impl PocketFrontPlan {
                 motions: 0,
                 stock_edge_entries: 0,
                 helical_entries: 0,
+                ramp_entries: 0,
+                max_ramp_angle_deg: None,
                 geometric_residual_status: ResidualStatus::Pending,
                 diagnostics: vec![
                     "Each depth level follows the boundary between cut and uncut stock inside the pocket region; every cutting stroke is proven within max_engagement_deg = acos(1 - stepover/r) against the committed cleared sweeps".into(),
@@ -232,6 +245,15 @@ impl PocketFrontPlan {
     }
     pub fn report(&self) -> &PocketFrontReport {
         &self.report
+    }
+    /// Planning progress (#198): depth levels done of those planned and the
+    /// active level's reachable material area.
+    pub fn progress(&self) -> crate::progress::Planned {
+        crate::progress::Planned::Area {
+            layers_done: self.report.completed_layers,
+            layers: self.report.layers.len(),
+            area_mm2: self.plans.front().and_then(|front| front.area_mm2()),
+        }
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         self.prefix.clone()
@@ -267,6 +289,7 @@ impl PocketFrontPlan {
             let before = (
                 plan.report().stock_edge_entries,
                 plan.report().helical_entries,
+                plan.report().ramp_entries,
             );
             if let Some(m) = plan.next_motion_with_stock(stock, cancel).map_err(|e| {
                 format!(
@@ -276,6 +299,15 @@ impl PocketFrontPlan {
             })? {
                 self.report.stock_edge_entries += plan.report().stock_edge_entries - before.0;
                 self.report.helical_entries += plan.report().helical_entries - before.1;
+                self.report.ramp_entries += plan.report().ramp_entries - before.2;
+                if plan.report().ramp_entries > 0 {
+                    let angle = plan.report().max_ramp_angle_deg;
+                    self.report.max_ramp_angle_deg = Some(
+                        self.report
+                            .max_ramp_angle_deg
+                            .map_or(angle, |a| a.max(angle)),
+                    );
+                }
                 self.position = m.curve.end();
                 self.next_id = m.id + 1;
                 self.generation = Some(stock.generation() + 1);
