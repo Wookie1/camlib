@@ -3066,7 +3066,7 @@ fn read_trailing_sections(
         for w in &mut words {
             *w = body.f64().map_err(|_| bad())?;
         }
-        columns.push((tolerance, ClearedSweep::decode(tag, words)?));
+        columns.push((tolerance, ClearedSweep::decode(tag, words, tolerance)?));
     }
     let state = crate::stock::ClearanceState {
         unproven,

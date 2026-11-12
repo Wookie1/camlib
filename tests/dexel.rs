@@ -301,11 +301,17 @@ fn height_view_matches_the_height_field() {
                     "{name}: cell {i} bounds do not overlap: {a:?} {b:?}"
                 );
                 if exact {
-                    // Same lower bounds; the height field's upper bound may be
-                    // tighter where it proves a partly covered cell cleared by
-                    // splitting it (`Stock::union_covered`), never looser.
+                    // Lower bounds are always identical. Upper bounds are too,
+                    // except in a cell the union rule lowered (it proves a
+                    // partly covered cell cleared by splitting it,
+                    // `Stock::union_covered`): there the height field's upper
+                    // bound is tighter than the dexel's, but never below the
+                    // true top, which the dexel's lower bound cannot exceed.
                     assert_eq!(a.lower_mm, b.lower_mm, "{name}: cell {i}");
-                    assert!(b.upper_mm <= a.upper_mm, "{name}: cell {i}: {a:?} {b:?}");
+                    if b.upper_mm != a.upper_mm {
+                        assert!(b.upper_mm < a.upper_mm, "{name}: cell {i}: {a:?} {b:?}");
+                        assert!(b.upper_mm >= a.lower_mm, "{name}: cell {i}: {a:?} {b:?}");
+                    }
                 }
             }
             let (h, d) = (height.volume(), dexel.volume());
