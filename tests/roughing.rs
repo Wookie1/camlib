@@ -4474,7 +4474,7 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
 /// route and both axis-first doglegs clear the stock and the bar. Returns
 /// (rapid and retract length mm, report).
 fn run_bar_travel(clearance: Option<f64>) -> (f64, serde_json::Value) {
-    let mut input = spiral_bar_input(true, 12., true);
+    let mut input = bar_input(12., true);
     input["initial_position_mm"] = serde_json::json!([0.0, 0.0, 30.0]);
     let op = &mut input["operations"][0];
     op["clearance_z_mm"] = 30.0.into();
