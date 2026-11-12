@@ -225,26 +225,68 @@ impl ClearedSweep {
         };
         (tag, w)
     }
-    pub(crate) fn decode(tag: u8, w: [f64; SWEEP_WORDS]) -> Result<Self, String> {
+    /// Rebuild a sweep from `encode`'s words, refusing any that no real
+    /// motion could have produced: `tolerance_mm` is the tolerance the column
+    /// was committed with (the same endpoint check `Curve::prepare` makes).
+    pub(crate) fn decode(
+        tag: u8,
+        w: [f64; SWEEP_WORDS],
+        tolerance_mm: f64,
+    ) -> Result<Self, String> {
         let bad = || "invalid checkpoint cleared sweep".to_string();
         if w.iter().any(|v| !v.is_finite()) || !radius_ok(w[1]) || w[2] < 0. {
             return Err(bad());
         }
+        let bounds = [[w[3], w[4]], [w[5], w[6]]];
+        let inside = |p: [f64; 2]| (0..2).all(|i| bounds[0][i] <= p[i] && p[i] <= bounds[1][i]);
+        let near = |p: [f64; 2], q: [f64; 2]| distance(p, q) <= tolerance_mm;
         let shape = match tag {
-            0 => Shape::Line {
-                a: [w[7], w[8]],
-                b: [w[9], w[10]],
-                unit: [w[11], w[12]],
-                length: w[13],
-            },
-            1 => Shape::Arc {
-                a: [w[7], w[8]],
-                b: [w[9], w[10]],
-                c: [w[11], w[12]],
-                radius: w[13],
-                angle: w[14],
-                sweep: w[15],
-            },
+            0 => {
+                let (a, b, unit, length) = ([w[7], w[8]], [w[9], w[10]], [w[11], w[12]], w[13]);
+                // A line has XY length, its unit direction runs from a to b,
+                // and its footprint box holds both ends.
+                let d = [b[0] - a[0], b[1] - a[1]];
+                if length <= 0.
+                    || (d[0].hypot(d[1]) - length).abs() > 1e-9 * (1. + length)
+                    || (unit[0] * length - d[0]).hypot(unit[1] * length - d[1])
+                        > 1e-9 * (1. + length)
+                    || !inside(a)
+                    || !inside(b)
+                {
+                    return Err(bad());
+                }
+                Shape::Line { a, b, unit, length }
+            }
+            1 => {
+                let (a, b, c) = ([w[7], w[8]], [w[9], w[10]], [w[11], w[12]]);
+                let (radius, angle, sweep) = (w[13], w[14], w[15]);
+                // An arc has a radius, a start on its circle at `angle`, a
+                // nonzero sweep, and an end where the sweep leads (within the
+                // tolerance the motion was accepted with).
+                let end = [
+                    c[0] + radius * (angle + sweep).cos(),
+                    c[1] + radius * (angle + sweep).sin(),
+                ];
+                if radius < 1e-6
+                    || sweep == 0.
+                    || (distance(a, c) - radius).abs() > 1e-9 * (1. + radius)
+                    || (angle.cos() * radius - (a[0] - c[0])).abs() > 1e-9 * (1. + radius)
+                    || (angle.sin() * radius - (a[1] - c[1])).abs() > 1e-9 * (1. + radius)
+                    || !near(end, b)
+                    || !inside(a)
+                    || !inside(b)
+                {
+                    return Err(bad());
+                }
+                Shape::Arc {
+                    a,
+                    b,
+                    c,
+                    radius,
+                    angle,
+                    sweep,
+                }
+            }
             _ => return Err(bad()),
         };
         // A restored sweep is a premise of later clearance proofs and of the

@@ -68,7 +68,7 @@ CRC-32), then the payload. Kinds (`src/stream.rs`):
 | Kind | Name | Holds |
 |---|---|---|
 | 1 | Chunk | One milling or thermal move and its height-field cell changes |
-| 2 | Checkpoint | The full committed stock and cursor, with the tool in the spindle at that position (#168: a tool change in place is measured from exactly it; a checkpoint written before it was recorded still restores, and such a change is then refused); a producer's also ends with its material checks' per-move proof states (`CAMPRF01` section, #108) and the stock's committed cleared columns (`CAMCOL01` section) |
+| 2 | Checkpoint | The full committed stock and cursor, with the tool in the spindle at that position (#168: a tool change in place is measured from exactly it; a checkpoint written before it was recorded still restores, and such a change is then refused); a producer's also ends with its material checks' per-move proof states (`CAMPRF01` section, #108) and the stock's committed cleared columns (`CAMCOL01` section; decoded sweeps are validated, and a section bound to other cells is dropped). A checkpoint without that section (a consumer's, or one written before it existed) still restores, but the resumed stock cannot use the union rule for passes before the checkpoint: those cells keep their looser upper bound until another pass clears them. Lower bounds are unchanged and no cell is ever lower than the uninterrupted run's, so the difference is only on the safe side |
 | 3 | Manifest | The canonical manifest (its SHA-256 binds every later frame) |
 | 4 | End | The run finished; final cursor and position |
 | 5 | Preview | A partial move's stock (not committed) |

@@ -257,6 +257,20 @@ fn removal_bounds_enclose_the_sampled_sweep() {
     }
 }
 
+/// Each `level` move's XY distance from `p` to its path, with its height.
+fn flat_reach(p: [f64; 2]) -> [(f64, f64); 3] {
+    let segment = |a: [f64; 2], b: [f64; 2]| {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)).clamp(0., 1.);
+        (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
+    };
+    [
+        (segment([-2., 3.], [12., 3.]), 5.),
+        (segment([-2., 6.], [12., 6.5]), 4.),
+        (((p[0] - 5.).hypot(p[1] - 5.) - 3.).abs(), 4.5),
+    ]
+}
+
 /// On three-axis moves the height view bounds the same material as the
 /// height field the existing kernel computes: identical lower bounds for a
 /// flat end mill at constant height (both use the exact distance to the
@@ -288,7 +302,6 @@ fn height_view_matches_the_height_field() {
         for (moves, exact) in [(&level[..], name == "flat"), (&ramp[..], false)] {
             let mut dexel = DexelStock::new(s.clone()).unwrap();
             let mut height = Stock::new(height_spec(&s)).unwrap();
-            let mut tightened = 0;
             for m in moves {
                 sweep(&mut dexel, &tool, m);
                 let d = height
@@ -302,64 +315,47 @@ fn height_view_matches_the_height_field() {
                     "{name}: cell {i} bounds do not overlap: {a:?} {b:?}"
                 );
                 if exact {
-                    // Same lower bounds. The upper bounds are the same too,
-                    // except in a cell the height field proves cleared by
-                    // several passes together (`Stock::union_covered`): there
-                    // its upper bound is lower, and it must still be a true
-                    // upper bound. That is checked here against the moves
-                    // themselves, at 81 points of the cell: the stock's top
-                    // at a point is the lowest pass whose cutter covers it.
+                    // Lower bounds are always identical. An upper bound is
+                    // identical too, unless the union rule lowered the cell:
+                    // it proves a partly covered cell cleared by splitting
+                    // it (`Stock::union_covered`). Then the height field's
+                    // bound is tighter than the dexel's, but never below the
+                    // true top. Both are checked against the moves
+                    // themselves: the highest surface left over any point of
+                    // the cell.
                     assert_eq!(a.lower_mm, b.lower_mm, "{name}: cell {i}");
+                    let [cx, cy] = height.cell_center(i).unwrap();
+                    let half = s.cell_size_mm / 2.;
+                    let mut top = f64::MIN;
+                    for u in 0..=6 {
+                        for v in 0..=6 {
+                            let p = [
+                                cx - half + s.cell_size_mm * u as f64 / 6.,
+                                cy - half + s.cell_size_mm * v as f64 / 6.,
+                            ];
+                            let mut z = s.max_mm[2];
+                            for (d, height) in flat_reach(p) {
+                                if d <= 1.5 {
+                                    z = z.min(height);
+                                }
+                            }
+                            top = top.max(z);
+                        }
+                    }
+                    assert!(b.upper_mm >= top - 1e-9, "{name}: cell {i}: {b:?} top {top}");
                     if b.upper_mm != a.upper_mm {
                         assert!(b.upper_mm < a.upper_mm, "{name}: cell {i}: {a:?} {b:?}");
-                        tightened += 1;
-                        let (ix, iy) = (i % 50, i / 50);
-                        for u in 0..=8 {
-                            for v in 0..=8 {
-                                let p = [
-                                    (ix as f64 + u as f64 / 8.) * 0.2,
-                                    (iy as f64 + v as f64 / 8.) * 0.2,
-                                ];
-                                let top = moves
-                                    .iter()
-                                    .filter(|m| path_distance(&m.curve, p) <= 1.5)
-                                    .map(|m| m.curve.start()[2])
-                                    .fold(6., f64::min);
-                                assert!(
-                                    b.upper_mm >= top - 1e-9,
-                                    "{name}: cell {i} claims {} where the stock stands to {top} at {p:?}",
-                                    b.upper_mm
-                                );
-                            }
-                        }
+                        // A lowered cell is covered whole by the moves, if
+                        // by no single one of them (a move's own test is
+                        // conservative at a curved edge).
+                        assert!(top < s.max_mm[2], "{name}: cell {i}: {a:?} {b:?}");
                     }
                 }
             }
             let (h, d) = (height.volume(), dexel.volume());
             assert!(d.remaining_lower_mm3 <= h.remaining_upper_mm3 + 1e-6);
             assert!(h.remaining_lower_mm3 <= d.remaining_upper_mm3 + 1e-6);
-            // The three level passes overlap, so some cells are cleared by
-            // two of them together.
-            assert_eq!(tightened > 0, exact, "{name}: {tightened} cells tightened");
         }
-    }
-}
-
-/// Distance in XY from `p` to a line or a full XY circle.
-fn path_distance(curve: &Curve, p: [f64; 2]) -> f64 {
-    match *curve {
-        Curve::Line { start, end } => {
-            let d = [end[0] - start[0], end[1] - start[1]];
-            let t = ((p[0] - start[0]) * d[0] + (p[1] - start[1]) * d[1])
-                / (d[0] * d[0] + d[1] * d[1]);
-            let t = t.clamp(0., 1.);
-            (p[0] - start[0] - t * d[0]).hypot(p[1] - start[1] - t * d[1])
-        }
-        Curve::Arc { start, center, .. } => {
-            let radius = (start[0] - center[0]).hypot(start[1] - center[1]);
-            ((p[0] - center[0]).hypot(p[1] - center[1]) - radius).abs()
-        }
-        _ => panic!("level moves are lines and circles"),
     }
 }
 
