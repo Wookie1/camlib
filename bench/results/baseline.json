@@ -300,21 +300,21 @@
      "toolpath": "Roughing",
      "issue": 27,
      "moves": 2169,
-     "cut_mm": 27414.475,
+     "cut_mm": 27414.455,
      "rapid_mm": 614.199,
-     "air_cut_mm": 21291.088,
+     "air_cut_mm": 21291.068,
      "plunges": 13,
      "retracts": 24,
      "removed_mm3": 5765.95,
-     "cycle_seconds_exact_stop": 7932.344,
-     "cycle_seconds_tangent": 7931.579,
+     "cycle_seconds_exact_stop": 7932.337,
+     "cycle_seconds_tangent": 7931.572,
      "engine_seconds": 0.0433
     }
    },
    "toolpath": {
     "moves": 2169,
-    "cycle_seconds_exact_stop": 7932.344,
-    "cycle_seconds_tangent": 7931.579,
+    "cycle_seconds_exact_stop": 7932.337,
+    "cycle_seconds_tangent": 7931.572,
     "posted_blocks": 2192,
     "post_error": null,
     "removed_mm3": [
@@ -323,7 +323,7 @@
     ],
     "material": {
      "leftover_mm3": [
-      930.8210736466043,
+      930.821474006398,
       1505.4823377094317
      ],
      "overcut_mm3": [
@@ -362,21 +362,21 @@
      "toolpath": "Roughing",
      "issue": 27,
      "moves": 924,
-     "cut_mm": 10665.255,
+     "cut_mm": 10665.257,
      "rapid_mm": 250.41,
-     "air_cut_mm": 6073.475,
+     "air_cut_mm": 6073.477,
      "plunges": 5,
      "retracts": 8,
      "removed_mm3": 5765.95,
-     "cycle_seconds_exact_stop": 1439.816,
-     "cycle_seconds_tangent": 1436.823,
+     "cycle_seconds_exact_stop": 1439.817,
+     "cycle_seconds_tangent": 1436.824,
      "engine_seconds": 0.0284
     }
    },
    "toolpath": {
     "moves": 924,
-    "cycle_seconds_exact_stop": 1439.816,
-    "cycle_seconds_tangent": 1436.823,
+    "cycle_seconds_exact_stop": 1439.817,
+    "cycle_seconds_tangent": 1436.824,
     "posted_blocks": 947,
     "post_error": null,
     "removed_mm3": [
@@ -424,20 +424,20 @@
      "toolpath": "Roughing",
      "issue": 27,
      "moves": 4501,
-     "cut_mm": 15978.541,
+     "cut_mm": 15978.543,
      "rapid_mm": 390.448,
-     "air_cut_mm": 1372.382,
+     "air_cut_mm": 1372.384,
      "plunges": 25,
      "retracts": 25,
      "removed_mm3": 5724.767,
-     "cycle_seconds_exact_stop": 1752.563,
+     "cycle_seconds_exact_stop": 1752.564,
      "cycle_seconds_tangent": 1752.232,
      "engine_seconds": 28.4249
     }
    },
    "toolpath": {
     "moves": 4501,
-    "cycle_seconds_exact_stop": 1752.563,
+    "cycle_seconds_exact_stop": 1752.564,
     "cycle_seconds_tangent": 1752.232,
     "posted_blocks": 4524,
     "post_error": null,
