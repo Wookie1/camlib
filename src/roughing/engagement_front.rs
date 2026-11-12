@@ -1810,6 +1810,7 @@ impl EngagementFrontPlan {
         let min_area = 0.02 * r * r;
         let keep_down = 6. * r;
         let mut refreshed = false;
+        let mut rechecked = false;
         loop {
             if cancel.is_cancelled() {
                 return Err("engagement_front planning cancelled".into());
@@ -1828,7 +1829,18 @@ impl EngagementFrontPlan {
                         (i, k, (q[0] - pos[0]).hypot(q[1] - pos[1]))
                     })
                     .min_by(|a, b| a.2.total_cmp(&b.2));
-                let Some((i, k, _)) = best else { break };
+                let Some((i, k, d)) = best else { break };
+                if d > 2. * r && !rechecked {
+                    // The cache holds the fronts as they were at the last
+                    // refresh, so the front this pass just advanced is not
+                    // in it: the nearest cached start can lie in another
+                    // area while material remains right here. Refresh once
+                    // before leaving, so an area is finished before the
+                    // next is begun instead of alternating between them.
+                    rechecked = true;
+                    self.refresh();
+                    continue;
+                }
                 self.layer.as_mut().unwrap().candidates.swap_remove(i);
                 if let Some(dir) = self.candidate_direction(k) {
                     found = Some((k, dir));
