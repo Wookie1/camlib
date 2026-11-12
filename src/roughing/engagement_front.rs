@@ -2336,7 +2336,7 @@ impl EngagementFrontPlan {
             let proven = self
                 .proven(height)
                 .map(|h| h.max(self.guides.cell_entry_height(stock, q)));
-            let above = self.travel(here, q, proven, z);
+            let above = self.travel(stock, here, q, proven, z);
             self.line(above, [q[0], q[1], z], MoveKind::Plunge);
             let start = second.a;
             self.certify(lead_in)?;
