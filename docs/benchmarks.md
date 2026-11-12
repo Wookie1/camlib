@@ -64,31 +64,31 @@ comparable only on the same machine; CI runs the same benchmark on every push.
 | Facing | [#24](https://github.com/stevecad/camlib/issues/24) | `facing` (face) | 20 | 442 | 42 (10%) | 31 | 2 | 2 | 1920 | 47.1 / 47.1 | 0.006 |
 | Facing | [#24](https://github.com/stevecad/camlib/issues/24) | `facing-large` (face) | 140 | 21474 | 394 (2%) | 207 | 2 | 2 | 119999 | 2153.3 / 2153.3 | 0.359 |
 | Facing | [#24](https://github.com/stevecad/camlib/issues/24) | `rest-pocket` (face) | 18 | 256 | 16 (6%) | 6 | 1 | 1 | 384 | 26.9 / 26.9 | 0.001 |
-| Pocket | [#25](https://github.com/stevecad/camlib/issues/25) | `pocket` (clear-pocket) | 352 | 3412 | 0 (0%) | 1137 | 48 | 48 | 8698 | 508.3 / 508.3 | 0.025 |
-| Pocket | [#25](https://github.com/stevecad/camlib/issues/25) | `pocket-dense` (clear-pocket) | 9088 | 79836 | 292 (0%) | 26383 | 1216 | 1216 | 8699 | 11873.8 / 11873.4 | 0.335 |
+| Pocket | [#25](https://github.com/stevecad/camlib/issues/25) | `pocket` (clear-pocket) | 352 | 3412 | 0 (0%) | 1137 | 48 | 48 | 8694 | 508.3 / 508.3 | 0.025 |
+| Pocket | [#25](https://github.com/stevecad/camlib/issues/25) | `pocket-dense` (clear-pocket) | 9088 | 79836 | 292 (0%) | 26383 | 1216 | 1216 | 8694 | 11873.8 / 11873.4 | 0.335 |
 | Pocket | [#25](https://github.com/stevecad/camlib/issues/25) | `rest-pocket` (pocket) | 30 | 99 | 8 (8%) | 44 | 4 | 4 | 124 | 16.7 / 16.7 | 0.001 |
 | RestPocket | [#25](https://github.com/stevecad/camlib/issues/25) | `rest-pocket` (rest) | 82 | 206 | 117 (57%) | 37 | 4 | 8 | 2 | 26.3 / 26.1 | 0.002 |
-| AdaptivePocket | [#26](https://github.com/stevecad/camlib/issues/26) | `adaptive-pocket` (adaptive) | 522 | 1096 | 493 (45%) | 90 | 8 | 8 | 472 | 144.4 / 144.1 | 1.814 |
-| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `rough-parallel` (rough) | 2927 | 37872 | 33811 (89%) | 212 | 12 | 12 | 1984 | 8900.3 / 8898.9 | 0.065 |
-| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-adaptive` (rough) | 4501 | 15979 | 1681 (11%) | 390 | 25 | 25 | 5746 | 1752.6 / 1752.2 | 28.425 |
-| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-fine-mesh` (rough) | 3295 | 7879 | 6464 (82%) | 200 | 3 | 3 | 5423 | 554.3 / 531.4 | 0.080 |
-| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-offset` (rough) | 924 | 10665 | 6089 (57%) | 250 | 5 | 8 | 5776 | 1439.8 / 1436.8 | 0.028 |
-| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-raster` (rough) | 2169 | 27414 | 21241 (77%) | 614 | 13 | 24 | 5803 | 7932.3 / 7931.6 | 0.043 |
-| Contour | [#28](https://github.com/stevecad/camlib/issues/28) | `chamfer` (rough-profile) | 40 | 358 | 0 (0%) | 148 | 8 | 8 | 2243 | 55.8 / 55.7 | 0.009 |
-| Contour | [#28](https://github.com/stevecad/camlib/issues/28) | `contour` (profile) | 40 | 358 | 0 (0%) | 148 | 8 | 8 | 2192 | 55.8 / 55.7 | 0.006 |
+| AdaptivePocket | [#26](https://github.com/stevecad/camlib/issues/26) | `adaptive-pocket` (adaptive) | 522 | 1096 | 431 (39%) | 90 | 8 | 8 | 472 | 144.4 / 144.1 | 1.814 |
+| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `rough-parallel` (rough) | 2927 | 37872 | 34195 (90%) | 212 | 12 | 12 | 1984 | 8900.3 / 8898.9 | 0.065 |
+| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-adaptive` (rough) | 4501 | 15979 | 1372 (9%) | 390 | 25 | 25 | 5725 | 1752.6 / 1752.2 | 28.425 |
+| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-fine-mesh` (rough) | 3295 | 7879 | 6462 (82%) | 200 | 3 | 3 | 5418 | 554.3 / 531.4 | 0.080 |
+| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-offset` (rough) | 924 | 10665 | 6073 (57%) | 250 | 5 | 8 | 5766 | 1439.8 / 1436.8 | 0.028 |
+| Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-raster` (rough) | 2169 | 27414 | 21291 (78%) | 614 | 13 | 24 | 5766 | 7932.3 / 7931.6 | 0.043 |
+| Contour | [#28](https://github.com/stevecad/camlib/issues/28) | `chamfer` (rough-profile) | 40 | 358 | 0 (0%) | 148 | 8 | 8 | 2236 | 55.8 / 55.7 | 0.009 |
+| Contour | [#28](https://github.com/stevecad/camlib/issues/28) | `contour` (profile) | 40 | 358 | 0 (0%) | 148 | 8 | 8 | 2186 | 55.8 / 55.7 | 0.006 |
 | Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `holes` (pilot) | 20 | 62 | 46 (74%) | 36 | 6 | 6 | 111 | 11.8 / 11.8 | 0.001 |
 | Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `reaming` (drill) | 8 | 44 | 23 (52%) | 25 | 2 | 2 | 313 | 11.3 / 11.3 | 0.002 |
 | Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `tapping` (drill) | 8 | 44 | 23 (52%) | 25 | 2 | 2 | 313 | 11.3 / 11.3 | 0.002 |
 | Bore | [#30](https://github.com/stevecad/camlib/issues/30) | `holes` (finish-holes) | 42 | 370 | 44 (12%) | 36 | 2 | 2 | 1177 | 39.2 / 39.2 | 0.017 |
-| Bore | [#30](https://github.com/stevecad/camlib/issues/30) | `thread-milling` (bore) | 21 | 185 | 12 (6%) | 16 | 1 | 1 | 661 | 19.6 / 19.6 | 0.036 |
+| Bore | [#30](https://github.com/stevecad/camlib/issues/30) | `thread-milling` (bore) | 21 | 185 | 12 (6%) | 16 | 1 | 1 | 660 | 19.6 / 19.6 | 0.036 |
 | Reaming | [#31](https://github.com/stevecad/camlib/issues/31) | `reaming` (bore) | 8 | 28 | 14 (50%) | 26 | 2 | 3 | 19 | 17.4 / 17.4 | 0.001 |
 | Tapping | [#32](https://github.com/stevecad/camlib/issues/32) | `tapping` (tap) | 10 | 28 | 28 (100%) | 28 | 0 | 2 | 0 | 3.5 / 3.5 | 0.001 |
 | ThreadMilling | [#33](https://github.com/stevecad/camlib/issues/33) | `thread-milling` (thread) | 14 | 140 | 97 (69%) | 0 | 2 | 2 | 23 | 28.1 / 28.1 | 0.264 |
-| TrochoidalSlot | [#34](https://github.com/stevecad/camlib/issues/34) | `trochoidal-slot` (slot) | 356 | 1153 | 18 (2%) | 42 | 2 | 2 | 269 | 125.4 / 121.9 | 0.009 |
-| Chamfer | [#35](https://github.com/stevecad/camlib/issues/35) | `chamfer` (top-bevel) | 10 | 82 | 0 (0%) | 19 | 2 | 2 | 37 | 10.9 / 10.9 | 0.018 |
+| TrochoidalSlot | [#34](https://github.com/stevecad/camlib/issues/34) | `trochoidal-slot` (slot) | 356 | 1153 | 15 (1%) | 42 | 2 | 2 | 269 | 125.4 / 121.9 | 0.009 |
+| Chamfer | [#35](https://github.com/stevecad/camlib/issues/35) | `chamfer` (top-bevel) | 10 | 82 | 0 (0%) | 19 | 2 | 2 | 38 | 10.9 / 10.9 | 0.018 |
 | Trace | [#36](https://github.com/stevecad/camlib/issues/36) | `trace` (engrave) | 24 | 108 | 0 (0%) | 60 | 4 | 4 | 170 | 15.5 / 15.5 | 0.002 |
 | VCarve | [#37](https://github.com/stevecad/camlib/issues/37) | `vcarve` (carve) | 1986 | 97 | 21 (22%) | 17 | 1 | 1 | 107 | 28.8 / 20.5 | 2.480 |
-| Flat | [#38](https://github.com/stevecad/camlib/issues/38) | `flat` (flats) | 156 | 680 | 176 (26%) | 459 | 39 | 39 | 1273 | 165.2 / 165.2 | 0.006 |
+| Flat | [#38](https://github.com/stevecad/camlib/issues/38) | `flat` (flats) | 156 | 680 | 176 (26%) | 459 | 39 | 39 | 1270 | 165.2 / 165.2 | 0.006 |
 | Parallel | [#39](https://github.com/stevecad/camlib/issues/39) | `parallel` (finish-roof) | 3321 | 1723 | 543 (32%) | 427 | 41 | 41 | 1508 | 334.8 / 316.9 | 0.131 |
 | Parallel | [#39](https://github.com/stevecad/camlib/issues/39) | `parallel-dense` (finish-roof) | 14023 | 8457 | 3170 (37%) | 2005 | 201 | 201 | 1511 | 1618.0 / 1555.9 | 0.634 |
 | Parallel | [#39](https://github.com/stevecad/camlib/issues/39) | `rough-parallel` (parallel) | 3321 | 1805 | 625 (35%) | 508 | 41 | 41 | 292 | 368.4 / 350.5 | 0.177 |
@@ -129,23 +129,23 @@ comparable only on the same machine; CI runs the same benchmark on every push.
 | Workload | What | Moves | Cycle s (exact / tangent) | Blocks | Leftover mm³ | Over-cut mm³ | Run s | First move s | Post s | Peak memory MiB |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | `facing` | Face a 40 x 24 block 2 mm | 20 | 47.1 / 47.1 | 43 | 0.0 / 254.0 | 0.0 / 0.0 | 0.011 | 0.005 | 0.003 | 26 |
-| `pocket` | Pocket around a round island (CAD region) | 352 | 508.3 / 508.3 | 383 | 3.8 / 537.6 | 0.0 / 489.6 | 0.035 | 0.009 | 0.024 | 31 |
+| `pocket` | Pocket around a round island (CAD region) | 352 | 508.3 / 508.3 | 383 | 3.8 / 541.5 | 0.0 / 489.6 | 0.035 | 0.009 | 0.024 | 31 |
 | `rest-pocket` | Face, 4 mm pocket, 2 mm rest pocket | 130 | 69.9 / 69.6 | 169 | 0.0 / 267.0 | 0.0 / 66.0 | 0.008 | 0.003 | 0.011 | 26 |
 | `adaptive-pocket` | Adaptive clearing of an L pocket | 522 | 144.4 / 144.1 | 777 | 0.0 / 481.6 | 0.0 / 56.0 | 1.822 | 0.105 | 3.489 | 385 |
-| `roughing-raster` | 3D raster roughing around a frustum | 2169 | 7932.3 / 7931.6 | 2400 | 930.8 / 1468.4 | 0.0 / 83.1 | 0.054 | 0.010 | 0.188 | 389 |
-| `roughing-offset` | 3D offset roughing around a frustum | 924 | 1439.8 / 1436.8 | 1219 | 930.8 / 1495.2 | 0.0 / 83.1 | 0.048 | 0.018 | 0.293 | 388 |
-| `roughing-adaptive` | 3D adaptive roughing around a frustum | 4501 | 1752.6 / 1752.2 | 7500 | 939.5 / 1525.3 | 0.0 / 53.8 | 28.443 | 4.817 | 44.237 | 395 |
-| `roughing-fine-mesh` | 3D offset roughing of a filleted boss from a fine mesh | 3295 | 554.3 / 531.4 | 4874 | 816.3 / 1380.1 | 0.0 / 0.4 | 0.314 | 0.227 | 10.079 | 406 |
-| `contour` | Outer and inner walls of an annulus | 40 | 55.8 / 55.7 | 79 | 0.0 / 825.6 | 0.0 / 430.2 | 0.011 | 0.005 | 0.010 | 384 |
+| `roughing-raster` | 3D raster roughing around a frustum | 2169 | 7932.3 / 7931.6 | 2400 | 930.8 / 1505.5 | 0.0 / 83.1 | 0.054 | 0.010 | 0.188 | 389 |
+| `roughing-offset` | 3D offset roughing around a frustum | 924 | 1439.8 / 1436.8 | 1219 | 930.8 / 1505.5 | 0.0 / 83.1 | 0.048 | 0.018 | 0.293 | 388 |
+| `roughing-adaptive` | 3D adaptive roughing around a frustum | 4501 | 1752.6 / 1752.2 | 7500 | 939.5 / 1546.7 | 0.0 / 53.8 | 28.443 | 4.817 | 44.237 | 395 |
+| `roughing-fine-mesh` | 3D offset roughing of a filleted boss from a fine mesh | 3295 | 554.3 / 531.4 | 4874 | 816.3 / 1385.3 | 0.0 / 0.4 | 0.314 | 0.227 | 10.079 | 406 |
+| `contour` | Outer and inner walls of an annulus | 40 | 55.8 / 55.7 | 79 | 0.0 / 831.6 | 0.0 / 430.2 | 0.011 | 0.005 | 0.010 | 384 |
 | `holes` | Pilot drilling then helical bore milling | 62 | 51.0 / 50.9 | 111 | 0.0 / 413.1 | 0.0 / 125.1 | 0.025 | 0.005 | 0.013 | 388 |
 | `reaming` | Drill then ream two holes | 16 | 28.7 / 28.7 | 46 | – | – | 0.010 | 0.006 | 0.004 | 29 |
 | `tapping` | Drill then rigid-tap two holes | 18 | 14.8 / 14.8 | 49 | – | – | 0.009 | 0.005 | 0.004 | 29 |
 | `thread-milling` | Bore then thread-mill M14 x 1.5 | 35 | 47.7 / 47.7 | 85 | – | – | 0.316 | 0.009 | 0.011 | 31 |
 | `trochoidal-slot` | Straight trochoidal slot | 356 | 125.4 / 121.9 | 555 | 0.0 / 407.8 | 0.0 / 53.6 | 0.013 | 0.005 | 0.083 | 27 |
-| `chamfer` | Chamfer the top edges of an annulus | 50 | 66.7 / 66.6 | 101 | 0.0 / 719.2 | 0.0 / 343.4 | 0.034 | 0.006 | 0.012 | 384 |
+| `chamfer` | Chamfer the top edges of an annulus | 50 | 66.7 / 66.6 | 101 | 0.0 / 725.6 | 0.0 / 343.4 | 0.034 | 0.006 | 0.012 | 384 |
 | `trace` | Engrave a rectangle and a hook | 24 | 15.5 / 15.5 | 49 | – | – | 0.006 | 0.004 | 0.004 | 26 |
 | `vcarve` | V-carve an L-shaped letter | 1986 | 28.8 / 20.5 | 2009 | – | – | 2.498 | 0.019 | 0.107 | 33 |
-| `flat` | Flat areas of a stepped part | 156 | 165.2 / 165.2 | 179 | 28.5 / 173.5 | 0.0 / 14.3 | 0.013 | 0.007 | 0.012 | 384 |
+| `flat` | Flat areas of a stepped part | 156 | 165.2 / 165.2 | 179 | 28.5 / 175.8 | 0.0 / 14.3 | 0.013 | 0.007 | 0.012 | 384 |
 | `rough-parallel` | Rough then parallel ball finish a roof | 6248 | 9268.7 / 9249.5 | 6549 | 0.0 / 146.1 | 0.0 / 99.6 | 0.264 | 0.010 | 0.484 | 396 |
 | `parallel` | Parallel finishing of a roof | 3321 | 334.8 / 316.9 | 3344 | 0.0 / 146.1 | 0.0 / 99.6 | 0.135 | 0.004 | 0.184 | 392 |
 | `spiral` | Spiral finishing of a roof | 2552 | 225.9 / 225.5 | 2575 | 0.0 / 149.9 | 0.0 / 79.0 | 0.093 | 0.005 | 0.150 | 390 |
@@ -159,7 +159,7 @@ comparable only on the same machine; CI runs the same benchmark on every push.
 | `waterline` | Waterline finishing of a tapered island | 112 | 33.0 / 33.0 | 135 | 369.9 / 809.3 | 0.0 / 89.3 | 0.135 | 0.129 | 0.009 | 389 |
 | `steep-and-shallow` | Steep-and-shallow finishing of a roof | 1744 | 342.8 / 333.7 | 1775 | 0.0 / 149.8 | 0.0 / 100.3 | 0.481 | 0.379 | 0.107 | 388 |
 | `facing-large` | Face a 300 x 200 block 2 mm (production size) | 140 | 2153.3 / 2153.3 | 163 | – | – | 0.408 | 0.048 | 0.009 | 69 |
-| `pocket-dense` | Pocket around a round island, 0.4 mm stepover, 0.25 mm stepdown | 9088 | 11873.8 / 11873.4 | 9175 | 3.8 / 536.3 | 0.0 / 489.6 | 0.344 | 0.010 | 0.532 | 44 |
+| `pocket-dense` | Pocket around a round island, 0.4 mm stepover, 0.25 mm stepdown | 9088 | 11873.8 / 11873.4 | 9175 | 3.8 / 541.5 | 0.0 / 489.6 | 0.344 | 0.010 | 0.532 | 44 |
 | `parallel-dense` | Parallel finishing of a roof, 0.1 mm stepover | 14023 | 1618.0 / 1555.9 | 14046 | 0.0 / 143.9 | 0.0 / 101.0 | 0.638 | 0.004 | 0.838 | 415 |
 | `spiral-dense` | Spiral finishing of a roof, 0.15 mm stepover | 12767 | 1125.9 / 1123.9 | 12790 | 0.0 / 144.2 | 0.0 / 86.6 | 0.498 | 0.007 | 0.748 | 417 |
 | `scallop-dense` | Scallop finishing of a roof, 0.15 mm stepover | 27025 | 1678.2 / 1565.8 | 27048 | 0.0 / 143.6 | 0.0 / 81.0 | 2.998 | 1.026 | 1.552 | 444 |

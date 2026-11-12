@@ -91,7 +91,7 @@
      "air_cut_mm": 0.0,
      "plunges": 48,
      "retracts": 48,
-     "removed_mm3": 8697.589,
+     "removed_mm3": 8693.749,
      "cycle_seconds_exact_stop": 508.314,
      "cycle_seconds_tangent": 508.274,
      "engine_seconds": 0.0247
@@ -104,13 +104,13 @@
     "posted_blocks": 383,
     "post_error": null,
     "removed_mm3": [
-     8697.589,
+     8693.749,
      9198.091
     ],
     "material": {
      "leftover_mm3": [
       3.8399999934493736,
-      537.6108729386283
+      541.4508681451769
      ],
      "overcut_mm3": [
       0.0,
@@ -118,7 +118,7 @@
      ],
      "leftover_cells": [
       12,
-      1668
+      1680
      ],
      "overcut_cells": [
       0,
@@ -240,7 +240,7 @@
      "moves": 522,
      "cut_mm": 1095.835,
      "rapid_mm": 89.83,
-     "air_cut_mm": 492.507,
+     "air_cut_mm": 431.028,
      "plunges": 8,
      "retracts": 8,
      "removed_mm3": 472.318,
@@ -302,10 +302,10 @@
      "moves": 2169,
      "cut_mm": 27414.475,
      "rapid_mm": 614.199,
-     "air_cut_mm": 21240.821,
+     "air_cut_mm": 21291.088,
      "plunges": 13,
      "retracts": 24,
-     "removed_mm3": 5803.069,
+     "removed_mm3": 5765.95,
      "cycle_seconds_exact_stop": 7932.344,
      "cycle_seconds_tangent": 7931.579,
      "engine_seconds": 0.0433
@@ -318,13 +318,13 @@
     "posted_blocks": 2400,
     "post_error": null,
     "removed_mm3": [
-     5803.069,
+     5765.95,
      6025.159
     ],
     "material": {
      "leftover_mm3": [
       930.8210736466043,
-      1468.3624145064769
+      1505.4823377094317
      ],
      "overcut_mm3": [
       0.0,
@@ -364,10 +364,10 @@
      "moves": 924,
      "cut_mm": 10665.255,
      "rapid_mm": 250.41,
-     "air_cut_mm": 6089.309,
+     "air_cut_mm": 6073.475,
      "plunges": 5,
      "retracts": 8,
-     "removed_mm3": 5776.189,
+     "removed_mm3": 5765.95,
      "cycle_seconds_exact_stop": 1439.816,
      "cycle_seconds_tangent": 1436.823,
      "engine_seconds": 0.0284
@@ -380,13 +380,13 @@
     "posted_blocks": 1219,
     "post_error": null,
     "removed_mm3": [
-     5776.189,
+     5765.95,
      6025.157
     ],
     "material": {
      "leftover_mm3": [
       930.8232233397312,
-      1495.2423633086164
+      1505.4823377094317
      ],
      "overcut_mm3": [
       0.0,
@@ -426,10 +426,10 @@
      "moves": 4501,
      "cut_mm": 15978.541,
      "rapid_mm": 390.448,
-     "air_cut_mm": 1680.643,
+     "air_cut_mm": 1372.382,
      "plunges": 25,
      "retracts": 25,
-     "removed_mm3": 5746.175,
+     "removed_mm3": 5724.767,
      "cycle_seconds_exact_stop": 1752.563,
      "cycle_seconds_tangent": 1752.232,
      "engine_seconds": 28.4249
@@ -442,13 +442,13 @@
     "posted_blocks": 7500,
     "post_error": null,
     "removed_mm3": [
-     5746.175,
+     5724.767,
      5987.143
     ],
     "material": {
      "leftover_mm3": [
       939.5261244023775,
-      1525.257090539153
+      1546.664960876536
      ],
      "overcut_mm3": [
       0.0,
@@ -488,10 +488,10 @@
      "moves": 3295,
      "cut_mm": 7879.228,
      "rapid_mm": 200.239,
-     "air_cut_mm": 6463.653,
+     "air_cut_mm": 6462.375,
      "plunges": 3,
      "retracts": 3,
-     "removed_mm3": 5422.985,
+     "removed_mm3": 5417.771,
      "cycle_seconds_exact_stop": 554.341,
      "cycle_seconds_tangent": 531.423,
      "engine_seconds": 0.0803
@@ -504,13 +504,13 @@
     "posted_blocks": 4874,
     "post_error": null,
     "removed_mm3": [
-     5422.985,
+     5417.771,
      5541.754
     ],
     "material": {
      "leftover_mm3": [
       816.3321077371903,
-      1380.0784195670124
+      1385.292279599272
      ],
      "overcut_mm3": [
       0.0,
@@ -553,7 +553,7 @@
      "air_cut_mm": 0.0,
      "plunges": 8,
      "retracts": 8,
-     "removed_mm3": 2191.997,
+     "removed_mm3": 2185.997,
      "cycle_seconds_exact_stop": 55.776,
      "cycle_seconds_tangent": 55.696,
      "engine_seconds": 0.0063
@@ -566,13 +566,13 @@
     "posted_blocks": 79,
     "post_error": null,
     "removed_mm3": [
-     2191.997,
+     2185.997,
      2636.003
     ],
     "material": {
      "leftover_mm3": [
       0.0,
-      825.6204042143374
+      831.6203967165204
      ],
      "overcut_mm3": [
       0.0,
@@ -580,7 +580,7 @@
      ],
      "leftover_cells": [
       0,
-      1447
+      1456
      ],
      "overcut_cells": [
       0,
@@ -805,7 +805,7 @@
      "air_cut_mm": 12.0,
      "plunges": 1,
      "retracts": 1,
-     "removed_mm3": 660.719,
+     "removed_mm3": 660.479,
      "cycle_seconds_exact_stop": 19.564,
      "cycle_seconds_tangent": 19.564,
      "engine_seconds": 0.0365
@@ -819,7 +819,7 @@
      "air_cut_mm": 97.017,
      "plunges": 2,
      "retracts": 2,
-     "removed_mm3": 23.063,
+     "removed_mm3": 23.088,
      "cycle_seconds_exact_stop": 28.139,
      "cycle_seconds_tangent": 28.119,
      "engine_seconds": 0.2639
@@ -832,7 +832,7 @@
     "posted_blocks": 85,
     "post_error": null,
     "removed_mm3": [
-     683.782,
+     683.567,
      717.77
     ],
     "material": null
@@ -859,7 +859,7 @@
      "moves": 356,
      "cut_mm": 1152.664,
      "rapid_mm": 42.264,
-     "air_cut_mm": 18.253,
+     "air_cut_mm": 15.476,
      "plunges": 2,
      "retracts": 2,
      "removed_mm3": 268.999,
@@ -924,7 +924,7 @@
      "air_cut_mm": 0.0,
      "plunges": 8,
      "retracts": 8,
-     "removed_mm3": 2243.197,
+     "removed_mm3": 2236.157,
      "cycle_seconds_exact_stop": 55.776,
      "cycle_seconds_tangent": 55.696,
      "engine_seconds": 0.0091
@@ -938,7 +938,7 @@
      "air_cut_mm": 0.0,
      "plunges": 2,
      "retracts": 2,
-     "removed_mm3": 37.366,
+     "removed_mm3": 37.993,
      "cycle_seconds_exact_stop": 10.934,
      "cycle_seconds_tangent": 10.914,
      "engine_seconds": 0.0179
@@ -951,13 +951,13 @@
     "posted_blocks": 101,
     "post_error": null,
     "removed_mm3": [
-     2280.563,
+     2274.151,
      2623.763
     ],
     "material": {
      "leftover_mm3": [
       0.0,
-      719.2360178606788
+      725.6482610613425
      ],
      "overcut_mm3": [
       0.0,
@@ -1000,7 +1000,7 @@
      "air_cut_mm": 0.0,
      "plunges": 4,
      "retracts": 4,
-     "removed_mm3": 169.686,
+     "removed_mm3": 169.623,
      "cycle_seconds_exact_stop": 15.517,
      "cycle_seconds_tangent": 15.517,
      "engine_seconds": 0.0018
@@ -1013,7 +1013,7 @@
     "posted_blocks": 49,
     "post_error": null,
     "removed_mm3": [
-     169.686,
+     169.623,
      208.627
     ],
     "material": null
@@ -1086,7 +1086,7 @@
      "air_cut_mm": 176.16,
      "plunges": 39,
      "retracts": 39,
-     "removed_mm3": 1272.746,
+     "removed_mm3": 1270.496,
      "cycle_seconds_exact_stop": 165.218,
      "cycle_seconds_tangent": 165.218,
      "engine_seconds": 0.006
@@ -1099,13 +1099,13 @@
     "posted_blocks": 179,
     "post_error": null,
     "removed_mm3": [
-     1272.746,
+     1270.496,
      1305.004
     ],
     "material": {
      "leftover_mm3": [
       28.499903087998064,
-      173.50391322992638
+      175.7539132301229
      ],
      "overcut_mm3": [
       0.0,
@@ -1113,7 +1113,7 @@
      ],
      "leftover_cells": [
       152,
-      668
+      680
      ],
      "overcut_cells": [
       0,
@@ -1145,7 +1145,7 @@
      "moves": 2927,
      "cut_mm": 37871.592,
      "rapid_mm": 212.137,
-     "air_cut_mm": 33811.312,
+     "air_cut_mm": 34195.176,
      "plunges": 12,
      "retracts": 12,
      "removed_mm3": 1983.996,
@@ -1963,7 +1963,7 @@
      "air_cut_mm": 292.0,
      "plunges": 1216,
      "retracts": 1216,
-     "removed_mm3": 8698.869,
+     "removed_mm3": 8693.749,
      "cycle_seconds_exact_stop": 11873.766,
      "cycle_seconds_tangent": 11873.446,
      "engine_seconds": 0.3345
@@ -1976,13 +1976,13 @@
     "posted_blocks": 9175,
     "post_error": null,
     "removed_mm3": [
-     8698.869,
+     8693.749,
      9198.091
     ],
     "material": {
      "leftover_mm3": [
       3.8399999934493736,
-      536.3308745364455
+      541.4508681451769
      ],
      "overcut_mm3": [
       0.0,
@@ -1990,7 +1990,7 @@
      ],
      "leftover_cells": [
       12,
-      1664
+      1680
      ],
      "overcut_cells": [
       0,
