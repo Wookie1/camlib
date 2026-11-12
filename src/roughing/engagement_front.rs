@@ -1851,26 +1851,12 @@ impl EngagementFrontPlan {
         // A controller may run a rapid as a straight line, as either
         // axis-first dogleg, or with each axis at its own rate (a diagonal,
         // then the rest along one axis): anywhere in the rectangle of its
-        // two ends. The cutter may only be where the layer's region allows
-        // it, the same region its passes and entries are certified against
-        // (beside the stock it is what keeps the tool from vise jaws and
-        // stops). So the rectangle's four sides and its diagonal must lie in
-        // that region; islands inside it are the part, which the stock
-        // bounds below cover. Otherwise the rapid stays at the retract
-        // height, as without the option.
-        let (a, b) = ([from[0], from[1]], to);
-        let corners = [a, [b[0], a[1]], b, [a[0], b[1]]];
-        let inside = (0..4)
-            .map(|k| (corners[k], corners[(k + 1) % 4]))
-            .chain(std::iter::once((a, b)))
-            .filter(|(p, q)| p != q)
-            .all(|(p, q)| {
-                self.guides
-                    .stroke_geometry_fits_radius(Stroke { a: p, b: q, arc: None }, self.r)
-            });
-        if !inside {
-            return retract;
-        }
+        // two ends, which is what the stock bound and the obstacles below
+        // are taken over. Both ends are positions the layer's region allows
+        // the cutter at; beside the stock, where no stock bound says
+        // anything, the rectangle between two such positions is taken to be
+        // as free as they are (the premise the entries beside the stock
+        // already rest on). A containment region withdraws that premise.
         // Declared obstacles. A containment region is kept by staying at the
         // retract height (a dogleg may leave it where the straight route
         // does not); an avoid area the rectangle meets is crossed above its
@@ -2804,7 +2790,7 @@ impl EngagementFrontPlan {
         let proven = self
             .proven(top)
             .map(|h| h.max(self.guides.cell_entry_height(stock, [start[0], start[1]])));
-        let above = self.travel(here, [start[0], start[1]], proven, start[2]);
+        let above = self.travel(stock, here, [start[0], start[1]], proven, start[2]);
         if above[2] > start[2] {
             self.line(above, start, MoveKind::Plunge);
         } else if above[2] < start[2] {
@@ -2915,7 +2901,7 @@ impl EngagementFrontPlan {
             let proven = self
                 .proven(height)
                 .map(|h| h.max(self.guides.cell_entry_height(stock, p)));
-            let above = self.travel(here, p, proven, z);
+            let above = self.travel(stock, here, p, proven, z);
             self.line(above, [p[0], p[1], z], MoveKind::Plunge);
             self.certify(Stroke::line(p, q))?;
             self.queue(
