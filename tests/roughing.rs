@@ -4689,7 +4689,14 @@ fn engagement_front_travel_clearance_lowers_rapids_over_cut_stock() {
     );
     assert_eq!(lowered(&high_report), 0);
     assert!(lowered(&low_report) > 0, "no rapid was lowered");
-    assert!(low < 0.8 * high, "lowered rapids did not shorten travel");
+    // Each lowered rapid must save travel. (A 20% overall saving held only
+    // while closed_box left a phantom hole in the bar's top that cost the
+    // job extra lifts; the solid bar needs four lifts, two of them lowered.)
+    assert!(low < high, "lowered rapids did not shorten travel");
+    assert!(
+        high - low >= 10. * lowered(&low_report) as f64,
+        "lowered rapids saved under 10 mm each: {high:.1} -> {low:.1}"
+    );
 }
 
 /// The strips closed by end walls (so later passes start beside the stock,
