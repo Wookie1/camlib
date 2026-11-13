@@ -1368,6 +1368,7 @@ impl WaterlinePlan {
                 continue;
             }
             let (ramp_from, passes) = self.ramp_setup();
+            let entry_points = self.side_entries(&loops, z, cancel)?;
             let mut profile = ProfileMotion::new(
                 self.op.settings(),
                 &self.spec,
@@ -1378,8 +1379,55 @@ impl WaterlinePlan {
                 self.next_id,
             );
             profile.ramp_from = ramp_from;
+            profile.entry_points = entry_points;
             self.profile = Some(profile);
         }
+    }
+    /// Per loop, a point beside its start, away from the part, where the
+    /// ball plunges before a horizontal lead onto the loop: the stock the
+    /// roughing left against the wall is then cut sideways, not by the
+    /// ball's tip. The lead (at the level's ball centre height) must be
+    /// clear of the part; higher at the same XY is clear too (the part is
+    /// a downward-extruded surface). None: the tangent lead as before.
+    fn side_entries(
+        &self,
+        loops: &[Vec<Stroke>],
+        z: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Vec<Option<[f64; 2]>>, String> {
+        let length = (self.radius / 2.).max(1.);
+        let center = z + self.radius;
+        let mut work = SurfaceWork::default();
+        let mut result = Vec::with_capacity(loops.len());
+        for edges in loops {
+            let start = edges[0].curve(z).start();
+            let t = edges[0].tangent(false);
+            let mut best: Option<([f64; 2], f64)> = None;
+            for sign in [1., -1.] {
+                let p = [
+                    start[0] - sign * length * t[1],
+                    start[1] + sign * length * t[0],
+                ];
+                if !self.surface.segment_clear(
+                    [p[0], p[1], center],
+                    [start[0], start[1], center],
+                    self.protected,
+                    &mut work,
+                    cancel,
+                )? {
+                    continue;
+                }
+                let d = self
+                    .surface
+                    .point_distance([p[0], p[1], center], &mut work, cancel)?
+                    .distance_mm;
+                if best.is_none_or(|(_, b)| d > b) {
+                    best = Some((p, d));
+                }
+            }
+            result.push(best.map(|(p, _)| p));
+        }
+        Ok(result)
     }
     /// Ramp: the current level descends from the one above (none for the
     /// first level); the lowest level is cut once more flat.
