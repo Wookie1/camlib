@@ -1338,7 +1338,13 @@ form one level) and finishes each level at its exact height plus
 `stock_to_leave_mm`, top level first, with a flat center-cutting end mill in
 raster rows along `axis`. A cut is kept only where the highest point of the
 part under the tool's swept disk is not above the cut (computed exactly per
-facet); each run starts with a vertical plunge. Near walls the tool stays a
+facet); each run starts with a vertical plunge. If the live stock at a run's
+start stands more than 0.05 mm above its height (roughing left it, or the
+stock was not cut there yet), the plunge stops just above that stock and the
+run is entered by zigzagging along the run itself, descending at 3 degrees (the
+helix angle of the roughing entries); every ramp point lies above the proven
+run, so it clears the part like the run does, and the report counts them as
+`ramped_entries`. Near walls the tool stays a
 radius away; the report gives the levels, runs, cut length and any row length
 that could not be proven clear (`dropped_length_mm`).
 
