@@ -284,7 +284,18 @@ def _pencil():
     import camlib
 
     tool = _ball4()
-    op = camlib.Pencil("pencil", tool, _mesh(_stepped), 0, 12, **CUT, tool_number=1, length_register=1)
+    op = camlib.Pencil(
+        "pencil",
+        tool,
+        _mesh(_stepped),
+        0,
+        12,
+        **CUT,
+        tool_number=1,
+        length_register=1,
+        # The coarse stock cells cannot bound a row-entry plunge (the default is to refuse).
+        plunge_unproven_entries=True,
+    )
     return dict(
         stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), 0.25),
         tools=(tool,),
