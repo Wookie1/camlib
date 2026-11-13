@@ -1317,6 +1317,16 @@ move's lowest tip) and any point of it may lie within the section's radius of
 the tool axis anywhere on the move. `steep_and_shallow` can then take the
 part's lowest point as its floor. Waterline is admitted the same way.
 
+Row entries: before plunging into a row, the stock cells bound how deep the
+ball would enter live stock (each cell counts up to its highest point anywhere
+in the cell the cutter overlaps). Deeper than 0.25 mm, the row is entered by a
+10 degree zigzag ramp along the row instead (`ramped_entries` in the report).
+Where no ramp is proven clear of the part, the operation is refused, naming
+the entry and its depth. There is no option to plunge anyway: rough or
+rest-rough the area first so the finishing pass starts in cleared stock, or use
+finer stock cells when the cell bound is pessimistic (next to steep walls
+coarse cells can overstate the depth).
+
 Flat and bull-nose end mills work too (raster and the spiral, radial and
 project patterns). Their contact with each triangle is exact (facet, edge and
 vertex), and every move between computed points is proven not to gouge: per

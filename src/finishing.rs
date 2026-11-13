@@ -1923,11 +1923,23 @@ impl ParallelPlan {
                         let mut work = self.report.work;
                         let ramp = self.entry_ramp(z0, &mut work, cancel)?;
                         self.report.work = work;
-                        if let Some(ramp) = ramp {
-                            target = z0;
-                            self.ramp = ramp.into();
-                            self.report.ramped_entries += 1;
-                            self.phase = Phase::Ramp;
+                        match ramp {
+                            Some(ramp) => {
+                                target = z0;
+                                self.ramp = ramp.into();
+                                self.report.ramped_entries += 1;
+                                self.phase = Phase::Ramp;
+                            }
+                            None => {
+                                // No silent full-depth plunge into live stock.
+                                return Err(format!(
+                                    "row entry at X{:.3} Y{:.3} would plunge up to {:.3} mm into \
+                                     stock (stock cell bounds, limit {ENTRY_PLUNGE_MM} mm) and no \
+                                     ramp along the row is proven clear; rough or rest-rough this \
+                                     area first, or use finer stock cells",
+                                    xy[0], xy[1], excess
+                                ));
+                            }
                         }
                     }
                     self.emit([xy[0], xy[1], target], MoveKind::Plunge)?
@@ -2066,9 +2078,13 @@ fn plunge_excess(stock: &Stock, xy: [f64; 2], tip: f64, r: f64, ball: f64) -> f6
             let Some(c) = stock.cell_center(k) else {
                 continue;
             };
-            // Cell centre distance: `upper_mm` is already the cell's highest
-            // point, and ENTRY_PLUNGE_MM keeps half the gate floor in hand.
-            let rho = (c[0] - xy[0]).hypot(c[1] - xy[1]);
+            // `upper_mm` bounds the whole cell, so test the cell's nearest
+            // point to the axis, not its centre: stock anywhere in a cell
+            // the footprint overlaps may stand there, and the cutter's
+            // lower face is lowest at that nearest point.
+            let gx = ((c[0] - xy[0]).abs() - wx / 2.).max(0.);
+            let gy = ((c[1] - xy[1]).abs() - wy / 2.).max(0.);
+            let rho = gx.hypot(gy);
             if rho > r {
                 continue;
             }

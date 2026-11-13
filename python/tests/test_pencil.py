@@ -45,9 +45,33 @@ class PencilTest(unittest.TestCase):
             length_register=1,
             coolant="flood",
         )
-        cuts, report = [], None
+        # Straight out of fresh 8 mm stock the entries would plunge ~4 mm
+        # into it with no ramp proven clear (audit #22): refused.
+        with self.assertRaisesRegex(Exception, "no ramp along the row is proven clear"):
+            with Simulation(
+                stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), 0.25),
+                tools=(tool,),
+                operations=(op,),
+                revision="1",
+                initial_position_mm=(0, 0, 12),
+            ) as sim:
+                for _ in sim.run_operations():
+                    pass
+        # Pencil is run after the floors and tops are finished, so the blank
+        # is the part with 0.1 mm left on floor and top and the walls to size.
+        # Fine cells: the entry stands 0.1 mm from the wall.
+        import cadquery as cq
+        from camlib.cadquery import export_stock_mesh
+
+        blank = (
+            cq.Workplane("XY")
+            .box(24, 16, 4.1, centered=False)
+            .union(cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4.1)))
+        )
+        stock = camlib.StockSpec.from_mesh(export_stock_mesh(blank), 0.05)
+        cuts, plunges, report = [], [], None
         with Simulation(
-            stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), 0.25),
+            stock=stock,
             tools=(tool,),
             operations=(op,),
             revision="1",
@@ -60,6 +84,8 @@ class PencilTest(unittest.TestCase):
                 motion = getattr(update, "motion", None)
                 if motion is not None and motion["kind"] == "cut":
                     cuts.append(motion["curve"])
+                if motion is not None and motion["kind"] == "plunge":
+                    plunges.append(motion["curve"]["end"])
             self.assertTrue(sim.state.finished)
         self.assertEqual(report["strategy"], "pencil")
         # Cuts along the boss corner: tip on the floor (Z 4), ball center
