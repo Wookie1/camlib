@@ -44,6 +44,7 @@ modules! {
     material_resume,
     material_surface,
     nesting,
+    no_entry,
     parallel,
     patterns,
     planar,

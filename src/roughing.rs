@@ -865,6 +865,16 @@ enum LayerPlan {
     Engagement(Box<EngagementFrontPlan>),
 }
 impl LayerPlan {
+    /// Why this layer, having made no motion, left material it was asked
+    /// to cut: its first area no entry reaches. Raster and offset layers
+    /// fit their entries before any motion and refuse there.
+    fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Pocket(_) => None,
+            Self::Adaptive(p) => p.refusal(),
+            Self::Engagement(p) => p.refusal(),
+        }
+    }
     fn construction_error_mm(&self) -> f64 {
         match self {
             Self::Pocket(p) => p.construction_error_mm(),
@@ -983,6 +993,10 @@ pub struct RoughingPlan {
     report: RoughingReport,
     front_progress: Option<FrontProgress>,
     materialized_report: OnceLock<RoughingReport>,
+    /// Why the first adaptive layer that made no motion left material it
+    /// was asked to cut (an area no entry reaches, `LayerPlan::refusal`):
+    /// the operation's refusal if no layer makes a motion (#250).
+    refusal: Option<String>,
 }
 impl RoughingPlan {
     pub fn prepare(
@@ -1730,6 +1744,7 @@ impl RoughingPlan {
             report,
             front_progress: None,
             materialized_report: OnceLock::new(),
+            refusal: None,
         })
     }
     pub fn report(&self) -> &RoughingReport {
@@ -1823,6 +1838,19 @@ impl RoughingPlan {
         loop {
             check(cancel)?;
             let Some(plan) = self.plans.front_mut() else {
+                // Roughing that cut nothing although a layer had material
+                // no entry reaches is refused, not planned without a
+                // motion (#250). Where it cut anything, a layer has such
+                // areas legitimately (a rest pass with a smaller cutter
+                // takes them): each is listed in its layer's report
+                // (`unentered_areas`) and counted in its residual.
+                if self.report.motions == 0
+                    && let Some(refusal) = &self.refusal
+                {
+                    return Err(format!(
+                        "{refusal}. No layer of this roughing has anything else to cut, so it is refused rather than planned without a motion"
+                    ));
+                }
                 return Ok(None);
             };
             if !self.activated {
@@ -1891,6 +1919,14 @@ impl RoughingPlan {
                 self.front_progress = plan.front_progress();
                 self.materialized_report.take();
                 return Ok(Some(m));
+            }
+            if self.refusal.is_none()
+                && let Some(why) = plan.refusal()
+            {
+                self.refusal = Some(format!(
+                    "{why}; roughing layer {} at Z{}",
+                    self.report.active_layer, self.report.layers[self.report.active_layer].tip_z_mm
+                ));
             }
             plan.finish(cancel)?;
             self.report.layers[self.report.active_layer].clearing = plan.report();
