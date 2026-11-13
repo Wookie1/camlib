@@ -55,6 +55,7 @@ Entry, tab and path options shops expect, then the larger additions.
 - #175 Parallel: rows all cut one way
 - #173 Contour following the part's outline at each depth (silhouette)
 - #157 Milling: an operation that runs a caller-supplied toolpath through the same simulation, checks and posting
+- #288 Milling tools: face mills and high-feed mills (real cutter profiles, depth-of-cut and entry limits)
 
 ## Phase 3: Complete turning
 
@@ -69,6 +70,8 @@ Entry, tab and path options shops expect, then the larger additions.
 - #16 Plasma/laser: automatic part nesting
 - #17 Plasma/laser: common-line cutting (needs #16 for automatic placements)
 - #18 Plasma/laser: marking and etching
+- #296 Plasma/laser: what sheet cutting still needs (tip-up avoidance, cut order, DXF in, part labels, remnants,
+  nesting options, fewer pierces, laser fly cutting): one PR per item, in the issue's order
 
 ## Phase 5: Multi-axis
 

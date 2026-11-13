@@ -723,9 +723,12 @@ class Flat:
     ``floor_z_mm`` and finishes each at its exact height (plus
     ``stock_to_leave_mm``) with a flat, center-cutting end mill, in raster
     rows ``stepover_mm`` apart along ``axis``. Each cut is kept only where
-    the part under the tool's swept disk is proven not above it; each run is
-    entered with a vertical plunge. Faces within ``level_tolerance_mm`` form
-    one level."""
+    the part under the tool's swept disk is proven not above it. A run with no
+    stock above its height is entered with a vertical plunge. A run with
+    stock above it is refused unless ``entry=RampEntry(angle_deg, ...)`` is
+    declared: the tool then plunges to the stock's top over the whole run and
+    ramps down along the run (Z-flat tools are never plunged into stock). Faces
+    within ``level_tolerance_mm`` form one level."""
 
     id: str
     tool: object
@@ -746,6 +749,9 @@ class Flat:
     coolant: str = field(kw_only=True)
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
+    # How a run under stock is entered: RampEntry(angle_deg, ...). None: no
+    # stock stands above the runs, and one that does is refused.
+    entry: object | None = None
 
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -754,6 +760,9 @@ class Flat:
             tool=getattr(self.tool, "id", self.tool),
             surface=self.surface.to_dict() if hasattr(self.surface, "to_dict") else self.surface,
         )
+        entry = result.pop("entry")
+        if entry is not None:
+            result["entry"] = entry.to_dict() if hasattr(entry, "to_dict") else dict(entry)
         for key in ("retract_z_mm", "feed_z_mm"):
             if result[key] is None:
                 result.pop(key)
