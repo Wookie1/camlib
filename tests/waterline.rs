@@ -391,7 +391,7 @@ impl camlib::stock::CancelSignal for CancelAfter {
 }
 #[test]
 fn waterline_cancel_generation_and_invalid_work_inputs_do_not_advance_cursor() {
-    use camlib::{stock::Stock, waterline::WaterlinePlan};
+    use camlib::{waterline::WaterlinePlan};
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let op = operation(&m);
@@ -480,7 +480,7 @@ fn waterline_cancel_generation_and_invalid_work_inputs_do_not_advance_cursor() {
 }
 #[test]
 fn waterline_heights_keep_rapids_above_feed_height_and_end_at_clearance() {
-    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
+    use camlib::{motion::MoveKind, waterline::WaterlinePlan};
     use std::sync::atomic::AtomicBool;
     let m = fixture();
     let cancel = AtomicBool::new(false);
@@ -541,7 +541,7 @@ fn waterline_heights_keep_rapids_above_feed_height_and_end_at_clearance() {
 }
 #[test]
 fn slope_limits_keep_only_the_steep_parts_of_each_contour() {
-    use camlib::{motion::MoveKind, stock::Stock, surface::SurfaceWork, waterline::WaterlinePlan};
+    use camlib::{motion::MoveKind, surface::SurfaceWork, waterline::WaterlinePlan};
     // Frustum fixture: 70 degree flanks and vertical walls.
     let m = fixture();
     let cancel = AtomicBool::new(false);
