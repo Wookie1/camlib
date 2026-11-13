@@ -437,7 +437,7 @@ fn waterline_cancel_generation_and_invalid_work_inputs_do_not_advance_cursor() {
         &cancel,
     )
     .unwrap();
-    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut stock = cleared(&m);
     let tool = m.tools[0].prepare().unwrap();
     // Allow entry, then cancel during contour preparation. Forty coordinator
     // polls can outlast the whole parallel batch on a fast/many-core host, so
@@ -502,7 +502,7 @@ fn waterline_heights_keep_rapids_above_feed_height_and_end_at_clearance() {
         &cancel,
     )
     .unwrap();
-    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut stock = cleared(&m);
     let tool = m.tools[0].prepare().unwrap();
     let mut motions = vec![];
     while let Some(motion) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
@@ -555,7 +555,7 @@ fn slope_limits_keep_only_the_steep_parts_of_each_contour() {
             &cancel,
         )
         .unwrap();
-        let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let stock = cleared(&m);
         let mut stock = stock;
         let tool = m.tools[0].prepare().unwrap();
         let mut out = vec![];
@@ -837,14 +837,56 @@ fn a_sloped_wall_is_kept_by_its_own_slope_at_every_level() {
         }
     }
 }
-#[test]
-fn loops_are_entered_from_beside_the_wall_not_on_it() {
-    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
-    // A box: the ball plunges at a point moved away from the wall, then
-    // leads in sideways, so stock left on the wall is not cut by its tip.
-    let m = fixture();
-    let cancel = AtomicBool::new(false);
-    let mut op = operation(&m);
+/// A plate (8..16 x 5..11 at Z6) whose surroundings the stock has been
+/// roughed around: up to Z6.3 within `reach` mm of the plate, below every
+/// level (Z2) farther out.
+fn roughed(
+    m: &camlib::stream::StreamManifest,
+    reach: f64,
+) -> (camlib::stock::Stock, camlib::stock::StockSpec) {
+    use camlib::stock::{HeightBounds, InitialStock, Stock};
+    let spec = m.stock.height().unwrap().clone();
+    let probe = Stock::new(spec.clone()).unwrap();
+    let [nx, ny] = probe.dimensions();
+    let [wx, wy] = probe.cell_widths_mm();
+    let near = |x: f64, y: f64| {
+        let dx = (8. - x).max(x - 16.).max(0.);
+        let dy = (5. - y).max(y - 11.).max(0.);
+        dx.hypot(dy)
+    };
+    let mut bounds = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            // Nearest point of the cell to the plate decides its height.
+            let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+            let (cx, cy) = (x0 + 0.5 * wx, y0 + 0.5 * wy);
+            let d = near(cx, cy).min(near(x0, y0)).min(near(x0 + wx, y0 + wy));
+            let top = if d <= reach { 6.3 } else { 2. };
+            bounds.push(HeightBounds {
+                lower_mm: top,
+                upper_mm: top,
+            });
+        }
+    }
+    let initial = InitialStock {
+        source_id: "roughed-plate".into(),
+        revision: "1".into(),
+        source_sha256: "0".repeat(64),
+        source_to_setup: camlib::motion::WorkFrame::identity(),
+        uncertainty_mm: 0.,
+        representation: "whole_cell_top_down".into(),
+        bounds,
+    };
+    (Stock::from_initial(spec.clone(), &initial).unwrap(), spec)
+}
+/// Stock roughed away below every level (Z2): the entries are free of it,
+/// for tests that are not about the stock.
+fn cleared(m: &camlib::stream::StreamManifest) -> camlib::stock::Stock {
+    roughed(m, -1.).0
+}
+fn plate(m: &camlib::stream::StreamManifest) -> camlib::waterline::WaterlineOperation {
+    use camlib::surface::SurfaceMesh;
+    let mut op = operation(m);
     let (a, b, c, d) = ([8., 5., 6.], [16., 5., 6.], [16., 11., 6.], [8., 11., 6.]);
     op.surface = SurfaceMesh {
         version: 1,
@@ -853,8 +895,72 @@ fn loops_are_entered_from_beside_the_wall_not_on_it() {
         source: serde_json::Value::Null,
         triangles: vec![[a, b, c], [a, c, d]].into(),
     };
+    op
+}
+#[test]
+fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
+    use camlib::{motion::MoveKind, waterline::WaterlinePlan};
+    // Roughing left a stair 3 mm wide against the plate (Z6.3): a fixed
+    // 1 mm offset from the loop still comes down into it. Independently of
+    // the plan, every plunge must end where the ball's surface over each
+    // stock cell it can touch is at or above the cell's upper bound.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let (mut stock, spec) = roughed(&m, 3.);
     let mut plan = WaterlinePlan::prepare(
-        op,
+        plate(&m),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let r = 2.;
+    let (mut plunges, mut beside) = (0, 0);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if motion.kind == MoveKind::Plunge {
+            let p = motion.curve.end();
+            let [nx, ny] = stock.dimensions();
+            let [wx, wy] = stock.cell_widths_mm();
+            for j in 0..ny {
+                for i in 0..nx {
+                    let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+                    let d = (x0 - p[0]).max(p[0] - x0 - wx).max(0.).hypot(
+                        (y0 - p[1]).max(p[1] - y0 - wy).max(0.),
+                    );
+                    if d < r {
+                        let ball = p[2] + r - (r * r - d * d).sqrt();
+                        let upper = stock.cells()[j * nx + i].upper_mm;
+                        assert!(
+                            ball >= upper - 1e-6,
+                            "plunge to {p:?} enters stock (cell {i},{j} up to {upper}, ball at {ball})"
+                        );
+                    }
+                }
+            }
+            plunges += 1;
+            if p[2] < 6.3 {
+                beside += 1;
+            }
+        }
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+    }
+    assert!(plunges > 0 && beside > 0, "{plunges} {beside}");
+}
+#[test]
+fn a_loop_with_no_stock_free_entry_is_refused_by_name() {
+    use camlib::waterline::WaterlinePlan;
+    // Raw stock to Z10 stands above every level everywhere: no point beside
+    // the wall is free of stock, and the loop is not entered on the wall.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut plan = WaterlinePlan::prepare(
+        plate(&m),
         &m.tools[0],
         m.stock.height().unwrap(),
         m.initial_position_mm,
@@ -862,34 +968,13 @@ fn loops_are_entered_from_beside_the_wall_not_on_it() {
         &cancel,
     )
     .unwrap();
-    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
-    let tool = m.tools[0].prepare().unwrap();
-    let to_box = |p: [f64; 3]| {
-        let dx = (8. - p[0]).max(p[0] - 16.).max(0.);
-        let dy = (5. - p[1]).max(p[1] - 11.).max(0.);
-        dx.hypot(dy)
-    };
-    let (mut plunges, mut entry) = (0, None);
-    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
-        let d = stock
-            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
-            .unwrap();
-        stock.apply_delta(&d).unwrap();
-        match motion.kind {
-            MoveKind::Plunge => entry = Some(motion.curve.end()),
-            MoveKind::Lead if entry.is_some() => {
-                // The lead onto the loop is horizontal and comes 1 mm (the
-                // ball radius 2 halved, at least 1) from farther out.
-                let (e, start) = (entry.take().unwrap(), motion.curve.end());
-                assert_eq!(e[2], start[2]);
-                assert!(
-                    to_box(e) >= to_box(start) + 0.9,
-                    "plunge at {e:?} is not beside the loop start {start:?}"
-                );
-                plunges += 1;
-            }
-            _ => (),
+    let stock = camlib::stock::Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let error = loop {
+        match plan.next_motion_with_stock(&stock, &cancel) {
+            Err(e) => break e,
+            Ok(Some(_)) => (),
+            Ok(None) => panic!("planned without refusing"),
         }
-    }
-    assert!(plunges > 0);
+    };
+    assert!(error.contains("has no entry beside the wall"), "{error}");
 }

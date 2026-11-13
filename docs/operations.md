@@ -1577,10 +1577,18 @@ report's `shadow_error_mm` is the largest such error over the levels cut.
 `safety_margin_mm` and `stock_to_leave_mm` work as for `Parallel`.
 
 A ball's contour is entered from beside the wall: the ball drops at a point
-moved away from the wall, on the side whose straight lead to the contour is
-clear of the surface, and then leads in sideways, so its tip never lands on the
-wall (it used to drop on the surface, up to 1.9 mm axially into stock). A loop
-with no such side keeps the tangent lead.
+moved away from the wall and then leads in sideways, so its tip never lands on
+the wall (it used to drop on the surface, up to 1.9 mm axially into stock). The
+point is chosen from the live stock. It is the nearest point, starting
+`max(r/2, 1)` mm from the loop and stepping out by that much up to 4 cutter
+radii, on either side of the loop start, where the lead to the contour is
+clear of the surface, the machining limits allow the plunge and the lead, and
+the stock under the ball (the upper bound of every cell its disk can touch) is
+at or below the height it plunges to. A loop with no such point is refused,
+naming the loop and the stock there: rough or rest-rough the area first so the
+stock beside the wall is cleared to the level. It is never entered on the wall
+or down into stock. The `waterline`, `waterline-dense` and `steep-and-shallow`
+benchmarks run on blanks roughed to 0.1 to 0.3 mm over the part.
 
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along
 its contour from the level above, instead of a flat lap and a step down; the

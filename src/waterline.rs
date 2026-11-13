@@ -776,6 +776,9 @@ pub struct WaterlinePlan {
     /// Machining limits (containment, avoid areas).
     region_limits: Option<crate::limits::PreparedLimits>,
 }
+/// How far out (in cutter radii) a loop's side entry is searched.
+const SIDE_ENTRY_REACH_RADII: f64 = 4.;
+
 impl WaterlinePlan {
     pub fn prepare_with_stock(
         op: WaterlineOperation,
@@ -1368,7 +1371,8 @@ impl WaterlinePlan {
                 continue;
             }
             let (ramp_from, passes) = self.ramp_setup();
-            let entry_points = self.side_entries(&loops, z, cancel)?;
+            let plunge_z = ramp_from.map_or(z, |from| from.max(z));
+            let entry_points = self.side_entries(stock, &loops, z, plunge_z, cancel)?;
             let mut profile = ProfileMotion::new(
                 self.op.settings(),
                 &self.spec,
@@ -1386,46 +1390,89 @@ impl WaterlinePlan {
     /// Per loop, a point beside its start, away from the part, where the
     /// ball plunges before a horizontal lead onto the loop: the stock the
     /// roughing left against the wall is then cut sideways, not by the
-    /// ball's tip. The lead (at the level's ball centre height) must be
-    /// clear of the part; higher at the same XY is clear too (the part is
-    /// a downward-extruded surface). None: the tangent lead as before.
+    /// ball's tip. A point is taken only where the lead (at the level's ball
+    /// centre height) is clear of the part (higher at the same XY is clear
+    /// too: the part is a downward-extruded surface), where the live stock
+    /// under the ball (the upper bound of every cell its disk can touch) is at
+    /// or below the height it plunges to, within the tolerance, and where the
+    /// plunge point and the lead are inside the machining limits.
+    ///
+    /// Points are tried from `max(r/2, 1)` mm out, in steps of that, up to
+    /// `SIDE_ENTRY_REACH_RADII` radii, on both sides of the loop start (the
+    /// side farther from the part first). A loop with no such point is
+    /// refused by name: the ball would come down into stock or on the wall.
     fn side_entries(
         &self,
+        stock: &Stock,
         loops: &[Vec<Stroke>],
         z: f64,
+        plunge_z: f64,
         cancel: &impl CancelSignal,
     ) -> Result<Vec<Option<[f64; 2]>>, String> {
-        let length = (self.radius / 2.).max(1.);
+        let step = (self.radius / 2.).max(1.);
+        let reach = SIDE_ENTRY_REACH_RADII * self.radius;
         let center = z + self.radius;
         let mut work = SurfaceWork::default();
         let mut result = Vec::with_capacity(loops.len());
         for edges in loops {
             let start = edges[0].curve(z).start();
             let t = edges[0].tangent(false);
-            let mut best: Option<([f64; 2], f64)> = None;
-            for sign in [1., -1.] {
-                let p = [
-                    start[0] - sign * length * t[1],
-                    start[1] + sign * length * t[0],
-                ];
-                if !self.surface.segment_clear(
-                    [p[0], p[1], center],
-                    [start[0], start[1], center],
-                    self.protected,
-                    &mut work,
-                    cancel,
-                )? {
-                    continue;
+            let mut found = None;
+            let mut stock_seen = f64::MIN;
+            let mut k = 1.;
+            while found.is_none() && k * step <= reach + 1e-9 {
+                let length = k * step;
+                let mut best: Option<([f64; 2], f64)> = None;
+                for sign in [1., -1.] {
+                    let p = [
+                        start[0] - sign * length * t[1],
+                        start[1] + sign * length * t[0],
+                    ];
+                    if !self.surface.segment_clear(
+                        [p[0], p[1], center],
+                        [start[0], start[1], center],
+                        self.protected,
+                        &mut work,
+                        cancel,
+                    )? {
+                        continue;
+                    }
+                    let top = stock_top(stock, p, self.radius);
+                    stock_seen = stock_seen.max(top);
+                    if top > plunge_z + self.op.tolerance_mm {
+                        continue;
+                    }
+                    if let Some(limits) = &self.region_limits {
+                        let lead = crate::motion::Curve::Line {
+                            start: [p[0], p[1], plunge_z],
+                            end: [start[0], start[1], plunge_z],
+                        };
+                        if !limits.allows(p, plunge_z)? || !limits.allows_curve(&lead, true)? {
+                            continue;
+                        }
+                    }
+                    let d = self
+                        .surface
+                        .point_distance([p[0], p[1], center], &mut work, cancel)?
+                        .distance_mm;
+                    if best.is_none_or(|(_, b)| d > b) {
+                        best = Some((p, d));
+                    }
                 }
-                let d = self
-                    .surface
-                    .point_distance([p[0], p[1], center], &mut work, cancel)?
-                    .distance_mm;
-                if best.is_none_or(|(_, b)| d > b) {
-                    best = Some((p, d));
-                }
+                found = best.map(|(p, _)| p);
+                k += 1.;
             }
-            result.push(best.map(|(p, _)| p));
+            let Some(point) = found else {
+                return Err(format!(
+                    "waterline {}: the loop at Z{z:.3} starting at ({:.3}, {:.3}) has no entry beside the wall within {reach:.3} mm ({} cutter radii) where the part is clear, the machining limits allow it and the stock is at or below Z{plunge_z:.3} under the ball (stock up to Z{:.3} where it was tried): the ball would come straight down into stock or onto the wall. Rough or rest-rough this area first, so the stock beside the wall is cleared down to this level, or change the limits",
+                    self.op.id,
+                    start[0],
+                    start[1],
+                    SIDE_ENTRY_REACH_RADII,
+                    stock_seen.max(z)
+                ));
+            };
+            result.push(Some(point));
         }
         Ok(result)
     }
@@ -1530,4 +1577,29 @@ pub(crate) fn flat_level_loops(
         }
     }
     Ok((loops, error))
+}
+
+/// Highest live stock upper bound over the cells a disk of radius r at xy
+/// can touch (whole cells: an overestimate, never an underestimate).
+fn stock_top(stock: &Stock, xy: [f64; 2], r: f64) -> f64 {
+    let spec = stock.spec();
+    let [nx, ny] = stock.dimensions();
+    let [wx, wy] = stock.cell_widths_mm();
+    let reach = r + 0.5 * wx.hypot(wy);
+    let range = |c: f64, lo: f64, w: f64, n: usize| {
+        let a = ((c - reach - lo) / w).floor().max(0.) as usize;
+        let b = (((c + reach - lo) / w).ceil().max(0.) as usize).min(n);
+        a..b
+    };
+    let mut top = spec.min_mm[2];
+    for j in range(xy[1], spec.min_mm[1], wy, ny) {
+        for i in range(xy[0], spec.min_mm[0], wx, nx) {
+            let k = j * nx + i;
+            let c = stock.cell_center(k).unwrap_or(xy);
+            if (c[0] - xy[0]).hypot(c[1] - xy[1]) <= reach {
+                top = top.max(stock.cells()[k].upper_mm);
+            }
+        }
+    }
+    top
 }

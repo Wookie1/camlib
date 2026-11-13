@@ -344,7 +344,14 @@ def _morph():
 def _steep_and_shallow():
     import camlib
 
+    import cadquery as cq
+    from camlib.cadquery import export_stock_mesh
+
     config = _options(_roof())
+    # Finishing follows roughing: the blank is the roof's planar envelope
+    # with 0.1 mm left.
+    envelope = cq.Workplane("XZ").polyline([(0, 0), (24, 0), (24, 4.1), (12, 8.1), (0, 4.1)]).close().extrude(-16)
+    config["stock"] = camlib.StockSpec.from_mesh(export_stock_mesh(envelope), 0.25)
     tool, surface = config["tools"][0], config["operations"][0].surface
     steep, shallow = camlib.steep_and_shallow(
         "finish",
@@ -374,7 +381,18 @@ def _rough_finish_target():
 
 
 def _waterline():
-    return _options(_support("waterline").waterline_job())
+    import camlib
+    import cadquery as cq
+    from camlib.cadquery import export_stock_mesh
+
+    config = _options(_support("waterline").waterline_job())
+    # Waterline finishing follows roughing: the blank leaves 0.3 mm on the
+    # island's walls and top and 0.1 mm on the base, so no loop is entered
+    # down into stock.
+    base = cq.Workplane("XY").box(24, 16, 2.1, centered=(False, False, False))
+    island = cq.Workplane("XY").workplane(offset=2).center(12, 8).rect(16.7, 10.7).extrude(6.3, taper=20)
+    stock = camlib.StockSpec.from_mesh(export_stock_mesh(base.union(island)), 0.4)
+    return dict(config, stock=stock)
 
 
 # --- production-density variants (engine performance at realistic density) ---
