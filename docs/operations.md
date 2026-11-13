@@ -1317,6 +1317,19 @@ move's lowest tip) and any point of it may lie within the section's radius of
 the tool axis anywhere on the move. `steep_and_shallow` can then take the
 part's lowest point as its floor. Waterline is admitted the same way.
 
+Row entries: before plunging into a row, the stock cells bound how deep the
+ball would enter live stock (each cell counts up to its highest point anywhere
+in the cell the cutter overlaps). Deeper than 0.25 mm, the row is entered by a
+10 degree zigzag ramp along the row instead (`ramped_entries` in the report).
+Where no ramp is proven clear of the part, the operation is refused, naming
+the entry. Next to steep walls coarse stock cells can make that bound very
+pessimistic; `plunge_unproven_entries=True` (opt-in, on `Parallel` and its
+patterns, `Pencil` and `Scallop`) plunges such entries as
+before and lists each in the report's `unproven_entries` (position, entry
+height and the cell bound). Those plunges are not proven by camlib: verify
+them independently, for example by re-simulating the posted program on a
+finer grid, before the program is used.
+
 Flat and bull-nose end mills work too (raster and the spiral, radial and
 project patterns). Their contact with each triangle is exact (facet, edge and
 vertex), and every move between computed points is proven not to gouge: per

@@ -355,17 +355,15 @@ class ActualDepthTest(unittest.TestCase):
 
 
 class RowEntryTest(unittest.TestCase):
-    def test_rows_under_stock_are_entered_by_a_ramp_not_a_plunge(self):
-        # Fresh 8 mm stock stands over a stepped part (flats at 4 and 7).
-        # Rows limited to slopes up to 45 deg skip the boss walls and
-        # re-enter beside and on the boss under that stock: a straight
-        # plunge would take the ball down through it each time.
+    def run_rows(self, cell):
         import cadquery as cq
         import camlib
         from camlib.cadquery import export_surface_mesh
 
-        part = cq.Workplane("XY").box(24, 16, 4, centered=False).union(
-            cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4))
+        part = (
+            cq.Workplane("XY")
+            .box(24, 16, 4, centered=False)
+            .union(cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4)))
         )
         surface = export_surface_mesh(part, source=dict(model="stepped", revision="1"))
         tool = ToolAssembly(
@@ -376,9 +374,164 @@ class RowEntryTest(unittest.TestCase):
             (HolderSection(30, 60, 4, 4),),
         )
         op = camlib.Parallel(
-            "rows", tool, surface, 0, 2, 12, slope_to_deg=45,
-            feed_mm_min=600, plunge_mm_min=150, spindle_rpm=12000,
-            tool_number=1, length_register=1, coolant="flood",
+            "rows",
+            tool,
+            surface,
+            0,
+            2,
+            12,
+            slope_to_deg=45,
+            feed_mm_min=600,
+            plunge_mm_min=150,
+            spindle_rpm=12000,
+            tool_number=1,
+            length_register=1,
+            coolant="flood",
+        )
+        motions = []
+        with Simulation(
+            stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), cell),
+            tools=(tool,),
+            operations=(op,),
+            revision="1",
+            initial_position_mm=(0, 0, 12),
+            verification=camlib.StreamChecks(stock_contact=camlib.StockContactOptions()),
+        ) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, Update):
+                    motions.append(update.motion)
+        return motions
+
+    def wedge_rows(self, plunge_unproven_entries):
+        # A 40 deg slope rising from the foot of a vertical wall, under fresh
+        # stock to Z12: rows start at the wall foot, the wall blocks a ramp
+        # backward and the slope a ramp forward, so no entry ramp is clear.
+        import cadquery as cq
+        import camlib
+        from camlib.cadquery import export_surface_mesh
+
+        profile = [(0, 0), (30, 0), (30, 10.39), (16, 10.39), (6, 2), (6, 12), (0, 12)]
+        part = cq.Workplane("XZ").polyline(profile).close().extrude(-16)
+        surface = export_surface_mesh(part, source=dict(model="wedge", revision="1"))
+        tool = ToolAssembly(
+            "ball4",
+            BallEndMill("b4", diameter=4, flute_length=20, overall_length=50),
+            30,
+            60,
+            (HolderSection(30, 60, 4, 4),),
+        )
+        op = camlib.Parallel(
+            "rows",
+            tool,
+            surface,
+            0,
+            2,
+            16,
+            slope_to_deg=45,
+            feed_mm_min=600,
+            plunge_mm_min=150,
+            spindle_rpm=12000,
+            tool_number=1,
+            length_register=1,
+            coolant="flood",
+            plunge_unproven_entries=plunge_unproven_entries,
+        )
+        report, motions = None, []
+        with Simulation(
+            stock=camlib.StockSpec((0, 0, 0), (30, 16, 12), 0.5),
+            tools=(tool,),
+            operations=(op,),
+            revision="1",
+            initial_position_mm=(0, 0, 16),
+            verification=camlib.StreamChecks(stock_contact=camlib.StockContactOptions()),
+        ) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, Update):
+                    motions.append(update.motion)
+                elif isinstance(update, OperationUpdate) and update.stage == "end":
+                    report = update.report
+        return report, motions
+
+    def test_an_entry_with_no_proven_ramp_is_refused_by_default(self):
+        with self.assertRaisesRegex(Exception, "no ramp along the row is proven clear"):
+            self.wedge_rows(False)
+
+    def test_opted_in_unproven_entries_plunge_and_are_all_listed(self):
+        report, motions = self.wedge_rows(True)
+        listed = report["unproven_entries"]
+        self.assertTrue(listed)
+        # Independent check: before the first cut the stock is the box to
+        # Z12, so every plunge whose ball tip ends below Z12 - 0.25 goes
+        # into fresh stock; each one at an entry must be listed, with a
+        # bound no smaller than the plunge's real depth into that stock.
+        keyed = {(round(e["x_mm"], 6), round(e["y_mm"], 6), round(e["z_mm"], 6)): e for e in listed}
+        deep = []
+        for m in motions:
+            if m["kind"] != "plunge":
+                continue
+            x, y, z = m["curve"]["end"]
+            if 12 - z > 0.25 and (round(x, 6), round(y, 6), round(z, 6)) in keyed:
+                deep.append(keyed[(round(x, 6), round(y, 6), round(z, 6))])
+                self.assertGreaterEqual(keyed[(round(x, 6), round(y, 6), round(z, 6))]["bound_mm"], 12 - z - 1e-9)
+        self.assertEqual(len(deep), len(listed))
+
+    def test_coarse_stock_cells_never_hide_stock_from_a_row_entry(self):
+        # Audit #22: on 2-8 mm stock cells the entry test used to read only
+        # cell centres, and the first entry plunged 4 mm into fresh stock at
+        # the stock's edge. Independent bound: before any cut the stock is
+        # the 0..24 x 0..16 box up to Z8, so a ball plunge to tip z at (x, y)
+        # cuts 8 - (z + 2 - sqrt(4 - d^2)) at the box point nearest the axis
+        # (d its distance). The first entry may cut at most 0.25 mm of it, or
+        # the operation refuses.
+        for cell in (2, 4, 8):
+            try:
+                motions = self.run_rows(cell)
+            except Exception as e:  # refused: no ramp proven clear
+                self.assertIn("no ramp along the row is proven clear", str(e))
+                continue
+            first = next(m for m in motions if m["kind"] == "plunge")
+            x, y, z = first["curve"]["end"]
+            d = math.hypot(max(0, x - 24, -x), max(0, y - 16, -y))
+            if d < 2:
+                cut = 8 - (z + 2 - math.sqrt(4 - d * d))
+                self.assertLessEqual(cut, 0.25 + 1e-9, (cell, first))
+
+    def test_rows_under_stock_are_entered_by_a_ramp_not_a_plunge(self):
+        # Fresh 8 mm stock stands over a stepped part (flats at 4 and 7).
+        # Rows limited to slopes up to 45 deg skip the boss walls and
+        # re-enter beside and on the boss under that stock: a straight
+        # plunge would take the ball down through it each time.
+        import cadquery as cq
+        import camlib
+        from camlib.cadquery import export_surface_mesh
+
+        part = (
+            cq.Workplane("XY")
+            .box(24, 16, 4, centered=False)
+            .union(cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4)))
+        )
+        surface = export_surface_mesh(part, source=dict(model="stepped", revision="1"))
+        tool = ToolAssembly(
+            "ball4",
+            BallEndMill("b4", diameter=4, flute_length=20, overall_length=50),
+            30,
+            60,
+            (HolderSection(30, 60, 4, 4),),
+        )
+        op = camlib.Parallel(
+            "rows",
+            tool,
+            surface,
+            0,
+            2,
+            12,
+            slope_to_deg=45,
+            feed_mm_min=600,
+            plunge_mm_min=150,
+            spindle_rpm=12000,
+            tool_number=1,
+            length_register=1,
+            coolant="flood",
         )
         report, motions = None, []
         with Simulation(

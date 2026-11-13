@@ -29,6 +29,11 @@ fn operation(m: &StreamManifest, pattern: FinishPattern) -> ParallelOperation {
         op.stepover_mm = 0.;
     }
     op.pattern = pattern;
+    // The fixture finishes straight out of fresh stock, so some pass
+    // entries plunge into it with no ramp proven clear (refused by
+    // default). These tests check the pattern geometry: opt in, and `run`
+    // checks every such plunge is listed in the report.
+    op.plunge_unproven_entries = true;
     op
 }
 
@@ -77,6 +82,13 @@ fn run(m: &StreamManifest, op: ParallelOperation) -> (Vec<Motion>, ParallelPlan,
         motions.push(motion);
     }
     plan.finish_report(&cancel).unwrap();
+    for e in &plan.report().unproven_entries {
+        assert!(
+            motions.iter().any(|m| m.kind == MoveKind::Plunge
+                && m.curve.end() == [e.x_mm, e.y_mm, e.z_mm]),
+            "listed unproven entry {e:?} has no plunge"
+        );
+    }
     assert_eq!(position[2], 10., "ends at clearance");
     (motions, plan, stock)
 }
