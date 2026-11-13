@@ -1913,7 +1913,9 @@ impl ParallelPlan {
                     let excess = plunge_excess(stock, xy, entry, self.radius, self.tip_offset);
                     let mut target = entry;
                     self.phase = Phase::Lead;
-                    if excess > ENTRY_PLUNGE_MM {
+                    // A one-way pass cuts in one direction only: a zigzag ramp
+                    // would cut back along the row, so it plunges as before.
+                    if excess > ENTRY_PLUNGE_MM && !self.op.one_way {
                         // Plunge only to where the cutter first meets live
                         // stock, then ramp the rest along the row.
                         let z0 =

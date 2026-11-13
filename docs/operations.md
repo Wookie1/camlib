@@ -1295,6 +1295,16 @@ climb milling and on the left conventional: `axis="x"` cuts conventional and
 cuts uphill or downhill; that depends on the surface, not on this option.)
 The report has `one_way: true` when it is set.
 
+Row entries: a row (or a re-entry after a gap) is entered by a vertical
+plunge. Where that plunge would cut more than 0.25 mm of live stock (half of
+the 0.5 mm axial-plunge floor of the zmap check; the ball's face against the
+stock cells under it), the ball plunges only to where it first meets stock and
+zigzags the rest down along the row line at 10 degrees (inside a 15 degree
+plunge limit), forward else backward, shortened up to three times, every leg
+proven clear of the protected part. If no clear ramp exists it plunges as
+before. The report counts them as `ramped_entries`. With `one_way=True` rows
+are always plunged: a zigzag ramp would cut back along the row.
+
 Depth: when the remaining stock stands no higher above `floor_z_mm` than the
 cutting length, every pass is within the flutes. Where it stands higher (a
 part taller than the flutes, after roughing), each feed move is checked
