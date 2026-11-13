@@ -1364,7 +1364,22 @@ form one level) and finishes each level at its exact height plus
 `stock_to_leave_mm`, top level first, with a flat center-cutting end mill in
 raster rows along `axis`. A cut is kept only where the highest point of the
 part under the tool's swept disk is not above the cut (computed exactly per
-facet); each run starts with a vertical plunge. Near walls the tool stays a
+facet). A run is entered by a vertical plunge where no live stock stands
+above its height at its start (within `tolerance_mm`). Where stock does (roughing
+left it, or the stock was not cut there yet), the run is entered by a ramp, and
+only if the operation declares `entry=RampEntry(angle_deg, ...)`: the tool
+plunges through air to the top of the live stock over the whole run (the highest
+cell bound anywhere along it, not just at its start), then zigzags down along
+the run at no more than the declared angle and at the entry's `feed_mm_min`
+(default the plunge feed). A zigzag that has to reverse on the run needs the
+entry's `min_length_mm`. Every ramp point lies above the proven run, so it
+clears the part like the run does; the report counts the ramped runs as
+`ramped_entries`. Nothing is plunged into stock on any path: a run with stock
+above it and no declared entry, a ramp that does not fit (too short a run, an
+angle too shallow for the run, or stock above the feed height) is refused,
+naming the run, its length and the stock above it. The `flat` benchmark runs on
+a blank roughed to 0.1 mm over the flats and declares a 3 degree entry. Near
+walls the tool stays a
 radius away; the report gives the levels, runs, cut length and any row length
 that could not be proven clear (`dropped_length_mm`).
 

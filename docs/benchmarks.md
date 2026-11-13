@@ -89,7 +89,7 @@ comparable only on the same machine; CI runs the same benchmark on every push.
 | Chamfer | [#35](https://github.com/stevecad/camlib/issues/35) | `chamfer` (top-bevel) | 10 | 82 | 0 (0%) | 19 | 2 | 2 | 37 | 10.9 / 10.9 | 0.018 |
 | Trace | [#36](https://github.com/stevecad/camlib/issues/36) | `trace` (engrave) | 24 | 108 | 0 (0%) | 60 | 4 | 4 | 170 | 15.5 / 15.5 | 0.003 |
 | VCarve | [#37](https://github.com/stevecad/camlib/issues/37) | `vcarve` (carve) | 1986 | 97 | 21 (22%) | 17 | 1 | 1 | 107 | 28.8 / 20.5 | 2.804 |
-| Flat | [#38](https://github.com/stevecad/camlib/issues/38) | `flat` (flats) | 156 | 680 | 176 (26%) | 459 | 39 | 39 | 1273 | 165.2 / 165.2 | 0.004 |
+| Flat | [#38](https://github.com/stevecad/camlib/issues/38) | `flat` (flats) | 222 | 965 | 427 (44%) | 459 | 105 | 39 | 36 | 191.0 / 191.0 | 0.004 |
 | Parallel | [#39](https://github.com/stevecad/camlib/issues/39) | `parallel` (finish-roof) | 3321 | 1723 | 543 (32%) | 427 | 41 | 41 | 1508 | 334.8 / 316.9 | 0.164 |
 | Parallel | [#39](https://github.com/stevecad/camlib/issues/39) | `parallel-dense` (finish-roof) | 14023 | 8457 | 3170 (37%) | 2005 | 201 | 201 | 1511 | 1618.0 / 1555.9 | 0.773 |
 | Parallel | [#39](https://github.com/stevecad/camlib/issues/39) | `rough-parallel` (parallel) | 3321 | 1805 | 625 (35%) | 508 | 41 | 41 | 292 | 368.4 / 350.5 | 0.175 |
@@ -183,7 +183,7 @@ limit the cutter actually runs, measured from the streamed moves alone
 | `chamfer` | Chamfer the top edges of an annulus | 50 | 66.7 / 66.6 | 81 | 0.0 / 719.2 | 0.0 / 343.4 | 0.036 | 0.006 | 0.015 | 387 |
 | `trace` | Engrave a rectangle and a hook | 24 | 15.5 / 15.5 | 47 | – | – | 0.011 | 0.007 | 0.005 | 42 |
 | `vcarve` | V-carve an L-shaped letter | 1986 | 28.8 / 20.5 | 2009 | – | – | 2.829 | 0.025 | 0.180 | 48 |
-| `flat` | Flat areas of a stepped part | 156 | 165.2 / 165.2 | 179 | 28.5 / 173.5 | 0.0 / 14.3 | 0.012 | 0.007 | 0.012 | 386 |
+| `flat` | Flat areas of a stepped part | 222 | 191.0 / 191.0 | 245 | 0.9 / 104.6 | 0.0 / 24.4 | 0.012 | 0.007 | 0.012 | 386 |
 | `rough-parallel` | Rough then parallel ball finish a roof | 6248 | 9268.7 / 9249.5 | 6279 | 0.0 / 146.1 | 0.0 / 99.6 | 0.272 | 0.012 | 0.527 | 399 |
 | `parallel` | Parallel finishing of a roof | 3321 | 334.8 / 316.9 | 3344 | 0.0 / 146.1 | 0.0 / 99.6 | 0.170 | 0.004 | 0.193 | 392 |
 | `spiral` | Spiral finishing of a roof | 2552 | 225.9 / 225.5 | 2575 | 0.0 / 149.9 | 0.0 / 79.0 | 0.105 | 0.005 | 0.202 | 390 |
