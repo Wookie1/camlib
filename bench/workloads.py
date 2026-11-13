@@ -267,8 +267,18 @@ def _flat():
 
     tool = _mill4()
     op = camlib.Flat("flats", tool, _mesh(_stepped), 0, 1.5, 12, **CUT, tool_number=1, length_register=1)
+    # Flat finishing follows roughing: the blank is the part with 0.1 mm left
+    # on the flats, so runs are not entered through solid stock.
+    import cadquery as cq
+    from camlib.cadquery import export_stock_mesh
+
+    blank = (
+        cq.Workplane("XY")
+        .box(24, 16, 4.1, centered=False)
+        .union(cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4.1)))
+    )
     return dict(
-        stock=camlib.StockSpec((0, 0, 0), (24, 16, 8), 0.25),
+        stock=camlib.StockSpec.from_mesh(export_stock_mesh(blank), 0.25),
         tools=(tool,),
         operations=(op,),
         revision="bench",
