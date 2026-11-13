@@ -1617,10 +1617,12 @@ point is chosen from the live stock. It is the nearest point, starting
 radii, on either side of the loop start, where the lead to the contour is
 clear of the surface, the machining limits allow the plunge and the lead, and
 the stock under the ball (the upper bound of every cell its disk can touch) is
-at or below the height it plunges to. A loop with no such point is refused,
-naming the loop and the stock there: rough or rest-rough the area first so the
-stock beside the wall is cleared to the level. It is never entered on the wall
-or down into stock. The `waterline`, `waterline-dense` and `steep-and-shallow`
+at or below the height it plunges to. A loop with no such point keeps the
+tangent lead on the wall, as before, and is counted in the report's
+`wall_entries`: there the ball may come down into stock, so rough or rest-rough
+that area first. (It is not refused, because stock that has not been roughed to
+the level would then stop every waterline before the reach checks that name
+the real limit.) The `waterline`, `waterline-dense` and `steep-and-shallow`
 benchmarks run on blanks roughed to 0.1 to 0.3 mm over the part.
 
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along

@@ -720,6 +720,13 @@ pub struct WaterlineReport {
     pub levels: usize,
     pub levels_completed: usize,
     pub empty_levels: usize,
+    /// Loops entered on the wall (the tangent lead) because no point beside
+    /// the wall within reach had the stock at or below the plunge height, the
+    /// part clear and the limits allowing it: the ball may come down into
+    /// stock there. Rough or rest-rough that area, or find the loop in
+    /// `level_reports`; absent when every loop has a proven side entry.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub wall_entries: usize,
     pub cut_segments: usize,
     pub loops_completed: usize,
     pub requested_bottom_z_mm: f64,
@@ -775,6 +782,9 @@ pub struct WaterlinePlan {
     limits: Option<(f64, f64)>,
     /// Machining limits (containment, avoid areas).
     region_limits: Option<crate::limits::PreparedLimits>,
+}
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 /// How far out (in cutter radii) a loop's side entry is searched.
 const SIDE_ENTRY_REACH_RADII: f64 = 4.;
@@ -1040,6 +1050,7 @@ impl WaterlinePlan {
             levels,
             levels_completed: 0,
             empty_levels: 0,
+            wall_entries: 0,
             cut_segments: 0,
             loops_completed: 0,
             requested_bottom_z_mm: op.bottom_z_mm,
@@ -1372,7 +1383,8 @@ impl WaterlinePlan {
             }
             let (ramp_from, passes) = self.ramp_setup();
             let plunge_z = ramp_from.map_or(z, |from| from.max(z));
-            let entry_points = self.side_entries(stock, &loops, z, plunge_z, cancel)?;
+            let (entry_points, wall) = self.side_entries(stock, &loops, z, plunge_z, cancel)?;
+            self.report.wall_entries += wall;
             let mut profile = ProfileMotion::new(
                 self.op.settings(),
                 &self.spec,
@@ -1399,8 +1411,11 @@ impl WaterlinePlan {
     ///
     /// Points are tried from `max(r/2, 1)` mm out, in steps of that, up to
     /// `SIDE_ENTRY_REACH_RADII` radii, on both sides of the loop start (the
-    /// side farther from the part first). A loop with no such point is
-    /// refused by name: the ball would come down into stock or on the wall.
+    /// side farther from the part first). A loop with no such point keeps
+    /// the tangent lead on the wall, as before, and is counted in the report's
+    /// `wall_entries`: there the ball may come down into stock. (Refusing
+    /// would stop every waterline on stock that has not been roughed to the
+    /// level, ahead of the reach checks that name why.)
     fn side_entries(
         &self,
         stock: &Stock,
@@ -1408,17 +1423,17 @@ impl WaterlinePlan {
         z: f64,
         plunge_z: f64,
         cancel: &impl CancelSignal,
-    ) -> Result<Vec<Option<[f64; 2]>>, String> {
+    ) -> Result<(Vec<Option<[f64; 2]>>, usize), String> {
         let step = (self.radius / 2.).max(1.);
         let reach = SIDE_ENTRY_REACH_RADII * self.radius;
         let center = z + self.radius;
         let mut work = SurfaceWork::default();
         let mut result = Vec::with_capacity(loops.len());
+        let mut wall = 0;
         for edges in loops {
             let start = edges[0].curve(z).start();
             let t = edges[0].tangent(false);
             let mut found = None;
-            let mut stock_seen = f64::MIN;
             let mut k = 1.;
             while found.is_none() && k * step <= reach + 1e-9 {
                 let length = k * step;
@@ -1438,7 +1453,6 @@ impl WaterlinePlan {
                         continue;
                     }
                     let top = stock_top(stock, p, self.radius);
-                    stock_seen = stock_seen.max(top);
                     if top > plunge_z + self.op.tolerance_mm {
                         continue;
                     }
@@ -1462,19 +1476,10 @@ impl WaterlinePlan {
                 found = best.map(|(p, _)| p);
                 k += 1.;
             }
-            let Some(point) = found else {
-                return Err(format!(
-                    "waterline {}: the loop at Z{z:.3} starting at ({:.3}, {:.3}) has no entry beside the wall within {reach:.3} mm ({} cutter radii) where the part is clear, the machining limits allow it and the stock is at or below Z{plunge_z:.3} under the ball (stock up to Z{:.3} where it was tried): the ball would come straight down into stock or onto the wall. Rough or rest-rough this area first, so the stock beside the wall is cleared down to this level, or change the limits",
-                    self.op.id,
-                    start[0],
-                    start[1],
-                    SIDE_ENTRY_REACH_RADII,
-                    stock_seen.max(z)
-                ));
-            };
-            result.push(Some(point));
+            wall += usize::from(found.is_none());
+            result.push(found);
         }
-        Ok(result)
+        Ok((result, wall))
     }
     /// Ramp: the current level descends from the one above (none for the
     /// first level); the lowest level is cut once more flat.

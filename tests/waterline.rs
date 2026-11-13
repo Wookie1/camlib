@@ -391,7 +391,7 @@ impl camlib::stock::CancelSignal for CancelAfter {
 }
 #[test]
 fn waterline_cancel_generation_and_invalid_work_inputs_do_not_advance_cursor() {
-    use camlib::{waterline::WaterlinePlan};
+    use camlib::{stock::Stock, waterline::WaterlinePlan};
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let op = operation(&m);
@@ -437,7 +437,7 @@ fn waterline_cancel_generation_and_invalid_work_inputs_do_not_advance_cursor() {
         &cancel,
     )
     .unwrap();
-    let mut stock = cleared(&m);
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
     let tool = m.tools[0].prepare().unwrap();
     // Allow entry, then cancel during contour preparation. Forty coordinator
     // polls can outlast the whole parallel batch on a fast/many-core host, so
@@ -480,7 +480,7 @@ fn waterline_cancel_generation_and_invalid_work_inputs_do_not_advance_cursor() {
 }
 #[test]
 fn waterline_heights_keep_rapids_above_feed_height_and_end_at_clearance() {
-    use camlib::{motion::MoveKind, waterline::WaterlinePlan};
+    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
     use std::sync::atomic::AtomicBool;
     let m = fixture();
     let cancel = AtomicBool::new(false);
@@ -502,7 +502,7 @@ fn waterline_heights_keep_rapids_above_feed_height_and_end_at_clearance() {
         &cancel,
     )
     .unwrap();
-    let mut stock = cleared(&m);
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
     let tool = m.tools[0].prepare().unwrap();
     let mut motions = vec![];
     while let Some(motion) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
@@ -541,7 +541,7 @@ fn waterline_heights_keep_rapids_above_feed_height_and_end_at_clearance() {
 }
 #[test]
 fn slope_limits_keep_only_the_steep_parts_of_each_contour() {
-    use camlib::{motion::MoveKind, surface::SurfaceWork, waterline::WaterlinePlan};
+    use camlib::{motion::MoveKind, stock::Stock, surface::SurfaceWork, waterline::WaterlinePlan};
     // Frustum fixture: 70 degree flanks and vertical walls.
     let m = fixture();
     let cancel = AtomicBool::new(false);
@@ -555,7 +555,7 @@ fn slope_limits_keep_only_the_steep_parts_of_each_contour() {
             &cancel,
         )
         .unwrap();
-        let stock = cleared(&m);
+        let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
         let mut stock = stock;
         let tool = m.tools[0].prepare().unwrap();
         let mut out = vec![];
@@ -879,11 +879,6 @@ fn roughed(
     };
     (Stock::from_initial(spec.clone(), &initial).unwrap(), spec)
 }
-/// Stock roughed away below every level (Z2): the entries are free of it,
-/// for tests that are not about the stock.
-fn cleared(m: &camlib::stream::StreamManifest) -> camlib::stock::Stock {
-    roughed(m, -1.).0
-}
 fn plate(m: &camlib::stream::StreamManifest) -> camlib::waterline::WaterlineOperation {
     use camlib::surface::SurfaceMesh;
     let mut op = operation(m);
@@ -951,12 +946,29 @@ fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
         stock.apply_delta(&d).unwrap();
     }
     assert!(plunges > 0 && beside > 0, "{plunges} {beside}");
+    assert_eq!(plan.report().wall_entries, 0);
+}
+/// Plan the whole operation, committing each move to the stock.
+fn drain(
+    m: &camlib::stream::StreamManifest,
+    plan: &mut camlib::waterline::WaterlinePlan,
+    stock: &mut camlib::stock::Stock,
+) {
+    let cancel = AtomicBool::new(false);
+    let tool = m.tools[0].prepare().unwrap();
+    while let Some(motion) = plan.next_motion_with_stock(stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+    }
 }
 #[test]
-fn a_loop_with_no_stock_free_entry_is_refused_by_name() {
+fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     use camlib::waterline::WaterlinePlan;
     // Raw stock to Z10 stands above every level everywhere: no point beside
-    // the wall is free of stock, and the loop is not entered on the wall.
+    // the wall is free of stock, so the loops keep the tangent lead on the
+    // wall, and the report counts them (the ball may come down into stock).
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let mut plan = WaterlinePlan::prepare(
@@ -968,13 +980,20 @@ fn a_loop_with_no_stock_free_entry_is_refused_by_name() {
         &cancel,
     )
     .unwrap();
-    let stock = camlib::stock::Stock::new(m.stock.height().unwrap().clone()).unwrap();
-    let error = loop {
-        match plan.next_motion_with_stock(&stock, &cancel) {
-            Err(e) => break e,
-            Ok(Some(_)) => (),
-            Ok(None) => panic!("planned without refusing"),
-        }
-    };
-    assert!(error.contains("has no entry beside the wall"), "{error}");
+    let mut stock = camlib::stock::Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    drain(&m, &mut plan, &mut stock);
+    assert!(plan.report().wall_entries > 0);
+    // Roughed so that every loop has a free side entry: none is reported.
+    let (mut stock, spec) = roughed(&m, 3.);
+    let mut plan = WaterlinePlan::prepare(
+        plate(&m),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    drain(&m, &mut plan, &mut stock);
+    assert_eq!(plan.report().wall_entries, 0);
 }
