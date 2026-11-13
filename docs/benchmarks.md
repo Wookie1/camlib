@@ -101,10 +101,10 @@ comparable only on the same machine; CI runs the same benchmark on every push.
 | Scallop | [#44](https://github.com/stevecad/camlib/issues/44) | `scallop` (scallop) | 2898 | 1076 | 134 (12%) | 451 | 34 | 34 | 1505 | 205.2 / 187.0 | 0.109 |
 | Scallop | [#44](https://github.com/stevecad/camlib/issues/44) | `scallop-dense` (scallop) | 27025 | 6962 | 2606 (37%) | 4357 | 589 | 589 | 1511 | 1678.2 / 1565.8 | 1.822 |
 | Pencil | [#45](https://github.com/stevecad/camlib/issues/45) | `pencil` (pencil) | 67 | 53 | 0 (0%) | 16 | 1 | 1 | 562 | 8.6 / 8.6 | 0.004 |
-| Waterline | [#46](https://github.com/stevecad/camlib/issues/46) | `waterline` (finish-levels) | 112 | 224 | 0 (0%) | 60 | 4 | 4 | 1719 | 33.0 / 33.0 | 0.127 |
-| Waterline | [#46](https://github.com/stevecad/camlib/issues/46) | `waterline-dense` (finish-levels) | 1847 | 3192 | 0 (0%) | 414 | 56 | 56 | 1730 | 460.2 / 460.2 | 0.995 |
-| Steep-and-shallow | [#47](https://github.com/stevecad/camlib/issues/47) | `steep-and-shallow` (finish-shallow) | 780 | 847 | 52 (6%) | 216 | 24 | 24 | 1256 | 156.6 / 152.9 | 0.080 |
-| Steep-and-shallow | [#47](https://github.com/stevecad/camlib/issues/47) | `steep-and-shallow` (finish-steep) | 866 | 1035 | 68 (7%) | 476 | 23 | 23 | 249 | 171.5 / 168.1 | 0.392 |
+| Waterline | [#46](https://github.com/stevecad/camlib/issues/46) | `waterline` (finish-levels) | 116 | 233 | 28 (12%) | 67 | 4 | 4 | 52 | 34.0 / 34.0 | 0.127 |
+| Waterline | [#46](https://github.com/stevecad/camlib/issues/46) | `waterline-dense` (finish-levels) | 1903 | 3307 | 404 (12%) | 525 | 56 | 56 | 63 | 476.2 / 476.2 | 0.995 |
+| Steep-and-shallow | [#47](https://github.com/stevecad/camlib/issues/47) | `steep-and-shallow` (finish-shallow) | 780 | 847 | 61 (7%) | 216 | 24 | 24 | 23 | 156.6 / 152.9 | 0.080 |
+| Steep-and-shallow | [#47](https://github.com/stevecad/camlib/issues/47) | `steep-and-shallow` (finish-steep) | 892 | 1074 | 240 (22%) | 505 | 23 | 23 | 0 | 176.1 / 172.7 | 0.392 |
 | ThermalCut | [#48](https://github.com/stevecad/camlib/issues/48) | `plasma` (plasma) | 66 | 757 | 0 (0%) | 397 | 6 | 6 | 4689 | 26.5 / 25.5 | 0.015 |
 | TurnFace | [#49](https://github.com/stevecad/camlib/issues/49) | `lathe-face-groove` (face) | 6 | 18 | 2 (11%) | 84 | 0 | 2 | 531 | 8.4 / 8.4 | 0.003 |
 | TurnFace | [#49](https://github.com/stevecad/camlib/issues/49) | `lathe-groove` (face) | 8 | 50 | 4 (8%) | 53 | 0 | 2 | 2513 | 20.8 / 20.8 | 0.003 |
@@ -158,15 +158,15 @@ comparable only on the same machine; CI runs the same benchmark on every push.
 | `geodesic` | Geodesic finishing of a roof, rings from a point | 5336 | 131.0 / 127.9 | 5359 | 0.0 / 148.6 | 0.0 / 65.6 | 2.225 | 1.820 | 0.333 | 396 |
 | `geodesic-boundary` | Geodesic finishing of a roof, inward from its boundary | 713 | 84.2 / 81.0 | 736 | 0.0 / 150.2 | 0.0 / 81.9 | 0.314 | 0.232 | 0.043 | 385 |
 | `pencil` | Pencil the inside corner of a stepped part | 67 | 8.6 / 8.6 | 90 | 648.6 / 884.2 | 0.0 / 27.3 | 0.024 | 0.019 | 0.007 | 384 |
-| `waterline` | Waterline finishing of a tapered island | 112 | 33.0 / 33.0 | 135 | 369.9 / 809.3 | 0.0 / 89.3 | 0.135 | 0.129 | 0.009 | 389 |
-| `steep-and-shallow` | Steep-and-shallow finishing of a roof | 1646 | 328.1 / 321.0 | 1677 | 0.0 / 149.8 | 0.0 / 152.0 | 0.481 | 0.379 | 0.107 | 388 |
+| `waterline` | Waterline finishing of a tapered island | 116 | 34.0 / 34.0 | 139 | 33.2 / 256.4 | 0.0 / 91.4 | 0.135 | 0.129 | 0.009 | 389 |
+| `steep-and-shallow` | Steep-and-shallow finishing of a roof | 1672 | 332.7 / 325.6 | 1703 | 0.0 / 149.8 | 0.0 / 152.0 | 0.481 | 0.379 | 0.107 | 388 |
 | `facing-large` | Face a 300 x 200 block 2 mm (production size) | 140 | 2153.3 / 2153.3 | 163 | – | – | 0.408 | 0.048 | 0.009 | 69 |
 | `roughing-adaptive-large` | 3D adaptive roughing of a 420 x 300 mm plate with bosses (production size) | 3994 | 4700.3 / 4698.0 | 4151 | 87492.3 / 138763.0 | 0.0 / 17399.6 | 14.610 | 2.526 | 48.296 | 134 |
 | `pocket-dense` | Pocket around a round island, 0.4 mm stepover, 0.25 mm stepdown | 9088 | 11873.8 / 11873.4 | 9111 | 3.8 / 536.3 | 0.0 / 489.6 | 0.344 | 0.010 | 0.532 | 44 |
 | `parallel-dense` | Parallel finishing of a roof, 0.1 mm stepover | 14023 | 1618.0 / 1555.9 | 14046 | 0.0 / 143.9 | 0.0 / 101.0 | 0.638 | 0.004 | 0.838 | 415 |
 | `spiral-dense` | Spiral finishing of a roof, 0.15 mm stepover | 12767 | 1125.9 / 1123.9 | 12790 | 0.0 / 144.2 | 0.0 / 86.6 | 0.498 | 0.007 | 0.748 | 417 |
 | `scallop-dense` | Scallop finishing of a roof, 0.15 mm stepover | 27025 | 1678.2 / 1565.8 | 27048 | 0.0 / 143.6 | 0.0 / 81.0 | 2.998 | 1.026 | 1.552 | 444 |
-| `waterline-dense` | Waterline finishing of a tapered island, 0.1 mm stepdown | 1847 | 460.2 / 460.2 | 1870 | 369.9 / 797.6 | 0.0 / 100.4 | 1.008 | 0.382 | 0.104 | 392 |
+| `waterline-dense` | Waterline finishing of a tapered island, 0.1 mm stepdown | 1903 | 476.2 / 476.2 | 1926 | 33.2 / 244.7 | 0.0 / 102.5 | 1.008 | 0.382 | 0.104 | 392 |
 | `plasma` | Plasma-cut a plate with holes and a nested washer | 66 | 26.5 / 25.5 | 270 | – | – | 0.082 | 0.068 | 0.064 | 45 |
 | `plasma-common-line` | Plasma-cut a row of four flush rectangles with common lines | 34 | 18.3 / 18.0 | 73 | – | – | 0.064 | 0.053 | 0.008 | 60 |
 | `lathe-shaft` | Face, rough and finish a stepped shaft | 46 | 111.6 / 111.6 | 71 | 0.9 / 194.2 | 0.0 / 0.0 | 0.075 | 0.016 | 0.011 | 31 |

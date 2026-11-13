@@ -1776,46 +1776,47 @@
     "finish-levels": {
      "toolpath": "Waterline",
      "issue": 46,
-     "moves": 112,
-     "cut_mm": 224.365,
-     "rapid_mm": 60.432,
-     "air_cut_mm": 0.0,
+     "moves": 116,
+     "cut_mm": 233.365,
+     "rapid_mm": 67.463,
+     "air_cut_mm": 27.875,
+     "link_mm": 0.0,
      "plunges": 4,
      "retracts": 4,
-     "removed_mm3": 1718.736,
-     "cycle_seconds_exact_stop": 32.984,
-     "cycle_seconds_tangent": 32.984,
+     "removed_mm3": 51.675,
+     "cycle_seconds_exact_stop": 34.047,
+     "cycle_seconds_tangent": 34.047,
      "engine_seconds": 0.1271
     }
    },
    "toolpath": {
-    "moves": 112,
-    "cycle_seconds_exact_stop": 32.984,
-    "cycle_seconds_tangent": 32.984,
-    "posted_blocks": 135,
+    "moves": 116,
+    "cycle_seconds_exact_stop": 34.047,
+    "cycle_seconds_tangent": 34.047,
+    "posted_blocks": 139,
     "post_error": null,
     "removed_mm3": [
-     1718.736,
-     2077.049
+     1618.861,
+     1763.059
     ],
     "material": {
      "leftover_mm3": [
-      369.91549654449483,
-      809.3220375988336
+      33.23025771239639,
+      256.3969865603765
      ],
      "overcut_mm3": [
       0.0,
-      89.30247743100252
+      91.42743224315859
      ],
      "leftover_cells": [
-      1797,
-      603
+      1717,
+      683
      ],
      "overcut_cells": [
       0,
-      572
+      652
      ],
-     "max_residual_height_mm": 10.000000000001364,
+     "max_residual_height_mm": 2.1000000000013643,
      "complete": true
     }
    },
@@ -1838,15 +1839,16 @@
     "finish-steep": {
      "toolpath": "Steep-and-shallow",
      "issue": 47,
-     "moves": 866,
-     "cut_mm": 1035.45,
-     "rapid_mm": 475.883,
-     "air_cut_mm": 68.251,
+     "moves": 892,
+     "cut_mm": 1074.45,
+     "rapid_mm": 505.254,
+     "air_cut_mm": 239.786,
+     "link_mm": 0.0,
      "plunges": 23,
      "retracts": 23,
-     "removed_mm3": 249.055,
-     "cycle_seconds_exact_stop": 171.478,
-     "cycle_seconds_tangent": 168.058,
+     "removed_mm3": 0.0,
+     "cycle_seconds_exact_stop": 176.078,
+     "cycle_seconds_tangent": 172.658,
      "engine_seconds": 0.3919
     },
     "finish-shallow": {
@@ -1855,24 +1857,25 @@
      "moves": 780,
      "cut_mm": 847.455,
      "rapid_mm": 215.565,
-     "air_cut_mm": 51.882,
+     "air_cut_mm": 61.019,
+     "link_mm": 0.0,
      "plunges": 24,
      "retracts": 24,
-     "removed_mm3": 1255.632,
+     "removed_mm3": 23.086,
      "cycle_seconds_exact_stop": 156.623,
      "cycle_seconds_tangent": 152.923,
      "engine_seconds": 0.0803
     }
    },
    "toolpath": {
-    "moves": 1646,
-    "cycle_seconds_exact_stop": 328.101,
-    "cycle_seconds_tangent": 320.981,
-    "posted_blocks": 1677,
+    "moves": 1672,
+    "cycle_seconds_exact_stop": 332.701,
+    "cycle_seconds_tangent": 325.581,
+    "posted_blocks": 1703,
     "post_error": null,
     "removed_mm3": [
-     1504.686,
-     1648.473
+     775.086,
+     918.873
     ],
     "material": {
      "leftover_mm3": [
@@ -2268,46 +2271,47 @@
     "finish-levels": {
      "toolpath": "Waterline",
      "issue": 46,
-     "moves": 1847,
-     "cut_mm": 3192.442,
-     "rapid_mm": 413.964,
-     "air_cut_mm": 0.0,
+     "moves": 1903,
+     "cut_mm": 3307.442,
+     "rapid_mm": 525.168,
+     "air_cut_mm": 404.48,
+     "link_mm": 0.0,
      "plunges": 56,
      "retracts": 56,
-     "removed_mm3": 1730.443,
-     "cycle_seconds_exact_stop": 460.233,
-     "cycle_seconds_tangent": 460.223,
+     "removed_mm3": 63.378,
+     "cycle_seconds_exact_stop": 476.247,
+     "cycle_seconds_tangent": 476.237,
      "engine_seconds": 0.995
     }
    },
    "toolpath": {
-    "moves": 1847,
-    "cycle_seconds_exact_stop": 460.233,
-    "cycle_seconds_tangent": 460.223,
-    "posted_blocks": 1870,
+    "moves": 1903,
+    "cycle_seconds_exact_stop": 476.247,
+    "cycle_seconds_tangent": 476.237,
+    "posted_blocks": 1926,
     "post_error": null,
     "removed_mm3": [
-     1730.443,
-     2088.169
+     1630.564,
+     1774.18
     ],
     "material": {
      "leftover_mm3": [
-      369.904672573398,
-      797.6153253325593
+      33.219433741299554,
+      244.69362885046158
      ],
      "overcut_mm3": [
       0.0,
-      100.41245945916594
+      102.53741427132202
      ],
      "leftover_cells": [
-      1772,
-      628
+      1692,
+      708
      ],
      "overcut_cells": [
       0,
-      628
+      708
      ],
-     "max_residual_height_mm": 10.000000000001364,
+     "max_residual_height_mm": 2.1000000000013643,
      "complete": true
     }
    },
