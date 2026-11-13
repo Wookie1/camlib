@@ -1,4 +1,3 @@
-from dataclasses import replace
 import importlib.util
 from pathlib import Path
 import unittest
@@ -18,6 +17,14 @@ def load(name, path):
 
 def roof():
     return load("parallel_support", ROOT / "python/tests/support/parallel.py")
+
+
+def roughed_roof_stock():
+    import cadquery as cq
+    from camlib.cadquery import export_stock_mesh
+
+    envelope = cq.Workplane("XZ").polyline([(0, 0), (24, 0), (24, 4.1), (12, 8.1), (0, 4.1)]).close().extrude(-16)
+    return camlib.StockSpec.from_mesh(export_stock_mesh(envelope), 0.25)
 
 
 def patterns(tool, surface):
@@ -93,13 +100,12 @@ class SurfacePatternTest(unittest.TestCase):
         tool, surface = config["tools"][0], config["operations"][0].surface
         for name, op in patterns(tool, surface).items():
             with self.subTest(name):
-                # Fresh stock over the roof: some patterns (scallop, project)
-                # enter where no ramp is proven clear (audit #22). Opt in,
-                # check every such plunge is listed, and that without the
-                # opt-in those patterns are refused.
+                # Stock roughed to 0.1 mm over the roof (a planar envelope),
+                # as a finishing pass meets it after roughing.
                 values = dict(
                     config,
-                    operations=(replace(op, plunge_unproven_entries=True),),
+                    stock=roughed_roof_stock(),
+                    operations=(op,),
                     verification=camlib.StreamChecks(stock_contact=camlib.StockContactOptions()),
                 )
                 report, plunges = None, []
@@ -112,12 +118,6 @@ class SurfacePatternTest(unittest.TestCase):
                             plunges.append(list(motion["curve"]["end"]))
                     self.assertTrue(sim.state.finished)
                     self.assertEqual(report["strategy"], name)
-                    for e in report.get("unproven_entries", []):
-                        self.assertIn([e["x_mm"], e["y_mm"], e["z_mm"]], plunges)
-                    if report.get("unproven_entries"):
-                        with Simulation(**dict(values, operations=(op,))) as strict:
-                            with self.assertRaisesRegex(SimulationError, "no ramp along the row is proven clear"):
-                                list(strict.run_operations())
                     self.assertEqual(report["rows_completed"], report["rows"])
                     self.assertLessEqual(report["max_certified_path_excess_mm"], 0.005)
                     self.assertGreater(sim.state.volume()["removed_lower_mm3"], 1)

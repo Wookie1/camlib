@@ -113,15 +113,9 @@ class Parallel:
     # or the high end with reverse) and returns at retract_z_mm with a rapid
     # link, for a consistent climb or conventional cut (docs/operations.md).
     one_way: bool = False
-    # Opt-in: a row entry the stock cells cannot prove shallow (and with no
-    # clear ramp) is refused by default. True plunges it and lists it in the
-    # report's ``unproven_entries``; verify those independently before use.
-    plunge_unproven_entries: bool = False
 
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
-        if not result["plunge_unproven_entries"]:
-            result.pop("plunge_unproven_entries")
         result.update(
             kind="parallel",
             tool=getattr(self.tool, "id", self.tool),
@@ -152,8 +146,6 @@ def _pattern_dict(op, kind, pattern_fields):
         tool=getattr(op.tool, "id", op.tool),
         surface=op.surface.to_dict() if hasattr(op.surface, "to_dict") else op.surface,
     )
-    if not result.get("plunge_unproven_entries", True):
-        result.pop("plunge_unproven_entries")
     for key in ("retract_z_mm", "feed_z_mm", "rest_threshold_mm"):
         if result.get(key, 0) is None:
             result.pop(key)
@@ -258,9 +250,6 @@ class Scallop:
     rest_threshold_mm: float | None = None
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
-    # Opt-in, as on Parallel: plunge entries the stock cells cannot prove
-    # shallow and list them in the report's ``unproven_entries``.
-    plunge_unproven_entries: bool = False
 
     def to_dict(self):
         return _pattern_dict(self, "scallop", ())
@@ -386,9 +375,6 @@ class Pencil:
     rest_threshold_mm: float | None = None
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
-    # Opt-in, as on Parallel: plunge entries the stock cells cannot prove
-    # shallow and list them in the report's ``unproven_entries``.
-    plunge_unproven_entries: bool = False
 
     def to_dict(self):
         result = _pattern_dict(self, "pencil", ("min_angle_deg", "sample_mm"))
@@ -434,9 +420,6 @@ class Spiral:
     rest_threshold_mm: float | None = None
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
-    # Opt-in, as on Parallel: plunge entries the stock cells cannot prove
-    # shallow and list them in the report's ``unproven_entries``.
-    plunge_unproven_entries: bool = False
 
     def to_dict(self):
         return _pattern_dict(
@@ -479,9 +462,6 @@ class Radial:
     rest_threshold_mm: float | None = None
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
-    # Opt-in, as on Parallel: plunge entries the stock cells cannot prove
-    # shallow and list them in the report's ``unproven_entries``.
-    plunge_unproven_entries: bool = False
 
     def to_dict(self):
         return _pattern_dict(
@@ -523,9 +503,6 @@ class Morph:
     rest_threshold_mm: float | None = None
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
-    # Opt-in, as on Parallel: plunge entries the stock cells cannot prove
-    # shallow and list them in the report's ``unproven_entries``.
-    plunge_unproven_entries: bool = False
 
     def to_dict(self):
         return _pattern_dict(self, "morph", ("from_path", "to_path"))
@@ -562,9 +539,6 @@ class Project:
     rest_threshold_mm: float | None = None
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
-    # Opt-in, as on Parallel: plunge entries the stock cells cannot prove
-    # shallow and list them in the report's ``unproven_entries``.
-    plunge_unproven_entries: bool = False
 
     def to_dict(self):
         return _pattern_dict(self, "project", ("paths",))

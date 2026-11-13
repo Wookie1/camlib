@@ -402,7 +402,7 @@ class RowEntryTest(unittest.TestCase):
                     motions.append(update.motion)
         return motions
 
-    def wedge_rows(self, plunge_unproven_entries):
+    def wedge_rows(self):
         # A 40 deg slope rising from the foot of a vertical wall, under fresh
         # stock to Z12: rows start at the wall foot, the wall blocks a ramp
         # backward and the slope a ramp forward, so no entry ramp is clear.
@@ -434,7 +434,6 @@ class RowEntryTest(unittest.TestCase):
             tool_number=1,
             length_register=1,
             coolant="flood",
-            plunge_unproven_entries=plunge_unproven_entries,
         )
         report, motions = None, []
         with Simulation(
@@ -454,26 +453,7 @@ class RowEntryTest(unittest.TestCase):
 
     def test_an_entry_with_no_proven_ramp_is_refused_by_default(self):
         with self.assertRaisesRegex(Exception, "no ramp along the row is proven clear"):
-            self.wedge_rows(False)
-
-    def test_opted_in_unproven_entries_plunge_and_are_all_listed(self):
-        report, motions = self.wedge_rows(True)
-        listed = report["unproven_entries"]
-        self.assertTrue(listed)
-        # Independent check: before the first cut the stock is the box to
-        # Z12, so every plunge whose ball tip ends below Z12 - 0.25 goes
-        # into fresh stock; each one at an entry must be listed, with a
-        # bound no smaller than the plunge's real depth into that stock.
-        keyed = {(round(e["x_mm"], 6), round(e["y_mm"], 6), round(e["z_mm"], 6)): e for e in listed}
-        deep = []
-        for m in motions:
-            if m["kind"] != "plunge":
-                continue
-            x, y, z = m["curve"]["end"]
-            if 12 - z > 0.25 and (round(x, 6), round(y, 6), round(z, 6)) in keyed:
-                deep.append(keyed[(round(x, 6), round(y, 6), round(z, 6))])
-                self.assertGreaterEqual(keyed[(round(x, 6), round(y, 6), round(z, 6))]["bound_mm"], 12 - z - 1e-9)
-        self.assertEqual(len(deep), len(listed))
+            self.wedge_rows()
 
     def test_coarse_stock_cells_never_hide_stock_from_a_row_entry(self):
         # Audit #22: on 2-8 mm stock cells the entry test used to read only
