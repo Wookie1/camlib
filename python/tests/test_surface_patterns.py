@@ -1,3 +1,4 @@
+from dataclasses import replace
 import importlib.util
 from pathlib import Path
 import unittest
@@ -92,18 +93,31 @@ class SurfacePatternTest(unittest.TestCase):
         tool, surface = config["tools"][0], config["operations"][0].surface
         for name, op in patterns(tool, surface).items():
             with self.subTest(name):
+                # Fresh stock over the roof: some patterns (scallop, project)
+                # enter where no ramp is proven clear (audit #22). Opt in,
+                # check every such plunge is listed, and that without the
+                # opt-in those patterns are refused.
                 values = dict(
                     config,
-                    operations=(op,),
+                    operations=(replace(op, plunge_unproven_entries=True),),
                     verification=camlib.StreamChecks(stock_contact=camlib.StockContactOptions()),
                 )
-                report = None
+                report, plunges = None, []
                 with Simulation(**values) as sim:
                     for update in sim.run_operations():
                         if isinstance(update, OperationUpdate) and update.stage == "end":
                             report = update.report
+                        motion = getattr(update, "motion", None)
+                        if motion is not None and motion["kind"] == "plunge":
+                            plunges.append(list(motion["curve"]["end"]))
                     self.assertTrue(sim.state.finished)
                     self.assertEqual(report["strategy"], name)
+                    for e in report.get("unproven_entries", []):
+                        self.assertIn([e["x_mm"], e["y_mm"], e["z_mm"]], plunges)
+                    if report.get("unproven_entries"):
+                        with Simulation(**dict(values, operations=(op,))) as strict:
+                            with self.assertRaisesRegex(SimulationError, "no ramp along the row is proven clear"):
+                                list(strict.run_operations())
                     self.assertEqual(report["rows_completed"], report["rows"])
                     self.assertLessEqual(report["max_certified_path_excess_mm"], 0.005)
                     self.assertGreater(sim.state.volume()["removed_lower_mm3"], 1)
