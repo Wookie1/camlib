@@ -266,7 +266,19 @@ def _flat():
     import camlib
 
     tool = _mill4()
-    op = camlib.Flat("flats", tool, _mesh(_stepped), 0, 1.5, 12, **CUT, tool_number=1, length_register=1)
+    op = camlib.Flat(
+        "flats",
+        tool,
+        _mesh(_stepped),
+        0,
+        1.5,
+        12,
+        **CUT,
+        tool_number=1,
+        length_register=1,
+        # The benchmark's declared entry, a fact about its tool and material.
+        entry=camlib.RampEntry(angle_deg=3, min_length_mm=1),
+    )
     # Flat finishing follows roughing: the blank is the part with 0.1 mm left
     # on the flats, so runs are not entered through solid stock.
     import cadquery as cq
