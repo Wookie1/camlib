@@ -1576,6 +1576,12 @@ report's `shadow_error_mm` is the largest such error over the levels cut.
 `contour_error_mm`; `reverse` cuts the contours the other way;
 `safety_margin_mm` and `stock_to_leave_mm` work as for `Parallel`.
 
+A ball's contour is entered from beside the wall: the ball drops at a point
+moved away from the wall, on the side whose straight lead to the contour is
+clear of the surface, and then leads in sideways, so its tip never lands on the
+wall (it used to drop on the surface, up to 1.9 mm axially into stock). A loop
+with no such side keeps the tangent lead.
+
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along
 its contour from the level above, instead of a flat lap and a step down; the
 lowest level is then cut once more flat. Each ramp follows a contour proven
