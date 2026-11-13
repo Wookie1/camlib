@@ -364,8 +364,10 @@ class RowEntryTest(unittest.TestCase):
         import camlib
         from camlib.cadquery import export_surface_mesh
 
-        part = cq.Workplane("XY").box(24, 16, 4, centered=False).union(
-            cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4))
+        part = (
+            cq.Workplane("XY")
+            .box(24, 16, 4, centered=False)
+            .union(cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4)))
         )
         surface = export_surface_mesh(part, source=dict(model="stepped", revision="1"))
         tool = ToolAssembly(
@@ -376,9 +378,19 @@ class RowEntryTest(unittest.TestCase):
             (HolderSection(30, 60, 4, 4),),
         )
         op = camlib.Parallel(
-            "rows", tool, surface, 0, 2, 12, slope_to_deg=45,
-            feed_mm_min=600, plunge_mm_min=150, spindle_rpm=12000,
-            tool_number=1, length_register=1, coolant="flood",
+            "rows",
+            tool,
+            surface,
+            0,
+            2,
+            12,
+            slope_to_deg=45,
+            feed_mm_min=600,
+            plunge_mm_min=150,
+            spindle_rpm=12000,
+            tool_number=1,
+            length_register=1,
+            coolant="flood",
         )
         report, motions = None, []
         with Simulation(
