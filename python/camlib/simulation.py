@@ -2157,6 +2157,17 @@ class Simulation:
                             CamWarning,
                             stacklevel=2,
                         )
+                    wall_entries = data["report"].get("wall_entries")
+                    if wall_entries:
+                        # Waterline: loops with no stock-free point beside the
+                        # wall keep the entry on it (the report's wall_entries).
+                        warnings.warn(
+                            f"operation {active!r} entered {wall_entries} loop(s) on the wall: the stock stands "
+                            "above the level on every side there, so the ball may come down into it. Rough or "
+                            "rest-rough that area first",
+                            CamWarning,
+                            stacklevel=2,
+                        )
                     active, completed_operations = None, completed_operations + 1
                 elif data["stage"] == "events":
                     # Mid-operation events (a dwell at the bottom of a hole),

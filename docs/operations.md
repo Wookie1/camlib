@@ -86,6 +86,9 @@ outside the stock. Options: `axis` (`"x"`/`"y"`), `mode` (`"zigzag"` or
 `"one_way"`), `entry_air_gap_mm` (1), `edge_overlap_mm` (default 10% of the
 tool diameter), `reverse`. Flat end mills.
 
+The Rust planner refuses exhausted motion IDs before emitting another move or
+changing its position; IDs never wrap to zero during facing.
+
 ## Pocket: `Pocket`, `RestPocket`
 
 Required: `region`, `top_z_mm`, `floor_z_mm`, `stepdown_mm`, `stepover_mm`
@@ -112,6 +115,13 @@ that are kept.** Boundaries are polygons (`Boundary.polygon`) or line/arc loops
 - `RestPocket` cuts only material left by earlier operations (it reads the
   simulated stock), typically with a smaller tool. `rest_tolerance_mm` (0.01)
   is how much leftover is ignored.
+- An entry comes straight down, or starts its helix or ramp, from the lowest
+  height at which the cuts already committed (by this or an earlier
+  operation) prove the whole tool clear of stock, so a level cut where an
+  earlier operation has been does not come down again from the top. Each
+  such proof has a work limit. One that reaches it proves nothing: the entry
+  then starts higher than it had to, which costs time and nothing else, and
+  the report counts it in `entry_proofs_unresolved` (absent when zero).
 - Links between separate regions (longer than ordinary stepovers) stay at
   cutting depth only through stock proven already cleared, and only when that
   is faster than leaving at `feed_z_mm` and plunging again (the default) or up
@@ -458,8 +468,8 @@ no full-width slotting, for hard materials and high-speed toolpaths.
     from it and feeds across at depth, which adds a short link.
   - `ramp_clearance_mm`: each helix starts this far above the material it
     meets, never above `feed_z_mm`.
-  The wall pass is entered by a plunge and its lead-in arc at `feed_mm_min`;
-  it has no stay-down link. `path_strategy="disk_front"` and `"stock_front"`
+  The wall pass is reached like any other pass (a stay-down link, or a
+  descent with these options) and enters on its lead-in arc at `feed_mm_min`. `path_strategy="disk_front"` and `"stock_front"`
   refuse all four by name.
 - Orbit options, `max_stay_down_mm` and `rest_tolerance_mm` do not apply and
   are refused. Corners the cutter cannot reach are left and reported as the
@@ -565,6 +575,26 @@ refused with its location: export the mesh with shared edge vertices
     `confined_stroke_mm`, `confined_max_engagement_deg`). This needs an entry
     that allows a helix or a ramp; with `StockEdgeEntry(helix=None)` the
     operation stops and names the place.
+  - **Each layer ends with a pass along the walls**, where stock still
+    stands beside them. The front's passes end at a wall a stepover apart,
+    which leaves a cusp between every two pass ends, well over the
+    `radial_allowance_mm` asked for (0.16 to 0.30 mm along a straight wall
+    where 0.1 mm was asked, with a 6 mm cutter at 0.6 mm engagement). The wall pass runs on the wall's exact offset
+    (cutter radius plus the allowance), so the walls are left with the
+    allowance and the operation after roughing meets even stock. It runs
+    only along stretches where the committed cuts do not already prove the
+    cutter's path clear (to within 0.01 mm, or 64 `tolerance_mm` if that is
+    more): a wall that ends where the stock does is an open run, and a
+    step-up layer beside a vertical wall cuts nothing. Two runs are joined
+    through the air between them when feeding across takes no longer than
+    a new entry's descent at the plunge feed would
+    (`feed_mm_min` x (feed height - layer Z) / `plunge_mm_min`). A run is
+    reached like any pass and enters on a quarter-arc lead-in; its strokes
+    are proven within the engagement limit like any other, and where one is
+    not (an inside corner, where the skin is as thick as the corner is
+    deep) it is entry motion as above, or with `StockEdgeEntry(helix=None)`
+    the run is left out. Reported per layer as `wall_passes` and
+    `wall_passes_skipped`.
   - Every cutting and link move is also checked exactly against the layer
     region before it is emitted, and the run fails rather than emit one that
     does not fit. Orbit options and `omit_empty_cuts` do not apply, the entry
@@ -703,12 +733,8 @@ not that path: with a shank as wide as the cutter, its outer edge can extend
 past the earlier nominal sweep. An offset smaller than the two paths' combined
 error does not supply physical clearance. No tolerance is added to admit it,
 and the planner does not silently snap or change the requested path.
-`engagement::cover::tests::a_path_on_several_collinear_sweeps_is_proven_without_margin`
-pins this limitation: R6 cuts at Z5 on Y = `0.1 + 0.2`, with a section on the
-deeper Z1 pass whose bottom is Z5.1. The exact repeated line passes; the same
-section offset by one ulp or +/-0.000001 mm is an expected refusal. Resolving
-such a job needs a proven path/assembly change, not acceptance of unproven
-clearance.
+Resolving such a job needs a proven path/assembly change, not acceptance of
+unproven clearance.
 
 The same proof decides the stock sweep's cutting-length check and the
 stock-contact verification of the shank, so a move the planner admits is not
@@ -1358,13 +1384,22 @@ form one level) and finishes each level at its exact height plus
 `stock_to_leave_mm`, top level first, with a flat center-cutting end mill in
 raster rows along `axis`. A cut is kept only where the highest point of the
 part under the tool's swept disk is not above the cut (computed exactly per
-facet); each run starts with a vertical plunge. If the live stock at a run's
-start stands more than 0.05 mm above its height (roughing left it, or the
-stock was not cut there yet), the plunge stops just above that stock and the
-run is entered by zigzagging along the run itself, descending at 3 degrees (the
-helix angle of the roughing entries); every ramp point lies above the proven
-run, so it clears the part like the run does, and the report counts them as
-`ramped_entries`. Near walls the tool stays a
+facet). A run is entered by a vertical plunge where no live stock stands
+above its height at its start (within `tolerance_mm`). Where stock does (roughing
+left it, or the stock was not cut there yet), the run is entered by a ramp, and
+only if the operation declares `entry=RampEntry(angle_deg, ...)`: the tool
+plunges through air to the top of the live stock over the whole run (the highest
+cell bound anywhere along it, not just at its start), then zigzags down along
+the run at no more than the declared angle and at the entry's `feed_mm_min`
+(default the plunge feed). A zigzag that has to reverse on the run needs the
+entry's `min_length_mm`. Every ramp point lies above the proven run, so it
+clears the part like the run does; the report counts the ramped runs as
+`ramped_entries`. Nothing is plunged into stock on any path: a run with stock
+above it and no declared entry, a ramp that does not fit (too short a run, an
+angle too shallow for the run, or stock above the feed height) is refused,
+naming the run, its length and the stock above it. The `flat` benchmark runs on
+a blank roughed to 0.1 mm over the flats and declares a 3 degree entry. Near
+walls the tool stays a
 radius away; the report gives the levels, runs, cut length and any row length
 that could not be proven clear (`dropped_length_mm`).
 
@@ -1390,6 +1425,12 @@ continuous clearance), along other XY patterns:
 Patterns are clipped to the stock grown by the cutter radius. Each run
 starts with a vertical plunge onto the surface at `plunge_mm_min` and ends
 with a vertical retract (rows of `Parallel` enter from outside the stock).
+
+The spiral guide's point buffer is checked against the planning memory budget
+before allocation. Its angular sampling gets finer as the radius grows; if
+the complete buffer does not fit, planning refuses with the memory diagnostic.
+Generation also refuses before an append could grow beyond that checked buffer,
+including when floating-point stepping exceeds the estimated point count.
 
 ### Scallop: `Scallop`
 
@@ -1601,6 +1642,22 @@ report's `shadow_error_mm` is the largest such error over the levels cut.
 `simplify` (default on) removes contour points that are not needed within
 `contour_error_mm`; `reverse` cuts the contours the other way;
 `safety_margin_mm` and `stock_to_leave_mm` work as for `Parallel`.
+
+A ball's contour is entered from beside the wall: the ball drops at a point
+moved away from the wall and then leads in sideways, so its tip never lands on
+the wall (it used to drop on the surface, up to 1.9 mm axially into stock). The
+point is chosen from the live stock. It is the nearest point, starting
+`max(r/2, 1)` mm from the loop and stepping out by that much up to 4 cutter
+radii, on either side of the loop start, where the lead to the contour is
+clear of the surface, the machining limits allow the plunge and the lead, and
+the stock under the ball (the upper bound of every cell its disk can touch) is
+at or below the height it plunges to. A loop with no such point keeps the
+tangent lead on the wall, as before, and is counted in the report's
+`wall_entries`, and the run warns (`CamWarning`): there the ball may come down
+into stock, so rough or rest-rough that area first. (It is not refused, because stock that has not been roughed to
+the level would then stop every waterline before the reach checks that name
+the real limit.) The `waterline`, `waterline-dense` and `steep-and-shallow`
+benchmarks run on blanks roughed to 0.1 to 0.3 mm over the part.
 
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along
 its contour from the level above, instead of a flat lap and a step down; the
@@ -1986,6 +2043,23 @@ with job.record("lathe", rapid_mm_min=6000) as run:   # playback: Player(run)
     run.wait()
 program = job.post_nc("lathe", machine=machine)        # checked NC text
 ```
+
+The seat's angles are the holder catalogue's, with its signs: a negative
+P-clamp holder is `TurningSeat(-6, -6)`. Negative rake tilts the face up away
+from the edge and negative inclination makes the nose the lowest point of the
+major edge; together they back both flanks of a negative insert off the work.
+The other sign of either puts a flank into the stock, and the cut is refused
+as a rub.
+
+A lathe setup's `tolerance_mm` is what every move may be into the part, the
+posted program's moves included: `Job.post` reads the program back and checks
+it with the same tolerance. A post writes within its machine's own
+`tolerance_mm` (0.01 mm unless declared) and decimals: an arc whose words
+cannot be exact at three decimals is written slightly off, or as chords. So
+a setup tolerance tighter than the posting can hold is refused when the
+program is read back, naming both tolerances: declare a machine
+`tolerance_mm` no larger than the setup's (with decimals to match), or a
+setup tolerance the posting fits in. A lathe program has no Y words.
 
 Playback seeks to any point, within a move too: the stock shown partway
 through a move is the planner's move kernel on that first part of the move,
@@ -2570,8 +2644,11 @@ tool.validate()   # the meshes, the placement and the insert cross-check
   - The mesh must be a closed surface. Faces tessellated separately need
     not share vertices: an edge with no face on its other side within
     twice the mesh's error is refused as open; camlib does not repair it.
+    A triangle with zero area before or after placement is refused by its zero-based
+    index, for body and insert models alike. Repair or export that facet
+    again; it is never silently dropped. No area tolerance is added.
   - The stated error is the caller's: `export_surface_mesh` bounds it for
-    planar and analytic faces and refuses surfaces it cannot bound.
+    planar, analytic and B-spline faces and refuses surfaces it cannot bound.
 - The checks run on the slices, not the triangles. A model is reduced once
   (and kept: a run asks for a tool's body at every operation); consecutive
   slices of one section are one prism, so a straight bar is a single piece
@@ -2588,7 +2665,9 @@ the model reaches, the mesh's error added), from a mesh such as
 `camlib.cadquery.step_mesh(path, max_error_mm=)` with its declared
 placement (the model point of the tool tip and the unit direction of the
 axis toward the spindle). A model that starts below the declared stickout,
-does not span the range, or is open is refused.
+does not span the range, is open, or contains a zero-area facet is refused.
+The resulting sections use the ordinary assembly, stock and scene checks;
+a mesh-derived milling holder is checked against fixtures on each move too.
 
 A lathe setup posts (`job.post_nc`, `job.post`) with any `Machine` whose `planes` include `"xz"`: arcs
 are written in G18. `GCodeDialect(x_diameter=True)` writes X as a diameter

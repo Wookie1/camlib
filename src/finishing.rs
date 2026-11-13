@@ -1918,8 +1918,7 @@ impl ParallelPlan {
                     if excess > ENTRY_PLUNGE_MM && !self.op.one_way {
                         // Plunge only to where the cutter first meets live
                         // stock, then ramp the rest along the row.
-                        let z0 =
-                            (entry + excess + crate::flat::ENTRY_PLUNGE_MM).min(self.position[2]);
+                        let z0 = (entry + excess + ENTRY_STOP_MM).min(self.position[2]);
                         let mut work = self.report.work;
                         let ramp = self.entry_ramp(z0, &mut work, cancel)?;
                         self.report.work = work;
@@ -2057,6 +2056,9 @@ const ENTRY_RAMP_RAD: f64 = 0.174_532_925_199_432_95;
 /// Live stock a vertical row entry may still cut before ramping instead
 /// (half the zmap ball axial-plunge floor of 0.5 mm).
 const ENTRY_PLUNGE_MM: f64 = 0.25;
+/// Height above the first live stock where a ramped entry's plunge stops
+/// (the 0.05 mm Flat used before its entry became a declared RampEntry).
+const ENTRY_STOP_MM: f64 = 0.05;
 
 /// How far a vertical plunge to `tip` at `xy` would cut into live stock: the
 /// most any cell (at its nearest point to the axis) stands above the

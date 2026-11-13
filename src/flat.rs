@@ -58,6 +58,12 @@ pub struct FlatOperation<G = SurfaceMesh> {
     /// Containment and avoid areas (clamps, fixtures, features to leave alone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<crate::limits::Limits>,
+    /// How a run is entered through stock left above it: a ramp along the
+    /// run (`RampEntry`: declared angle, feed and shortest reversal). None
+    /// declares that no stock stands above the runs; a run that has stock
+    /// above its start is then refused (see `FlatPlan::plunge_or_ramp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<crate::entry::PocketEntry>,
 }
 impl<G> FlatOperation<G> {
     pub(crate) fn map_geometry<H, E>(
@@ -66,6 +72,7 @@ impl<G> FlatOperation<G> {
     ) -> Result<FlatOperation<H>, E> {
         Ok(FlatOperation {
             limits: self.limits,
+            entry: self.entry,
             id: self.id,
             tool: self.tool,
             surface: f(self.surface)?,
@@ -110,12 +117,6 @@ pub struct FlatReport {
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
-
-/// Ramp angle of a run's entry through stock left above it (3 deg, the
-/// helix angle of the roughing entries).
-pub(crate) const ENTRY_RAMP_RAD: f64 = 0.052_359_877_559_829_89;
-/// Stock above a run's height that a straight plunge may still remove.
-pub(crate) const ENTRY_PLUNGE_MM: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 struct Tri {
@@ -1512,7 +1513,7 @@ pub struct FlatPlan {
     run: usize,
     phase: Phase,
     radius: f64,
-    ramp: std::collections::VecDeque<(Vec3, MoveKind)>,
+    ramp: std::collections::VecDeque<Vec3>,
     initial: Vec3,
     position: Vec3,
     next_id: u64,
@@ -1626,6 +1627,15 @@ impl FlatPlan {
                 ),
             ],
         )?;
+        if let Some(entry) = &op.entry {
+            let Some(ramp) = entry.ramp() else {
+                return Err(
+                    "flat-area finishing: only a RampEntry enters a run (a helix has no place on a straight run); use entry=RampEntry(angle_deg, ...) or declare none"
+                        .into(),
+                );
+            };
+            ramp.validate(op.tolerance_mm, op.plunge_mm_min)?;
+        }
         let heights = crate::heights::Heights::resolve(
             op.clearance_z_mm,
             op.retract_z_mm,
@@ -1820,46 +1830,65 @@ impl FlatPlan {
     pub fn report(&self) -> &FlatReport {
         &self.report
     }
-    /// A run whose start has more than ENTRY_PLUNGE_MM of live stock above
-    /// its height is entered by zigzagging along the run itself, descending
-    /// at ENTRY_RAMP_RAD from just above that stock, then cutting back to
-    /// its start. Every ramp point lies vertically above the proven run, so
-    /// it clears the part like the run does; None: a straight plunge.
-    fn entry_ramp(&self, run: Run, top: f64) -> Option<Vec<(Vec3, MoveKind)>> {
-        if top <= run.z + ENTRY_PLUNGE_MM {
-            return None;
+    /// What enters the run at `run.a` after the rapid descent: a straight
+    /// plunge where no live stock stands above the run's height there (the
+    /// cells' upper bounds, within a tolerance), otherwise a ramp from the
+    /// stock's top over the whole run, down the run by the declared
+    /// `RampEntry`. Each ramp point lies vertically above the proven run, so
+    /// it clears the part as the run does. A run the ramp does not fit, or
+    /// stock above a run with no entry declared, is refused: a flat end mill
+    /// is never plunged into stock.
+    fn plunge_or_ramp(
+        &self,
+        run: Run,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<(f64, Vec<Vec3>)>, String> {
+        let at_start = stock_top(stock, run.a, self.radius);
+        if at_start <= run.z + self.op.tolerance_mm {
+            return Ok(None);
         }
         let length = (run.b[0] - run.a[0]).hypot(run.b[1] - run.a[1]);
+        let top = run_stock_top(stock, run, self.radius, cancel)?;
+        let which = format!(
+            "flat-area run from ({:.3}, {:.3}) to ({:.3}, {:.3}) at Z{:.3}, {length:.3} mm long, has stock up to Z{top:.3} ({:.3} mm above it, {:.3} mm above it at its start)",
+            run.a[0],
+            run.a[1],
+            run.b[0],
+            run.b[1],
+            run.z,
+            top - run.z,
+            at_start - run.z
+        );
+        let Some(entry) = self.op.entry.as_ref().and_then(|e| e.ramp()) else {
+            return Err(format!(
+                "{which}, and the operation declares no entry: a flat end mill is not plunged into stock. Declare entry=RampEntry(angle_deg, ...) for the tool, or rough or rest-rough this area first"
+            ));
+        };
         if length <= 16. * self.op.tolerance_mm {
-            return None;
+            return Err(format!(
+                "{which}: the run is shorter than 16 tolerances, too short to ramp on. Rough or rest-rough this area first"
+            ));
         }
-        let drop = length * ENTRY_RAMP_RAD.tan();
-        let mut z = (top + ENTRY_PLUNGE_MM).min(self.heights.feed);
-        let mut at_a = true;
-        let mut moves = vec![];
-        while z > run.z {
-            let (from, to) = if at_a { (run.a, run.b) } else { (run.b, run.a) };
-            if z - drop > run.z {
-                z -= drop;
-                moves.push(([to[0], to[1], z], MoveKind::Cut));
-                at_a = !at_a;
-            } else {
-                let f = (z - run.z) / drop;
-                let q = [
-                    from[0] + f * (to[0] - from[0]),
-                    from[1] + f * (to[1] - from[1]),
-                ];
-                moves.push(([q[0], q[1], run.z], MoveKind::Cut));
-                if q != run.a {
-                    moves.push(([run.a[0], run.a[1], run.z], MoveKind::Cut));
-                }
-                z = run.z;
-            }
-            if moves.len() > 4096 {
-                return None;
-            }
+        if top > self.heights.feed {
+            return Err(format!(
+                "{which}, above the feed height Z{:.3}: raise feed_z_mm/retract_z_mm or rough this area first",
+                self.heights.feed
+            ));
         }
-        Some(moves)
+        let chain = [crate::pocket::Stroke::line(run.a, run.b)];
+        let curves = entry
+            .zigzag(&chain, top, run.z)
+            .map_err(|why| format!("{which}: {why}. Use a steeper declared angle, a longer run, or rough this area first"))?;
+        let mut points = vec![];
+        let first = curves.first().map_or(run.a, |c| {
+            let q = c.start();
+            [q[0], q[1]]
+        });
+        // Over the run at the stock's top, then down the legs.
+        points.push([first[0], first[1], top]);
+        points.extend(curves.iter().map(|c| c.end()));
+        Ok(Some((top, points)))
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         vec![
@@ -1918,6 +1947,7 @@ impl FlatPlan {
                 return Err("flat-area planning cancelled".into());
             }
             let p = self.position;
+            let mut ramp_feed = None;
             let (end, kind, next) = match self.phase {
                 Phase::Done => {
                     self.drained = true;
@@ -1943,23 +1973,32 @@ impl FlatPlan {
                 ),
                 Phase::Plunge => {
                     let run = self.runs[self.run];
-                    let top = stock_top(stock, run.a, self.radius);
-                    match self.entry_ramp(run, top) {
-                        Some(moves) => {
-                            self.ramp = moves.into();
+                    match self.plunge_or_ramp(run, stock, cancel)? {
+                        Some((top, points)) => {
+                            self.ramp = points.into();
                             self.report.ramped_entries += 1;
-                            // Down through air to just above the stock.
-                            let z = (top + ENTRY_PLUNGE_MM).min(p[2]).max(run.z);
-                            ([p[0], p[1], z], MoveKind::Plunge, Phase::Ramp)
+                            // Down through air to the stock's top over the run.
+                            (
+                                [p[0], p[1], top.min(p[2]).max(run.z)],
+                                MoveKind::Plunge,
+                                Phase::Ramp,
+                            )
                         }
                         None => ([p[0], p[1], run.z], MoveKind::Plunge, Phase::Cut),
                     }
                 }
                 Phase::Ramp => {
-                    let (end, kind) = self.ramp.pop_front().expect("ramp move");
+                    let end = self.ramp.pop_front().expect("ramp move");
+                    ramp_feed = Some(
+                        self.op
+                            .entry
+                            .as_ref()
+                            .and_then(|e| e.feed_mm_min())
+                            .unwrap_or(self.op.plunge_mm_min),
+                    );
                     (
                         end,
-                        kind,
+                        MoveKind::Plunge,
                         if self.ramp.is_empty() {
                             Phase::Cut
                         } else {
@@ -2006,7 +2045,7 @@ impl FlatPlan {
                 curve,
                 feed_mm_min: match kind {
                     MoveKind::Rapid => None,
-                    MoveKind::Plunge => Some(self.op.plunge_mm_min),
+                    MoveKind::Plunge => Some(ramp_feed.unwrap_or(self.op.plunge_mm_min)),
                     _ => Some(self.op.feed_mm_min),
                 },
             };
@@ -2018,10 +2057,40 @@ impl FlatPlan {
     }
 }
 
+/// Highest live stock upper bound over the cells the cutter's disk touches
+/// anywhere along a run: sampled at no more than half a cell apart, each
+/// sample's disk widened to cover the capsule between samples.
+fn run_stock_top(
+    stock: &Stock,
+    run: Run,
+    r: f64,
+    cancel: &impl CancelSignal,
+) -> Result<f64, String> {
+    let [wx, wy] = stock.cell_widths_mm();
+    let step = 0.5 * wx.min(wy);
+    let length = (run.b[0] - run.a[0]).hypot(run.b[1] - run.a[1]);
+    let n = (length / step).ceil().max(1.) as usize;
+    if n > 1_000_000 {
+        return Err("flat-area run too long to read the stock over".into());
+    }
+    let wide = r.hypot(0.5 * length / n as f64);
+    let mut top = f64::MIN;
+    for i in 0..=n {
+        if i % 1024 == 0 && cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let f = i as f64 / n as f64;
+        let xy = [
+            run.a[0] + f * (run.b[0] - run.a[0]),
+            run.a[1] + f * (run.b[1] - run.a[1]),
+        ];
+        top = top.max(stock_top(stock, xy, wide));
+    }
+    Ok(top)
+}
+
 /// Highest live stock upper bound over the cells a disk of radius r at xy
 /// can touch (whole cells: an overestimate, never an underestimate).
-/// Highest live stock under a tool of radius `r` at `xy` (cell centres
-/// within `r` plus half a cell diagonal).
 pub(crate) fn stock_top(stock: &Stock, xy: [f64; 2], r: f64) -> f64 {
     let spec = stock.spec();
     let [nx, ny] = stock.dimensions();
