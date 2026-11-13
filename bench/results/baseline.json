@@ -1080,36 +1080,37 @@
     "flats": {
      "toolpath": "Flat",
      "issue": 38,
-     "moves": 156,
-     "cut_mm": 680.42,
+     "moves": 222,
+     "cut_mm": 964.771,
      "rapid_mm": 458.843,
-     "air_cut_mm": 176.16,
-     "plunges": 39,
+     "air_cut_mm": 426.794,
+     "link_mm": 0.0,
+     "plunges": 105,
      "retracts": 39,
-     "removed_mm3": 1272.746,
-     "cycle_seconds_exact_stop": 165.218,
-     "cycle_seconds_tangent": 165.218,
+     "removed_mm3": 36.021,
+     "cycle_seconds_exact_stop": 190.983,
+     "cycle_seconds_tangent": 190.983,
      "engine_seconds": 0.006
     }
    },
    "toolpath": {
-    "moves": 156,
-    "cycle_seconds_exact_stop": 165.218,
-    "cycle_seconds_tangent": 165.218,
-    "posted_blocks": 179,
+    "moves": 222,
+    "cycle_seconds_exact_stop": 190.983,
+    "cycle_seconds_tangent": 190.983,
+    "posted_blocks": 245,
     "post_error": null,
     "removed_mm3": [
-     1272.746,
-     1305.004
+     996.021,
+     997.104
     ],
     "material": {
      "leftover_mm3": [
-      28.499903087998064,
-      173.50391322992638
+      0.9499980904040726,
+      104.6286757239113
      ],
      "overcut_mm3": [
       0.0,
-      14.25382027625564
+      24.403785277142067
      ],
      "leftover_cells": [
       152,
@@ -1117,7 +1118,7 @@
      ],
      "overcut_cells": [
       0,
-      76
+      132
      ],
      "max_residual_height_mm": 4.000010000001364,
      "complete": true
