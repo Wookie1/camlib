@@ -837,3 +837,163 @@ fn a_sloped_wall_is_kept_by_its_own_slope_at_every_level() {
         }
     }
 }
+/// A plate (8..16 x 5..11 at Z6) whose surroundings the stock has been
+/// roughed around: up to Z6.3 within `reach` mm of the plate, below every
+/// level (Z2) farther out.
+fn roughed(
+    m: &camlib::stream::StreamManifest,
+    reach: f64,
+) -> (camlib::stock::Stock, camlib::stock::StockSpec) {
+    use camlib::stock::{HeightBounds, InitialStock, Stock};
+    let spec = m.stock.height().unwrap().clone();
+    let probe = Stock::new(spec.clone()).unwrap();
+    let [nx, ny] = probe.dimensions();
+    let [wx, wy] = probe.cell_widths_mm();
+    let near = |x: f64, y: f64| {
+        let dx = (8. - x).max(x - 16.).max(0.);
+        let dy = (5. - y).max(y - 11.).max(0.);
+        dx.hypot(dy)
+    };
+    let mut bounds = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            // Nearest point of the cell to the plate decides its height.
+            let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+            let (cx, cy) = (x0 + 0.5 * wx, y0 + 0.5 * wy);
+            let d = near(cx, cy).min(near(x0, y0)).min(near(x0 + wx, y0 + wy));
+            let top = if d <= reach { 6.3 } else { 2. };
+            bounds.push(HeightBounds {
+                lower_mm: top,
+                upper_mm: top,
+            });
+        }
+    }
+    let initial = InitialStock {
+        source_id: "roughed-plate".into(),
+        revision: "1".into(),
+        source_sha256: "0".repeat(64),
+        source_to_setup: camlib::motion::WorkFrame::identity(),
+        uncertainty_mm: 0.,
+        representation: "whole_cell_top_down".into(),
+        bounds,
+    };
+    (Stock::from_initial(spec.clone(), &initial).unwrap(), spec)
+}
+fn plate(m: &camlib::stream::StreamManifest) -> camlib::waterline::WaterlineOperation {
+    use camlib::surface::SurfaceMesh;
+    let mut op = operation(m);
+    let (a, b, c, d) = ([8., 5., 6.], [16., 5., 6.], [16., 11., 6.], [8., 11., 6.]);
+    op.surface = SurfaceMesh {
+        version: 1,
+        units: "mm".into(),
+        surface_error_mm: 0.,
+        source: serde_json::Value::Null,
+        triangles: vec![[a, b, c], [a, c, d]].into(),
+    };
+    op
+}
+#[test]
+fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
+    use camlib::{motion::MoveKind, waterline::WaterlinePlan};
+    // Roughing left a stair 3 mm wide against the plate (Z6.3): a fixed
+    // 1 mm offset from the loop still comes down into it. Independently of
+    // the plan, every plunge must end where the ball's surface over each
+    // stock cell it can touch is at or above the cell's upper bound.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let (mut stock, spec) = roughed(&m, 3.);
+    let mut plan = WaterlinePlan::prepare(
+        plate(&m),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let r = 2.;
+    let (mut plunges, mut beside) = (0, 0);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if motion.kind == MoveKind::Plunge {
+            let p = motion.curve.end();
+            let [nx, ny] = stock.dimensions();
+            let [wx, wy] = stock.cell_widths_mm();
+            for j in 0..ny {
+                for i in 0..nx {
+                    let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+                    let d = (x0 - p[0]).max(p[0] - x0 - wx).max(0.).hypot(
+                        (y0 - p[1]).max(p[1] - y0 - wy).max(0.),
+                    );
+                    if d < r {
+                        let ball = p[2] + r - (r * r - d * d).sqrt();
+                        let upper = stock.cells()[j * nx + i].upper_mm;
+                        assert!(
+                            ball >= upper - 1e-6,
+                            "plunge to {p:?} enters stock (cell {i},{j} up to {upper}, ball at {ball})"
+                        );
+                    }
+                }
+            }
+            plunges += 1;
+            if p[2] < 6.3 {
+                beside += 1;
+            }
+        }
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+    }
+    assert!(plunges > 0 && beside > 0, "{plunges} {beside}");
+    assert_eq!(plan.report().wall_entries, 0);
+}
+/// Plan the whole operation, committing each move to the stock.
+fn drain(
+    m: &camlib::stream::StreamManifest,
+    plan: &mut camlib::waterline::WaterlinePlan,
+    stock: &mut camlib::stock::Stock,
+) {
+    let cancel = AtomicBool::new(false);
+    let tool = m.tools[0].prepare().unwrap();
+    while let Some(motion) = plan.next_motion_with_stock(stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+    }
+}
+#[test]
+fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
+    use camlib::waterline::WaterlinePlan;
+    // Raw stock to Z10 stands above every level everywhere: no point beside
+    // the wall is free of stock, so the loops keep the tangent lead on the
+    // wall, and the report counts them (the ball may come down into stock).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut plan = WaterlinePlan::prepare(
+        plate(&m),
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = camlib::stock::Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    drain(&m, &mut plan, &mut stock);
+    assert!(plan.report().wall_entries > 0);
+    // Roughed so that every loop has a free side entry: none is reported.
+    let (mut stock, spec) = roughed(&m, 3.);
+    let mut plan = WaterlinePlan::prepare(
+        plate(&m),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    drain(&m, &mut plan, &mut stock);
+    assert_eq!(plan.report().wall_entries, 0);
+}
