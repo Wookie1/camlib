@@ -786,6 +786,9 @@ pub struct WaterlinePlan {
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
+/// Per loop the side entry point (None: the tangent lead), and how many
+/// loops have none.
+type SideEntries = (Vec<Option<[f64; 2]>>, usize);
 /// How far out (in cutter radii) a loop's side entry is searched.
 const SIDE_ENTRY_REACH_RADII: f64 = 4.;
 
@@ -1423,7 +1426,7 @@ impl WaterlinePlan {
         z: f64,
         plunge_z: f64,
         cancel: &impl CancelSignal,
-    ) -> Result<(Vec<Option<[f64; 2]>>, usize), String> {
+    ) -> Result<SideEntries, String> {
         let step = (self.radius / 2.).max(1.);
         let reach = SIDE_ENTRY_REACH_RADII * self.radius;
         let center = z + self.radius;
