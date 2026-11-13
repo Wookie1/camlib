@@ -184,6 +184,10 @@ pub struct EngagementFrontReport {
     /// material (where the cell bounds proved the rapid could come lower)
     /// and feeding across at depth.
     pub offset_descents: usize,
+    /// Rapids between passes that travelled below `retract_z_mm`, at
+    /// `travel_clearance_mm` above the whole-cell stock bounds under every
+    /// tool section over the rectangle their ends span.
+    pub lowered_travels: usize,
     /// Passes that cleared a remnant too thin for a full step (a sliver
     /// left between passes) from beside it at depth, instead of a helix.
     pub remnant_passes: usize,
@@ -280,6 +284,7 @@ impl Default for EngagementFrontReport {
             slot_side_entries: 0,
             air_entries: 0,
             offset_descents: 0,
+            lowered_travels: 0,
             remnant_passes: 0,
             fast_links: 0,
             fast_link_mm: 0.,
@@ -653,6 +658,12 @@ pub(crate) struct EngagementFrontPlan {
     heights: Heights,
     /// See `RoughingOperation::rapid_descent_clearance_mm`.
     rapid_descent: Option<f64>,
+    /// See `RoughingOperation::travel_clearance_mm`.
+    travel_clearance: Option<f64>,
+    /// The bounding box and top of each avoid area of the operation's
+    /// limits (`None` when one cannot be measured), for `travel_height`.
+    #[allow(clippy::type_complexity)]
+    avoid_boxes: std::sync::OnceLock<Option<Vec<([f64; 4], f64)>>>,
     /// See `RoughingOperation::ramp_clearance_mm`.
     ramp_clearance: Option<f64>,
     /// See `RoughingOperation::link_feed_mm_min`.
@@ -706,6 +717,7 @@ pub(crate) struct EngagementFrontPlan {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FrontMotionOptions {
     pub rapid_descent_clearance_mm: Option<f64>,
+    pub travel_clearance_mm: Option<f64>,
     pub ramp_clearance_mm: Option<f64>,
     pub link_feed_mm_min: Option<f64>,
     pub link_chip_thinning: bool,
@@ -720,6 +732,7 @@ impl FrontMotionOptions {
                 "rapid_descent_clearance_mm",
                 self.rapid_descent_clearance_mm,
             ),
+            ("travel_clearance_mm", self.travel_clearance_mm),
             ("ramp_clearance_mm", self.ramp_clearance_mm),
             ("link_feed_mm_min", self.link_feed_mm_min),
         ] {
@@ -750,6 +763,7 @@ impl EngagementFrontPlan {
     /// Validated options (`FrontMotionOptions::validate`).
     pub(crate) fn with_motion_options(self, options: FrontMotionOptions) -> Self {
         self.with_rapid_descent(options.rapid_descent_clearance_mm)
+            .with_travel_clearance(options.travel_clearance_mm)
             .with_ramp_clearance(options.ramp_clearance_mm)
             .with_link_feed(options.link_feed_mm_min, options.link_chip_thinning)
     }
@@ -824,6 +838,8 @@ impl EngagementFrontPlan {
             entry,
             heights,
             rapid_descent: None,
+            travel_clearance: None,
+            avoid_boxes: std::sync::OnceLock::new(),
             ramp_clearance: None,
             link_feed: None,
             chip_thinning: false,
@@ -875,6 +891,11 @@ impl EngagementFrontPlan {
     /// See `RoughingOperation::rapid_descent_clearance_mm` (validated there).
     pub(crate) fn with_rapid_descent(mut self, clearance: Option<f64>) -> Self {
         self.rapid_descent = clearance;
+        self
+    }
+    /// See `RoughingOperation::travel_clearance_mm` (validated there).
+    pub(crate) fn with_travel_clearance(mut self, clearance: Option<f64>) -> Self {
+        self.travel_clearance = clearance;
         self
     }
     pub(crate) fn construction_error_mm(&self) -> f64 {
@@ -1844,15 +1865,34 @@ impl EngagementFrontPlan {
     /// Rapid from `from` up to the retract height, across to `to`, and down
     /// to the feed height (or the proven rapid-descent stop below it), never
     /// below `at_least`: the caller's next motion starts there, so the rapid
-    /// ends at or above it and every endpoint connects.
-    fn travel(&mut self, from: Vec3, to: Point, proven: Option<f64>, at_least: f64) -> Vec3 {
-        let up = if (from[2] - self.heights.retract).abs() < 1e-12 || from[2] >= self.heights.feed {
-            let up = [from[0], from[1], from[2].max(self.heights.retract)];
+    /// ends at or above it and every endpoint connects. With
+    /// `travel_clearance_mm`, the rapid across runs lower when the
+    /// whole-cell stock bounds allow: see `travel_height`.
+    fn travel(
+        &mut self,
+        stock: &Stock,
+        from: Vec3,
+        to: Point,
+        proven: Option<f64>,
+        at_least: f64,
+    ) -> Vec3 {
+        let height = self.travel_height(stock, from, to, at_least);
+        let up = if height < self.heights.feed {
+            // Below the feed height: straight up, then across.
+            let up = [from[0], from[1], height];
+            self.line(from, up, MoveKind::Retract);
+            self.report.lowered_travels += 1;
+            up
+        } else if (from[2] - height).abs() < 1e-12 || from[2] >= self.heights.feed {
+            let up = [from[0], from[1], from[2].max(height)];
             self.line(from, up, MoveKind::Rapid);
             up
         } else {
-            self.lift(from, self.heights.retract)
+            self.lift(from, height)
         };
+        if height < self.heights.retract && height >= self.heights.feed {
+            self.report.lowered_travels += 1;
+        }
         let across = [to[0], to[1], up[2]];
         self.line(up, across, MoveKind::Rapid);
         let stop = match (self.rapid_descent, proven) {
@@ -1864,6 +1904,74 @@ impl EngagementFrontPlan {
         let above = [to[0], to[1], stop];
         self.line(across, above, MoveKind::Rapid);
         above
+    }
+
+    /// The height of the rapid across from `from` to above `to`: the retract
+    /// height, or with `travel_clearance_mm` that far above the highest
+    /// whole-cell stock upper bound any tool section can meet anywhere in
+    /// the rectangle spanned by the two ends (so either axis-first dogleg is
+    /// clear too), when that is lower. Never below `from` or `at_least`.
+    /// Stock only loses material, so bounds of the committed stock stay
+    /// upper bounds while queued cuts are still to be committed.
+    fn travel_height(&self, stock: &Stock, from: Vec3, to: Point, at_least: f64) -> f64 {
+        let retract = self.heights.retract;
+        let Some(clearance) = self.travel_clearance else {
+            return retract;
+        };
+        // The rectangle every route between the ends lies in, grown by the
+        // widest tool section: what the tool can be over on the way.
+        let reach = self.guides.widest_part_radius() + 32. * self.op.tolerance_mm;
+        let (lo, hi) = (
+            [from[0].min(to[0]) - reach, from[1].min(to[1]) - reach],
+            [from[0].max(to[0]) + reach, from[1].max(to[1]) + reach],
+        );
+        // A controller may run a rapid as a straight line, as either
+        // axis-first dogleg, or with each axis at its own rate (a diagonal,
+        // then the rest along one axis): anywhere in the rectangle of its
+        // two ends, which is what the stock bound and the obstacles below
+        // are taken over. Both ends are positions the layer's region allows
+        // the cutter at; beside the stock, where no stock bound says
+        // anything, the rectangle between two such positions is taken to be
+        // as free as they are (the premise the entries beside the stock
+        // already rest on). A containment region withdraws that premise.
+        // Declared obstacles. A containment region is kept by staying at the
+        // retract height (a dogleg may leave it where the straight route
+        // does not); an avoid area the rectangle meets is crossed above its
+        // top by the same clearance. Areas that cannot be measured keep the
+        // retract height too.
+        let mut height = self.guides.cell_route_height(stock, [from[0], from[1]], to);
+        if !height.is_finite() {
+            return retract;
+        }
+        if let Some(limits) = &self.op.limits {
+            if limits.contain.is_some() {
+                return retract;
+            }
+            let boxes = self.avoid_boxes.get_or_init(|| {
+                limits
+                    .avoid
+                    .iter()
+                    .map(|area| {
+                        let region = area
+                            .region
+                            .prepare(crate::planar::ConstructionOptions {
+                                tolerance_mm: self.op.tolerance_mm,
+                            })
+                            .ok()?;
+                        Some((region.bounds()?, area.top_z_mm))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+            let Some(boxes) = boxes else {
+                return retract;
+            };
+            for &([x0, y0, x1, y1], top) in boxes {
+                if x0 <= hi[0] && x1 >= lo[0] && y0 <= hi[1] && y1 >= lo[1] {
+                    height = height.max(top);
+                }
+            }
+        }
+        (height + clearance).max(from[2]).max(at_least).min(retract)
     }
 
     /// A vertical entry at `q` sits beside the material it is about to cut,
@@ -2073,7 +2181,7 @@ impl EngagementFrontPlan {
             } else if let Some((p, proven_p, samples)) = descent {
                 // Plunge beside the entry, where the stock bounds let the
                 // rapid come down, then feed across to it at depth.
-                let above = self.travel(here, p, proven_p, z);
+                let above = self.travel(stock, here, p, proven_p, z);
                 self.line(above, [p[0], p[1], z], MoveKind::Plunge);
                 let layer = self.layer.as_mut().unwrap();
                 for s in samples {
@@ -2085,7 +2193,7 @@ impl EngagementFrontPlan {
                 self.report.stock_edge_entries += 1;
                 self.report.offset_descents += 1;
             } else {
-                let above = self.travel(here, q, proven, z);
+                let above = self.travel(stock, here, q, proven, z);
                 self.line(above, [q[0], q[1], z], MoveKind::Plunge);
                 self.report.lifts += 1;
                 self.report.stock_edge_entries += 1;
@@ -2473,7 +2581,7 @@ impl EngagementFrontPlan {
             let proven = self
                 .proven(height)
                 .map(|h| h.max(self.guides.cell_entry_height(stock, q)));
-            let above = self.travel(here, q, proven, z);
+            let above = self.travel(stock, here, q, proven, z);
             self.line(above, [q[0], q[1], z], MoveKind::Plunge);
             let start = second.a;
             self.certify(lead_in)?;
@@ -2759,7 +2867,7 @@ impl EngagementFrontPlan {
         let proven = self
             .proven(top)
             .map(|h| h.max(self.guides.cell_entry_height(stock, [start[0], start[1]])));
-        let above = self.travel(here, [start[0], start[1]], proven, start[2]);
+        let above = self.travel(stock, here, [start[0], start[1]], proven, start[2]);
         if above[2] > start[2] {
             self.line(above, start, MoveKind::Plunge);
         } else if above[2] < start[2] {
@@ -2870,7 +2978,7 @@ impl EngagementFrontPlan {
             let proven = self
                 .proven(height)
                 .map(|h| h.max(self.guides.cell_entry_height(stock, p)));
-            let above = self.travel(here, p, proven, z);
+            let above = self.travel(stock, here, p, proven, z);
             self.line(above, [p[0], p[1], z], MoveKind::Plunge);
             self.certify(Stroke::line(p, q))?;
             self.queue(
@@ -3214,7 +3322,7 @@ impl EngagementFrontPlan {
             // A rapid-descent stop below the helix start (rapid clearance
             // under the ramp clearance) ends at the start instead: higher
             // than the proven stop, so no less safe, and continuous.
-            let above = self.travel(here, [start[0], start[1]], proven, start[2]);
+            let above = self.travel(stock, here, [start[0], start[1]], proven, start[2]);
             if above[2] > start[2] {
                 self.line(above, start, MoveKind::Plunge);
             } else if above[2] < start[2] {

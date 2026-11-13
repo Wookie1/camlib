@@ -54,6 +54,58 @@ impl PocketPlan {
         }
         height
     }
+    /// The largest radius of any tool section (cutter, neck, shank, holder).
+    pub(crate) fn widest_part_radius(&self) -> f64 {
+        self.air_entry_parts
+            .iter()
+            .map(|&(radius, _)| radius)
+            .fold(0., f64::max)
+    }
+    /// `cell_entry_height` for every tool position in the axis-aligned
+    /// rectangle spanned by `a` and `b`: the lowest tip height above which
+    /// no whole-cell stock upper bound meets any tool section anywhere in
+    /// that rectangle. The rectangle, not just the segment `a`-`b`, so a
+    /// horizontal rapid at that height is clear whichever route the
+    /// controller takes between its ends: the straight line or either
+    /// axis-first dogleg (G0 interpolation is controller-dependent; see
+    /// LinuxCNC G0 and FANUC non-linear positioning, parameter LRP).
+    pub(crate) fn cell_route_height(&self, stock: &Stock, a: Point, b: Point) -> f64 {
+        let [nx, ny] = stock.dimensions();
+        let [wx, wy] = stock.cell_widths_mm();
+        let min = stock.spec().min_mm;
+        let cells = stock.cells();
+        let guard = 32. * self.operation.tolerance_mm;
+        let (lo, hi) = (
+            [a[0].min(b[0]), a[1].min(b[1])],
+            [a[0].max(b[0]), a[1].max(b[1])],
+        );
+        let mut height = f64::NEG_INFINITY;
+        for &(radius, bottom) in &self.air_entry_parts {
+            let reach = radius + guard;
+            let span = |l: f64, h: f64, o: f64, w: f64, n: usize| {
+                let first = ((l - reach - o) / w).floor().max(0.);
+                let last = ((h + reach - o) / w).floor().min(n as f64 - 1.);
+                (first as usize, last)
+            };
+            let (i0, i1) = span(lo[0], hi[0], min[0], wx, nx);
+            let (j0, j1) = span(lo[1], hi[1], min[1], wy, ny);
+            if i1 < 0. || j1 < 0. {
+                continue;
+            }
+            for j in j0..=j1 as usize {
+                for i in i0..=i1 as usize {
+                    let (x0, y0) = (min[0] + i as f64 * wx, min[1] + j as f64 * wy);
+                    // Gap between the cell and the rectangle, per axis.
+                    let dx = (x0 - hi[0]).max(lo[0] - x0 - wx).max(0.);
+                    let dy = (y0 - hi[1]).max(lo[1] - y0 - wy).max(0.);
+                    if dx.hypot(dy) <= reach {
+                        height = height.max(cells[j * nx + i].upper_mm - bottom);
+                    }
+                }
+            }
+        }
+        height
+    }
     /// `cell_entry_height` for every tool position on the straight paths
     /// `path` (each within `pad` of the true path: a flattened arc's chord
     /// error): the lowest tip height above which no whole-cell stock upper
@@ -525,5 +577,100 @@ mod tests {
         }
         assert!(highest.is_finite());
         assert!(highest <= 2.72, "rest ramp starts in proven air: {highest}");
+    }
+}
+
+#[cfg(test)]
+mod route_height_tests {
+    use super::*;
+    use crate::stock::{HeightBounds, StockSnapshot};
+
+    /// A floor at Z2 with one pillar to Z80 in the cell at (16, 12), and the
+    /// fixture's tool: cutter and shank of radius 2, holder of radius 4 from
+    /// 30 mm above the tip.
+    fn pillar() -> (PocketPlan, Stock, [f64; 2]) {
+        let manifest: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+            "../../fixtures/operations/helical-pocket.json"
+        ))
+        .unwrap();
+        let Operation::Pocket(operation) = manifest.operations[0].clone() else {
+            panic!("pocket fixture")
+        };
+        let plan = PocketPlan::prepare(
+            operation,
+            &manifest.tools[0],
+            manifest.stock.height().unwrap(),
+            manifest.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .unwrap();
+        let mut spec = manifest.stock.height().unwrap().clone();
+        spec.max_mm[2] = 100.;
+        let blank = Stock::new(spec.clone()).unwrap();
+        let [nx, ny] = blank.dimensions();
+        let [wx, wy] = blank.cell_widths_mm();
+        let (i, j) = ((16. / wx) as usize, (12. / wy) as usize);
+        let mut cells = vec![
+            HeightBounds {
+                lower_mm: 2.,
+                upper_mm: 2.,
+            };
+            nx * ny
+        ];
+        cells[j * nx + i] = HeightBounds {
+            lower_mm: 80.,
+            upper_mm: 80.,
+        };
+        let stock = Stock::from_snapshot(StockSnapshot {
+            spec,
+            generation: 0,
+            cells,
+        })
+        .unwrap();
+        // The pillar cell's far corner from the origin side.
+        (plan, stock, [(i + 1) as f64 * wx, (j + 1) as f64 * wy])
+    }
+
+    #[test]
+    fn a_route_is_as_high_as_every_tool_section_needs() {
+        let (plan, stock, corner) = pillar();
+        let radii: Vec<f64> = plan.air_entry_parts.iter().map(|p| p.0).collect();
+        let (narrow, wide) = (
+            radii.iter().copied().fold(f64::INFINITY, f64::min),
+            radii.iter().copied().fold(0., f64::max),
+        );
+        assert!(
+            wide > narrow + 1.,
+            "the fixture's holder is wider: {radii:?}"
+        );
+        // A route parallel to x, `gap` beyond the pillar in y: what each
+        // section needs there, from the sections themselves.
+        for gap in [0.5 * narrow, (narrow + wide) / 2., wide + 1.] {
+            let y = corner[1] + gap;
+            let (a, b) = ([4., y], [28., y + 0.3]);
+            let needed = plan
+                .air_entry_parts
+                .iter()
+                .map(|&(radius, bottom)| if gap <= radius { 80. } else { 2. } - bottom)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let height = plan.cell_route_height(&stock, a, b);
+            assert!(
+                (height - needed).abs() < 1e-9,
+                "gap {gap}: the route is at {height}, the sections need {needed}"
+            );
+        }
+        // Between the cutter's reach and the holder's, it is the holder over
+        // the pillar that sets the height, not the cutter over the floor.
+        let y = corner[1] + (narrow + wide) / 2.;
+        assert!(plan.cell_route_height(&stock, [4., y], [28., y]) > 2. + 1.);
+        // A dogleg: the pillar inside the rectangle of two ends whose
+        // straight line passes well clear of it.
+        let height = plan.cell_route_height(
+            &stock,
+            [corner[0] - 8., corner[1] - 8.],
+            [corner[0] + 2., corner[1] + 2.],
+        );
+        assert!((height - 80.).abs() < 1e-9, "{height}");
     }
 }

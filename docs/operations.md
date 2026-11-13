@@ -613,7 +613,27 @@ refused with its location: export the mesh with shared edge vertices
   down from `feed_z_mm` through material already cut. An entry beside the
   material it cuts (where the whole-cell stock bounds still hold that
   material) then plunges a few stock cells back, where the bounds let the
-  rapid come lower, and feeds across at depth. A helical entry ramps only
+  rapid come lower, and feeds across at depth. With `travel_clearance_mm`
+  (opt-in, on `Roughing`), a rapid between passes leaves the cut straight up
+  and travels that far above the highest whole-cell stock upper bound any
+  tool-assembly section can meet over the rectangle its two ends span,
+  when that is below `retract_z_mm`. The rectangle covers the straight
+  route and both axis-first doglegs, since how a controller interpolates
+  G0 varies. A clamp declared as an avoid area (the operation's `limits`) is
+  crossed above its top by the same clearance whenever that rectangle, grown
+  by the widest tool section, meets it; with a containment region the
+  rapids are not lowered at all. Fixtures declared only in the run's
+  verification scene are not seen by the planner (the run still checks every
+  move against them, along the straight route): declare a clamp inside the
+  work area as an avoid area, or leave the option off. Beside the stock,
+  where no stock bound says anything, the space between two positions the
+  cutter is allowed at is taken to be free, as it is for the entries that
+  come down beside the stock. A controller may round the corner between two
+  consecutive rapids instead of stopping at it (path blending; how far it
+  may stray is a setting of the controller, to be read from its manual), and
+  a lowered rapid's corners are only this clearance above the stock: give a
+  clearance larger than that deviation. Reported per layer as
+  `lowered_travels`. A helical entry ramps only
   through material: above the height the committed cuts or the stock cell
   bounds prove clear over its whole bore it descends straight down, and a
   bore that is clear to the layer gets a straight plunge (reported as

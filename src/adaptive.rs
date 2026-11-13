@@ -73,6 +73,9 @@ impl AdaptivePocketOperation {
     pub(crate) fn front_motion_options(&self) -> crate::roughing::FrontMotionOptions {
         crate::roughing::FrontMotionOptions {
             rapid_descent_clearance_mm: self.rapid_descent_clearance_mm,
+            // Roughing only for now: a pocket's rapids stay at the retract
+            // height.
+            travel_clearance_mm: None,
             ramp_clearance_mm: self.ramp_clearance_mm,
             link_feed_mm_min: self.link_feed_mm_min,
             link_chip_thinning: self.link_chip_thinning,

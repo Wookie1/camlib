@@ -4908,6 +4908,126 @@ fn engagement_front_empty_step_up_keeps_the_cleared_memory() {
     }
 }
 
+/// Run the bar job (end walls, a high retract) with `travel_clearance_mm`
+/// set or not, committing every motion. Every rapid that runs across below
+/// the retract height is checked against the exact stock left by the cuts
+/// before it (from the cut curves, not the stock model): over the whole
+/// rectangle its ends span, grown by the cutter radius, so the straight
+/// route and both axis-first doglegs clear the stock and the bar. Returns
+/// (rapid and retract length mm, report).
+fn run_bar_travel(clearance: Option<f64>) -> (f64, serde_json::Value) {
+    let mut input = bar_input(12., true);
+    input["initial_position_mm"] = serde_json::json!([0.0, 0.0, 30.0]);
+    let op = &mut input["operations"][0];
+    op["clearance_z_mm"] = 30.0.into();
+    op["retract_z_mm"] = 30.0.into();
+    if let Some(c) = clearance {
+        op["travel_clearance_mm"] = c.into();
+    }
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let mut history: Vec<camlib::motion::Motion> = Vec::new();
+    let mut current = m.initial_position_mm;
+    let mut travel = 0.;
+    let (r, top) = (3., 12.);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        assert!(history.len() < 60000, "unbounded engagement_front path");
+        assert_eq!(motion.curve.start(), current);
+        current = motion.curve.end();
+        certify_bar(&motion.curve);
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        if matches!(motion.kind, MoveKind::Rapid | MoveKind::Retract) {
+            travel += ((b[0] - a[0]).hypot(b[1] - a[1])).hypot(b[2] - a[2]);
+        }
+        let across = (b[0] - a[0]).hypot(b[1] - a[1]) > 1e-9;
+        if motion.kind == MoveKind::Rapid && across && a[2] < 30. - 1e-9 {
+            assert!(
+                (a[2] - b[2]).abs() < 1e-12,
+                "rapid across changes Z: {motion:?}"
+            );
+            let (x0, x1) = (a[0].min(b[0]) - r, a[0].max(b[0]) + r);
+            let (y0, y1) = (a[1].min(b[1]) - r, a[1].max(b[1]) + r);
+            let step = 0.2;
+            let (nx, ny) = (
+                ((x1 - x0) / step).ceil() as usize,
+                ((y1 - y0) / step).ceil() as usize,
+            );
+            for i in 0..=nx {
+                for j in 0..=ny {
+                    let p = [x0 + i as f64 * step, y0 + j as f64 * step];
+                    if p[0] < 0. || p[0] > 60. || p[1] < 0. || p[1] > 40. {
+                        continue;
+                    }
+                    // The bar and the end walls are never cut.
+                    let kept = (12. ..=28.).contains(&p[1]) || p[0] <= 4. || p[0] >= 56.;
+                    let height = if kept {
+                        top
+                    } else {
+                        history
+                            .iter()
+                            .filter(|old| old.kind != MoveKind::Rapid)
+                            .map(|old| exact_height_for(&old.curve, p, r, top))
+                            .fold(top, f64::min)
+                    };
+                    assert!(
+                        a[2] > height + 0.5,
+                        "rapid across at Z{} over stock at {p:?} (Z{height}): {motion:?}",
+                        a[2]
+                    );
+                }
+            }
+        }
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        if matches!(motion.kind, MoveKind::Rapid | MoveKind::Retract) {
+            assert!(
+                delta.changes().iter().all(|c| c.after == c.before),
+                "rapid removes stock: {motion:?}"
+            );
+        }
+        stock.apply_delta(&delta).unwrap();
+        history.push(motion);
+    }
+    plan.finish_report(&|| false).unwrap();
+    (travel, serde_json::to_value(plan.report()).unwrap())
+}
+
+/// With `travel_clearance_mm`, rapids between passes run just above the
+/// stock their route can meet instead of climbing to the retract height,
+/// proven clear over the whole rectangle of each route (dogleg-safe).
+#[test]
+fn engagement_front_travel_clearance_lowers_rapids_over_cut_stock() {
+    let lowered = |report: &serde_json::Value| -> u64 {
+        report["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["clearing"]["lowered_travels"].as_u64().unwrap())
+            .sum()
+    };
+    let (high, high_report) = run_bar_travel(None);
+    let (low, low_report) = run_bar_travel(Some(1.));
+    eprintln!(
+        "rapid travel {high:.0} mm at retract, {low:.0} mm lowered ({} lowered)",
+        lowered(&low_report)
+    );
+    assert_eq!(lowered(&high_report), 0);
+    assert!(lowered(&low_report) > 0, "no rapid was lowered");
+    assert!(low < 0.8 * high, "lowered rapids did not shorten travel");
+}
+
 /// The strips closed by end walls (so later passes start beside the stock,
 /// proven only by the committed sweeps), with the operation's top 48 mm
 /// above the Z6 layer (a deep layer, as under a tall part). A vertical entry into cut stock is
@@ -4944,4 +5064,132 @@ fn engagement_front_deep_layer_entries_are_proven() {
         count(&shallow, "helical_entries")
     );
     assert!((deep_mean - shallow_mean).abs() < 0.5, "{deep_mean} {shallow_mean}");
+}
+
+// travel_clearance_mm and a clamp declared as an avoid area.
+
+#[derive(Debug, Default)]
+struct ClampStats {
+    lowered: u64,
+    /// Rapids the shared link guard (as `regeneration::run` applies it) refuses.
+    guard_refusals: usize,
+    first_refusal: Option<String>,
+    /// Rapids across below the clamp top that the link guard accepts although
+    /// the rectangle of their ends, grown by the widest tool radius, meets the
+    /// clamp: clear on the straight route only, not on an axis-first dogleg.
+    dogleg_only: usize,
+    first_dogleg: Option<String>,
+    /// Rapids across below the stock top whose whole cutter rectangle lies
+    /// outside the stock footprint (nothing the planner knows is there).
+    low_outside: usize,
+    lowest_outside: f64,
+}
+
+/// The bar job with a clamp on top of the retained bar, declared as an avoid
+/// area: x 26..34, y 16..24, top Z25 (the bar top is Z12, the retract Z30).
+fn run_bar_clamp(clearance: Option<f64>, ends: bool) -> ClampStats {
+    let clamp = [26., 16., 34., 24.];
+    let clamp_top = 25.;
+    // The widest tool section: the holder.
+    let r = 6.;
+    let mut input = bar_input(12., ends);
+    input["initial_position_mm"] = serde_json::json!([0.0, 0.0, 30.0]);
+    let op = &mut input["operations"][0];
+    op["clearance_z_mm"] = 30.0.into();
+    op["retract_z_mm"] = 30.0.into();
+    op["limits"] = serde_json::json!({"avoid": [{
+        "region": {
+            "version": 1, "units": "mm", "name": "clamp", "boundary_error_mm": 0.0,
+            "components": [{"outer": {"vertices": [
+                [clamp[0], clamp[1], 0.0], [clamp[2], clamp[1], 0.0],
+                [clamp[2], clamp[3], 0.0], [clamp[0], clamp[3], 0.0]]}, "holes": []}],
+            "source": null
+        },
+        "top_z_mm": clamp_top
+    }]});
+    if let Some(c) = clearance {
+        op["travel_clearance_mm"] = c.into();
+    }
+    let m: StreamManifest = serde_json::from_value(input).unwrap();
+    m.validate().unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let mut plan = OperationPlan::prepare_with_stock(
+        m.operations[0].clone(),
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let guard =
+        camlib::limits::LinkGuard::new(m.operations[0].limits(), &m.tools[0], m.sweep.tolerance_mm)
+            .unwrap()
+            .expect("the avoid area gives a link guard");
+    let mut stats = ClampStats {
+        lowest_outside: f64::INFINITY,
+        ..Default::default()
+    };
+    let mut count = 0;
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+        count += 1;
+        assert!(count < 60000, "unbounded engagement_front path");
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        let refused = guard.check(&motion).err();
+        if let Some(e) = &refused {
+            stats.guard_refusals += 1;
+            stats.first_refusal.get_or_insert_with(|| e.clone());
+        }
+        let across = (b[0] - a[0]).hypot(b[1] - a[1]) > 1e-9;
+        if motion.kind == MoveKind::Rapid && across {
+            let (x0, x1) = (a[0].min(b[0]) - r, a[0].max(b[0]) + r);
+            let (y0, y1) = (a[1].min(b[1]) - r, a[1].max(b[1]) + r);
+            let z = a[2].min(b[2]);
+            let meets = x0 < clamp[2] && x1 > clamp[0] && y0 < clamp[3] && y1 > clamp[1];
+            if z < clamp_top && meets && refused.is_none() {
+                stats.dogleg_only += 1;
+                stats
+                    .first_dogleg
+                    .get_or_insert_with(|| format!("{a:?} -> {b:?}"));
+            }
+            if z < 12. && (x1 < 0. || x0 > 60. || y1 < 0. || y0 > 40.) {
+                stats.low_outside += 1;
+                stats.lowest_outside = stats.lowest_outside.min(z);
+            }
+        }
+        let delta = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+    }
+    plan.finish_report(&|| false).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    stats.lowered = report["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["clearing"]["lowered_travels"].as_u64().unwrap())
+        .sum();
+    stats
+}
+
+/// Without the option every rapid crosses the clamp above its top (retract
+/// Z30 > clamp top Z25). With it, a lowered rapid must not pass the clamp
+/// below its top on any route a controller may take.
+#[test]
+fn engagement_front_travel_clearance_keeps_lowered_rapids_above_a_clamp() {
+    for ends in [true, false] {
+        let plain = run_bar_clamp(None, ends);
+        eprintln!("ends={ends} travel_clearance_mm=None: {plain:?}");
+        assert_eq!((plain.guard_refusals, plain.dogleg_only), (0, 0));
+        let low = run_bar_clamp(Some(1.), ends);
+        eprintln!("ends={ends} travel_clearance_mm=1: {low:?}");
+        assert!(low.lowered > 0);
+        assert_eq!(
+            (low.guard_refusals, low.dogleg_only),
+            (0, 0),
+            "ends={ends}: lowered rapids pass the clamp below its top: {low:?}"
+        );
+    }
 }
