@@ -39,6 +39,14 @@ class NestPart:
     ``quantity``; copies that do not fit are not a refusal, and the result's
     ``filled`` says how many were placed.
 
+    ``kit``: a name. Parts with the same kit are placed one after another, so
+    they lie together on the sheet, and all of them or none: a kit that does
+    not fit whole is left out whole (a refusal, or with ``allow_unplaced``
+    listed as unplaced). Kits take their place among the other parts by their
+    highest priority, then their largest part. The result's ``kits`` gives
+    each kit's parts, whether it was placed and the box round its copies. A
+    filler belongs to no kit.
+
     ``marks``: TracePath lines and arcs in the part's own coordinates (a part
     number in your own stroke letters, a bend line). The nest places them
     with every copy (turned, and mirrored with a part that is turned over)
@@ -59,9 +67,11 @@ class NestPart:
     fill: bool = False
     marks: tuple = ()
     no_lead: tuple = ()
+    kit: str | None = None
 
     def to_dict(self):
         return dict(
+            **({} if self.kit is None else dict(kit=self.kit)),
             region=_region(self.region),
             quantity=self.quantity,
             rotations_deg=list(self.rotations_deg),
@@ -125,6 +135,15 @@ class NestResult:
     # The parts' edges kept free of leads, as placed (TracePath): the
     # ``keep_off`` of the cut's LeadPlacement.
     no_lead: tuple = ()
+    # The copies in the order they were placed: ((part, copy), ...).
+    order: tuple = ()
+    # The kits: dicts of name, parts, placed and bounds_mm (the box round
+    # the kit's copies; absent when it was left out).
+    kits: tuple = ()
+    # With lead_room="at_leads": where each placed part's outline must
+    # start (a point on its drawn edge, in the order of placements): the
+    # ``starts`` of the cut's LeadPlacement.
+    lead_starts: tuple = ()
 
 
 def _trace_path(path):
@@ -158,6 +177,9 @@ def _nest_result(report):
         marks=tuple(_trace_path(m["path"]) for m in report.get("marks", ())),
         mark_placements=tuple((m["placement"], m["mark"]) for m in report.get("marks", ())),
         no_lead=tuple(_trace_path(path) for path in report.get("no_lead", ())),
+        order=tuple((part, copy) for part, copy in report.get("order", ())),
+        kits=tuple(report.get("kits", ())),
+        lead_starts=tuple((x, y) for x, y in report.get("lead_starts", ())),
     )
 
 
@@ -233,6 +255,12 @@ class Nest:
     fill_axis: str = "y"
     boundary_tolerance_mm: float = 0.01
     tolerance_mm: float = 1e-5
+    # Where room is kept for the cut's leads: "all_round" every part, or
+    # "at_leads": only where each outline will start (the result's
+    # lead_starts, to be given to the cut's LeadPlacement(starts=...)).
+    lead_room: str = "all_round"
+    # The cut's overcut_mm (part of the room kept with lead_room="at_leads").
+    overcut_mm: float = 0.0
 
     @classmethod
     def for_cut(cls, cut, sheet, parts, *, part_spacing_mm, edge_margin_mm, resolution_mm, **options):
@@ -251,6 +279,7 @@ class Nest:
             pierce_clearance_mm=cut.pierce_clearance_mm,
             corner_loops=cut.corner_loops,
             chain=cut.chain,
+            overcut_mm=cut.overcut_mm,
             boundary_tolerance_mm=cut.boundary_tolerance_mm,
             tolerance_mm=cut.tolerance_mm,
             **options,
@@ -272,6 +301,8 @@ class Nest:
             seed=self.seed,
             start_corner=self.start_corner,
             fill_axis=self.fill_axis,
+            lead_room=self.lead_room,
+            overcut_mm=self.overcut_mm,
             boundary_tolerance_mm=self.boundary_tolerance_mm,
             tolerance_mm=self.tolerance_mm,
         )
@@ -300,7 +331,7 @@ class Nest:
             tuple((u["part"], u["quantity"]) for u in report["unplaced"]),
         )
 
-    def remnant(self, parts, *, remnant_margin_mm, crop=None):
+    def remnant(self, parts, *, remnant_margin_mm, crop=None, skeleton=None):
         """What is left of the sheet after ``parts`` (a NestResult, or the
         ``PlanarRegion`` a ThermalCut cut) are cut from it with this nest's
         kerf and leads: a ``Remnant`` whose ``region`` is the sheet less every
@@ -310,7 +341,9 @@ class Nest:
         coordinates, so it is the ``sheet`` of the next Nest when the remnant
         is put back against the same reference; ``camlib.dxf.write_regions``
         saves it as a DXF. ``crop``: the cut's CropCut; its kerf is removed
-        too, so the offcut it frees is one of the remnant's ``pieces``."""
+        too, so the offcut it frees is one of the remnant's ``pieces``.
+        ``skeleton``: the cut's SkeletonCutUp; the area it cuts into pieces
+        is removed, out to where its cuts run off."""
         region = parts.region if isinstance(parts, NestResult) else parts
         fields = self.to_dict()
         report = _request(
@@ -320,6 +353,7 @@ class Nest:
                 parts=_region(region),
                 remnant_margin_mm=remnant_margin_mm,
                 **({} if crop is None else dict(crop=crop.to_dict())),
+                **({} if skeleton is None else dict(skeleton=skeleton.to_dict())),
                 **({} if self.chain is None else dict(chain=self.chain.to_dict())),
                 **{
                     key: fields[key]
@@ -351,15 +385,18 @@ class Nest:
             report=report,
         )
 
-    def verify(self, placements, region):
+    def verify(self, placements, region, lead_starts=()):
         """The independent check alone, for a layout from anywhere (an edited
         nest, a manual layout): returns its report, or raises ValueError
-        naming the parts that are too close, overlap or leave the sheet."""
+        naming the parts that are too close, overlap or leave the sheet.
+        With ``lead_room="at_leads"`` give the layout's ``lead_starts``: the
+        room for each part's leads is built and checked at its start."""
         return _request(
             "verify_nest",
             nest=self.to_dict(),
             placements=[p.to_dict() for p in placements],
             region=_region(region),
+            lead_starts=[[float(x), float(y)] for x, y in lead_starts],
         )
 
 

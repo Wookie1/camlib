@@ -46,6 +46,13 @@ pub struct LeadPlacement {
     pub keep_off_distance_mm: f64,
     #[serde(default)]
     pub prefer: LeadPreference,
+    /// Where loops start, declared: points on the parts' drawn edges, in the
+    /// sheet's coordinates (a nest planned with its lead room at the leads
+    /// gives them as `lead_starts`). A loop whose edge passes through one
+    /// starts there, whatever else is declared, and is refused if its leads
+    /// are not clear there: the room for them was kept at that place only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub starts: Vec<P2>,
 }
 
 /// The distance from `p` to a stroke.
@@ -93,6 +100,9 @@ pub(crate) struct Prepared {
     /// an arc of this radius on the kerf path.
     offset: f64,
     prefer: LeadPreference,
+    starts: Vec<P2>,
+    /// How near the kerf path's offset a declared start must be to it.
+    tolerance: f64,
 }
 
 impl Prepared {
@@ -124,7 +134,91 @@ impl Prepared {
             reach: placement.keep_off_distance_mm + offset.abs(),
             offset: offset.abs(),
             prefer: placement.prefer,
+            starts: {
+                if placement
+                    .starts
+                    .iter()
+                    .flatten()
+                    .any(|v| !(v.is_finite() && v.abs() <= 1e6))
+                {
+                    return Err("lead_placement: starts must be finite points".into());
+                }
+                placement.starts.clone()
+            },
+            tolerance: guard,
         })
+    }
+
+    /// The loop started at the declared start that lies on its edge, with
+    /// that start: the first declared point whose distance to a stroke of
+    /// the kerf path is the path's offset from the drawn edge, at the point
+    /// of the stroke nearest it. None when no declared start is on this
+    /// loop.
+    pub(crate) fn declared(&self, strokes: &[Stroke]) -> Option<(P2, Vec<Stroke>)> {
+        for &p in &self.starts {
+            for (k, s) in strokes.iter().enumerate() {
+                if (stroke_distance(s, p) - self.offset).abs() > self.tolerance {
+                    continue;
+                }
+                // The fraction of the stroke nearest the point.
+                let t = match s.arc {
+                    None => {
+                        let d = [s.b[0] - s.a[0], s.b[1] - s.a[1]];
+                        let v = [p[0] - s.a[0], p[1] - s.a[1]];
+                        (v[0] * d[0] + v[1] * d[1]) / (d[0] * d[0] + d[1] * d[1])
+                    }
+                    Some((c, sweep)) => {
+                        let start = (s.a[1] - c[1]).atan2(s.a[0] - c[0]);
+                        let at = (p[1] - c[1]).atan2(p[0] - c[0]);
+                        let along = if sweep >= 0. {
+                            (at - start).rem_euclid(std::f64::consts::TAU)
+                        } else {
+                            (start - at).rem_euclid(std::f64::consts::TAU)
+                        };
+                        along / sweep.abs()
+                    }
+                };
+                if !(0. ..=1.).contains(&t) {
+                    continue;
+                }
+                // At a stroke's end the loop starts with the next stroke
+                // (no sliver of a stroke is left there).
+                let length = crate::profiles::stroke_length(s);
+                let t = if t * length <= self.tolerance {
+                    0.
+                } else if (1. - t) * length <= self.tolerance {
+                    1.
+                } else {
+                    t
+                };
+                let at = if t == 0. {
+                    s.a
+                } else if t == 1. {
+                    s.b
+                } else {
+                    stroke_point(s, t)
+                };
+                let mut r = vec![];
+                if t < 1. {
+                    r.push(Stroke {
+                        a: at,
+                        b: s.b,
+                        arc: s.arc.map(|(c, w)| (c, w * (1. - t))),
+                    });
+                }
+                r.extend_from_slice(&strokes[k + 1..]);
+                r.extend_from_slice(&strokes[..k]);
+                if t > 0. {
+                    r.push(Stroke {
+                        a: s.a,
+                        b: at,
+                        arc: s.arc.map(|(c, w)| (c, w * t)),
+                    });
+                }
+                return Some((p, r));
+            }
+        }
+        None
     }
 
     /// Whether a loop starting at `p` (a point of the kerf path) would put
@@ -269,6 +363,8 @@ mod tests {
             reach: 1.,
             offset: 0.5,
             prefer,
+            starts: vec![],
+            tolerance: 1e-9,
         }
     }
 

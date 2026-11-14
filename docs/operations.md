@@ -1902,7 +1902,12 @@ cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=
   counts the loops moved (`leads_moved`). For nested parts declare the edges
   on the part, `NestPart(no_lead=...)`, and pass the nest's `result.no_lead`
   as `keep_off` ([nesting](nesting.md)). Not planned together with
-  `common_line`.
+  `common_line`. `starts=...` declares where loops start: points on the
+  parts' drawn edges, in the sheet's coordinates. A loop whose edge passes
+  through one starts there, whatever else is declared, and is refused, never
+  moved, when its leads are not clear there. A nest planned with
+  `lead_room="at_leads"` kept room for the leads at those places only and
+  gives them as `result.lead_starts`.
 - **Corner loops**: `corner_loops=camlib.CornerLoops(overshoot_mm,
   min_angle_deg=..., max_angle_deg=...)` cuts a loop into the scrap at the
   parts' outside corners. A plasma arc trails the torch and a machine slows
@@ -1965,6 +1970,53 @@ cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=
   planned together with `common_line`. The report counts the links
   (`chain_links`) and their length (`chain_length_mm`, not in
   `cut_length_mm`); `pierces` and `dwell_seconds` drop accordingly.
+- **Bridges between parts**: `bridges=camlib.Bridges(width_mm,
+  max_length_mm=..., max_parts=...)` keeps neighbouring parts joined to each
+  other by an uncut strip of the scrap between them, so small parts do not
+  tilt or drop between the slats and come off the table together, to be
+  broken apart afterwards (Amada AP100US, "Chain and Bridge Cutting": bridge
+  size and the greatest distance between parts allowed for one). Where two
+  parts at the same nesting depth have straight edges facing each other, no
+  more than `max_length_mm` apart and overlapping by the bridge and a kerf
+  either side, each outline's kerf path is opened over the bridge and the two
+  openings are joined by two cuts across the gap. The two outlines are then
+  one closed loop round both parts, cut on one pierce; the strip between the
+  crossing cuts, `width_mm` wide between the kerfs' edges, is never cut. The
+  nearest pairs are bridged first. A pair gets one bridge and a group is a
+  tree of at most `max_parts` parts: two bridges between one pair, or a ring
+  of bridged parts, would enclose a window of scrap needing a pierce of its
+  own. Parts with no facing neighbour in reach keep their own outline. There
+  are no defaults. The crossing cuts are proven clear of every part like any
+  kerf; the group's holes are cut before its loop; with `avoid_cut_parts`
+  the group comes free as one piece. Leads, micro-joints, corner treatment
+  and chain cutting apply to the group's loop as to any outline. Not planned
+  together with `common_line`. The report lists each bridge (`bridges`: its
+  two parts, its middle and the distance it spans) and the groups
+  (`bridged_groups`); `order` names every part of a group at its loop.
+- **Skeleton cut-up**: `skeleton=camlib.SkeletonCutUp(max_piece_mm,
+  part_clearance_mm=..., run_off_mm=..., area_mm=(x0, y0, x1, y1))` cuts
+  the lace left round the parts into pieces small enough to lift off the
+  table, after every part is cut and before a crop cut (Hypertherm, ProNest
+  "Skeleton Cut-Up": dedicated cuts that make the skeleton easy to remove).
+  The cuts are straight lines on an even grid over `area_mm` (the sheet, or
+  the part of it the nest used, e.g. `NestResult.used_bounds_mm` out to the
+  sheet's edges; there is no default, as the planner does not know which
+  edges are the sheet's), no further apart than `max_piece_mm` each way. A
+  line is cut only where it is over the lace: it stops `part_clearance_mm`
+  short of every part's kerf (0: it runs into the kerf, so the piece is
+  severed there), and it never runs over a hole, where there is no plate
+  under the torch. Each stretch is pierced once, at its end nearer a part
+  and the pierce clearance from every part, and cut straight to its other
+  end; where that is the area's edge it runs `run_off_mm` past it. The short
+  neck left at a pierced end that faces a part holds the piece until the
+  lace is lifted. Every pierce crater and every kerf is proven clear of
+  the parts like a crop cut's; height control is off over these cuts (they
+  cross kerfs already cut). With `avoid_cut_parts` every part is a freed
+  piece by then: the pierces and the ends of the cuts also keep that
+  clearance from every part, so the lines stop that much shorter. The report counts them (`skeleton_cuts`,
+  `skeleton_length_mm`); each is one of `pierces` and their length is in
+  `cut_length_mm`. `Nest.remnant(..., skeleton=...)` removes the area it
+  divides from the remnant ([nesting](nesting.md)).
 - **Crop cut**: `crop=camlib.CropCut(((x0, y0), (x1, y1)))` (or three points
   for an L) adds a last cut that frees the usable offcut from the skeleton.
   The points are the kerf's centre line in the sheet's coordinates. The beam
@@ -2005,12 +2057,19 @@ gap = cut.common_line_spacing_mm()   # place the parts this far apart
 - **Detection is exact**: the kerf paths of the two parts must coincide, to
   the operation's `tolerance_mm`, along a complete straight edge of both, at
   least `min_length_mm` long, ending at outside corners where the two parts
-  are flush (their neighbouring edges in line). That covers pairs and rows of
-  parts.
+  are flush (their neighbouring edges in line). That covers pairs, rows and
+  rectangular grids of parts.
+- **Grids**: where four parts meet, the common lines one way and the other
+  cross. The shared edges that lie in one line are then one cut, from the
+  group's outline on one side to its outline on the other, each shared edge
+  cut once; the lines across are cut the same way and cross them. All of
+  them come before the group's outline, so every part is held by the sheet
+  until the outline frees the group. The report's `common_lines` lists each
+  such cut once, with `pairs`: every pair of parts it separates.
 - **Refused, never cut twice**: kerf paths that coincide in any other way
   (part of an edge, parts not flush, a shorter edge than `min_length_mm`,
-  common lines meeting at a corner as in a grid, a part against a hole wall,
-  arcs), and facing edges closer than the spacing. The message names the parts
+  parts staggered so that a common line ends where only one of its two parts
+  has another beyond it, a part against a hole wall, arcs), and facing edges closer than the spacing. The message names the parts
   and the spacing. Facing edges further apart are cut separately as always;
   where their kerfs overlap this is reported. With no common line at all the
   operation plans exactly as without the option, and says so in the report.

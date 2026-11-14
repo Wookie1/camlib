@@ -1002,3 +1002,183 @@ fn chain_cutting_joins_outlines_through_the_scrap_with_one_pierce() {
     let error = cut(serde_json::json!({"chain": {"max_link_mm": 45.}, "common_line": {"min_length_mm": 5.}})).err().unwrap();
     assert!(error.contains("chain is not planned together with common_line"), "{error}");
 }
+
+#[test]
+fn bridges_keep_neighbouring_parts_joined_by_an_uncut_strip() {
+    let cut = |extra: serde_json::Value| {
+        let mut op = operation(extra);
+        op.parts = row();
+        run(op)
+    };
+    let bridges = serde_json::json!({"width_mm": 3., "max_length_mm": 12., "max_parts": 8});
+    let (events, plan, stock) = cut(serde_json::json!({"bridges": bridges})).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    // The five holes, then one loop round all five parts: six pierces.
+    let (pierces, _) = pierces_and_links(&events);
+    assert_eq!(pierces, 6);
+    assert_eq!(report["pierces"], 6);
+    assert_eq!(report["bridged_groups"], serde_json::json!([[0, 1, 2, 3, 4]]));
+    let planned = report["bridges"].as_array().unwrap();
+    assert_eq!(planned.len(), 4);
+    let order = report["order"].as_array().unwrap();
+    assert!(order[..5].iter().all(|l| !l[1].is_null()));
+    assert_eq!(order[5..].iter().filter(|l| l[1].is_null()).count(), 5);
+    // In the stock, independently of the planner. Between parts k and k+1
+    // (edges at x = 36 + 36 k and 46 + 36 k) the bridge is at the middle of
+    // the facing edges, y = 53: the strip stands from one part to the other,
+    // 3 mm wide, and the kerf either side of it is cut through.
+    for (k, bridge) in planned.iter().enumerate() {
+        let (x0, x1) = (36. + 36. * k as f64, 46. + 36. * k as f64);
+        assert_eq!(bridge["parts"], serde_json::json!([k, k + 1]));
+        assert!((bridge["length_mm"].as_f64().unwrap() - 10.).abs() < 1e-9);
+        let at = bridge["at_mm"].as_array().unwrap();
+        assert!((at[0].as_f64().unwrap() - 0.5 * (x0 + x1)).abs() < 1e-9);
+        assert!((at[1].as_f64().unwrap() - 53.).abs() < 1e-9);
+        for x in [x0 - 1., x0 + 0.5, 0.5 * (x0 + x1), x1 - 0.5, x1 + 1.] {
+            for y in [52., 53., 54.] {
+                assert!(top_at(&stock, [x, y]).0 >= 5.99, "strip cut at {x} {y}");
+            }
+        }
+        // The crossing cuts: 1.5 mm (half the strip) plus half a kerf from
+        // the middle line, either side.
+        for y in [53. - 2.25, 53. + 2.25] {
+            assert!(top_at(&stock, [0.5 * (x0 + x1), y]).1 <= 0.01, "{y}");
+        }
+        // And the parts' facing edges are cut elsewhere along them.
+        for y in [44., 62.] {
+            assert!(top_at(&stock, [x0 + 0.75, y]).1 <= 0.01);
+            assert!(top_at(&stock, [x1 - 0.75, y]).1 <= 0.01);
+        }
+    }
+    // Pairs only.
+    let pairs = serde_json::json!({"width_mm": 3., "max_length_mm": 12., "max_parts": 2});
+    let (events, plan, _) = cut(serde_json::json!({"bridges": pairs})).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    assert_eq!(pierces_and_links(&events).0, 5 + 3);
+    assert_eq!(report["bridged_groups"], serde_json::json!([[0, 1], [2, 3]]));
+    // Parts further apart than a bridge may span are cut on their own.
+    let short = serde_json::json!({"width_mm": 3., "max_length_mm": 8., "max_parts": 8});
+    let (events, plan, _) = cut(serde_json::json!({"bridges": short})).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    assert_eq!(pierces_and_links(&events).0, 10);
+    assert!(report.get("bridges").is_none() && report.get("bridged_groups").is_none());
+    // With rapids kept off freed parts: the group comes free as one.
+    let (_, plan, _) = cut(serde_json::json!({
+        "bridges": bridges, "avoid_cut_parts": {"clearance_mm": 6.}
+    }))
+    .unwrap();
+    assert_eq!(serde_json::to_value(plan.report()).unwrap()["pierces"], 6);
+    // Refusals name the problem.
+    let error = cut(serde_json::json!({"bridges": {"width_mm": 0., "max_length_mm": 12., "max_parts": 8}}))
+        .err()
+        .unwrap();
+    assert!(error.contains("width_mm"), "{error}");
+    let error = cut(serde_json::json!({"bridges": bridges, "common_line": {"min_length_mm": 5.}}))
+        .err()
+        .unwrap();
+    assert!(error.contains("bridges are not planned together with common_line"), "{error}");
+}
+
+#[test]
+fn the_skeleton_is_cut_up_after_the_parts_clear_of_them_and_never_over_a_hole() {
+    let cut = |extra: serde_json::Value| {
+        let mut op = operation(extra);
+        op.parts = row();
+        run(op)
+    };
+    // The row's five 26 mm squares stand at x = 10 + 36 k, y = 40..66, each
+    // with a 5 mm hole at its middle, on a 200 x 120 sheet.
+    let squares: Vec<[f64; 4]> =
+        (0..5).map(|k| [10. + 36. * k as f64, 40., 36. + 36. * k as f64, 66.]).collect();
+    let off = |p: [f64; 3], s: &[f64; 4]| {
+        let dx = (s[0] - p[0]).max(p[0] - s[2]).max(0.);
+        let dy = (s[1] - p[1]).max(p[1] - s[3]).max(0.);
+        dx.hypot(dy)
+    };
+    let rules = serde_json::json!({
+        "max_piece_mm": 70., "part_clearance_mm": 0., "run_off_mm": 2., "area_mm": [0., 0., 200., 120.]
+    });
+    let (plain_events, plain_plan, _) = cut(serde_json::json!({})).unwrap();
+    let plain = serde_json::to_value(plain_plan.report()).unwrap();
+    let (events, plan, stock) = cut(serde_json::json!({"skeleton": rules})).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    // The parts are cut exactly as without it, first.
+    assert_eq!(events[..plain_events.len() - 1], plain_events[..plain_events.len() - 1]);
+    let lines: Vec<&Motion> = events[plain_events.len() - 1..]
+        .iter()
+        .filter_map(|e| match e {
+            Event::Motion { motion } if motion.kind == MoveKind::Cut => Some(motion),
+            _ => None,
+        })
+        .collect();
+    let count = report["skeleton_cuts"].as_u64().unwrap() as usize;
+    assert_eq!(lines.len(), count);
+    assert!(count >= 4, "{count}");
+    assert_eq!(report["pierces"].as_u64().unwrap(), plain["pierces"].as_u64().unwrap() + count as u64);
+    let total: f64 = lines.iter().map(|m| length(&m.curve)).sum();
+    assert!((report["skeleton_length_mm"].as_f64().unwrap() - total).abs() < 1e-9);
+    assert!(
+        (report["cut_length_mm"].as_f64().unwrap() - plain["cut_length_mm"].as_f64().unwrap() - total).abs()
+            < 1e-6
+    );
+    // 200 wide in three columns, 120 high in two rows: lines at x = 200/3
+    // and 400/3, and at y = 60, which runs through the parts.
+    let third = 200. / 3.;
+    for m in &lines {
+        let (a, b) = (m.curve.start(), m.curve.end());
+        let vertical = a[0] == b[0];
+        assert!(vertical || a[1] == b[1], "{m:?}");
+        if vertical {
+            assert!((a[0] - third).abs() < 1e-9 || (a[0] - 2. * third).abs() < 1e-9, "{a:?}");
+        } else {
+            assert_eq!(a[1], 60.);
+        }
+        // Independently of the planner: every point of the line keeps the
+        // kerf's half width off every part, the pierce is the crater's
+        // reach from them, and no point is over a hole.
+        assert!(squares.iter().all(|s| off(a, s) >= 0.75 + 1.5), "{a:?}");
+        for k in 0..=400 {
+            let t = k as f64 / 400.;
+            let p = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), 0.];
+            assert!(squares.iter().all(|s| off(p, s) >= 0.75), "{p:?}");
+        }
+    }
+    // A line that reaches the area's edge runs off it by the declared 2 mm;
+    // one that ends at a part stops in that part's kerf.
+    let ends: Vec<[f64; 3]> = lines.iter().map(|m| m.curve.end()).collect();
+    assert!(ends.iter().any(|e| e[1] == 122. || e[1] == -2. || e[0] == 202. || e[0] == -2.), "{ends:?}");
+    assert!(
+        ends.iter().any(|e| squares.iter().any(|s| (0.74..1.0).contains(&off(*e, s)))),
+        "{ends:?}"
+    );
+    // The lace between two parts is cut through at y = 60.
+    assert!(top_at(&stock, [41., 60.]).1 <= 0.01);
+    // With rapids kept off freed parts the cut-up still plans.
+    let (avoiding, plan, _) = cut(serde_json::json!({
+        "skeleton": rules, "avoid_cut_parts": {"clearance_mm": 4.}
+    }))
+    .unwrap();
+    let mut fired = false;
+    let mut cut_up = 0;
+    for e in &avoiding[plain_events.len() - 1..] {
+        match e {
+            Event::Beam { power_percent } => fired = *power_percent > 0.,
+            Event::Motion { motion } if motion.kind == MoveKind::Cut && std::mem::take(&mut fired) => {
+                cut_up += 1;
+                let p = motion.curve.start();
+                assert!(squares.iter().all(|s| off(p, s) >= 4.), "{p:?}");
+            }
+            _ => {}
+        }
+    }
+    assert!(cut_up >= 2);
+    // Its pierces then keep that clearance from every part too.
+    assert!(serde_json::to_value(plan.report()).unwrap()["skeleton_cuts"].as_u64().unwrap() >= 2);
+    // Refusals name the problem.
+    let error = cut(serde_json::json!({"skeleton": {
+        "max_piece_mm": 0., "part_clearance_mm": 0., "run_off_mm": 2., "area_mm": [0., 0., 200., 120.]
+    }}))
+    .err()
+    .unwrap();
+    assert!(error.contains("max_piece_mm"), "{error}");
+}

@@ -41,6 +41,7 @@ fn part(region: PlanarRegion, quantity: u32, rotations_deg: &[f64]) -> NestPart 
         mirror: false,
         priority: 0,
         fill: false,
+        kit: None,
         marks: vec![],
         no_lead: vec![],
     }
@@ -155,7 +156,7 @@ fn parts_with_holes_and_arcs_nest_with_the_declared_distances_proven() {
     assert!(used[0] >= reach + 5. && used[1] >= reach + 5.);
     assert!(used[2] <= 400. - reach - 5. && used[3] <= 250. - reach - 5.);
     // The independent check accepts the layout on its own, too.
-    assert_eq!(verify(&request, &result.placements, &result.region).unwrap(), *check);
+    assert_eq!(verify(&request, &result.placements, &result.region, &[]).unwrap(), *check);
 }
 
 #[test]
@@ -202,7 +203,7 @@ fn washers_are_placed_in_a_plate_hole_only_when_proven_and_allowed() {
     let error = run(&request).unwrap_err();
     assert!(error.contains("do not fit") && error.contains("part 1: 1 of 1"), "{error}");
     // And the check refuses the hole layout under that rule.
-    let error = verify(&request, &result.placements, &result.region).unwrap_err();
+    let error = verify(&request, &result.placements, &result.region, &[]).unwrap_err();
     assert!(error.contains("lies in a hole"), "{error}");
 }
 
@@ -267,14 +268,14 @@ fn rotations_and_mirror_are_used_only_as_declared() {
     // a rigid (mirrored) copy, and a forged flag is refused.
     let mut forged = result.placements.clone();
     forged[0].mirrored = !forged[0].mirrored;
-    let error = verify(&mirrored, &forged, &result.region).unwrap_err();
+    let error = verify(&mirrored, &forged, &result.region, &[]).unwrap_err();
     assert!(error.contains("vertices and arcs") || error.contains("rigid copy"), "{error}");
     mirrored.parts[0].mirror = false;
     let plain = run(&mirrored).unwrap();
     assert!(!plain.placements[0].mirrored);
     let mut flipped = plain.placements.clone();
     flipped[0].mirrored = true;
-    assert!(verify(&mirrored, &flipped, &plain.region).unwrap_err().contains("does not allow"));
+    assert!(verify(&mirrored, &flipped, &plain.region, &[]).unwrap_err().contains("does not allow"));
 }
 
 #[test]
@@ -337,12 +338,12 @@ fn the_independent_check_refuses_layouts_that_break_a_distance() {
     assert!(gap >= need && found >= need);
     let step = gap - need + 0.001;
     let (placements, region) = shifted(&result, 1, [unit[0] * step, unit[1] * step]);
-    let error = verify(&request, &placements, &region).unwrap_err();
+    let error = verify(&request, &placements, &region, &[]).unwrap_err();
     assert!(error.contains("apart"), "{error}");
     // Just inside the requirement is still accepted.
     let step = gap - need - 0.001;
     let (placements, region) = shifted(&result, 1, [unit[0] * step, unit[1] * step]);
-    let near = verify(&request, &placements, &region).unwrap();
+    let near = verify(&request, &placements, &region, &[]).unwrap();
     let least = near.min_part_distance_mm.unwrap();
     assert!(least >= need && least <= need + 0.001 + 1e-9, "{least}");
     // One plate wholly inside the other's outline... is impossible for equal
@@ -350,20 +351,20 @@ fn the_independent_check_refuses_layouts_that_break_a_distance() {
     let washer = result.placements[2].translation_mm;
     let onto = [a[0] + 85. - washer[0], a[1] + 70. - washer[1]];
     let (placements, region) = shifted(&result, 2, onto);
-    assert!(verify(&request, &placements, &region).is_err());
+    assert!(verify(&request, &placements, &region, &[]).is_err());
     // Off the sheet's margin, and off the sheet altogether.
     let (placements, region) = shifted(&result, 0, [-(a[0] - 2.), 0.]);
-    assert!(verify(&request, &placements, &region).unwrap_err().contains("sheet's edge"));
+    assert!(verify(&request, &placements, &region, &[]).unwrap_err().contains("sheet's edge"));
     let (placements, region) = shifted(&result, 0, [-1000., 0.]);
-    assert!(verify(&request, &placements, &region).unwrap_err().contains("not on the sheet"));
+    assert!(verify(&request, &placements, &region, &[]).unwrap_err().contains("not on the sheet"));
     // A region that is not the placed part (stretched) is refused.
     let mut region = result.region.clone();
     region.components[0].outer.vertices[1][0] += 0.01;
-    assert!(verify(&request, &result.placements, &region).unwrap_err().contains("rigid copy"));
+    assert!(verify(&request, &result.placements, &region, &[]).unwrap_err().contains("rigid copy"));
     // A missing or duplicated copy is refused.
     let mut placements = result.placements.clone();
     placements[1].copy = 0;
-    assert!(verify(&request, &placements, &result.region).unwrap_err().contains("placed twice"));
+    assert!(verify(&request, &placements, &result.region, &[]).unwrap_err().contains("placed twice"));
 }
 
 #[test]
@@ -627,7 +628,7 @@ fn every_corner_and_axis_nests_the_mixed_parts_with_the_distances_proven() {
                 assert!(r.parts[p.part].rotations_deg.contains(&p.rotation_deg) && !p.mirrored);
             }
             // The layout verifies as a layout from anywhere does.
-            verify(&r, &result.placements, &result.region).unwrap();
+            verify(&r, &result.placements, &result.region, &[]).unwrap();
         }
     }
 }
@@ -690,7 +691,7 @@ fn parts_that_overflow_a_sheet_go_on_the_next_one() {
         // Each sheet's layout verifies on its own sheet, with the parts as the request names them.
         let mut one = r.clone();
         one.sheet = sheets[sheet.sheet].clone();
-        verify(&one, &sheet.nest.placements, &sheet.nest.region).unwrap();
+        verify(&one, &sheet.nest.placements, &sheet.nest.region, &[]).unwrap();
     }
     assert_eq!(placed, [5, 4]);
     // The sheets are used in the order given, and one that is not needed is left alone.
@@ -821,4 +822,236 @@ fn a_cut_with_corner_loops_gets_room_for_them() {
         .unwrap(),
     );
     assert!(run(&request).unwrap_err().contains("overshoot_mm"));
+}
+
+#[test]
+fn a_kit_is_placed_together_whole_or_not_at_all() {
+    // Two kits of a bracket and two washers each, and loose plates between
+    // them in the declared order. Without kits the parts are placed largest
+    // first, so the two kits' parts interleave.
+    let parts = || {
+        vec![
+            part(bracket(), 1, &[0., 90.]),
+            part(washer(), 2, &[0.]),
+            part(plate(), 1, &[0., 90.]),
+            part(bracket(), 1, &[0., 90.]),
+            part(washer(), 2, &[0.]),
+        ]
+    };
+    let sheet = || region(rect(0., 0., 400., 250.), vec![]);
+    let plain = run(&request(sheet(), parts())).unwrap();
+    assert!(plain.kits.is_empty());
+    // Largest first: the plate, both brackets, then the four washers.
+    assert_eq!(
+        plain.order.iter().map(|o| o.0).collect::<Vec<_>>(),
+        vec![2, 0, 3, 1, 1, 4, 4]
+    );
+    let mut kitted = request(sheet(), parts());
+    for (i, name) in [(0, "a"), (1, "a"), (3, "b"), (4, "b")] {
+        kitted.parts[i].kit = Some(name.into());
+    }
+    let result = run(&kitted).unwrap();
+    assert_eq!(result.check.status, "proven");
+    // Each kit's copies are placed one after another, its larger part
+    // first; the plate (larger than any kit's largest part) still leads.
+    assert_eq!(
+        result.order.iter().map(|o| o.0).collect::<Vec<_>>(),
+        vec![2, 0, 1, 1, 3, 4, 4]
+    );
+    assert_eq!(result.kits.len(), 2);
+    for (kit, (name, members)) in result.kits.iter().zip([("a", vec![0, 1]), ("b", vec![3, 4])]) {
+        assert_eq!((kit.name.as_str(), &kit.parts, kit.placed), (name, &members, true));
+        // The box reported is the box of its copies, measured here from
+        // the placed outlines.
+        let b = kit.bounds_mm.unwrap();
+        let mut own = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for (p, c) in result.placements.iter().zip(&result.region.components) {
+            if members.contains(&p.part) {
+                for v in &c.outer.vertices {
+                    // A circle's two vertices are its ends on x; its
+                    // radius reaches as far on y.
+                    let r = if v[2] == 1. { 12. } else { 0. };
+                    own = [own[0].min(v[0]), own[1].min(v[1] - r), own[2].max(v[0]), own[3].max(v[1] + r)];
+                }
+            }
+        }
+        for k in 0..4 {
+            assert!((b[k] - own[k]).abs() < 1e-6, "{b:?} {own:?}");
+        }
+    }
+    // A kit with priority goes first, all of it.
+    kitted.parts[3].priority = 1;
+    let first = run(&kitted).unwrap();
+    assert_eq!(first.order.iter().map(|o| o.0).collect::<Vec<_>>(), vec![3, 4, 4, 2, 0, 1, 1]);
+    // A kit that does not fit whole is left out whole, and the rest is
+    // placed: here there is room for one bracket and its washers only.
+    // The narrowest 90 mm high sheet (to 10 mm) that takes one such kit.
+    let one_kit = |width: f64| {
+        request(
+            region(rect(0., 0., width, 90.), vec![]),
+            vec![part(bracket(), 1, &[0., 90.]), part(washer(), 2, &[0.])],
+        )
+    };
+    let width = (10..60)
+        .map(|k| 10. * k as f64)
+        .find(|w| run(&one_kit(*w)).is_ok())
+        .expect("a sheet that takes one kit");
+    let mut tight = request(region(rect(0., 0., width, 90.), vec![]), parts());
+    tight.parts.remove(2);
+    for (i, name) in [(0, "a"), (1, "a"), (2, "b"), (3, "b")] {
+        tight.parts[i].kit = Some(name.into());
+    }
+    assert!(run(&tight).unwrap_err().contains("do not fit"));
+    tight.allow_unplaced = true;
+    let partial = run(&tight).unwrap();
+    assert_eq!(partial.check.status, "proven");
+    let placed: Vec<bool> = partial.kits.iter().map(|k| k.placed).collect();
+    assert_eq!(placed.iter().filter(|p| **p).count(), 1, "{placed:?}");
+    let out = partial.kits.iter().find(|k| !k.placed).unwrap();
+    assert!(out.bounds_mm.is_none());
+    assert!(partial.placements.iter().all(|p| !out.parts.contains(&p.part)));
+    for &part in &out.parts {
+        let quantity = tight.parts[part].quantity;
+        assert!(partial.unplaced.iter().any(|u| u.part == part && u.quantity == quantity));
+    }
+    // A filler belongs to no kit.
+    let mut bad = request(sheet(), parts());
+    bad.parts[1].fill = true;
+    bad.parts[1].kit = Some("a".into());
+    assert!(run(&bad).unwrap_err().contains("a filler part belongs to none"));
+}
+
+#[test]
+fn lead_room_kept_only_at_the_leads_nests_denser_and_the_cut_starts_there() {
+    use camlib::nesting::LeadRoom;
+    // Brackets and plates, then as many washers as fit: with the room for
+    // leads kept all round every part, and with it kept only where each
+    // outline starts.
+    let parts = || {
+        let mut filler = part(washer(), 400, &[0.]);
+        filler.fill = true;
+        vec![part(plate(), 2, &[0., 90.]), part(bracket(), 4, &[0., 90., 180., 270.]), filler]
+    };
+    let mut all_round = request(region(rect(0., 0., 400., 250.), vec![]), parts());
+    all_round.part_in_part = false;
+    let mut at_leads = all_round.clone();
+    at_leads.lead_room = LeadRoom::AtLeads;
+    let (wide, dense) = (run(&all_round).unwrap(), run(&at_leads).unwrap());
+    assert!(wide.lead_starts.is_empty() && wide.check.lead_room.is_none());
+    let (few, many) = (wide.filled[0].1, dense.filled[0].1);
+    // Denser: at least a tenth more washers on the same sheet.
+    assert!(many as f64 >= 1.1 * few as f64, "{few} washers all round, {many} at the leads");
+    assert!(dense.utilisation > wide.utilisation);
+    // Parts now stand a kerf path apart (plus the spacing), not a lead apart.
+    assert!(dense.check.part_distance_mm < wide.check.part_distance_mm - 2. * KERF);
+    assert!(dense.check.min_part_distance_mm.unwrap() >= dense.check.part_distance_mm);
+    // One start per placed part, on its outline, with its room proven.
+    assert_eq!(dense.lead_starts.len(), dense.placements.len());
+    let room = dense.check.lead_room.clone().unwrap();
+    assert!(room.min_part_distance_mm.unwrap() >= room.part_distance_mm);
+    assert!(room.min_room_distance_mm.unwrap() >= room.room_distance_mm);
+    assert!(room.min_sheet_distance_mm >= room.sheet_distance_mm);
+    for (start, placed) in dense.lead_starts.iter().zip(&dense.region.components) {
+        assert!(distance_to_part(*start, placed) < 0.5, "{start:?}");
+    }
+    // The check stands on its own: the same layout verifies, and a start
+    // moved along its edge into a neighbour's room, a start off its outline
+    // or starts missing are refused.
+    assert_eq!(
+        verify(&at_leads, &dense.placements, &dense.region, &dense.lead_starts).unwrap(),
+        dense.check
+    );
+    let mut off = dense.lead_starts.clone();
+    off[0] = [off[0][0] + 7., off[0][1] + 7.];
+    assert!(verify(&at_leads, &dense.placements, &dense.region, &off).unwrap_err().contains("not on its outline"));
+    assert!(verify(&at_leads, &dense.placements, &dense.region, &[]).unwrap_err().contains("lead starts for"));
+    assert!(verify(&all_round, &wide.placements, &wide.region, &off).unwrap_err().contains("all round"));
+    // The cut, given the starts: it plans (its own proofs of every lead,
+    // kerf and pierce crater against every part), every outline starts at
+    // its declared start, and independently no beam-on point of one part
+    // comes within half a kerf of another part.
+    let operation: ThermalCutOperation = serde_json::from_value(serde_json::json!({
+        "id": "plasma", "tool": "torch", "parts": dense.region, "feed_mm_min": 2500.,
+        "cut_height_mm": 1.5, "pierce_delay_s": 0.5,
+        "lead_in": at_leads.lead_in, "lead_out": at_leads.lead_out,
+        "lead_placement": {"keep_off_distance_mm": 0., "starts": dense.lead_starts},
+        "tolerance_mm": 1e-5, "work_offset": 1, "tool_number": 1, "length_register": 1
+    }))
+    .unwrap();
+    let spec = StockSpec {
+        version: 1,
+        units: "mm".into(),
+        min_mm: [0., 0., 0.],
+        max_mm: [400., 250., 6.],
+        cell_size_mm: 0.5,
+        max_cells: 1 << 22,
+    };
+    let cancel = AtomicBool::new(false);
+    let mut plan = ThermalCutPlan::prepare(operation.clone(), &torch(), &spec, [0., 0., 40.], 1, &cancel).unwrap();
+    let stock = camlib::stock::Stock::new(spec.clone()).unwrap();
+    let mut events = plan.prefix_events();
+    events.extend(plan.take_events());
+    let mut stock = stock;
+    let prepared = torch().prepare().unwrap();
+    while let Some(m) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let delta = stock
+            .preview_sweep(&prepared, &m, 1., camlib::stock::SweepOptions::default(), &cancel)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+        events.push(Event::Motion { motion: m });
+        events.extend(plan.take_events());
+    }
+    let order = plan.report().order.clone();
+    let (mut loops, mut beam) = (0, false);
+    let mut first_cut: Vec<Option<[f64; 2]>> = vec![None; order.len()];
+    for e in &events {
+        match e {
+            Event::Beam { power_percent } => {
+                let on = *power_percent > 0.;
+                loops += usize::from(on && !beam);
+                beam = on;
+            }
+            Event::Motion { motion } if beam => {
+                let l = loops - 1;
+                let own = order[l].0;
+                for p in [motion.curve.start(), motion.curve.end()] {
+                    for (k, other) in dense.region.components.iter().enumerate() {
+                        if k != own {
+                            let d = distance_to_part([p[0], p[1]], other);
+                            assert!(d >= KERF / 2., "loop {l} of part {own} is {d} mm from part {k}");
+                        }
+                    }
+                }
+                if motion.kind == camlib::motion::MoveKind::Cut && first_cut[l].is_none() {
+                    let p = motion.curve.start();
+                    first_cut[l] = Some([p[0], p[1]]);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut outlines = 0;
+    for (l, &(part, hole)) in order.iter().enumerate() {
+        if hole.is_none() {
+            outlines += 1;
+            let (at, declared) = (first_cut[l].unwrap(), dense.lead_starts[part]);
+            let d = (at[0] - declared[0]).hypot(at[1] - declared[1]);
+            // The kerf path's offset from the drawn edge.
+            assert!((d - (KERF / 2. + 0.005)).abs() < 1e-6, "part {part}: {d}");
+        }
+    }
+    assert_eq!(outlines, dense.placements.len());
+    // A start whose leads have no room is refused, not moved: the plate's
+    // start put on another part's start.
+    let mut wrong = dense.lead_starts.clone();
+    wrong[0] = wrong[1];
+    let mut moved = operation;
+    moved.lead_placement.as_mut().unwrap().starts = wrong[..1].to_vec();
+    // (Only part 1's edge passes through that point, so part 0 starts where
+    // it would have without a declaration: nothing to refuse there.)
+    assert!(ThermalCutPlan::prepare(moved, &torch(), &spec, [0., 0., 40.], 1, &cancel).is_ok());
+    // Part in part is not planned with it.
+    let mut nested = at_leads.clone();
+    nested.part_in_part = true;
+    assert!(run(&nested).unwrap_err().contains("part_in_part"));
 }

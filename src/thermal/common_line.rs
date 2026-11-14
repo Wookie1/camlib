@@ -30,9 +30,14 @@
 //!
 //! Supported: a shared edge that is a complete straight edge of both parts,
 //! ending at outside corners where the neighbouring edges of the two parts
-//! are in line (parts flush at both ends: pairs and rows). The outline of
-//! the group then runs straight across each end of the common line, as one
-//! move (no vertex there: nothing needs one).
+//! are in line (parts flush at both ends: pairs, rows and rectangular
+//! grids). The outline of the group then runs straight across each end of
+//! a common line that reaches it, as one move (no vertex there: nothing
+//! needs one). In a grid the common lines one way and the other cross where
+//! four parts meet: the shared edges that lie in one line are one cut, from
+//! the group's outline on one side to its outline on the other (an end
+//! where four parts meet has no scrap to pierce in), so each shared edge is
+//! still cut once, and all of them before the outline that frees the group.
 //! Anything else whose kerf paths coincide is refused, never cut twice.
 //!
 //! What is proven, compared with a job without common lines:
@@ -84,8 +89,13 @@ pub struct CommonLineReport {
     /// at either end.
     pub start_mm: Point,
     pub end_mm: Point,
-    /// The length of the shared edge.
+    /// The length of the shared edge (of all of them, for a line through a
+    /// grid).
     pub shared_length_mm: f64,
+    /// Every pair of parts the cut separates, where it runs through a grid
+    /// and separates more than `parts`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pairs: Vec<[usize; 2]>,
 }
 
 /// A loop as planned: (part, hole, strokes in cutting direction).
@@ -96,6 +106,9 @@ pub(super) struct Cut {
     /// Between the group's outline at either end.
     pub ends: [Point; 2],
     pub shared_length: f64,
+    /// Every pair of parts it separates (one, or several in a line through
+    /// a grid).
+    pub pairs: Vec<[usize; 2]>,
 }
 
 #[derive(Default)]
@@ -316,11 +329,13 @@ pub(super) fn any(profiles: &Profiles, tol: f64) -> bool {
 ///   allowance from every cut, as from its own);
 /// - every two strokes of their kerf paths are apart, except the strokes
 ///   one declared common line replaces on its two parts (the shared stroke
-///   and the corner arc at each end of it), which coincide by definition.
+///   and the corner arc at each end of it), which coincide by definition
+///   (in a grid, a corner arc where four parts meet is replaced by both
+///   lines that cross there).
 fn separate(
     rings: &[Ring],
     boundaries: &[(usize, Vec<Stroke>)],
-    removed: &HashMap<(usize, usize), usize>,
+    removed: &HashMap<(usize, usize), Vec<usize>>,
     offset: f64,
     tol: f64,
 ) -> Result<(), String> {
@@ -352,10 +367,12 @@ fn separate(
             }
             for (i, p) in a.2.iter().enumerate() {
                 for (j, q) in b.2.iter().enumerate() {
+                    // Replaced by the same common line (a corner arc where
+                    // four parts meet is replaced by two).
                     let shared = removed
                         .get(&(la, i))
                         .zip(removed.get(&(lb, j)))
-                        .is_some_and(|(x, y)| x == y);
+                        .is_some_and(|(x, y)| x.iter().any(|c| y.contains(c)));
                     if !shared && apart(p, q) <= tol {
                         return Err(format!(
                             "thermal cut common line: the kerf paths of parts {} and {} touch or cross near ({:.3}, {:.3}); {fix}",
@@ -431,7 +448,7 @@ pub(super) fn plan(
     // The strokes (loop, index) a common line replaces: the shared stroke
     // and the corner arc at either end of it, on both parts; each with the
     // common line it belongs to.
-    let mut removed: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut removed: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     // After a stroke (loop, index) the outline runs straight on into the
     // stroke (loop, index) of the other part.
     let mut jump: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
@@ -446,7 +463,17 @@ pub(super) fn plan(
         }
         i
     }
-    for h in hits(&rings, tol) {
+    // Every stroke that is a shared edge, known before any common line is
+    // built: where one ends at another (a grid), no outline passes.
+    let all_hits = hits(&rings, tol);
+    let shared: HashSet<(usize, usize)> = all_hits
+        .iter()
+        .filter(|h| h.straight && h.opposite && h.full)
+        .flat_map(|h| [(h.loops[0], h.strokes[0]), (h.loops[1], h.strokes[1])])
+        .collect();
+    // Whether each end of each cut is on the group's outline.
+    let mut on_outline: Vec<[bool; 2]> = vec![];
+    for h in all_hits {
         let [la, lb] = h.loops;
         let (pa, pb) = (rings[la].0, rings[lb].0);
         let between = format!("thermal cut common line: parts {pa} and {pb}");
@@ -501,6 +528,7 @@ pub(super) fn plan(
         // At each end the outline arrives on one part's edge and leaves on
         // the other's: the two must be in line.
         let mut ends = [[0.; 2]; 2];
+        let mut outline_ends = [true; 2];
         for (end, (from, to)) in [
             ((la, at(sa.len(), i, -2)), (lb, at(sb.len(), j, 2))),
             ((lb, at(sb.len(), j, -2)), (la, at(sa.len(), i, 2))),
@@ -526,21 +554,39 @@ pub(super) fn plan(
             let k = cross(sub(s.b, sa[i].a), v) / cross(u, v);
             let junction = [sa[i].a[0] + k * u[0], sa[i].a[1] + k * u[1]];
             ends[end] = junction;
-            if jump.insert(from, to).is_some() || !targets.insert(to) {
-                return Err(format!(
-                    "{between}: common lines that meet at a corner (a grid of parts) are not supported; keep common lines to pairs and rows"
-                ));
+            // In a grid the two edges beyond this end are common lines
+            // themselves (the line across it): four parts meet here and no
+            // outline passes. Otherwise both are outline, and it runs
+            // straight across.
+            match (shared.contains(&from), shared.contains(&to)) {
+                (true, true) => outline_ends[end] = false,
+                (false, false) => {
+                    if jump.insert(from, to).is_some() || !targets.insert(to) {
+                        return Err(format!(
+                            "{between}: common lines that meet at a corner without forming a rectangular grid are not supported; keep common lines to pairs, rows and rectangular grids"
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{between}: at an end of the shared edge one part has a common line beyond it and the other does not (parts staggered); align the parts into a rectangular grid or separate them"
+                    ));
+                }
             }
         }
-        for key in [-1, 0, 1]
+        for (k, key) in [-1, 0, 1]
             .into_iter()
-            .flat_map(|k| [(la, at(sa.len(), i, k)), (lb, at(sb.len(), j, k))])
+            .flat_map(|k| [(k, (la, at(sa.len(), i, k))), (k, (lb, at(sb.len(), j, k)))])
         {
-            if removed.insert(key, cuts.len()).is_some() {
+            // A corner arc where four parts meet belongs to the two common
+            // lines that cross there; a shared edge to one.
+            let lines = removed.entry(key).or_default();
+            if k == 0 && !lines.is_empty() {
                 return Err(format!(
-                    "{between}: common lines that meet at a corner (a grid of parts) are not supported; keep common lines to pairs and rows"
+                    "{between}: an edge is shared with two parts at once; separate the parts"
                 ));
             }
+            lines.push(cuts.len());
         }
         let (ra, rb) = (root(&mut group, pa), root(&mut group, pb));
         group[ra.max(rb)] = ra.min(rb);
@@ -548,7 +594,56 @@ pub(super) fn plan(
             parts: [pa, pb],
             ends,
             shared_length: h.length,
+            pairs: vec![[pa, pb]],
         });
+        on_outline.push(outline_ends);
+    }
+    // Common lines in one line through a grid are one cut, from the
+    // group's outline on one side to its outline on the other: an end where
+    // four parts meet has no scrap to pierce in.
+    loop {
+        let mut joined = None;
+        'search: for a in 0..cuts.len() {
+            for b in a + 1..cuts.len() {
+                for (ea, eb) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let (ca, cb) = (&cuts[a], &cuts[b]);
+                    let (da, db) = (sub(ca.ends[1], ca.ends[0]), sub(cb.ends[1], cb.ends[0]));
+                    if !on_outline[a][ea]
+                        && !on_outline[b][eb]
+                        && dist(ca.ends[ea], cb.ends[eb]) <= tol
+                        && cross(da, db).abs()
+                            <= 1e-9 * dist(ca.ends[0], ca.ends[1]) * dist(cb.ends[0], cb.ends[1])
+                    {
+                        joined = Some((a, b, ea, eb));
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let Some((a, b, ea, eb)) = joined else {
+            break;
+        };
+        let other = cuts.remove(b);
+        let other_outline = on_outline.remove(b);
+        let cut = &mut cuts[a];
+        cut.ends = [cut.ends[1 - ea], other.ends[1 - eb]];
+        on_outline[a] = [on_outline[a][1 - ea], other_outline[1 - eb]];
+        cut.shared_length += other.shared_length;
+        cut.pairs.extend(other.pairs);
+        // The strokes the joined cut replaced now belong to this one.
+        for index in removed.values_mut().flatten() {
+            if *index == b {
+                *index = a;
+            } else if *index > b {
+                *index -= 1;
+            }
+        }
+    }
+    if let Some(k) = on_outline.iter().position(|ends| ends.contains(&false)) {
+        return Err(format!(
+            "thermal cut common line: the common line between parts {} and {} ends where four parts meet and does not run on to the group's outline; arrange the parts as a rectangular grid or separate them",
+            cuts[k].parts[0], cuts[k].parts[1]
+        ));
     }
     if jump
         .iter()
@@ -1023,6 +1118,11 @@ impl Cut {
                 start_mm: start,
                 end_mm: end,
                 shared_length_mm: self.shared_length,
+                pairs: if self.pairs.len() > 1 {
+                    self.pairs.clone()
+                } else {
+                    vec![]
+                },
             },
             length,
         ))

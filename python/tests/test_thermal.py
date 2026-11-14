@@ -993,6 +993,108 @@ class ChainCuttingTest(unittest.TestCase):
             self.assertEqual(counts, [10, 6], module)
 
 
+class BridgesTest(unittest.TestCase):
+    """Bridges between parts (#296 B3): neighbouring parts stay joined by an
+    uncut strip and are cut as one loop."""
+
+    BRIDGES = camlib.Bridges(3, max_length_mm=12, max_parts=8)
+
+    def test_a_row_is_one_loop_and_the_strips_are_never_crossed(self):
+        squares, region = ChainCuttingTest.row()
+        beam, pierces, report, cuts = False, 0, None, []
+        with job(parts=region, bridges=self.BRIDGES).regenerate() as run:
+            for u in run:
+                update = u.update
+                if isinstance(update, VerificationUpdate):
+                    self.assertEqual(update.status, "clear", update)
+                if isinstance(update, OperationUpdate) and update.stage == "events":
+                    for event in update.events:
+                        if event["kind"] == "beam":
+                            beam = event["power_percent"] > 0
+                            pierces += beam
+                motion = getattr(update, "motion", None)
+                if motion is not None and motion["kind"] != "rapid":
+                    self.assertTrue(beam, motion)
+                    cuts.append(motion["curve"])
+                if isinstance(update, OperationUpdate) and update.stage == "end":
+                    report = update.report
+        self.assertEqual((pierces, report["pierces"]), (6, 6))
+        self.assertEqual(report["bridged_groups"], [[0, 1, 2, 3, 4]])
+        self.assertEqual([b["parts"] for b in report["bridges"]], [[k, k + 1] for k in range(4)])
+        # Independently of the planner: no beam-on move comes nearer the
+        # middle line of a bridge than half the strip and half the kerf.
+        for k, bridge in enumerate(report["bridges"]):
+            x0, x1 = squares[k][2], squares[k + 1][0]
+            self.assertAlmostEqual(bridge["length_mm"], x1 - x0)
+            self.assertEqual(bridge["at_mm"], [(x0 + x1) / 2, 53])
+            for curve in cuts:
+                a, b = curve["start"][:2], curve["end"][:2]
+                for i in range(41):
+                    x, y = (a[j] + i / 40 * (b[j] - a[j]) for j in range(2))
+                    if curve["kind"] != "line":
+                        continue
+                    if x0 - 0.7 < x < x1 + 0.7:
+                        self.assertGreaterEqual(abs(y - 53), 1.5 + 0.75 - 1e-6, (curve, x, y))
+
+    def test_bridges_post_through_every_plasma_post_in_inches(self):
+        from dataclasses import replace
+
+        from test_drill_cycles import example
+
+        _, region = ChainCuttingTest.row()
+        tool = camlib.Torch("torch", kerf_width=1.5)
+        fixed, limits = BeamPostsInInchesTest.FIXED, BeamPostsInInchesTest.LIMITS
+        for module, post, decoder, machine, cut, on in (
+            (
+                "qtplasmac_post",
+                "QtPlasmaCPost",
+                "QtPlasmaCDecoder",
+                dict(planes=("xy",), max_sweep_rad=math.tau),
+                {},
+                "M3",
+            ),
+            (
+                "centroid_plasma_post",
+                "CentroidPlasmaPost",
+                "CentroidPlasmaDecoder",
+                dict(max_sweep_rad=math.tau),
+                dict(height_control=False),
+                "M61",
+            ),
+            ("wincnc_plasma_post", "WinCNCPlasmaPost", "WinCNCPlasmaDecoder", {}, dict(height_control=False), "M61"),
+        ):
+            m = example(module)
+            j = job(tool, parts=region, **{**fixed, **cut, "bridges": self.BRIDGES})
+            start = replace(j.setups[0], initial_position_mm=(0, 0, THICKNESS + 1.5))
+            j = camlib.Job("plasma", "1", (start,))
+            header = j.compile().setup("sheet").program_header()
+            setting = ToolSetting.for_tool(
+                tool, number=1, length_register=1, position_after_mm=header.initial_position_mm
+            )
+            posted = j.post_nc(
+                "sheet",
+                machine=m.define_machine(
+                    "table", setting, output_units="inch", decimals=4, helices=False, **limits, **machine
+                ),
+                post=getattr(m, post),
+                decoder=getattr(m, decoder),
+                lowering=camlib.LoweringOptions(native_arcs=True),
+                accept={"unchecked_machine"},
+            )
+            lines = [line.split() for line in posted.text.splitlines() if line.split()]
+            self.assertEqual(sum(words[0] == on for words in lines), 6, module)
+
+    def test_values_are_declared(self):
+        _, region = ChainCuttingTest.row()
+        with self.assertRaises(TypeError):
+            camlib.Bridges(3)
+        for bad in (camlib.Bridges(0, max_length_mm=12, max_parts=8), camlib.Bridges(3, max_length_mm=12, max_parts=1)):
+            with self.assertRaisesRegex(Exception, "bridges: "):
+                with job(parts=region, bridges=bad).regenerate() as run:
+                    for _ in run:
+                        pass
+
+
 class StraightEdgedHolesTest(unittest.TestCase):
     """Holes with straight edges get their leads and pierce in the hole
     (issue #78): rectangles, a slot, polygons, small holes near the lead size

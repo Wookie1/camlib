@@ -144,6 +144,39 @@ class CommonLineTest(unittest.TestCase):
         with self.assertRaisesRegex(SimulationError, "topology"):
             run(cut(common_line=None))
 
+    def test_a_grid_shares_every_inner_edge_once(self):
+        from dataclasses import replace
+
+        op = cut()
+        gap = op.common_line_spacing_mm()
+        # 3 x 2 parts of 40 x 30, a kerf path apart both ways.
+        parts = tuple(
+            rect(20 + i * (40 + gap), 20 + j * (30 + gap), 60 + i * (40 + gap), 50 + j * (30 + gap))
+            for j in range(2)
+            for i in range(3)
+        )
+        statuses, events, report = run(replace(op, parts=PlanarRegion("grid", parts, 0)))
+        self.assertEqual(statuses, {"clear"})
+        # Two lines one way and one the other, then the one outline.
+        lines = report["common_lines"]
+        self.assertEqual(len(lines), 3)
+        self.assertEqual((report["loops"], report["pierces"]), (1, 4))
+        self.assertEqual(sorted(len(line["pairs"]) for line in lines), [2, 2, 3])
+        # Each shared edge is in exactly one line.
+        pairs = sorted(tuple(sorted(pair)) for line in lines for pair in line["pairs"])
+        self.assertEqual(pairs, [(0, 1), (0, 3), (1, 2), (1, 4), (2, 5), (3, 4), (4, 5)])
+        self.assertEqual(sum(e["kind"] == "beam" and e["power_percent"] > 0 for e in events), 4)
+
+    def test_staggered_parts_are_refused(self):
+        from dataclasses import replace
+
+        op = cut()
+        gap = op.common_line_spacing_mm()
+        a, b = rect(20, 20, 60, 50), rect(60 + gap, 20, 100 + gap, 50)
+        above = rect(20, 50 + gap, 60, 80 + gap)
+        with self.assertRaisesRegex(Exception, "staggered"):
+            run(replace(op, parts=PlanarRegion("l", (a, b, above), 0)))
+
 
 if __name__ == "__main__":
     unittest.main()

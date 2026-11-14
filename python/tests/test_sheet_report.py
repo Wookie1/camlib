@@ -440,5 +440,68 @@ class ChainCuttingTest(unittest.TestCase):
         self.assertEqual(camlib.sheet_report(out["reports"].values()).pierces, report["pierces"])
 
 
+class SkeletonCutUpTest(unittest.TestCase):
+    """Skeleton cut-up on nested parts (#296 D4): the lace is cut into
+    pieces after the parts, clear of them, and is no remnant."""
+
+    def test_the_lace_is_cut_into_pieces_and_leaves_the_rest_as_remnant(self):
+        planned = nest()
+        result = planned.run()
+        used = result.used_bounds_mm
+        # Cut up what the nest used, out to the sheet's left, bottom and top
+        # edges; what lies beyond stays whole.
+        area = (0, 0, math.ceil(used[2]) + 6, 120)
+        self.assertLess(area[2], 190)
+        rules = camlib.SkeletonCutUp(60, part_clearance_mm=0, run_off_mm=2, area_mm=area)
+        plain = run(result)
+        out = run(result, skeleton=rules)
+        self.assertEqual(out["statuses"], {"clear"})
+        report, before = out["reports"]["plasma"], plain["reports"]["plasma"]
+        count = report["skeleton_cuts"]
+        self.assertGreaterEqual(count, 2)
+        self.assertEqual(report["pierces"], before["pierces"] + count)
+        # The parts are cut exactly as without it, first; then the lines.
+        cuts = [m for m in out["motions"] if m["kind"] == "cut"]
+        first = [m for m in plain["motions"] if m["kind"] == "cut"]
+        self.assertEqual(cuts[: len(first)], first)
+        lines = [m["curve"] for m in cuts[len(first) :]]
+        self.assertEqual(len(lines), count)
+        self.assertAlmostEqual(report["skeleton_length_mm"], sum(length(c) for c in lines))
+        self.assertAlmostEqual(report["cut_length_mm"] - before["cut_length_mm"], report["skeleton_length_mm"], 6)
+        # Independently of the planner: straight, on the grid, never in a
+        # part, never further apart than declared.
+        xs = sorted({c["start"][0] for c in lines if c["start"][0] == c["end"][0]})
+        ys = sorted({c["start"][1] for c in lines if c["start"][1] == c["end"][1]})
+        for c in lines:
+            self.assertEqual(c["kind"], "line")
+            self.assertTrue(c["start"][0] == c["end"][0] or c["start"][1] == c["end"][1], c)
+            for k in range(101):
+                q = tuple(c["start"][i] + k / 100 * (c["end"][i] - c["start"][i]) for i in range(2))
+                self.assertFalse(in_region(q, result.region), q)
+        for marks, low, high in ((xs, area[0], area[2]), (ys, area[1], area[3])):
+            edges = [low, *marks, high]
+            self.assertTrue(all(b - a <= 60 + 1e-9 for a, b in zip(edges, edges[1:])), edges)
+        # The remnant: nothing of the cut-up area, all of the rest.
+        left = planned.remnant(result, remnant_margin_mm=1, skeleton=rules)
+        self.assertEqual(len(left.pieces), 1)
+        xs = [v[0] for v in left.pieces[0].components[0].outer.vertices]
+        self.assertGreater(min(xs), area[2] + 2)
+        self.assertEqual(max(xs), 200)
+        self.assertLess(left.area_mm2, planned.remnant(result, remnant_margin_mm=1).area_mm2)
+        whole = camlib.SkeletonCutUp(60, part_clearance_mm=0, run_off_mm=2, area_mm=(0, 0, 200, 120))
+        self.assertEqual(planned.remnant(result, remnant_margin_mm=1, skeleton=whole).pieces, ())
+        # The sheet report takes the pierces and the length as cut.
+        sheet = camlib.sheet_report(out["reports"].values())
+        self.assertEqual(sheet.pierces, report["pierces"])
+
+    def test_values_are_declared(self):
+        with self.assertRaises(TypeError):
+            camlib.SkeletonCutUp(60)
+        result = nest().run()
+        bad = camlib.SkeletonCutUp(0, part_clearance_mm=0, run_off_mm=2, area_mm=(0, 0, 200, 120))
+        with self.assertRaisesRegex(Exception, "max_piece_mm"):
+            run(result, skeleton=bad)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -320,5 +320,123 @@ class RemnantTest(unittest.TestCase):
                     self.assertFalse(within((x, y), flat(old.outer)))
 
 
+class KitTest(unittest.TestCase):
+    """Kits (#296 C2): parts placed together, whole or not at all."""
+
+    def kitted(self, sheet=SHEET, **options):
+        parts = (
+            camlib.NestPart(WASHER, 2, (0,), kit="a"),
+            camlib.NestPart(PLATE, 1, (0, 90)),
+            camlib.NestPart(WASHER, 3, (0,), kit="b"),
+        )
+        return nest(parts=parts, sheet=sheet, **options)
+
+    def test_a_kit_is_placed_one_after_another_and_reported(self):
+        result = self.kitted().run()
+        self.assertEqual(result.check["status"], "proven")
+        # The plate (the largest part) first, then each kit's copies together.
+        self.assertEqual([part for part, _ in result.order], [1, 0, 0, 2, 2, 2])
+        self.assertEqual(
+            [(k["name"], k["parts"], k["placed"]) for k in result.kits], [("a", [0], True), ("b", [2], True)]
+        )
+        for kit in result.kits:
+            x0, y0, x1, y1 = kit["bounds_mm"]
+            centres = [p.translation_mm for p in result.placements if p.part in kit["parts"]]
+            # The washers are 9 mm in radius about their own origin.
+            self.assertAlmostEqual(x0, min(c[0] for c in centres) - 9, places=6)
+            self.assertAlmostEqual(y1, max(c[1] for c in centres) + 9, places=6)
+            self.assertLessEqual(x0, x1)
+            self.assertLessEqual(y0, y1)
+        # Without kits nothing is reported as one.
+        self.assertEqual(nest().run().kits, ())
+
+    def test_a_kit_that_does_not_fit_whole_is_left_out_whole(self):
+        from camlib.planar import Boundary, Component, PlanarRegion
+
+        small = PlanarRegion("sheet", (Component(Boundary.polygon(((0, 0), (140, 0), (140, 70), (0, 70)))),), 0)
+        parts = (camlib.NestPart(WASHER, 2, (0,), kit="a"), camlib.NestPart(WASHER, 9, (0,), kit="b"))
+        with self.assertRaisesRegex(ValueError, "do not fit"):
+            nest(parts=parts, sheet=small).run()
+        result = nest(parts=parts, sheet=small, allow_unplaced=True).run()
+        self.assertEqual([k["placed"] for k in result.kits], [True, False])
+        self.assertEqual({p.part for p in result.placements}, {0})
+        self.assertEqual(result.unplaced, ((1, 9),))
+        self.assertNotIn("bounds_mm", result.kits[1])
+
+
+class LeadRoomTest(unittest.TestCase):
+    """Lead room kept only at the leads (#296 C5): a denser nest, and a cut
+    that starts every outline where the room is."""
+
+    PARTS = (
+        camlib.NestPart(PLATE, 1, (0, 90)),
+        camlib.NestPart(WASHER, 200, (0,), fill=True),
+    )
+
+    def test_the_nest_is_denser_and_the_cut_starts_at_the_declared_starts(self):
+        from dataclasses import replace
+
+        from camlib.simulation import OperationUpdate, VerificationUpdate
+
+        wide = nest(parts=self.PARTS, part_in_part=False).run()
+        planned = nest(parts=self.PARTS, part_in_part=False, lead_room="at_leads")
+        dense = planned.run()
+        self.assertEqual(wide.lead_starts, ())
+        self.assertGreater(dense.filled[0][1], wide.filled[0][1])
+        self.assertEqual(len(dense.lead_starts), len(dense.placements))
+        room = dense.check["lead_room"]
+        self.assertGreaterEqual(room["min_part_distance_mm"], room["part_distance_mm"])
+        self.assertGreaterEqual(room["min_room_distance_mm"], room["room_distance_mm"])
+        self.assertGreaterEqual(room["min_sheet_distance_mm"], room["sheet_distance_mm"])
+        # The room as documented: the lead-in is Lead(1, 1) (length, radius),
+        # the kerf 1 and the pierce clearance 0.5, so the crater reaches 1
+        # round the pierce; the lead-out, Lead(0.5, 1), needs less.
+        self.assertAlmostEqual(room["half_width_mm"], 1 + 1)
+        self.assertAlmostEqual(room["height_mm"], 0.505 + 1 + 1 + 1)
+        # The layout verifies from outside with its starts, and not without.
+        self.assertEqual(planned.verify(dense.placements, dense.region, dense.lead_starts), dense.check)
+        with self.assertRaisesRegex(ValueError, "lead starts for"):
+            planned.verify(dense.placements, dense.region)
+        # The cut, given the starts: every move clear, and every outline's
+        # first cut begins the kerf path's offset from its declared start.
+        op = replace(
+            cut(),
+            parts=dense.region,
+            lead_placement=camlib.LeadPlacement(keep_off_distance_mm=0, starts=dense.lead_starts),
+        )
+        setup = camlib.Setup(
+            "sheet",
+            stock=camlib.StockSpec((0, 0, 0), (200, 120, 3), 0.25),
+            tools=(op.tool,),
+            operations=(camlib.OperationNode(op, sources=()),),
+            initial_position_mm=(0, 0, 40),
+            verification=camlib.StreamChecks(stock_contact=camlib.StockContactOptions()),
+        )
+        statuses, starts, report, fresh = set(), [], None, False
+        with camlib.Job("dense", "1", (setup,)).regenerate() as run:
+            for u in run:
+                v = u.update
+                if isinstance(v, VerificationUpdate):
+                    statuses.add(v.status)
+                elif isinstance(v, OperationUpdate):
+                    if v.stage == "events":
+                        fresh = fresh or any(e["kind"] == "beam" and e["power_percent"] > 0 for e in v.events)
+                    if v.stage == "end":
+                        report = v.report
+                elif v.motion["kind"] == "cut" and fresh:
+                    starts.append(tuple(v.motion["curve"]["start"][:2]))
+                    fresh = False
+        self.assertEqual(statuses, {"clear"})
+        outlines = [k for k, (_, hole) in enumerate(report["order"]) if hole is None]
+        self.assertEqual(len(outlines), len(dense.placements))
+        for k in outlines:
+            part = report["order"][k][0]
+            self.assertAlmostEqual(math.dist(starts[k], dense.lead_starts[part]), 0.505, places=6)
+
+    def test_it_is_not_planned_with_part_in_part(self):
+        with self.assertRaisesRegex(ValueError, "part_in_part"):
+            nest(parts=self.PARTS, lead_room="at_leads").run()
+
+
 if __name__ == "__main__":
     unittest.main()

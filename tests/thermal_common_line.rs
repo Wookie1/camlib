@@ -576,10 +576,11 @@ fn what_is_not_exactly_a_common_line_is_refused() {
     // The same height, shifted along the edge.
     let err = refusal(&[A, [b[0], 25., b[2], 55.]], serde_json::json!({}));
     assert!(err.contains("complete edge"), "{err}");
-    // A 2 x 2 grid: common lines meet at the middle.
+    // Three parts in an L: the line between the two lower ones ends where
+    // only one of them has a part above it.
     let up = |r: Rect| [r[0], r[3] + SPACING, r[2], r[3] + SPACING + 30.];
-    let err = refusal(&[A, b, up(A), up(b)], serde_json::json!({}));
-    assert!(err.contains("grid"), "{err}");
+    let err = refusal(&[A, b, up(A)], serde_json::json!({}));
+    assert!(err.contains("staggered"), "{err}");
     // Shorter than the declared minimum.
     let err = refusal(&[A, b], serde_json::json!({"common_line": {"min_length_mm": 31.}}));
     assert!(err.contains("min_length_mm"), "{err}");
@@ -598,4 +599,55 @@ fn what_is_not_exactly_a_common_line_is_refused() {
         serde_json::json!({"lead_in": {"length_mm": 0., "radius_mm": 3.}}),
     );
     assert!(err.contains("lengthen lead_in"), "{err}");
+}
+
+#[test]
+fn a_rectangular_grid_shares_every_inner_edge_once() {
+    let up = |r: Rect| [r[0], r[3] + SPACING, r[2], r[3] + SPACING + 30.];
+    let b = right_of(A, SPACING);
+    // 2 x 2: one line each way, each through the grid from outline to
+    // outline, crossing in the middle.
+    let rects = [A, b, up(A), up(b)];
+    let (events, plan, stock) = run(operation(&rects, serde_json::json!({}))).unwrap();
+    let r = plan.report();
+    assert_eq!(r.common_lines.len(), 2, "{:?}", r.diagnostics);
+    assert_eq!((r.loops, r.pierces), (1, 3));
+    check_sheet(&rects, &events, &stock);
+    for line in &r.common_lines {
+        // Each separates two pairs of parts and is as long as two shared
+        // edges; its ends are on the group's outline, a kerf path outside
+        // the parts.
+        assert_eq!(line.pairs.len(), 2, "{line:?}");
+        let vertical = (line.start_mm[0] - line.end_mm[0]).abs() < 1e-9;
+        let (span, shared) = if vertical { (60. + SPACING + 2. * OFFSET, 60.) } else { (80. + SPACING + 2. * OFFSET, 80.) };
+        let length = (line.start_mm[0] - line.end_mm[0]).hypot(line.start_mm[1] - line.end_mm[1]);
+        assert!((length - span).abs() < 1e-9, "{length} {span}");
+        assert!((line.shared_length_mm - shared).abs() < 1e-9);
+    }
+    // Both lines are cut before the outline, each in one move.
+    let cuts = moves(&events, MoveKind::Cut);
+    let vertical = |m: &Motion| (m.curve.start()[0] - m.curve.end()[0]).abs() < 1e-9;
+    assert!(vertical(cuts[0]) != vertical(cuts[1]), "{:?} {:?}", cuts[0], cuts[1]);
+    // Every part is separate from its neighbours all along each inner
+    // edge: the kerf between them is open, in the simulated sheet.
+    let mid_x = 60. + OFFSET;
+    let mid_y = 50. + OFFSET;
+    for y in [25., 45., 60., 80.] {
+        assert!(!solid(&stock, [mid_x, y]), "{y}");
+    }
+    for x in [25., 55., 70., 100.] {
+        assert!(!solid(&stock, [x, mid_y]), "{x}");
+    }
+    // 3 x 2: two lines one way and one the other.
+    let c = right_of(b, SPACING);
+    let rects = [A, b, c, up(A), up(b), up(c)];
+    let (events, plan, stock) = run(operation(&rects, serde_json::json!({}))).unwrap();
+    let r = plan.report();
+    assert_eq!(r.common_lines.len(), 3, "{:?}", r.diagnostics);
+    assert_eq!((r.loops, r.pierces), (1, 4));
+    assert_eq!(r.common_lines.iter().map(|l| l.pairs.len()).sum::<usize>(), 2 + 2 + 3);
+    check_sheet(&rects, &events, &stock);
+    // Reversed direction is the same sheet.
+    let (events, _, stock) = run(operation(&rects, serde_json::json!({"reverse": true}))).unwrap();
+    check_sheet(&rects, &events, &stock);
 }

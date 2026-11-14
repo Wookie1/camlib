@@ -42,6 +42,26 @@ pub struct NestCheck {
     pub numerical_guard_mm: f64,
     /// Parts proven to lie inside a hole of another part.
     pub parts_in_holes: usize,
+    /// With the lead room at the leads: what was proven of the room kept at
+    /// each outline's start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lead_room: Option<LeadRoomCheck>,
+}
+
+/// The check of the rooms kept for leads: each a rectangle on its part's
+/// drawn edge at the declared start, built here from the request's leads
+/// (not taken from the planner), with the required and the smallest found
+/// distance to the other parts, to the other rooms and to the sheet's edge.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LeadRoomCheck {
+    pub half_width_mm: f64,
+    pub height_mm: f64,
+    pub part_distance_mm: f64,
+    pub min_part_distance_mm: Option<f64>,
+    pub room_distance_mm: f64,
+    pub min_room_distance_mm: Option<f64>,
+    pub sheet_distance_mm: f64,
+    pub min_sheet_distance_mm: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -442,6 +462,7 @@ pub(super) fn verify(
     clearances: &Clearances,
     placements: &[Placement],
     region: &PlanarRegion,
+    lead_starts: &[P2],
 ) -> Result<NestCheck, String> {
     let options = ConstructionOptions {
         tolerance_mm: request.tolerance_mm,
@@ -629,14 +650,173 @@ pub(super) fn verify(
             }
         }
     }
+    let lead_room = match &clearances.zones {
+        None if lead_starts.is_empty() => None,
+        None => {
+            return Err(
+                "nest check: lead starts are given, but the request keeps its lead room all round"
+                    .into(),
+            );
+        }
+        Some(zones) => Some(lead_rooms(zones, &sheet, &parts, lead_starts, guard)?),
+    };
     Ok(NestCheck {
         status: "proven",
+        lead_room,
         part_distance_mm: clearances.part_distance_mm,
         min_part_distance_mm: (parts.len() > 1).then_some(min_parts),
         sheet_distance_mm: clearances.sheet_distance_mm,
         min_sheet_distance_mm: (!parts.is_empty()).then_some(min_sheet),
         numerical_guard_mm: guard,
         parts_in_holes,
+    })
+}
+
+/// The rooms kept for the leads, proven: each declared start lies on its
+/// part's drawn outline; the room built on the edge there keeps its
+/// distance from every other part and every other room, and lies on the
+/// sheet that far from its edge and its holes.
+fn lead_rooms(
+    zones: &super::Zones,
+    sheet: &Part,
+    parts: &[Part],
+    lead_starts: &[P2],
+    guard: f64,
+) -> Result<LeadRoomCheck, String> {
+    if lead_starts.len() != parts.len() {
+        return Err(format!(
+            "nest check: {} lead starts for {} placed parts (with the lead room at the leads each part needs one)",
+            lead_starts.len(),
+            parts.len()
+        ));
+    }
+    let mut rooms: Vec<Loop> = vec![];
+    for (k, (&p, part)) in lead_starts.iter().zip(parts).enumerate() {
+        // The edge of the outline the start lies on, and its direction
+        // there.
+        let mut found: Option<P2> = None;
+        for e in &part.outer.edges {
+            let (d, along) = match *e {
+                Edge::Line(a, b) => {
+                    let length = dist(a, b);
+                    (
+                        point_segment(p, a, b),
+                        [(b[0] - a[0]) / length, (b[1] - a[1]) / length],
+                    )
+                }
+                Edge::Arc { a, b, c, r, ccw } => {
+                    let radial = sub(p, c);
+                    let n = radial[0].hypot(radial[1]).max(f64::MIN_POSITIVE);
+                    let turn = if ccw { 1. } else { -1. };
+                    (
+                        point_arc(p, a, b, c, r, ccw),
+                        [-turn * radial[1] / n, turn * radial[0] / n],
+                    )
+                }
+            };
+            if d <= guard {
+                found = Some(along);
+                break;
+            }
+        }
+        let Some(along) = found else {
+            return Err(format!(
+                "nest check: the lead start of placed part {k} ({}, {}) is not on its outline",
+                p[0], p[1]
+            ));
+        };
+        // Outward: the side of the edge that is not the part.
+        let left = [-along[1], along[0]];
+        let probe = 64. * guard.max(1e-9);
+        let inside_left = part
+            .outer
+            .contains([p[0] + probe * left[0], p[1] + probe * left[1]]);
+        let out = if inside_left {
+            [-left[0], -left[1]]
+        } else {
+            left
+        };
+        let at = |a: f64, o: f64| {
+            [
+                p[0] + a * along[0] + o * out[0],
+                p[1] + a * along[1] + o * out[1],
+                0.,
+            ]
+        };
+        let (w, h) = (zones.half_width_mm, zones.height_mm);
+        let mut vertices = vec![at(-w, 0.), at(w, 0.), at(w, h), at(-w, h)];
+        if cross(along, out) < 0. {
+            vertices.reverse();
+        }
+        rooms.push(Loop::new(&Boundary { vertices })?);
+    }
+    let need_part = zones.part_distance_mm + guard;
+    let need_room = zones.zone_distance_mm + guard;
+    let need_sheet = zones.sheet_distance_mm + guard;
+    let (mut min_part, mut min_room, mut min_sheet) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    for (k, room) in rooms.iter().enumerate() {
+        let mut d = min_sheet.max(need_sheet);
+        for l in sheet.loops() {
+            d = loop_distance(room, l, d);
+        }
+        if d < need_sheet {
+            return Err(format!(
+                "nest check: the lead room of placed part {k} is {d} mm from the sheet's edge; {} mm is required",
+                zones.sheet_distance_mm
+            ));
+        }
+        min_sheet = min_sheet.min(d);
+        if sheet.locate(room.first()) != Some(None) {
+            return Err(format!(
+                "nest check: the lead room of placed part {k} is not on the sheet"
+            ));
+        }
+        for (j, other) in parts.iter().enumerate() {
+            if j == k {
+                continue;
+            }
+            let mut d = min_part.max(need_part);
+            for l in other.loops() {
+                d = loop_distance(room, l, d);
+            }
+            if d < need_part {
+                return Err(format!(
+                    "nest check: the lead room of placed part {k} is {d} mm from part {j}; {} mm is required",
+                    zones.part_distance_mm
+                ));
+            }
+            min_part = min_part.min(d);
+            if room.contains(other.outer.first()) || other.outer.contains(room.first()) {
+                return Err(format!(
+                    "nest check: the lead room of placed part {k} overlaps part {j}"
+                ));
+            }
+        }
+        for (j, other) in rooms.iter().enumerate().skip(k + 1) {
+            let d = loop_distance(room, other, min_room.max(need_room));
+            if d < need_room {
+                return Err(format!(
+                    "nest check: the lead rooms of placed parts {k} and {j} are {d} mm apart; {} mm is required",
+                    zones.zone_distance_mm
+                ));
+            }
+            min_room = min_room.min(d);
+            if room.contains(other.first()) || other.contains(room.first()) {
+                return Err(format!(
+                    "nest check: the lead rooms of placed parts {k} and {j} overlap"
+                ));
+            }
+        }
+    }
+    Ok(LeadRoomCheck {
+        half_width_mm: zones.half_width_mm,
+        height_mm: zones.height_mm,
+        part_distance_mm: zones.part_distance_mm,
+        min_part_distance_mm: (parts.len() > 1).then_some(min_part),
+        room_distance_mm: zones.zone_distance_mm,
+        min_room_distance_mm: (parts.len() > 1).then_some(min_room),
+        sheet_distance_mm: zones.sheet_distance_mm,
+        min_sheet_distance_mm: min_sheet,
     })
 }
 

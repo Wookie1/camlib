@@ -26,13 +26,17 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{FRAC_PI_2, PI};
 
+mod bridges;
 mod common_line;
 mod corners;
 mod lead_placement;
+mod skeleton;
 mod tip_up;
+pub use bridges::{BridgeReport, Bridges};
 pub use common_line::{CommonLine, CommonLineReport};
 pub use corners::{CornerLoops, CornerSlowdown, loop_reach_mm};
 pub use lead_placement::{LeadPlacement, LeadPreference};
+pub use skeleton::SkeletonCutUp;
 pub use tip_up::AvoidCutParts;
 
 /// How the torch or head height is controlled.
@@ -197,10 +201,18 @@ pub struct ThermalCutOperation {
     /// Off unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corner_slowdown: Option<CornerSlowdown>,
+    /// Keep neighbouring parts joined to each other by an uncut strip (see
+    /// `thermal/bridges.rs`). Off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridges: Option<Bridges>,
     /// Join the outlines of neighbouring parts by cuts through the scrap,
     /// one pierce for the chain. Off unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<ChainCutting>,
+    /// Cut the lace into pieces after every part is cut (see
+    /// `thermal/skeleton.rs`). Off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skeleton: Option<Box<SkeletonCutUp>>,
     /// A last cut that frees the usable offcut from the skeleton. Off unless
     /// set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,6 +296,12 @@ pub struct ThermalCutReport {
     pub chain_links: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_length_mm: Option<f64>,
+    /// The skeleton cut-up's cuts and their length (in `cut_length_mm` too;
+    /// each is one of `pierces`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skeleton_cuts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skeleton_length_mm: Option<f64>,
     /// The crop cut's length (in `cut_length_mm` too; its pierce is one of
     /// `pierces`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,6 +316,12 @@ pub struct ThermalCutReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerouted_rapids: Option<usize>,
     pub loops_completed: usize,
+    /// The bridges that keep parts joined (empty unless `bridges`), and the
+    /// groups of parts they join.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bridges: Vec<BridgeReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bridged_groups: Vec<Vec<usize>>,
     /// The common lines, in cutting order (empty unless `common_line`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub common_lines: Vec<CommonLineReport>,
@@ -728,6 +752,47 @@ impl ThermalCutPlan {
                 .collect();
             common = plan;
         }
+        // Bridges: the outlines of the parts they join become one loop each.
+        let mut bridge_groups: Vec<Vec<usize>> = vec![];
+        let mut bridge_reports: Vec<BridgeReport> = vec![];
+        if let Some(b) = op.bridges.as_ref().filter(|_| op.common_line.is_none()) {
+            let (outlines, holes): (Vec<Loop>, Vec<Loop>) =
+                loops.into_iter().partition(|l| l.hole.is_none());
+            let planned = bridges::plan(
+                outlines
+                    .into_iter()
+                    .map(|l| bridges::Outline {
+                        part: l.part,
+                        depth: depth[l.part],
+                        strokes: l.strokes,
+                    })
+                    .collect(),
+                b,
+                kerf,
+                offset,
+                !op.reverse,
+                guard,
+            );
+            loops = holes;
+            loops.extend(planned.outlines.into_iter().map(|o| Loop {
+                length: o.strokes.iter().map(crate::profiles::stroke_length).sum(),
+                strokes: o.strokes,
+                part: o.part,
+                hole: None,
+            }));
+            bridge_groups = planned.groups;
+            bridge_reports = planned.bridges;
+        }
+        let mut common_diagnostics = std::mem::take(&mut common.diagnostics);
+        // The parts cut as one group with `part`: joined by bridges, or by
+        // common lines.
+        let members_of = |part: usize| -> Vec<usize> {
+            bridge_groups
+                .iter()
+                .find(|g| g.contains(&part))
+                .cloned()
+                .unwrap_or_else(|| common.members(part))
+        };
         // Order: deepest parts first; within a part its holes, then its
         // outline; parts of equal depth as `part_order` says.
         if let PartOrder::Spread { min_distance_mm } = op.part_order
@@ -765,6 +830,20 @@ impl ThermalCutPlan {
                     op.id
                 ));
             }
+        }
+        if let Some(b) = &op.bridges {
+            b.validate()
+                .map_err(|e| format!("thermal cut {}: {e}", op.id))?;
+            if op.common_line.is_some() {
+                return Err(format!(
+                    "thermal cut {}: bridges are not planned together with common_line (parts on a common line already share an edge); use one of them",
+                    op.id
+                ));
+            }
+        }
+        if let Some(k) = &op.skeleton {
+            k.validate()
+                .map_err(|e| format!("thermal cut {}: {e}", op.id))?;
         }
         if let Some(chain) = &op.chain {
             if !(chain.max_link_mm.is_finite()
@@ -828,7 +907,7 @@ impl ThermalCutPlan {
             let part = remaining.remove(k);
             part_sequence.push(part);
             // Parts joined by common lines are cut as one group.
-            let members = common.members(part);
+            let members = members_of(part);
             remaining.retain(|p| !members.contains(p));
             let mut own: Vec<usize> = (0..loops.len())
                 .filter(|&l| members.contains(&loops[l].part))
@@ -948,7 +1027,7 @@ impl ThermalCutPlan {
         let mut micro_joints = 0;
         let mut cut_length = 0.;
         let mut diagnostics = prepared.diagnostics;
-        diagnostics.append(&mut common.diagnostics);
+        diagnostics.append(&mut common_diagnostics);
         if op.common_line.is_some() && !shared {
             diagnostics.push(
                 "common_line: no two parts are exactly one kerf path apart; nothing is shared"
@@ -1026,9 +1105,20 @@ impl ThermalCutPlan {
             }
             let lp = &loops[l];
             report_order.push((lp.part, lp.hole));
+            if lp.hole.is_none() {
+                // A bridged group's one outline is every member's.
+                report_order.extend(
+                    bridge_groups
+                        .iter()
+                        .filter(|g| g.contains(&lp.part))
+                        .flatten()
+                        .filter(|&&p| p != lp.part)
+                        .map(|&p| (p, None)),
+                );
+            }
             pierced.push(match lp.hole {
                 Some(h) => format!("hole {h} of part {}", lp.part),
-                None => match common.members(lp.part).as_slice() {
+                None => match members_of(lp.part).as_slice() {
                     [_] => format!("the outline of part {}", lp.part),
                     group => format!("the outline of parts {group:?}"),
                 },
@@ -1133,8 +1223,28 @@ impl ThermalCutPlan {
             // than declared, clear of every part and off the pieces
             // already cut free. Otherwise the start is chosen as usual
             // (and the outline pierced unless the link to it is clear).
+            // A declared start (a nest that kept room for the leads at that
+            // place only): the loop starts there or the cut is refused.
+            let declared = lead_rules
+                .as_ref()
+                .and_then(|rules| rules.declared(&strokes));
+            if let Some((point, at)) = &declared {
+                clear_at(at).map_err(|e| {
+                    format!(
+                        "thermal cut {}: part {} {}: the leads at the declared start ({:.3}, {:.3}) are not clear ({e}); the nest kept room for the leads planned with it (the same lead_in, lead_out, overcut and pierce clearance): cut with those, or nest again for this cut",
+                        op.id,
+                        lp.part,
+                        lp.hole.map_or("outline".into(), |h| format!("hole {h}")),
+                        point[0],
+                        point[1]
+                    )
+                })?;
+            }
             let mut chain_start = false;
-            if pending_link && let Some(chain) = &op.chain {
+            if declared.is_none()
+                && pending_link
+                && let Some(chain) = &op.chain
+            {
                 use lead_placement::Start;
                 let from = [pos[0], pos[1]];
                 let n = strokes.len();
@@ -1189,7 +1299,10 @@ impl ThermalCutPlan {
                     }
                 }
             }
-            if chain_start {
+            if let Some((_, at)) = declared {
+                leads_moved += usize::from(at[0].a != strokes[0].a);
+                strokes = at;
+            } else if chain_start {
                 // Settled above.
             } else if let Some(rules) = &lead_rules {
                 // The first start, in the preferred order, that is off the
@@ -1799,10 +1912,27 @@ impl ThermalCutPlan {
             // micro-joints hold it.
             leaving = (op.avoid_cut_parts.is_some() && joints == 0).then(|| {
                 let c = &definition.components[lp.part];
-                freed.add(match lp.hole {
-                    Some(h) => &c.holes[h],
-                    None => &c.outer,
-                })
+                match lp.hole {
+                    Some(h) => freed.add(&c.holes[h]),
+                    None => {
+                        // A bridged group comes free as one: every member,
+                        // the one the torch stands beside last (it is the
+                        // piece the next rapid leaves).
+                        let mut group = members_of(lp.part);
+                        let beside = |part: usize| {
+                            Stroke::from_boundary(&definition.components[part].outer)
+                                .iter()
+                                .map(|s| (s.a[0] - pos[0]).hypot(s.a[1] - pos[1]))
+                                .fold(f64::INFINITY, f64::min)
+                        };
+                        group.sort_by(|a, b| beside(*b).total_cmp(&beside(*a)).then(a.cmp(b)));
+                        let mut last = 0;
+                        for part in group {
+                            last = freed.add(&definition.components[part].outer);
+                        }
+                        last
+                    }
+                }
             });
             freed_by_loop.push(leaving);
             if program && !pending_link {
@@ -1818,22 +1948,76 @@ impl ThermalCutPlan {
         // The crop cut, last: every part is cut, so nothing it frees can be a
         // part. Its pierce crater and its kerf are proven clear of every
         // part as a lead's are.
+        // The cuts made after every part: the skeleton cut-up, then the
+        // crop cut. Each is pierced at its first point and follows its
+        // points with no leads and no offset; its pierce crater and its
+        // kerf are proven clear of every part.
         let mut crop_length_mm = None;
+        let (mut skeleton_cuts, mut skeleton_length) = (0usize, 0.);
+        let mut last_cuts: Vec<(Vec<[f64; 2]>, &str, bool)> = vec![];
+        if let Some(rules) = &op.skeleton {
+            let step = (kerf / 16.).clamp(0.02, 0.25);
+            let reach = skeleton::Reach {
+                // Samples that far apart both clear leave everything
+                // between them clear by half a step less.
+                cut: offset + rules.part_clearance_mm + step,
+                pierce: offset + pierce_clearance + step,
+                min_length: 2. * kerf,
+                step,
+            };
+            let cuts = skeleton::plan(
+                rules,
+                &reach,
+                |p| {
+                    if cancel.is_cancelled() {
+                        return Err("thermal cut planning cancelled".into());
+                    }
+                    // Over a hole there is no plate under the torch.
+                    for (_, hole) in &holes {
+                        if hole.query(p)?.signed_clearance_mm.unwrap_or(-1.) > -reach.cut {
+                            return Ok(None);
+                        }
+                    }
+                    let signed = source
+                        .query(p)?
+                        .signed_clearance_mm
+                        .unwrap_or(-f64::INFINITY);
+                    Ok((signed < 0.).then_some(-signed))
+                },
+                |p| {
+                    // Every part is cut free by now: a pierce the torch cannot
+                    // travel to is no pierce.
+                    op.avoid_cut_parts.as_ref().is_none_or(|avoid| {
+                        freed
+                            .blocked(freed.len(), p, p, avoid.clearance_mm, None)
+                            .is_none()
+                    })
+                },
+            )
+            .map_err(|e| format!("thermal cut {}: {e}", op.id))?;
+            last_cuts.extend(
+                cuts.into_iter()
+                    .map(|c| (vec![c.from, c.to], "skeleton cut", false)),
+            );
+        }
         if let Some(crop) = &op.crop {
-            let points = &crop.points_mm;
+            last_cuts.push((crop.points_mm.clone(), "crop cut", op.height_control));
+        }
+        for (points, what, thc) in &last_cuts {
+            let (what, thc) = (*what, *thc);
             let low = |p: [f64; 2]| at_z(p, z_check);
             probe(
                 &crater_probe,
                 line(at_z(points[0], top + 1.), low(points[0])),
-                "crop cut's pierce point",
+                &format!("{what}'s pierce point"),
             )?;
             for w in points.windows(2) {
-                probe(&kerf_probe, line(low(w[0]), low(w[1])), "crop cut")?;
+                probe(&kerf_probe, line(low(w[0]), low(w[1])), what)?;
             }
             let detour = match &op.avoid_cut_parts {
                 Some(avoid) => freed
                     .route([pos[0], pos[1]], points[0], avoid.clearance_mm, leaving)
-                    .map_err(|e| format!("thermal cut {}: crop cut: {e}", op.id))?,
+                    .map_err(|e| format!("thermal cut {}: {what}: {e}", op.id))?,
                 None => vec![],
             };
             rerouted += usize::from(!detour.is_empty());
@@ -1890,7 +2074,7 @@ impl ThermalCutPlan {
                 MoveKind::Plunge,
                 op.plunge_mm_min,
             );
-            if op.height_control {
+            if thc {
                 steps.push_back(Step::Event(Event::HeightControl { on: true }));
             }
             let mut length = 0.;
@@ -1904,7 +2088,7 @@ impl ThermalCutPlan {
                     Some(op.feed_mm_min),
                 );
             }
-            if op.height_control {
+            if thc {
                 steps.push_back(Step::Event(Event::HeightControl { on: false }));
             }
             steps.push_back(Step::Event(Event::Beam { power_percent: 0. }));
@@ -1918,7 +2102,15 @@ impl ThermalCutPlan {
                 );
             }
             cut_length += length;
-            crop_length_mm = Some(length);
+            if what == "crop cut" {
+                crop_length_mm = Some(length);
+            } else {
+                skeleton_cuts += 1;
+                skeleton_length += length;
+            }
+            // A cut-up line frees nothing the next rapid must leave, and
+            // ends where the torch can travel from.
+            leaving = None;
         }
         if common.len() > 0 {
             common_line::check_kerfs(steps.iter(), &pierced, kerf, op.tolerance_mm)?;
@@ -2049,7 +2241,7 @@ impl ThermalCutPlan {
                     _ => {}
                 }
             }
-            debug_assert_eq!(freed.len(), freed_by_loop.iter().flatten().count());
+            debug_assert!(freed.len() >= freed_by_loop.iter().flatten().count());
         }
         let start_of = |part: usize| {
             let v = definition.components[part].outer.vertices[0];
@@ -2090,7 +2282,9 @@ impl ThermalCutPlan {
             parts: definition.components.len(),
             loops: order.len() - common.len(),
             small_holes: small,
-            pierces: order.len() + usize::from(op.crop.is_some()) - chain_links,
+            pierces: order.len() + usize::from(op.crop.is_some()) + skeleton_cuts - chain_links,
+            skeleton_cuts: op.skeleton.as_ref().map(|_| skeleton_cuts),
+            skeleton_length_mm: op.skeleton.as_ref().map(|_| skeleton_length),
             chain_links: op.chain.map(|_| chain_links),
             chain_length_mm: op.chain.map(|_| chain_length),
             micro_joints,
@@ -2107,6 +2301,8 @@ impl ThermalCutPlan {
             dwell_seconds,
             rerouted_rapids: op.avoid_cut_parts.map(|_| rerouted),
             loops_completed: 0,
+            bridges: bridge_reports,
+            bridged_groups: bridge_groups.clone(),
             common_lines,
             diagnostics,
         };

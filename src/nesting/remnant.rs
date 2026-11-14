@@ -59,6 +59,11 @@ pub struct RemnantRequest {
     /// piece of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop: Option<crate::thermal::CropCut>,
+    /// The skeleton cut-up made after the parts (the thermal cut's
+    /// `skeleton`): the area it cuts into pieces is no remnant, and is
+    /// removed with the run-off of its cuts and the margin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skeleton: Option<crate::thermal::SkeletonCutUp>,
 }
 
 /// A box round the segment a-b, `r` to each side and past each end.
@@ -243,7 +248,10 @@ pub fn remnant(request: &RemnantRequest) -> Result<Remnant, String> {
     };
     let mut diagnostics = vec![];
     let mut crop_check: Option<(usize, f64, f64)> = None;
-    if request.parts.components.is_empty() && request.crop.is_none() {
+    if let Some(k) = &request.skeleton {
+        k.validate().map_err(|e| format!("remnant: {e}"))?;
+    }
+    if request.parts.components.is_empty() && request.crop.is_none() && request.skeleton.is_none() {
         let mut region = empty(request.sheet.components.clone());
         region.boundary_error_mm = request.sheet.boundary_error_mm;
         return Ok(Remnant {
@@ -340,7 +348,39 @@ pub fn remnant(request: &RemnantRequest) -> Result<Remnant, String> {
             });
         }
     }
-    let removed = removed.expect("parts or a crop cut");
+    // The area a skeleton cut-up divides, out to where its cuts run off.
+    let skeleton_box = request.skeleton.as_ref().map(|k| {
+        let grow = k.run_off_mm + crop_required + slack;
+        let [x0, y0, x1, y1] = k.area_mm;
+        [x0 - grow, y0 - grow, x1 + grow, y1 + grow]
+    });
+    if let Some([x0, y0, x1, y1]) = skeleton_box {
+        let area = PlanarRegion {
+            version: 1,
+            units: "mm".into(),
+            name: "skeleton".into(),
+            boundary_error_mm: 0.,
+            components: vec![Component {
+                outer: Boundary {
+                    vertices: vec![[x0, y0, 0.], [x1, y0, 0.], [x1, y1, 0.], [x0, y1, 0.]],
+                },
+                holes: vec![],
+            }],
+            source: serde_json::Value::Null,
+        }
+        .prepare(options)
+        .map_err(|e| format!("remnant: skeleton cut-up: {e}"))?;
+        removed = Some(match removed {
+            None => area,
+            Some(all) => {
+                all.boolean_prepared(&area, Boolean::Union)
+                    .map_err(|e| format!("remnant: uniting what the skeleton cut-up removed: {e}"))?
+                    .into_parts()
+                    .1
+            }
+        });
+    }
+    let removed = removed.expect("parts, a crop cut or a skeleton cut-up");
     let left = sheet
         .boolean_prepared(&removed, Boolean::Difference)
         .map_err(|e| format!("remnant: the sheet less what the cut removed: {e}"))?;
@@ -398,6 +438,25 @@ pub fn remnant(request: &RemnantRequest) -> Result<Remnant, String> {
                 }
             }
             crop_check = Some((points, nearest, crop_required));
+        }
+        // Nothing of the area a skeleton cut-up divides is in the remnant:
+        // a grid of points over it, each outside.
+        if let Some(k) = &request.skeleton {
+            let [x0, y0, x1, y1] = k.area_mm;
+            for i in 0..=32 {
+                for j in 0..=32 {
+                    let p = [
+                        x0 + (x1 - x0) * i as f64 / 32.,
+                        y0 + (y1 - y0) * j as f64 / 32.,
+                    ];
+                    if matches!(prepared.query(p)?.verdict, Verdict::Allowed) {
+                        return Err(format!(
+                            "remnant: the construction failed its check and is not returned: ({:.4}, {:.4}) lies in the area the skeleton cut-up divides and in the remnant; this is a defect: report it",
+                            p[0], p[1]
+                        ));
+                    }
+                }
+            }
         }
         let sheet_uncertainty = request.sheet.boundary_error_mm + 2. * uncertainty;
         for c in &region.components {

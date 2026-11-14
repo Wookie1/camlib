@@ -82,6 +82,10 @@ pub enum Request {
         nest: Box<crate::nesting::NestRequest>,
         placements: Vec<crate::nesting::Placement>,
         region: PlanarRegion,
+        /// The layout's lead starts (a nest with its lead room at the
+        /// leads).
+        #[serde(default)]
+        lead_starts: Vec<[f64; 2]>,
     },
     PrepareVerification {
         scene: crate::verification::Scene,
@@ -177,7 +181,13 @@ fn execute(session: &mut Session, request: Request) -> Result<Value, String> {
             nest,
             placements,
             region,
-        } => Ok(json!(crate::nesting::verify(&nest, &placements, &region)?)),
+            lead_starts,
+        } => Ok(json!(crate::nesting::verify(
+            &nest,
+            &placements,
+            &region,
+            &lead_starts
+        )?)),
         Request::PrepareVerification { scene, options } => {
             session.prepare_verification(&scene, options)?;
             Ok(
