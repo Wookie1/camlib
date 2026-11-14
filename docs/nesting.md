@@ -39,6 +39,7 @@ cut = dataclasses.replace(cut, parts=result.region)   # cut the nest
 | `sheet` | A `PlanarRegion` of one outline; its holes are areas already cut out of a remnant |
 | `parts` | `NestPart(region, quantity, rotations_deg, mirror=False, priority=0, fill=False)`: a `PlanarRegion` of one outline with holes, the number of copies, the allowed rotations (degrees counter-clockwise; `(0,)` keeps the part as drawn), and whether it may also be turned over. Parts of a higher `priority` are placed first (nearest the start corner). `fill=True` makes a filler: placed after every other part, as many copies as fit up to `quantity`, with no refusal for the rest (the result's `filled` lists `(part, copies)`) |
 | `kerf_mm`, `lead_in`, `lead_out`, `pierce_clearance_mm` | What the cut will use. `Nest.for_cut(cut, ...)` reads them, and the tolerances, from a `ThermalCut` |
+| `corner_loops` | The cut's `CornerLoops`, if it has them (`Nest.for_cut` reads it): room is kept for the loops as for the leads, `overshoot / tan(min angle / 4)` beyond the kerf path's corner |
 | `part_spacing_mm` | Material left between what is cut for two parts |
 | `edge_margin_mm` | Material left between what is cut for a part and the sheet's outline or holes |
 | `resolution_mm` | Column spacing of the placement (see Limits) |
@@ -59,7 +60,12 @@ part. A lead starts where its loop starts; its pierce point lies the lead's arc
 radius along the loop and radius + length away from it, so at most
 `hypot(radius, radius + length)` from the loop, and the pierce crater reaches
 `pierce_clearance_mm` beyond half a kerf round it. The larger of the lead-in's
-and the lead-out's reach is the result's `lead_reach_mm`. Everything cut for a
+and the lead-out's reach is the result's `lead_reach_mm`; with the cut's
+`corner_loops` declared it is at least the loops' reach too (a loop's far
+side is `overshoot / tan(t / 4)` from the point where the kerf path's edges
+meet at a corner turning by `t`, the most at `min_angle_deg`; that point is
+`offset / cos(t / 2)` from the drawn corner, the most at `max_angle_deg`).
+Everything cut for a
 part therefore lies within `kerf + allowance + lead_reach` of the part, and a
 nest keeps
 
@@ -140,6 +146,7 @@ and unplaced copies always add up to the declared quantities.
 | `used_bounds_mm` | The box round the placed parts |
 | `lead_reach_mm` | How far leads and pierce craters may reach beyond a kerf's edge |
 | `check` | The independent check's report |
+| `no_lead` | The parts' edges kept free of leads, as placed (below) |
 | `marks`, `mark_placements` | The parts' marks as placed (below) and, for each, the `(placement, mark)` it came from |
 
 ## Part labels
@@ -160,6 +167,20 @@ result = camlib.Nest.for_cut(cut, sheet, (camlib.NestPart(plate, 4, (0, 90), mar
 marking = camlib.ThermalMark("labels", torch, result.region, result.marks, feed_mm_min=4000,
                              mark_height_mm=2.5, power_percent=15, mark_width_mm=0.8,
                              tool_number=1, length_register=1)
+```
+
+`NestPart(..., no_lead=(...))` declares, the same way, the stretches of a
+part's outline that must not carry a lead (a seen or welded edge): paths
+along the drawn edge in the part's coordinates. They are placed with every
+copy and returned as `result.no_lead`, the `keep_off` of the cut's
+`LeadPlacement` ([operations](operations.md)):
+
+```python
+edge = camlib.TracePath((0, 0), (camlib.TraceLine((70, 0)),))          # the part's bottom edge
+result = camlib.Nest.for_cut(cut, sheet, (camlib.NestPart(plate, 4, (0, 90), no_lead=(edge,)),),
+                             part_spacing_mm=2, edge_margin_mm=5, resolution_mm=1).run()
+cut = dataclasses.replace(cut, parts=result.region,
+                          lead_placement=camlib.LeadPlacement(result.no_lead, keep_off_distance_mm=3, prefer="corner"))
 ```
 
 ## Where the nest starts
