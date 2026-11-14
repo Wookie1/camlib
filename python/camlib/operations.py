@@ -320,13 +320,13 @@ class Geodesic:
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
     mode: str = "contact"
+    # Entry where live stock stands above a pass: RampEntry(...), as in Parallel.
+    entry: object | None = None
 
     def __post_init__(self):
         _geodesic_seed(self.seed)
         if self.mode not in ("contact", "tool_centre"):
             raise ValueError('Geodesic mode must be "contact" or "tool_centre"')
-    # Entry where live stock stands above a pass: RampEntry(...), as in Parallel.
-    entry: object | None = None
 
     def to_dict(self):
         result = _pattern_dict(self, "geodesic", ())
