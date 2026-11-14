@@ -66,6 +66,82 @@ pub(crate) fn check_chunk_size(chunk: &impl Serialize) -> Result<(), String> {
 /// (rounded words) runs as a spiral between the two (LinuxCNC arc_data_ijk;
 /// FANUC within parameter 3410): it strays from the start-radius circle by at
 /// most that difference, which is added.
+/// The arc a decoded block is replayed as. Arc words whose start and end
+/// radius differ (within the controller's declared tolerance) describe no
+/// single circle: the controller's path lies between the circles through
+/// the start and through the end about the written centre. Checks of the
+/// decoded program need one curve, so this is the circle through the written
+/// start and end whose centre is nearest the written one (the written centre
+/// moved along the chord onto its bisector). For an arc of at most half a
+/// turn its distance from the written centre runs monotonically from the
+/// start radius to the end radius, so it lies in that same band, and no
+/// point of the controller's path is further from it than the mismatch,
+/// which `curve_difference` has already charged to the block's deviation
+/// bound. Lines, and arcs whose words agree, are returned unchanged.
+pub(crate) fn replay_curve(curve: &Curve) -> Result<Curve, String> {
+    let (start, end, center, plane, sweep, helix) = match *curve {
+        Curve::Arc {
+            start,
+            end,
+            center,
+            plane,
+            sweep_rad,
+        } => (start, end, center, plane, sweep_rad, false),
+        Curve::Helix {
+            start,
+            end,
+            center,
+            plane,
+            sweep_rad,
+        } => (start, end, center, plane, sweep_rad, true),
+        Curve::Line { .. } => return Ok(curve.clone()),
+    };
+    let [u, v, _] = plane.axes();
+    let r1 = (start[u] - center[u]).hypot(start[v] - center[v]);
+    let r2 = (end[u] - center[u]).hypot(end[v] - center[v]);
+    let (dx, dy) = (end[u] - start[u], end[v] - start[v]);
+    let chord2 = dx * dx + dy * dy;
+    if r1 == r2 || chord2 == 0. {
+        return Ok(curve.clone());
+    }
+    if sweep.abs() > std::f64::consts::PI + 1e-9 {
+        return Err("arc words that differ in radius are modelled for at most half a turn".into());
+    }
+    // The written centre, moved along the chord onto its bisector.
+    let along = ((center[u] - 0.5 * (start[u] + end[u])) * dx
+        + (center[v] - 0.5 * (start[v] + end[v])) * dy)
+        / chord2;
+    let mut c = center;
+    c[u] -= along * dx;
+    c[v] -= along * dy;
+    let (x, y) = (start[u] - c[u], start[v] - c[v]);
+    let (ex, ey) = (end[u] - c[u], end[v] - c[v]);
+    let angle = (x * ey - y * ex).atan2(x * ex + y * ey);
+    let tau = std::f64::consts::TAU;
+    let w = if sweep > 0. {
+        angle.rem_euclid(tau)
+    } else {
+        -(-angle).rem_euclid(tau)
+    };
+    Ok(if helix {
+        Curve::Helix {
+            start,
+            end,
+            center: c,
+            plane,
+            sweep_rad: w,
+        }
+    } else {
+        Curve::Arc {
+            start,
+            end,
+            center: c,
+            plane,
+            sweep_rad: w,
+        }
+    })
+}
+
 pub(crate) fn curve_difference(a: &Curve, b: &Curve, tolerance: f64) -> Result<f64, String> {
     let spiral = match *b {
         Curve::Arc {
@@ -243,4 +319,119 @@ pub(crate) fn format_number(value: f64, decimals: usize) -> Result<String, Strin
     } else {
         text
     })
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::motion::Plane;
+
+    /// Arc words that differ in radius: the replay circle passes through the
+    /// written start and end, and every point of it lies between the two
+    /// circles about the written centre (the band the controller's path is
+    /// in), so it is never further from that path than the mismatch.
+    #[test]
+    fn the_replay_circle_stays_in_the_band_between_the_written_radii() {
+        let mut worst = 0f64;
+        for k in 0..1200 {
+            // Every plane, flat arcs and helixes.
+            let plane = [Plane::Xy, Plane::Xz, Plane::Yz][k % 3];
+            let helix = k % 2 == 1;
+            let [u, v, a] = plane.axes();
+            let a0 = 0.37 * k as f64;
+            let sweep = [0.05, 0.3, 1.2, 2.8, 3.1][k % 5] * if k % 4 < 2 { 1. } else { -1. };
+            let r = [0.8, 6., 60., 400.][k % 4];
+            let gap = [0.0003, 0.001, 0.005][k % 3] * if k % 7 < 3 { 1. } else { -1. };
+            let mut center = [0.; 3];
+            (center[u], center[v], center[a]) = (12.5, -7.25, 3.);
+            let mut start = center;
+            start[u] += r * a0.cos();
+            start[v] += r * a0.sin();
+            let a1 = a0 + sweep;
+            let mut end = center;
+            end[u] += (r + gap) * a1.cos();
+            end[v] += (r + gap) * a1.sin();
+            if helix {
+                end[a] -= 1.5;
+            }
+            let written = if helix {
+                Curve::Helix {
+                    start,
+                    end,
+                    center,
+                    plane,
+                    sweep_rad: sweep,
+                }
+            } else {
+                Curve::Arc {
+                    start,
+                    end,
+                    center,
+                    plane,
+                    sweep_rad: sweep,
+                }
+            };
+            let replay = replay_curve(&written).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&replay),
+                std::mem::discriminant(&written)
+            );
+            let (Curve::Arc {
+                start: s,
+                end: e,
+                center: c,
+                plane: p,
+                sweep_rad: w,
+            }
+            | Curve::Helix {
+                start: s,
+                end: e,
+                center: c,
+                plane: p,
+                sweep_rad: w,
+            }) = replay
+            else {
+                panic!()
+            };
+            assert_eq!((s, e, p), (start, end, plane));
+            assert!(
+                (w - sweep).abs() < 0.02 && w.signum() == sweep.signum(),
+                "{w} {sweep}"
+            );
+            // An exact circle: it prepares at the tightest tolerance.
+            replay.prepare(1e-9).unwrap();
+            let radius = (s[u] - c[u]).hypot(s[v] - c[v]);
+            let from = (s[v] - c[v]).atan2(s[u] - c[u]);
+            let (low, high) = (r.min(r + gap), r.max(r + gap));
+            for j in 0..=200 {
+                let angle = from + w * j as f64 / 200.;
+                let q = [c[u] + radius * angle.cos(), c[v] + radius * angle.sin()];
+                let d = (q[0] - center[u]).hypot(q[1] - center[v]);
+                worst = worst.max(low - d).max(d - high);
+                assert!(
+                    d >= low - 1e-9 && d <= high + 1e-9,
+                    "{d} outside {low}..{high}"
+                );
+            }
+        }
+        assert!(worst <= 1e-9, "{worst}");
+        // Agreeing words and lines are returned as they are; more than half
+        // a turn with a mismatch has no such model.
+        let exact = Curve::Arc {
+            start: [1., 0., 0.],
+            end: [0., 1., 0.],
+            center: [0., 0., 0.],
+            plane: Plane::Xy,
+            sweep_rad: std::f64::consts::FRAC_PI_2,
+        };
+        assert_eq!(replay_curve(&exact).unwrap(), exact);
+        let long = Curve::Arc {
+            start: [1., 0., 0.],
+            end: [0., -1.001, 0.],
+            center: [0., 0., 0.],
+            plane: Plane::Xy,
+            sweep_rad: 1.5 * std::f64::consts::PI,
+        };
+        assert!(replay_curve(&long).is_err());
+    }
 }

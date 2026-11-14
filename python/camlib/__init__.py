@@ -83,6 +83,7 @@ _EXPORTS = {
             "CropCut",
             "CornerLoops",
             "CornerSlowdown",
+            "ChainCutting",
             "LeadPlacement",
             "MicroJoints",
             "CommonLine",

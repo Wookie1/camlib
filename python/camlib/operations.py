@@ -1939,6 +1939,26 @@ class CornerLoops:
 
 
 @dataclass(frozen=True)
+class ChainCutting:
+    """Chain cutting in a ``ThermalCut``: the outlines of parts cut one after
+    the other are joined by a straight cut through the scrap, from the end of
+    one outline's lead-out to the start of the next one's lead-in, so the
+    beam stays on and the next part needs no pierce. A link is cut only where
+    it is no longer than ``max_link_mm`` (no default) and its kerf is proven
+    clear of every part; otherwise the next outline is pierced as usual.
+    Holes are always pierced; the holes of the parts in a chain are cut
+    before its outlines. A chained outline starts where the shortest clear
+    link reaches it (a corner, a stroke end or the middle of an edge). Not planned with ``common_line``. The report counts
+    the links (``chain_links``, ``chain_length_mm``) and ``pierces`` drops by
+    as many."""
+
+    max_link_mm: float
+
+    def to_dict(self):
+        return dict(max_link_mm=self.max_link_mm)
+
+
+@dataclass(frozen=True)
 class CornerSlowdown:
     """A reduced feed round corners in a ``ThermalCut``: from ``distance_mm``
     before a corner to ``distance_mm`` after it the cut runs at
@@ -2029,7 +2049,10 @@ class ThermalCut:
 
     ``corner_loops=CornerLoops(...)`` cuts a loop into the scrap at outside
     corners, and ``corner_slowdown=CornerSlowdown(...)`` reduces the feed
-    round corners."""
+    round corners.
+
+    ``chain=ChainCutting(max_link_mm)`` joins the outlines of neighbouring
+    parts by cuts through the scrap, one pierce for the chain."""
 
     id: str
     tool: object
@@ -2063,6 +2086,7 @@ class ThermalCut:
     lead_placement: LeadPlacement | None = field(default=None, kw_only=True)
     corner_loops: CornerLoops | None = field(default=None, kw_only=True)
     corner_slowdown: CornerSlowdown | None = field(default=None, kw_only=True)
+    chain: ChainCutting | None = field(default=None, kw_only=True)
 
     def common_line_spacing_mm(self):
         """The gap between two parts whose facing edges are a common line:
@@ -2100,7 +2124,7 @@ class ThermalCut:
             result.pop("lead_placement")
         else:
             result["lead_placement"] = self.lead_placement.to_dict()
-        for name in ("corner_loops", "corner_slowdown"):
+        for name in ("corner_loops", "corner_slowdown", "chain"):
             option = result.pop(name)
             if option is not None:
                 result[name] = option.to_dict()

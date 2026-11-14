@@ -197,6 +197,10 @@ pub struct ThermalCutOperation {
     /// Off unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corner_slowdown: Option<CornerSlowdown>,
+    /// Join the outlines of neighbouring parts by cuts through the scrap,
+    /// one pierce for the chain. Off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<ChainCutting>,
     /// A last cut that frees the usable offcut from the skeleton. Off unless
     /// set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +216,22 @@ pub struct ThermalCutOperation {
     pub work_offset: u8,
     pub tool_number: u32,
     pub length_register: u32,
+}
+
+/// Chain cutting: the outlines of parts cut one after the other are joined
+/// by a straight cut through the scrap, from the end of one outline's
+/// lead-out to the start of the next one's lead-in, so the beam stays on and
+/// the second part needs no pierce (Amada AP100US, "Chain and Bridge
+/// Cutting": one continuous cut processes the part boundaries, holes are cut
+/// on their own, "Max Chain Length" bounds the cut between parts; Voortman
+/// knowledge base, "V303: Chain Cutting": several parts in one continuous
+/// motion, fewer pierces). A link is cut only where it is no longer than
+/// `max_link_mm` and its kerf is proven clear of every part; otherwise the
+/// next outline is pierced as usual.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainCutting {
+    pub max_link_mm: f64,
 }
 
 /// The crop cut: a straight cut (two points) or an L (three), in the
@@ -258,6 +278,12 @@ pub struct ThermalCutReport {
     /// Stretches cut at the reduced feed (`corner_slowdown`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corner_slowdowns: Option<usize>,
+    /// Outlines started through a chain link instead of a pierce (`chain`),
+    /// and the links' total length (leads, not in `cut_length_mm`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_links: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_length_mm: Option<f64>,
     /// The crop cut's length (in `cut_length_mm` too; its pierce is one of
     /// `pierces`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -740,6 +766,23 @@ impl ThermalCutPlan {
                 ));
             }
         }
+        if let Some(chain) = &op.chain {
+            if !(chain.max_link_mm.is_finite()
+                && chain.max_link_mm > 0.
+                && chain.max_link_mm <= 1e6)
+            {
+                return Err(format!(
+                    "thermal cut {}: chain max_link_mm {} must be positive (the longest cut through the scrap from one part to the next)",
+                    op.id, chain.max_link_mm
+                ));
+            }
+            if op.common_line.is_some() {
+                return Err(format!(
+                    "thermal cut {}: chain is not planned together with common_line (a common line's parts are already cut as one group); use one of them",
+                    op.id
+                ));
+            }
+        }
         if let Some(avoid) = &op.avoid_cut_parts {
             if !(avoid.clearance_mm.is_finite()
                 && avoid.clearance_mm > 0.
@@ -814,6 +857,47 @@ impl ThermalCutPlan {
                 at = loops[l].strokes[0].a;
             }
             order.extend(ordered);
+        }
+        // Chain cutting: parts cut one after the other, equally deep, whose
+        // outlines start within a link's length of each other form a group;
+        // the group's holes are cut first, then its outlines one after the
+        // other, so a link can join them. Every hole is still cut before its
+        // own outline, and deeper parts before the parts round them.
+        if let Some(chain) = &op.chain {
+            let outline_of = |part: usize| {
+                order
+                    .iter()
+                    .copied()
+                    .find(|&l| loops[l].part == part && loops[l].hole.is_none())
+            };
+            let mut regrouped = Vec::with_capacity(order.len());
+            let mut outlines: Vec<usize> = vec![];
+            let mut previous: Option<usize> = None;
+            for &part in &part_sequence {
+                let near = previous.is_some_and(|before| {
+                    depth[before] == depth[part]
+                        && match (outline_of(before), outline_of(part)) {
+                            (Some(a), Some(b)) => {
+                                let (a, b) = (loops[a].strokes[0].a, loops[b].strokes[0].a);
+                                (a[0] - b[0]).hypot(a[1] - b[1]) <= chain.max_link_mm
+                            }
+                            _ => false,
+                        }
+                });
+                if !near {
+                    regrouped.append(&mut outlines);
+                }
+                for &l in order.iter().filter(|&&l| loops[l].part == part) {
+                    if loops[l].hole.is_some() {
+                        regrouped.push(l);
+                    } else {
+                        outlines.push(l);
+                    }
+                }
+                previous = Some(part);
+            }
+            regrouped.append(&mut outlines);
+            order = regrouped;
         }
         // Proofs: the kerf (with the boundary margin) never touches a part,
         // and each pierce crater stays clear of every part.
@@ -909,7 +993,11 @@ impl ThermalCutPlan {
             .map_err(|e| format!("thermal cut {}: {e}", op.id))?;
         // What each pierce cuts, for the refusals of the kerf checks.
         let mut pierced = vec![];
-        for &l in &order {
+        // Chain cutting: the beam was left on at the end of the last outline,
+        // for a link to this one.
+        let mut pending_link = false;
+        let (mut chain_links, mut chain_length) = (0usize, 0.);
+        for (index, &l) in order.iter().enumerate() {
             if l >= loops.len() {
                 let [a, b] = common.cut(l - loops.len()).parts;
                 pierced.push(format!("the common line between parts {a} and {b}"));
@@ -1036,7 +1124,74 @@ impl ThermalCutPlan {
                 }
                 Ok(())
             };
-            if let Some(rules) = &lead_rules {
+            // Chain cutting, the beam still on from the last outline: this
+            // outline starts where a link reaches it, the shortest first.
+            // Its possible starts are its stroke ends and the middles of
+            // its straight strokes, less those on edges kept free of
+            // leads; one is taken when its leads and pierce point are clear
+            // as for any start and the link to its lead-in is no longer
+            // than declared, clear of every part and off the pieces
+            // already cut free. Otherwise the start is chosen as usual
+            // (and the outline pierced unless the link to it is clear).
+            let mut chain_start = false;
+            if pending_link && let Some(chain) = &op.chain {
+                use lead_placement::Start;
+                let from = [pos[0], pos[1]];
+                let n = strokes.len();
+                let lead_in_start = |r: &[Stroke]| {
+                    let (start, t) = (r[0].a, r[0].tangent(false));
+                    let normal = scrap(t);
+                    let center = add(start, normal, lin.radius_mm);
+                    add(add(center, t, -lin.radius_mm), normal, lin.length_mm)
+                };
+                let mut reachable: Vec<(f64, Vec<Stroke>)> = (0..n)
+                    .map(Start::End)
+                    .chain(
+                        (0..n)
+                            .filter(|&k| strokes[k].arc.is_none())
+                            .map(Start::Middle),
+                    )
+                    .filter(|start| {
+                        lead_rules
+                            .as_ref()
+                            .is_none_or(|rules| !rules.kept_off(start.point(&strokes)))
+                    })
+                    .map(|start| {
+                        let r = start.rotate(&strokes);
+                        let p = lead_in_start(&r);
+                        ((p[0] - from[0]).hypot(p[1] - from[1]), r)
+                    })
+                    .filter(|(length, _)| *length <= chain.max_link_mm)
+                    .collect();
+                reachable.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (length, r) in reachable.into_iter().take(16) {
+                    let p = lead_in_start(&r);
+                    if clear_at(&r).is_ok()
+                        && op.avoid_cut_parts.as_ref().is_none_or(|avoid| {
+                            freed
+                                .blocked(freed.len(), from, p, avoid.clearance_mm, leaving)
+                                .is_none()
+                        })
+                        && (length <= guard
+                            || probe(
+                                &kerf_probe,
+                                line(at_z(from, z_check), at_z(p, z_check)),
+                                "chain link",
+                            )
+                            .is_ok())
+                    {
+                        if lead_rules.is_some() {
+                            leads_moved += usize::from(r[0].a != strokes[0].a);
+                        }
+                        strokes = r;
+                        chain_start = true;
+                        break;
+                    }
+                }
+            }
+            if chain_start {
+                // Settled above.
+            } else if let Some(rules) = &lead_rules {
                 // The first start, in the preferred order, that is off the
                 // kept-off edges and whose leads and pierce are clear; one
                 // that is only off them is taken to the checks below (a
@@ -1162,67 +1317,114 @@ impl ThermalCutPlan {
                 lin = l;
                 (center, a, pierce) = geometry(l);
             }
-            // Travel to the pierce point and pierce: round the pieces
-            // already cut free where that is asked for.
-            let detour = match &op.avoid_cut_parts {
-                Some(avoid) => freed
-                    .route([pos[0], pos[1]], pierce, avoid.clearance_mm, leaving)
-                    .map_err(|e| format!("thermal cut {}: {e}", op.id))?,
-                None => vec![],
-            };
-            rerouted += usize::from(!detour.is_empty());
-            if program {
-                push_move(
-                    &mut steps,
-                    [pos[0], pos[1], z_travel.max(pos[2])],
-                    &mut pos,
-                    MoveKind::Rapid,
-                    None,
-                );
+            // Chain cutting: straight through the scrap from where the last
+            // outline's lead-out ended to this lead-in's start, the beam
+            // on, where that is short enough, its kerf is clear of every
+            // part and it keeps off the pieces already cut free. Otherwise
+            // the beam goes off and this outline is pierced.
+            let mut linked = false;
+            if std::mem::take(&mut pending_link) {
+                let from = [pos[0], pos[1]];
+                let length = (pierce[0] - from[0]).hypot(pierce[1] - from[1]);
+                linked = op.chain.is_some_and(|chain| length <= chain.max_link_mm)
+                    && op.avoid_cut_parts.as_ref().is_none_or(|avoid| {
+                        freed
+                            .blocked(freed.len(), from, pierce, avoid.clearance_mm, leaving)
+                            .is_none()
+                    })
+                    && (length <= guard
+                        || probe(
+                            &kerf_probe,
+                            line(at_z(from, z_check), at_z(pierce, z_check)),
+                            "chain link",
+                        )
+                        .is_ok());
+                if linked {
+                    push_move(
+                        &mut steps,
+                        at_z(pierce, z_cut),
+                        &mut pos,
+                        MoveKind::Lead,
+                        Some(op.feed_mm_min),
+                    );
+                    chain_links += 1;
+                    chain_length += length;
+                } else {
+                    steps.push_back(Step::Event(Event::Beam { power_percent: 0. }));
+                    if program {
+                        push_move(
+                            &mut steps,
+                            [pos[0], pos[1], z_travel],
+                            &mut pos,
+                            MoveKind::Rapid,
+                            None,
+                        );
+                    }
+                }
             }
-            for p in detour {
-                let z = pos[2];
-                push_move(&mut steps, at_z(p, z), &mut pos, MoveKind::Rapid, None);
-            }
-            if program {
-                push_move(
-                    &mut steps,
-                    at_z(pierce, pos[2]),
-                    &mut pos,
-                    MoveKind::Rapid,
-                    None,
-                );
-                push_move(
-                    &mut steps,
-                    at_z(pierce, z_pierce),
-                    &mut pos,
-                    MoveKind::Rapid,
-                    None,
-                );
-            } else {
+            if !linked {
+                // Travel to the pierce point and pierce: round the pieces
+                // already cut free where that is asked for.
+                let detour = match &op.avoid_cut_parts {
+                    Some(avoid) => freed
+                        .route([pos[0], pos[1]], pierce, avoid.clearance_mm, leaving)
+                        .map_err(|e| format!("thermal cut {}: {e}", op.id))?,
+                    None => vec![],
+                };
+                rerouted += usize::from(!detour.is_empty());
+                if program {
+                    push_move(
+                        &mut steps,
+                        [pos[0], pos[1], z_travel.max(pos[2])],
+                        &mut pos,
+                        MoveKind::Rapid,
+                        None,
+                    );
+                }
+                for p in detour {
+                    let z = pos[2];
+                    push_move(&mut steps, at_z(p, z), &mut pos, MoveKind::Rapid, None);
+                }
+                if program {
+                    push_move(
+                        &mut steps,
+                        at_z(pierce, pos[2]),
+                        &mut pos,
+                        MoveKind::Rapid,
+                        None,
+                    );
+                    push_move(
+                        &mut steps,
+                        at_z(pierce, z_pierce),
+                        &mut pos,
+                        MoveKind::Rapid,
+                        None,
+                    );
+                } else {
+                    push_move(
+                        &mut steps,
+                        at_z(pierce, z_cut),
+                        &mut pos,
+                        MoveKind::Rapid,
+                        None,
+                    );
+                }
+                steps.push_back(Step::Event(Event::Beam {
+                    power_percent: power,
+                }));
+                if op.pierce_delay_s > 0. {
+                    steps.push_back(Step::Event(Event::Dwell {
+                        seconds: op.pierce_delay_s,
+                    }));
+                }
                 push_move(
                     &mut steps,
                     at_z(pierce, z_cut),
                     &mut pos,
-                    MoveKind::Rapid,
-                    None,
+                    MoveKind::Plunge,
+                    op.plunge_mm_min,
                 );
             }
-            steps.push_back(Step::Event(Event::Beam {
-                power_percent: power,
-            }));
-            if op.pierce_delay_s > 0. {
-                steps.push_back(Step::Event(Event::Dwell {
-                    seconds: op.pierce_delay_s,
-                }));
-            }
-            push_move(
-                &mut steps,
-                at_z(pierce, z_cut),
-                &mut pos,
-                MoveKind::Plunge,
-                op.plunge_mm_min,
-            );
             let wear = op.compensation == Compensation::Wear;
             let comp_side = if op.reverse {
                 CompensationSide::Left
@@ -1581,7 +1783,16 @@ impl ThermalCutPlan {
             if thc_on {
                 steps.push_back(Step::Event(Event::HeightControl { on: false }));
             }
-            steps.push_back(Step::Event(Event::Beam { power_percent: 0. }));
+            // Chain cutting: the next outline may be reached by a link, so
+            // the beam stays on until that is decided at its start.
+            pending_link = op.chain.is_some()
+                && lp.hole.is_none()
+                && order
+                    .get(index + 1)
+                    .is_some_and(|&next| next < loops.len() && loops[next].hole.is_none());
+            if !pending_link {
+                steps.push_back(Step::Event(Event::Beam { power_percent: 0. }));
+            }
             steps.push_back(Step::Done);
             micro_joints += joints;
             // What this loop cut free: the hole's slug or the part, unless
@@ -1594,7 +1805,7 @@ impl ThermalCutPlan {
                 })
             });
             freed_by_loop.push(leaving);
-            if program {
+            if program && !pending_link {
                 push_move(
                     &mut steps,
                     [pos[0], pos[1], z_travel],
@@ -1879,7 +2090,9 @@ impl ThermalCutPlan {
             parts: definition.components.len(),
             loops: order.len() - common.len(),
             small_holes: small,
-            pierces: order.len() + usize::from(op.crop.is_some()),
+            pierces: order.len() + usize::from(op.crop.is_some()) - chain_links,
+            chain_links: op.chain.map(|_| chain_links),
+            chain_length_mm: op.chain.map(|_| chain_length),
             micro_joints,
             cut_length_mm: cut_length,
             order: report_order,

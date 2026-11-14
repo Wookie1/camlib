@@ -310,6 +310,12 @@ class GCodeDialect:
     # value if it differs; 0 demands exactly consistent words.
     radius_tolerance_mm: float = 0.00127
     radius_relative_tolerance: float = 0.001
+    # The start/end radius mismatch the post may WRITE (0: exactly consistent
+    # words only, whatever the controller accepts; at most
+    # radius_tolerance_mm). With it, arcs that have no exactly consistent
+    # words at the output's decimals stay arcs (at most half a turn each);
+    # the mismatch is charged to the block's deviation bound.
+    arc_word_mismatch_mm: float = 0
     fixed_modes: tuple[str, ...] = ()
     # Word carrying the thread lead in a tap_cycle block (Centroid rigid G84
     # takes Q on every line); None writes the synchronized feed F instead.
@@ -479,6 +485,11 @@ class GCodeDialect:
             raise ValueError('invalid declared circle radius tolerance')
         if not math.isfinite(self.radius_relative_tolerance) or not 0 <= self.radius_relative_tolerance <= 0.001:
             raise ValueError('invalid declared relative circle radius tolerance')
+        if (
+            not math.isfinite(self.arc_word_mismatch_mm)
+            or not 0 <= self.arc_word_mismatch_mm <= self.radius_tolerance_mm
+        ):
+            raise ValueError('arc_word_mismatch_mm must be within 0..radius_tolerance_mm (what the controller accepts)')
         if 'css_on' in declared:
             if ('css_limit' in declared) == (self.css_limit_word is not None):
                 raise ValueError(
@@ -787,6 +798,8 @@ class Machine:
             data.pop('schedule_post_feeds')
         if data['dialect']['beam_mark'] is None:
             data['dialect'].pop('beam_mark')
+        if not data['dialect']['arc_word_mismatch_mm']:
+            data['dialect'].pop('arc_word_mismatch_mm')
         return data
 
     def schedule(self, program, *, adjust_feeds=True, cancel=None):
@@ -1812,6 +1825,7 @@ class GCodePost(PostProcessor):
                 self.machine.dialect.radius_tolerance_mm,
                 self.machine.dialect.radius_relative_tolerance,
                 self.machine.max_sweep_rad,
+                self.machine.dialect.arc_word_mismatch_mm,
             )
         except ValueError as error:
             raise ValueError(
@@ -2984,6 +2998,7 @@ class NativeGCodeDecoder(GCodeDecoder):
                         'parentheses_comments',
                         'radius_tolerance_mm',
                         'radius_relative_tolerance',
+                        'arc_word_mismatch_mm',
                     )
                 }
             )
@@ -3216,6 +3231,7 @@ class PostEngine:
                                 'parentheses_comments',
                                 'radius_tolerance_mm',
                                 'radius_relative_tolerance',
+                                'arc_word_mismatch_mm',
                             )
                         },
                         codes={c.effect: c.code for c in d.commands},

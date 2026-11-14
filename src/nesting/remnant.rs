@@ -43,6 +43,11 @@ pub struct RemnantRequest {
     /// The thermal cut's corner loops: what they cut is removed too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corner_loops: Option<crate::thermal::CornerLoops>,
+    /// The thermal cut's chain cutting: a link runs between two leads, so
+    /// no point of it is further than half its longest length from one, and
+    /// that much more round every part is given up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<crate::thermal::ChainCutting>,
     #[serde(default = "boundary_tolerance")]
     pub boundary_tolerance_mm: f64,
     pub tolerance_mm: f64,
@@ -213,6 +218,15 @@ pub fn remnant(request: &RemnantRequest) -> Result<Remnant, String> {
         request.pierce_clearance_mm,
         request.corner_loops.as_ref(),
     );
+    if let Some(chain) = &request.chain
+        && !(chain.max_link_mm.is_finite() && chain.max_link_mm > 0. && chain.max_link_mm <= 1e6)
+    {
+        return Err(format!(
+            "remnant: chain max_link_mm {} must be positive",
+            chain.max_link_mm
+        ));
+    }
+    let cut_reach_mm = cut_reach_mm + request.chain.map_or(0., |chain| chain.max_link_mm / 2.);
     let required = cut_reach_mm + request.remnant_margin_mm;
     let empty = |components| PlanarRegion {
         version: 1,

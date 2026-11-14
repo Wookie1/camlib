@@ -8,7 +8,7 @@ use std::f64::consts::TAU;
 
 const ABS_0_005: RadiusTolerance = RadiusTolerance {
     absolute_mm: 0.005,
-    relative: 0.,
+    relative: 0., written_mm: 0.
 };
 
 fn decoder() -> Decoder {

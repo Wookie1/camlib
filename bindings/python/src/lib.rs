@@ -2233,7 +2233,7 @@ fn probe_legs(
 }
 
 #[pyfunction]
-#[pyo3(signature = (curve_json, start, unit, decimals, geometry_tolerance, output_tolerance, radius_tolerance, radius_relative_tolerance=0.0, max_sweep_rad=f64::INFINITY))]
+#[pyo3(signature = (curve_json, start, unit, decimals, geometry_tolerance, output_tolerance, radius_tolerance, radius_relative_tolerance=0.0, max_sweep_rad=f64::INFINITY, arc_word_mismatch=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn round_circular_words(
     curve_json: &str,
@@ -2245,6 +2245,7 @@ fn round_circular_words(
     radius_tolerance: f64,
     radius_relative_tolerance: f64,
     max_sweep_rad: f64,
+    arc_word_mismatch: f64,
 ) -> PyResult<(Vec<f64>, Vec<f64>)> {
     if curve_json.len() > 4096 {
         return Err(PyValueError::new_err(
@@ -2263,6 +2264,7 @@ fn round_circular_words(
         camlib::post_rounding::RadiusTolerance {
             absolute_mm: radius_tolerance,
             relative: radius_relative_tolerance,
+            written_mm: arc_word_mismatch,
         },
         max_sweep_rad,
     )

@@ -875,3 +875,130 @@ fn corner_slowdown_reduces_the_feed_round_corners_with_height_control_held_off()
         assert!(error.contains(word), "{error}");
     }
 }
+
+/// Beam-on events (pierces) and the lead moves longer than any lead-in or
+/// lead-out (the chain links), as the program runs them.
+type Link = ([f64; 3], [f64; 3]);
+fn pierces_and_links(events: &[Event]) -> (usize, Vec<Link>) {
+    let mut pierces = 0;
+    let mut links = vec![];
+    let mut on = false;
+    for e in events {
+        match e {
+            Event::Beam { power_percent } => {
+                pierces += usize::from(*power_percent > 0.);
+                on = *power_percent > 0.;
+            }
+            Event::Motion { motion } if motion.kind == MoveKind::Lead => {
+                assert!(on, "a lead with the beam off: {motion:?}");
+                if matches!(motion.curve, Curve::Line { .. }) && length(&motion.curve) > 5. {
+                    links.push((motion.curve.start(), motion.curve.end()));
+                }
+            }
+            _ => {}
+        }
+    }
+    (pierces, links)
+}
+
+#[test]
+fn chain_cutting_joins_outlines_through_the_scrap_with_one_pierce() {
+    let cut = |extra: serde_json::Value| {
+        let mut op = operation(extra);
+        op.parts = row();
+        run(op)
+    };
+    let squares: Vec<[f64; 4]> =
+        (0..5).map(|k| [10. + 36. * k as f64, 40., 36. + 36. * k as f64, 66.]).collect();
+    let off = |p: [f64; 2], s: &[f64; 4]| {
+        let dx = (s[0] - p[0]).max(p[0] - s[2]).max(0.);
+        let dy = (s[1] - p[1]).max(p[1] - s[3]).max(0.);
+        dx.hypot(dy)
+    };
+    // Without the option: a pierce for every hole and every outline.
+    let (events, plan, _) = cut(serde_json::json!({})).unwrap();
+    let plain = serde_json::to_value(plan.report()).unwrap();
+    assert_eq!(pierces_and_links(&events), (10, vec![]));
+    assert_eq!(plain["pierces"], 10);
+    assert!(plain.get("chain_links").is_none());
+    // Chained: the holes first, then the five outlines on one pierce.
+    let (events, plan, stock) = cut(serde_json::json!({"chain": {"max_link_mm": 45.}})).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    let (pierces, links) = pierces_and_links(&events);
+    assert_eq!((pierces, links.len()), (6, 4));
+    assert_eq!((report["pierces"].as_u64(), report["chain_links"].as_u64()), (Some(6), Some(4)));
+    let total: f64 = links
+        .iter()
+        .map(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]))
+        .sum();
+    assert!((report["chain_length_mm"].as_f64().unwrap() - total).abs() < 1e-9);
+    // Every hole before every outline; each part's hole before its outline.
+    let order = report["order"].as_array().unwrap();
+    assert!(order[..5].iter().all(|l| !l[1].is_null()) && order[5..].iter().all(|l| l[1].is_null()));
+    // Independently of the planner: each link's kerf (0.75 mm either side
+    // of it) stays off every part, and is no longer than declared.
+    for (a, b) in &links {
+        assert!((a[0] - b[0]).hypot(a[1] - b[1]) <= 45.);
+        for k in 0..=400 {
+            let t = k as f64 / 400.;
+            let p = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+            assert!(squares.iter().all(|s| off(p, s) > 0.75), "{p:?}");
+        }
+    }
+    // The same feed-seconds less nothing, the dwells for four pierces less.
+    assert!(
+        (plain["dwell_seconds"].as_f64().unwrap() - report["dwell_seconds"].as_f64().unwrap() - 2.)
+            .abs()
+            < 1e-9
+    );
+    // Every part is still cut free and kept: its outline's kerf is open
+    // and the part beside it stands.
+    for s in &squares {
+        let y = 0.5 * (s[1] + s[3]);
+        assert!(top_at(&stock, [s[0] - 0.75, y]).1 <= 0.01, "{s:?}");
+        assert!(top_at(&stock, [s[2] + 0.75, y]).1 <= 0.01, "{s:?}");
+        assert!(top_at(&stock, [s[0] + 3., y]).0 >= 5.99, "{s:?}");
+    }
+    // Round parts with holes, staggered: the kerf paths are arcs and the
+    // links leave them at an angle. Each link still stays its kerf's half
+    // width off every disc, measured from the disc centres.
+    let discs: Vec<[f64; 2]> = (0..5)
+        .map(|k| [24. + 34. * k as f64, if k % 2 == 0 { 40. } else { 58. }])
+        .collect();
+    let mut op = operation(serde_json::json!({"chain": {"max_link_mm": 60.}}));
+    op.parts = PlanarRegion {
+        components: discs
+            .iter()
+            .map(|c| Component {
+                outer: circle(*c, 12.),
+                holes: vec![circle(*c, 4.)],
+            })
+            .collect(),
+        ..row()
+    };
+    let (events, plan, _) = run(op).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    let (pierces, links) = pierces_and_links(&events);
+    assert!(!links.is_empty() && pierces == 10 - links.len(), "{pierces} {links:?}");
+    assert_eq!(report["chain_links"].as_u64(), Some(links.len() as u64));
+    for (a, b) in &links {
+        for k in 0..=400 {
+            let t = k as f64 / 400.;
+            let p = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+            assert!(
+                discs.iter().all(|c| (p[0] - c[0]).hypot(p[1] - c[1]) > 12. + 0.75),
+                "{p:?}"
+            );
+        }
+    }
+    // A link longer than declared is not cut: the next outline is pierced.
+    let (events, plan, _) = cut(serde_json::json!({"chain": {"max_link_mm": 5.}})).unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    assert_eq!(pierces_and_links(&events), (10, vec![]));
+    assert_eq!((report["pierces"].as_u64(), report["chain_links"].as_u64()), (Some(10), Some(0)));
+    // Refusals name the problem.
+    let error = cut(serde_json::json!({"chain": {"max_link_mm": 0.}})).err().unwrap();
+    assert!(error.contains("max_link_mm"), "{error}");
+    let error = cut(serde_json::json!({"chain": {"max_link_mm": 45.}, "common_line": {"min_length_mm": 5.}})).err().unwrap();
+    assert!(error.contains("chain is not planned together with common_line"), "{error}");
+}

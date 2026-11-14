@@ -3,7 +3,7 @@ use crate::{
     motion::{Curve, Vec3},
     post::{curve_difference, format_number},
 };
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 
 /// A controller's accepted mismatch between the start and end radius of
 /// circular words (LinuxCNC `arc_data_ijk`, interp_arc.cc): accepted when
@@ -17,6 +17,12 @@ pub struct RadiusTolerance {
     pub absolute_mm: f64,
     #[serde(default)]
     pub relative: f64,
+    /// The mismatch the post may write (0: exactly consistent words only,
+    /// whatever the controller accepts; at most `absolute_mm`). Declared by
+    /// a dialect whose controller documents its tolerance and whose arcs
+    /// are to stay arcs at the output's decimals.
+    #[serde(default)]
+    pub written_mm: f64,
 }
 impl RadiusTolerance {
     pub fn valid(&self) -> bool {
@@ -24,6 +30,8 @@ impl RadiusTolerance {
             && (0. ..=0.005).contains(&self.absolute_mm)
             && self.relative.is_finite()
             && (0. ..=0.001).contains(&self.relative)
+            && self.written_mm.is_finite()
+            && (0. ..=self.absolute_mm).contains(&self.written_mm)
     }
     pub fn accepts(&self, r1: f64, r2: f64) -> bool {
         self.accepts_error((r1 - r2).abs(), r1.max(r2))
@@ -246,8 +254,25 @@ pub fn circular_words(
                 sweep_rad: w,
             }
         };
-        // Reserve rounding margin below the source/stock consistency tolerance.
-        curve.prepare((geometry_tolerance * 0.5).max(1e-9)).ok()?;
+        // The written arc as the decoder will read it: from the start round
+        // the written centre, so its end misses the written end by the
+        // words' radius mismatch. Words are exactly consistent (the arc
+        // closes within half the source tolerance) unless the dialect
+        // declares a mismatch it may write (`written_mm`, within what the
+        // controller accepts): then the session that certifies the block
+        // prepares the decoded arc at the output tolerance,
+        // `curve_difference` below charges the mismatch to the error (the
+        // controller's path between the two radii is not known closer), and
+        // the block is replayed as one circle (`post::replay_curve`), which
+        // is proven to stay between the two radii for at most half a turn:
+        // a longer arc keeps exactly consistent words.
+        let exact = (geometry_tolerance * 0.5).max(1e-9);
+        let closes_within = if w.abs() <= PI {
+            radius_tolerance.written_mm.max(exact)
+        } else {
+            exact
+        };
+        curve.prepare(closes_within).ok()?;
         let error = curve_difference(source, &curve, geometry_tolerance).ok()?;
         (error <= output_tolerance).then_some(error)
     };
@@ -366,6 +391,13 @@ mod tests {
     const ABS_0_005: RadiusTolerance = RadiusTolerance {
         absolute_mm: 0.005,
         relative: 0.,
+        written_mm: 0.,
+    };
+    /// The same, and the post may write that mismatch.
+    const WRITES_0_005: RadiusTolerance = RadiusTolerance {
+        absolute_mm: 0.005,
+        relative: 0.,
+        written_mm: 0.005,
     };
     /// LinuxCNC 2.9 interp_arc.cc: rejected when abs > 100 T, or when
     /// rel > R and abs > T (T = CENTER_ARC_RADIUS_TOLERANCE_MM, R = 0.001).
@@ -374,6 +406,7 @@ mod tests {
         let linuxcnc = RadiusTolerance {
             absolute_mm: 0.00127,
             relative: 0.001,
+            written_mm: 0.,
         };
         assert!(linuxcnc.accepts(2., 2.00127));
         // r = 2: 0.005 is 0.25 % and above T: LinuxCNC refuses it.
@@ -386,19 +419,22 @@ mod tests {
         let exact = RadiusTolerance {
             absolute_mm: 0.,
             relative: 0.001,
+            written_mm: 0.,
         };
         assert!(exact.accepts(5., 5.) && !exact.accepts(5., 5.000001));
         assert!(
             !RadiusTolerance {
                 absolute_mm: 0.006,
-                relative: 0.
+                relative: 0.,
+                written_mm: 0.,
             }
             .valid()
         );
         assert!(
             !RadiusTolerance {
                 absolute_mm: 0.001,
-                relative: 0.002
+                relative: 0.002,
+                written_mm: 0.,
             }
             .valid()
         );
@@ -406,7 +442,6 @@ mod tests {
 
     use super::*;
     use crate::motion::Plane;
-    use std::f64::consts::PI;
 
     /// Regression: an ordinary pocket arc around an r=4 island (Ø6 cutter).
     /// The previous segment's endpoint was already rounded (Y21.99983). At 3
@@ -609,6 +644,7 @@ mod tests {
     const EXACT: RadiusTolerance = RadiusTolerance {
         absolute_mm: 0.,
         relative: 0.,
+        written_mm: 0.,
     };
 
     /// Issue #169: X29.999 Y20 I10.002 J0.006 from (9.995, 20) has exactly
@@ -652,6 +688,78 @@ mod tests {
         assert_eq!(radii.start, (x * x).sqrt());
         assert_eq!(radii.end, (ex * ex).sqrt());
         assert_eq!(radii.error, (radii.start - radii.end).abs());
+    }
+
+    /// Shallow arcs of a large radius at four decimals of an inch: few have
+    /// words whose radii are equal on the word grid, so a controller with no
+    /// documented radius tolerance gets most of them as checked lines.
+    /// Where the dialect declares the mismatch it may write, every one has
+    /// words whose mismatch the controller accepts, and both circles the words describe (through the
+    /// start and through the end) stay within the output tolerance of the
+    /// planned arc.
+    #[test]
+    fn a_declared_radius_tolerance_keeps_shallow_inch_arcs_as_arcs() {
+        let (cx, cy, r, sweep) = (33.337, 47.219, 60.3, 0.3);
+        let mut kept = [0, 0];
+        let mut widest = 0f64;
+        for k in 0..64 {
+            let a0 = 0.1 + k as f64 * 0.37;
+            let a1 = a0 + sweep;
+            let quantize = |v: f64| (v / 25.4 * 1e4).round() / 1e4 * 25.4;
+            // The controller stands where the last block ended: the planned
+            // start, rounded to a word.
+            let planned = [cx + r * a0.cos(), cy + r * a0.sin(), 0.];
+            let start = [quantize(planned[0]), quantize(planned[1]), 0.];
+            let source = Curve::Arc {
+                start: planned,
+                end: [cx + r * a1.cos(), cy + r * a1.sin(), 0.],
+                center: [cx, cy, 0.],
+                plane: Plane::Xy,
+                sweep_rad: sweep,
+            };
+            for (i, tolerance) in [EXACT, WRITES_0_005].into_iter().enumerate() {
+                let Ok((end, offsets)) =
+                    circular_words(&source, start, 25.4, 4, 1e-5, 0.01, tolerance, PI)
+                else {
+                    continue;
+                };
+                kept[i] += 1;
+                let radii = arc_radii(
+                    [start[0], start[1]],
+                    [end[0], end[1]],
+                    [offsets[0], offsets[1]],
+                    25.4,
+                );
+                assert!(tolerance.accepts_arc(&radii), "{radii:?}");
+                widest = widest.max(radii.error);
+                let c = [start[0] + offsets[0], start[1] + offsets[1]];
+                let from = (start[1] - c[1]).atan2(start[0] - c[0]);
+                let to = (end[1] - c[1]).atan2(end[0] - c[0]);
+                let turned = (to - from).rem_euclid(TAU);
+                for j in 0..=64 {
+                    let angle = from + turned * j as f64 / 64.;
+                    for radius in [radii.start, radii.end] {
+                        let p = [c[0] + radius * angle.cos(), c[1] + radius * angle.sin()];
+                        // Off the planned arc: off its circle, or past its ends.
+                        let at = (p[1] - cy).atan2(p[0] - cx);
+                        let along = (at - a0).rem_euclid(TAU);
+                        let off = if along <= sweep {
+                            ((p[0] - cx).hypot(p[1] - cy) - r).abs()
+                        } else {
+                            let s = source.start();
+                            let e = source.end();
+                            (p[0] - s[0])
+                                .hypot(p[1] - s[1])
+                                .min((p[0] - e[0]).hypot(p[1] - e[1]))
+                        };
+                        assert!(off <= 0.01, "{off} at {angle}");
+                    }
+                }
+            }
+        }
+        assert!(kept[1] == 64 && kept[0] < 32, "{kept:?}");
+        // The tolerance was needed: some words differ in radius.
+        assert!(widest > 1e-4 && widest <= 0.005, "{widest}");
     }
 
     /// The word chooser keeps exactly consistent authored words at zero

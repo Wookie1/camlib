@@ -127,6 +127,7 @@ Key settings:
 | `fixed_modes` | Modes the controller always has, so they are not written |
 | `radius_tolerance_mm` | Allowed start/end radius mismatch of written arcs (0 to 0.005; default LinuxCNC's 0.00127) |
 | `radius_relative_tolerance` | Relative mismatch also allowed up to 100 × `radius_tolerance_mm` (0 to 0.001; default LinuxCNC's 0.001) |
+| `arc_word_mismatch_mm` | Start/end radius mismatch the post may *write* (0 to `radius_tolerance_mm`; default 0: exactly consistent words only) |
 | `dwell_word`, `dwell_resolution_s`, `dwell_max_s` | Dwell word, step and range |
 | `cycle_dwell_unit`, `peck_reentry_mm`, `chip_break_lift_mm` | Canned-cycle dwell unit and the controller's peck return amounts |
 | `tap_pitch_word` | Lead word of a rigid tapping cycle (Centroid Q), or feed |
@@ -285,6 +286,22 @@ documented ones (0.00127 mm and 0.1 %), so a stock LinuxCNC accepts every
 block; declare your INI's `CENTER_ARC_RADIUS_TOLERANCE_MM` if it differs (at
 most 0.005 here). `radius_tolerance_mm=0` demands exactly consistent words, as
 the controller posts above without a documented tolerance use.
+
+What the controller accepts and what the post writes are declared apart. By
+default the post writes only exactly consistent words (start and end radius
+equal on the word grid), whatever the controller would accept; an arc that
+has none within the posting tolerance at the output's decimals is posted as
+checked lines (`native_arcs=True`) or refused. Shallow arcs of a large radius
+at four decimals of an inch are the usual case. A dialect that declares
+`arc_word_mismatch_mm` (at most `radius_tolerance_mm`) lets the post write
+words that differ in radius by up to that much, for arcs of at most half a
+turn, so those arcs stay arcs. Such a block is certified with the mismatch
+added to its deviation bound: how the controller blends the two radii is not
+assumed, only that its path lies between the circle through the start and the
+circle through the end about the written centre. The posted program's stock
+and machine checks then replay the block as one exact circle, through the
+written start and end with its centre moved along the chord onto its
+bisector, which lies in that same band.
 
 The radii are decided on the words themselves, so every platform writes the
 same program (issue #169). When the start, end and centre offsets are all

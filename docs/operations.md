@@ -1941,6 +1941,30 @@ cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=
   counts the slowed stretches (`corner_slowdowns`), and `feed_seconds`
   includes them at their feed. A laser's power ramp at corners is not
   offered: no post here has a controller that documents one.
+- **Chain cutting**: `chain=camlib.ChainCutting(max_link_mm)` joins the
+  outlines of parts cut one after the other by a straight cut through the
+  scrap, from the end of one outline's lead-out to the start of the next
+  one's lead-in: the beam stays on, and the next part needs no pierce and no
+  pierce delay (Amada AP100US, "Chain and Bridge Cutting": one continuous cut
+  for the part boundaries, holes cut on their own, a longest chain length).
+  A link is cut only where it is no longer than `max_link_mm` (no default),
+  its kerf is proven clear of every part like a lead and, with
+  `avoid_cut_parts`, it keeps that clearance from the pieces already cut
+  free; where it is not, the beam goes off and the next outline is pierced
+  as before. Holes are always pierced. Parts cut one after the other, equally
+  deep, whose outlines start within `max_link_mm` of each other form a
+  chain: its holes are cut first, then its outlines, so every hole is still
+  cut before its own outline and nested parts before the parts round them.
+  Which parts follow each other is `part_order`'s. A chained outline starts
+  where a link reaches it: of its corners, stroke ends and edge middles
+  (less any edge `lead_placement` keeps free of leads), the one with the
+  shortest clear link whose leads are clear too; `leads_moved` counts it
+  when `lead_placement` is declared. Where none is reachable the outline
+  starts as it otherwise would and is pierced. A link is fed at the cut's feed with height control off,
+  like a lead, and posted as an ordinary feed move with the torch on. Not
+  planned together with `common_line`. The report counts the links
+  (`chain_links`) and their length (`chain_length_mm`, not in
+  `cut_length_mm`); `pierces` and `dwell_seconds` drop accordingly.
 - **Crop cut**: `crop=camlib.CropCut(((x0, y0), (x1, y1)))` (or three points
   for an L) adds a last cut that frees the usable offcut from the skeleton.
   The points are the kerf's centre line in the sheet's coordinates. The beam

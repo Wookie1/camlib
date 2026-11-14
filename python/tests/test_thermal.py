@@ -46,7 +46,7 @@ def job(tool=None, **cut):
     op = camlib.ThermalCut(
         "plasma",
         tool,
-        parts(),
+        values.pop("parts", None) or parts(),
         2500,
         values.pop("cut_height_mm", 1.5),
         **{'pierce_delay_s': 0, 'power_percent': 100, 'tool_number': 1, 'length_register': 1, **values},
@@ -374,6 +374,167 @@ class ThermalCutTest(unittest.TestCase):
             accept={"unchecked_machine"},
         ).text.splitlines()
         self.assertEqual(nc2.count("M71"), 6)
+        # A table whose own programs carry no start macro and run in the
+        # operator's local coordinates (ShopSabre with ProNest's post: G90,
+        # the cuts between M61 and M62, M66): neither M65 nor G92 is written,
+        # a comment states each premise instead, and the program still
+        # decodes back to the plan.
+        m3 = w.define_machine(
+            "table",
+            ToolSetting.for_tool(tool, number=1, length_register=1, position_after_mm=header.initial_position_mm),
+            start_code=None,
+            local_coordinates="keep",
+            output_units='inch',
+            decimals=4,
+            max_feed_mm_min=10000,
+            max_spindle_rpm=30000,
+            arcs=True,
+            helices=False,
+            max_tool_number=1,
+            max_length_register=1,
+            tool_changes=True,
+            rapid_mm_min=6000,
+        )
+        nc3 = j.post_nc(
+            "sheet",
+            machine=m3,
+            post=w.WinCNCPlasmaPost,
+            decoder=w.WinCNCPlasmaDecoder,
+            lowering=camlib.LoweringOptions(native_arcs=True),
+            accept={"unchecked_machine"},
+        ).text.splitlines()
+        self.assertEqual(nc3[:6], ["G90", "G20", "G40", "G49", "(WORK ZERO AS SET AT THE MACHINE)", "(TORCH TORCH)"])
+        self.assertTrue(nc3[6].startswith("G0 X"), nc3[6])
+        self.assertNotIn("G92", nc3)
+        self.assertNotIn("M65", nc3)
+        self.assertEqual((nc3.count("M61"), nc3.count("M62"), nc3[-1]), (6, 6, "M66"))
+        # Every other line is the same program as with the macro and G92.
+        m4 = replace(m3, start_code="M65", local_coordinates="cancel")
+        nc4 = j.post_nc(
+            "sheet",
+            machine=m4,
+            post=w.WinCNCPlasmaPost,
+            decoder=w.WinCNCPlasmaDecoder,
+            lowering=camlib.LoweringOptions(native_arcs=True),
+            accept={"unchecked_machine"},
+        ).text.splitlines()
+        self.assertEqual([line for line in nc4 if line not in ("G92", "M65")], [line for line in nc3 if line[0] != "("])
+        # Height control from the program (WinCNC's L36 on, L37 off): off
+        # before the first torch-on, on over each loop's cut and off again
+        # before its lead-out (never on in the small hole), and left on at
+        # the end. Without the declaration the command is refused.
+        jh = job(tool, **{**fixed, "height_control": True})
+        jh = camlib.Job("plasma", "1", (replace(jh.setups[0], initial_position_mm=(0, 0, THICKNESS + 1.5)),))
+        nch = jh.post_nc(
+            "sheet",
+            machine=replace(m3, program_height_control=True),
+            post=w.WinCNCPlasmaPost,
+            decoder=w.WinCNCPlasmaDecoder,
+            lowering=camlib.LoweringOptions(native_arcs=True),
+            accept={"unchecked_machine"},
+        ).text.splitlines()
+        self.assertEqual(nch[nch.index("M61") - 1], "L37")
+        self.assertEqual((nch.count("L36"), nch.count("L37")), (5 + 1, 5 + 1))
+        self.assertEqual(nch[-3:], ["M62", "L36", "M66"])
+        state, torch = None, False
+        for line in nch:
+            if line in ("M61", "M62"):
+                # Never on when the torch fires or goes out.
+                self.assertIs(state, False, line)
+                torch = line == "M61"
+            elif line in ("L36", "L37"):
+                state = line == "L36"
+                self.assertTrue(torch or line == "L37" or nch[-2] == line)
+        self.assertEqual([line for line in nch if line not in ("L36", "L37")], nc3)
+        with self.assertRaisesRegex(Exception, "program_height_control=True"):
+            jh.post_nc(
+                "sheet",
+                machine=m3,
+                post=w.WinCNCPlasmaPost,
+                decoder=w.WinCNCPlasmaDecoder,
+                lowering=camlib.LoweringOptions(native_arcs=True),
+                accept={"unchecked_machine"},
+            )
+        # Arcs. A plate whose edges are shallow arcs of a large radius, at a
+        # position four decimals of an inch do not state exactly: with
+        # exactly consistent words required most of those arcs have none and
+        # are posted as checked lines. WinCNC takes arcs within its arc_err
+        # setting; declared, every arc stays an arc, and the program is
+        # still decoded and certified against the plan.
+        bowed = PlanarRegion(
+            "bowed",
+            (
+                Component(
+                    Boundary(
+                        (
+                            (33.337, 27.219, 0.04),
+                            (153.337, 27.219, 0.04),
+                            (153.337, 97.219, 0.04),
+                            (33.337, 97.219, 0.04),
+                        )
+                    )
+                ),
+            ),
+            0,
+        )
+        jb = job(tool, parts=bowed, **fixed)
+        jb = camlib.Job("plasma", "1", (replace(jb.setups[0], initial_position_mm=(0, 0, THICKNESS + 1.5)),))
+        exact, tolerant = (
+            jb.post_nc(
+                "sheet",
+                machine=machine,
+                post=w.WinCNCPlasmaPost,
+                decoder=w.WinCNCPlasmaDecoder,
+                lowering=camlib.LoweringOptions(native_arcs=True),
+                accept={"unchecked_machine"},
+            ).text.splitlines()
+            for machine in (m3, replace(m3, arc_radius_tolerance_mm=0.005, dialect=w._dialect("M66", 0.005)))
+        )
+        count = lambda lines, codes: sum(line[:2] in codes for line in lines)  # noqa: E731
+        self.assertGreater(count(exact, ("G1",)), 20)
+        # The four edges and the leads' arcs; the only lines are the leads' own.
+        self.assertLessEqual(count(tolerant, ("G1",)), 2)
+        self.assertGreaterEqual(count(tolerant, ("G2", "G3")), 4)
+        self.assertLess(len(tolerant), len(exact))
+        with self.assertRaisesRegex(ValueError, "radius tolerance"):
+            w._dialect("M66", 0.05)
+        # The feed from the control's material setup: declared, no F word is
+        # written, the program still decodes to the plan (the decoder cuts at
+        # the declared feed), and it is the F-word program less its F words.
+        # A cut planned at another feed anywhere (here the small hole's 60 %)
+        # is refused: the program could not say it.
+        material = replace(m3, material_feed_mm_min=2500)
+        js = job(tool, **{**fixed, "small_holes": None})
+        js = camlib.Job("plasma", "1", (replace(js.setups[0], initial_position_mm=(0, 0, THICKNESS + 1.5)),))
+        with_f, without_f = (
+            js.post_nc(
+                "sheet",
+                machine=machine,
+                post=w.WinCNCPlasmaPost,
+                decoder=w.WinCNCPlasmaDecoder,
+                lowering=camlib.LoweringOptions(native_arcs=True),
+                accept={"unchecked_machine"},
+            ).text.splitlines()
+            for machine in (m3, material)
+        )
+        self.assertTrue(any(" F" in line for line in with_f))
+        self.assertFalse(any("F" in line for line in without_f if line[0] != "("), without_f[:12])
+        self.assertEqual([" ".join(word for word in line.split(" ") if word[0] != "F") for line in with_f], without_f)
+        with self.assertRaisesRegex(Exception, "planned at 1500 mm/min.*material_feed_mm_min"):
+            j.post_nc(
+                "sheet",
+                machine=material,
+                post=w.WinCNCPlasmaPost,
+                decoder=w.WinCNCPlasmaDecoder,
+                lowering=camlib.LoweringOptions(native_arcs=True),
+                accept={"unchecked_machine"},
+            )
+        with self.assertRaisesRegex(ValueError, "material_feed_mm_min"):
+            replace(m3, material_feed_mm_min=0)
+        with self.assertRaisesRegex(ValueError, "local_coordinates"):
+            replace(m3, local_coordinates="machine")
+        with self.assertRaisesRegex(ValueError, "distinct M macro codes"):
+            replace(m3, torch_off_code="M61")
 
     def test_micro_joints(self):
         report = None
@@ -701,6 +862,135 @@ def inside_polygon(p, vertices):
         if (y0 > p[1]) != (y1 > p[1]) and p[0] < x0 + (p[1] - y0) * (x1 - x0) / (y1 - y0):
             inside = not inside
     return inside
+
+
+class ChainCuttingTest(unittest.TestCase):
+    """Chain cutting (#296 B2): one pierce for a row of parts, the links cut
+    through the scrap with the torch on."""
+
+    @staticmethod
+    def row():
+        squares = [(10 + 36 * k, 40, 36 + 36 * k, 66) for k in range(5)]
+        return squares, PlanarRegion(
+            "row",
+            tuple(
+                Component(
+                    Boundary.polygon(((x0, y0), (x1, y0), (x1, y1), (x0, y1))),
+                    (circle((x0 + 13, y0 + 13), 5),),
+                )
+                for x0, y0, x1, y1 in squares
+            ),
+            0,
+        )
+
+    def cut(self, **options):
+        squares, region = self.row()
+        beam, links, report = False, [], None
+        pierces = 0
+        with job(parts=region, **options).regenerate() as run:
+            for u in run:
+                update = u.update
+                if isinstance(update, VerificationUpdate):
+                    self.assertEqual(update.status, "clear", update)
+                if isinstance(update, OperationUpdate) and update.stage == "events":
+                    for event in update.events:
+                        if event["kind"] == "beam":
+                            beam = event["power_percent"] > 0
+                            pierces += beam
+                motion = getattr(update, "motion", None)
+                if motion is not None and motion["kind"] == "lead":
+                    self.assertTrue(beam, motion)
+                    a, b = motion["curve"]["start"], motion["curve"]["end"]
+                    if motion["curve"]["kind"] == "line" and math.dist(a[:2], b[:2]) > 5:
+                        links.append((a, b))
+                if isinstance(update, OperationUpdate) and update.stage == "end":
+                    report = update.report
+        return squares, pierces, links, report
+
+    def test_a_row_is_cut_on_one_pierce_and_every_link_is_clear(self):
+        _, pierces, links, plain = self.cut()
+        self.assertEqual((pierces, links, plain["pierces"]), (10, [], 10))
+        self.assertNotIn("chain_links", plain)
+        squares, pierces, links, report = self.cut(chain=camlib.ChainCutting(45))
+        self.assertEqual((pierces, len(links)), (6, 4))
+        self.assertEqual((report["pierces"], report["chain_links"]), (6, 4))
+        self.assertAlmostEqual(report["chain_length_mm"], sum(math.dist(a[:2], b[:2]) for a, b in links), places=9)
+        # Four pierce delays fewer, and the travel between the outlines gone.
+        self.assertAlmostEqual(plain["dwell_seconds"] - report["dwell_seconds"], 4 * 0.5, places=9)
+        self.assertLess(report["rapid_length_mm"], plain["rapid_length_mm"])
+        # The holes before the outlines, every part's hole before its outline.
+        self.assertTrue(all(hole is not None for _, hole in report["order"][:5]))
+        self.assertTrue(all(hole is None for _, hole in report["order"][5:]))
+        # Independently of the planner: every link's kerf (0.75 mm either
+        # side) stays off every part, and none is longer than declared.
+        for a, b in links:
+            self.assertLessEqual(math.dist(a[:2], b[:2]), 45)
+            for k in range(401):
+                x, y = (a[i] + k / 400 * (b[i] - a[i]) for i in range(2))
+                for x0, y0, x1, y1 in squares:
+                    off = math.hypot(max(x0 - x, x - x1, 0), max(y0 - y, y - y1, 0))
+                    self.assertGreater(off, 0.75, (a, b, x, y))
+
+    def test_a_link_that_is_too_long_or_not_declared_sensibly(self):
+        _, pierces, links, report = self.cut(chain=camlib.ChainCutting(5))
+        self.assertEqual((pierces, links, report["pierces"], report["chain_links"]), (10, [], 10, 0))
+        with self.assertRaisesRegex(Exception, "max_link_mm"):
+            self.cut(chain=camlib.ChainCutting(0))
+        with self.assertRaisesRegex(Exception, "chain is not planned together with common_line"):
+            self.cut(chain=camlib.ChainCutting(45), common_line=camlib.CommonLine(5))
+
+    def test_a_chain_posts_through_every_plasma_post_in_inches(self):
+        # The links are ordinary feed moves with the torch on: each post
+        # writes four torch-on codes fewer, and its program decodes back to
+        # the plan.
+        from dataclasses import replace
+
+        from test_drill_cycles import example
+
+        _, region = self.row()
+        tool = camlib.Torch("torch", kerf_width=1.5)
+        fixed, limits = BeamPostsInInchesTest.FIXED, BeamPostsInInchesTest.LIMITS
+        for module, post, decoder, machine, cut, on in (
+            (
+                "qtplasmac_post",
+                "QtPlasmaCPost",
+                "QtPlasmaCDecoder",
+                dict(planes=("xy",), max_sweep_rad=math.tau),
+                {},
+                "M3",
+            ),
+            (
+                "centroid_plasma_post",
+                "CentroidPlasmaPost",
+                "CentroidPlasmaDecoder",
+                dict(max_sweep_rad=math.tau),
+                dict(height_control=False),
+                "M61",
+            ),
+            ("wincnc_plasma_post", "WinCNCPlasmaPost", "WinCNCPlasmaDecoder", {}, dict(height_control=False), "M61"),
+        ):
+            m = example(module)
+            counts = []
+            for options in ({}, dict(chain=camlib.ChainCutting(45))):
+                j = job(tool, parts=region, **{**fixed, **cut, **options})
+                start = replace(j.setups[0], initial_position_mm=(0, 0, THICKNESS + 1.5))
+                j = camlib.Job("plasma", "1", (start,))
+                header = j.compile().setup("sheet").program_header()
+                setting = ToolSetting.for_tool(
+                    tool, number=1, length_register=1, position_after_mm=header.initial_position_mm
+                )
+                posted = j.post_nc(
+                    "sheet",
+                    machine=m.define_machine(
+                        "table", setting, output_units="inch", decimals=4, helices=False, **limits, **machine
+                    ),
+                    post=getattr(m, post),
+                    decoder=getattr(m, decoder),
+                    lowering=camlib.LoweringOptions(native_arcs=True),
+                    accept={"unchecked_machine"},
+                )
+                counts.append(sum(line.split()[0] == on for line in posted.text.splitlines() if line.split()))
+            self.assertEqual(counts, [10, 6], module)
 
 
 class StraightEdgedHolesTest(unittest.TestCase):

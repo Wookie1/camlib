@@ -39,6 +39,7 @@ cut = dataclasses.replace(cut, parts=result.region)   # cut the nest
 | `sheet` | A `PlanarRegion` of one outline; its holes are areas already cut out of a remnant |
 | `parts` | `NestPart(region, quantity, rotations_deg, mirror=False, priority=0, fill=False)`: a `PlanarRegion` of one outline with holes, the number of copies, the allowed rotations (degrees counter-clockwise; `(0,)` keeps the part as drawn), and whether it may also be turned over. Parts of a higher `priority` are placed first (nearest the start corner). `fill=True` makes a filler: placed after every other part, as many copies as fit up to `quantity`, with no refusal for the rest (the result's `filled` lists `(part, copies)`) |
 | `kerf_mm`, `lead_in`, `lead_out`, `pierce_clearance_mm` | What the cut will use. `Nest.for_cut(cut, ...)` reads them, and the tolerances, from a `ThermalCut` |
+| `chain` | The cut's `ChainCutting`, if it has one (`Nest.for_cut` reads it). The layout is the same with or without it; `Nest.remnant` gives up half of `max_link_mm` more round every part, since a link cuts through the scrap between two parts' leads |
 | `corner_loops` | The cut's `CornerLoops`, if it has them (`Nest.for_cut` reads it): room is kept for the loops as for the leads, `overshoot / tan(min angle / 4)` beyond the kerf path's corner |
 | `part_spacing_mm` | Material left between what is cut for two parts |
 | `edge_margin_mm` | Material left between what is cut for a part and the sheet's outline or holes |

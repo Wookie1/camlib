@@ -222,6 +222,9 @@ class Nest:
     pierce_clearance_mm: float | None = None
     # The cut's CornerLoops: room is kept for the loops as for the leads.
     corner_loops: object | None = None
+    # The cut's ChainCutting: its links cut through the scrap between parts,
+    # so the remnant gives up half the longest link more round every part.
+    chain: object | None = None
     part_in_part: bool = True
     allow_unplaced: bool = False
     search_iterations: int = 0
@@ -247,6 +250,7 @@ class Nest:
             resolution_mm,
             pierce_clearance_mm=cut.pierce_clearance_mm,
             corner_loops=cut.corner_loops,
+            chain=cut.chain,
             boundary_tolerance_mm=cut.boundary_tolerance_mm,
             tolerance_mm=cut.tolerance_mm,
             **options,
@@ -316,6 +320,7 @@ class Nest:
                 parts=_region(region),
                 remnant_margin_mm=remnant_margin_mm,
                 **({} if crop is None else dict(crop=crop.to_dict())),
+                **({} if self.chain is None else dict(chain=self.chain.to_dict())),
                 **{
                     key: fields[key]
                     for key in (

@@ -226,6 +226,7 @@ impl Decoder {
             parentheses_comments: d.parentheses_comments,
             radius_tolerance_mm: d.radius_tolerance_mm,
             radius_relative_tolerance: d.radius_relative_tolerance,
+            arc_word_mismatch_mm: d.arc_word_mismatch_mm,
         })?;
         Ok(Self {
             position: initial_position,

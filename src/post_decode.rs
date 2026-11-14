@@ -27,6 +27,9 @@ pub struct Config {
     /// Relative start/end radius tolerance (see RadiusTolerance).
     #[serde(default)]
     pub radius_relative_tolerance: f64,
+    /// The radius mismatch the post may write (see RadiusTolerance).
+    #[serde(default)]
+    pub arc_word_mismatch_mm: f64,
 }
 struct Compiled {
     numeric: HashMap<(u8, u64), u8>,
@@ -110,6 +113,7 @@ impl Config {
         RadiusTolerance {
             absolute_mm: self.radius_tolerance_mm,
             relative: self.radius_relative_tolerance,
+            written_mm: self.arc_word_mismatch_mm,
         }
     }
 }

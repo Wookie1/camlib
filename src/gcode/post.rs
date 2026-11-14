@@ -1517,6 +1517,7 @@ impl DefaultPost {
             crate::post_rounding::RadiusTolerance {
                 absolute_mm: m.dialect.radius_tolerance_mm,
                 relative: m.dialect.radius_relative_tolerance,
+                written_mm: m.dialect.arc_word_mismatch_mm,
             },
             m.max_sweep_rad,
         )
