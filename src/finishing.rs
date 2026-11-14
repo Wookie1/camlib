@@ -1941,12 +1941,17 @@ impl ParallelPlan {
             let q = c.start();
             [q[0], q[1]]
         });
-        let mut points = vec![[first[0], first[1], top]];
+        // (tip point, its planar ramp height): the planar legs sampled finely
+        // enough to follow the part, each kept at or above the part's
+        // contact; a move that is not proven clear (the part bulges between
+        // samples, e.g. over a convex edge) is halved, the midpoint lifted
+        // onto the contact, down to a depth.
+        let mut samples: Vec<(Vec3, f64)> = vec![([first[0], first[1], top], top)];
         for c in &curves {
             let (p, q) = (c.start(), c.end());
             let run = (q[0] - p[0]).hypot(q[1] - p[1]);
             let n = (run / step).ceil().max(1.);
-            if n > 1e5 || points.len() > 1_000_000 {
+            if n > 1e5 || samples.len() > 1_000_000 {
                 return Err(format!(
                     "{which}: the ramp needs too many moves to follow the part; use a steeper declared angle or rough this area first"
                 ));
@@ -1959,19 +1964,43 @@ impl ParallelPlan {
                 let xy = [p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])];
                 let planar = p[2] + f * (q[2] - p[2]);
                 let contact = self.contact_z(xy, work, cancel)? - self.tip_offset;
-                points.push([xy[0], xy[1], planar.max(contact)]);
+                samples.push(([xy[0], xy[1], planar.max(contact)], planar));
             }
         }
-        let mut previous = [a[0], a[1], top + self.tip_offset];
-        for p in &points {
-            let reference = [p[0], p[1], p[2] + self.tip_offset];
-            if !self.clear(previous, reference, work, cancel)? {
-                return Err(format!(
-                    "{which}: the declared ramp down the pass's path is not clear of the part (a move reaches X{:.3} Y{:.3} Z{:.3}). Rough or rest-rough this area first",
-                    p[0], p[1], p[2]
-                ));
+        let mut points = Vec::with_capacity(samples.len());
+        let mut previous = ([a[0], a[1], top], top);
+        for next in samples {
+            // Stack of pending moves from `previous`, each with its depth.
+            let mut pending = vec![(next, 0u32)];
+            while let Some((end, depth)) = pending.pop() {
+                let from = [
+                    previous.0[0],
+                    previous.0[1],
+                    previous.0[2] + self.tip_offset,
+                ];
+                let to = [end.0[0], end.0[1], end.0[2] + self.tip_offset];
+                if self.clear(from, to, work, cancel)? {
+                    points.push(end.0);
+                    previous = end;
+                    continue;
+                }
+                let run = (end.0[0] - previous.0[0]).hypot(end.0[1] - previous.0[1]);
+                if depth >= 24 || run <= 16. * self.op.tolerance_mm || points.len() > 1_000_000 {
+                    return Err(format!(
+                        "{which}: the declared ramp down the pass's path is not clear of the part (a move reaches X{:.3} Y{:.3} Z{:.3}). Rough or rest-rough this area first",
+                        end.0[0], end.0[1], end.0[2]
+                    ));
+                }
+                let xy = [
+                    0.5 * (previous.0[0] + end.0[0]),
+                    0.5 * (previous.0[1] + end.0[1]),
+                ];
+                let planar = 0.5 * (previous.1 + end.1);
+                let contact = self.contact_z(xy, work, cancel)? - self.tip_offset;
+                let mid = ([xy[0], xy[1], planar.max(contact)], planar);
+                pending.push((end, depth + 1));
+                pending.push((mid, depth + 1));
             }
-            previous = reference;
         }
         self.entry_target = top;
         self.ramp = points.into();
