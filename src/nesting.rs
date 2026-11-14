@@ -74,6 +74,7 @@ use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
 pub mod check;
+pub mod remnant;
 pub use check::NestCheck;
 
 type P2 = [f64; 2];
@@ -90,10 +91,111 @@ pub struct NestPart {
     /// Whether the part may also be placed mirrored (turned over).
     #[serde(default)]
     pub mirror: bool,
+    /// Parts of a higher priority are placed before those of a lower one
+    /// (so nearer the start corner); within a priority, largest first.
+    #[serde(default)]
+    pub priority: i32,
+    /// A filler: placed after every other part, as many copies as fit up to
+    /// `quantity`. Copies that do not fit are not a refusal; the result
+    /// lists how many were placed.
+    #[serde(default)]
+    pub fill: bool,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// The corner of the sheet's bounding box the nest fills from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartCorner {
+    #[default]
+    LowerLeft,
+    LowerRight,
+    UpperLeft,
+    UpperRight,
+}
+
+/// The axis parts are stacked along from the start corner before the nest
+/// advances along the other: `Y` fills a column of the sheet, then the next
+/// column in x; `X` fills a row, then the next row in y.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillAxis {
+    X,
+    #[default]
+    Y,
+}
+
+/// The planner always fills from the lower left, up a column and then to
+/// the next column. Another start corner or fill axis is the same fill in a
+/// frame where the sheet is reflected and/or its axes are exchanged: a
+/// sheet point p is planned at `L p`, with L one of the eight symmetries of
+/// the square. Each orientation of a part is planned as L applied to that
+/// orientation, so a part placed at t' in the frame lies at `L^-1 t'` on the
+/// sheet with the same rotation and mirror flag. The independent check then
+/// runs on the sheet itself and knows nothing of the frame.
+#[derive(Clone, Copy)]
+struct Frame {
+    /// Rows of L.
+    l: [P2; 2],
+}
+impl Frame {
+    fn new(corner: StartCorner, axis: FillAxis) -> Self {
+        let sx = match corner {
+            StartCorner::LowerLeft | StartCorner::UpperLeft => 1.,
+            StartCorner::LowerRight | StartCorner::UpperRight => -1.,
+        };
+        let sy = match corner {
+            StartCorner::LowerLeft | StartCorner::LowerRight => 1.,
+            StartCorner::UpperLeft | StartCorner::UpperRight => -1.,
+        };
+        Self {
+            l: match axis {
+                // Columns advance along the sheet's x, parts stack along y.
+                FillAxis::Y => [[sx, 0.], [0., sy]],
+                // Columns advance along the sheet's y, parts stack along x.
+                FillAxis::X => [[0., sy], [sx, 0.]],
+            },
+        }
+    }
+    fn identity(&self) -> bool {
+        self.l == [[1., 0.], [0., 1.]]
+    }
+    /// Whether L turns a loop round (a reflection).
+    fn reversing(&self) -> bool {
+        self.l[0][0] * self.l[1][1] - self.l[0][1] * self.l[1][0] < 0.
+    }
+    fn to(&self, p: P2) -> P2 {
+        [
+            self.l[0][0] * p[0] + self.l[0][1] * p[1],
+            self.l[1][0] * p[0] + self.l[1][1] * p[1],
+        ]
+    }
+    /// L is orthogonal: its inverse is its transpose.
+    fn from(&self, p: P2) -> P2 {
+        [
+            self.l[0][0] * p[0] + self.l[1][0] * p[1],
+            self.l[0][1] * p[0] + self.l[1][1] * p[1],
+        ]
+    }
+    /// Loops in the frame, material still on their left.
+    fn loops(&self, loops: Vec<Vec<P2>>) -> Vec<Vec<P2>> {
+        if self.identity() {
+            return loops;
+        }
+        loops
+            .into_iter()
+            .map(|l| {
+                let mut points: Vec<P2> = l.into_iter().map(|p| self.to(p)).collect();
+                if self.reversing() {
+                    points.reverse();
+                }
+                points
+            })
+            .collect()
+    }
 }
 fn boundary_tolerance() -> f64 {
     0.01
@@ -131,6 +233,13 @@ pub struct NestRequest {
     pub search_iterations: u32,
     #[serde(default)]
     pub seed: u64,
+    /// The corner the nest fills from (default: the lower left).
+    #[serde(default)]
+    pub start_corner: StartCorner,
+    /// The axis parts are stacked along before the nest advances along the
+    /// other (default: y, columns left to right from a left corner).
+    #[serde(default)]
+    pub fill_axis: FillAxis,
     /// As in the thermal cut that will cut the nest.
     #[serde(default = "boundary_tolerance")]
     pub boundary_tolerance_mm: f64,
@@ -179,6 +288,9 @@ pub struct NestResult {
     pub check: NestCheck,
     pub search_iterations: u32,
     pub search_improvements: u32,
+    /// Copies placed of each filler part: (part, copies).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filled: Vec<(usize, u32)>,
     pub diagnostics: Vec<String>,
 }
 
@@ -270,7 +382,14 @@ fn clearances(request: &NestRequest) -> Result<Clearances, String> {
         .iter()
         .map(|p| p.region.boundary_error_mm)
         .fold(0., f64::max);
-    let allowance = error + request.boundary_tolerance_mm / 2.;
+    let (lead_reach_mm, cut) = cut_reach(
+        kerf,
+        error,
+        request.boundary_tolerance_mm,
+        &request.lead_in,
+        &request.lead_out,
+        request.pierce_clearance_mm,
+    );
     // A lead starts where its loop starts: the pierce point lies its arc
     // radius along the loop's tangent and radius + length along its normal
     // from there (thermal.rs), and the crater reaches the pierce clearance
@@ -279,15 +398,29 @@ fn clearances(request: &NestRequest) -> Result<Clearances, String> {
     // hole too small for its leads: it stays inside that hole, where only a
     // part nested in the same hole could meet it, and the cut proves it
     // clear of every part or refuses.
-    let reach = |l: &Lead| l.radius_mm.hypot(l.radius_mm + l.length_mm);
-    let lead_reach_mm = (reach(&request.lead_in) + request.pierce_clearance_mm.unwrap_or(kerf))
-        .max(reach(&request.lead_out));
-    let cut = kerf + allowance + lead_reach_mm;
     Ok(Clearances {
         lead_reach_mm,
         part_distance_mm: 2. * cut + request.part_spacing_mm,
         sheet_distance_mm: cut + request.edge_margin_mm + request.sheet.boundary_error_mm,
     })
+}
+
+/// How far leads and pierce craters reach beyond a kerf's edge
+/// (`lead_reach_mm`), and how far from a part its cut can remove material:
+/// the kerf, the allowance (`error`: the boundaries' error; half the cut's
+/// boundary tolerance) and that reach.
+pub(crate) fn cut_reach(
+    kerf: f64,
+    error: f64,
+    boundary_tolerance: f64,
+    lead_in: &Lead,
+    lead_out: &Lead,
+    pierce_clearance: Option<f64>,
+) -> (f64, f64) {
+    let allowance = error + boundary_tolerance / 2.;
+    let reach = |l: &Lead| l.radius_mm.hypot(l.radius_mm + l.length_mm);
+    let lead_reach_mm = (reach(lead_in) + pierce_clearance.unwrap_or(kerf)).max(reach(lead_out));
+    (lead_reach_mm, kerf + allowance + lead_reach_mm)
 }
 
 /// (cos, sin) of a rotation; exact for quarter turns.
@@ -792,11 +925,12 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
         .sheet
         .prepare(options)
         .map_err(|e| format!("nest sheet: {e}"))?;
-    let sheet_loops = polygons(sheet.definition(), true, false, deviation);
+    let frame = Frame::new(request.start_corner, request.fill_axis);
+    let sheet_loops = frame.loops(polygons(sheet.definition(), true, false, deviation));
     let sheet_bounds = bounds(&sheet_loops);
     if (sheet_bounds[2] - sheet_bounds[0]) / request.resolution_mm > 1e6 {
         return Err(format!(
-            "nest: resolution_mm {} gives more than a million columns across this sheet; use a coarser resolution",
+            "nest: resolution_mm {} gives more than a million columns across this sheet (along its fill's advance); use a coarser resolution",
             request.resolution_mm
         ));
     }
@@ -830,7 +964,7 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
             for &rotation_deg in &part.rotations_deg {
                 let turn = rotation(rotation_deg);
                 let turned = |loops: &[Vec<P2>]| -> Vec<Vec<P2>> {
-                    loops
+                    let oriented = loops
                         .iter()
                         .map(|l| {
                             let mut points: Vec<P2> = l
@@ -847,7 +981,8 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
                             }
                             points
                         })
-                        .collect()
+                        .collect();
+                    frame.loops(oriented)
                 };
                 let inset = turned(&inset);
                 orientations.push(Shape {
@@ -869,7 +1004,14 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
         resolution: request.resolution_mm,
         cancel,
     };
-    // Largest area first; equal areas in the declared order.
+    // Required parts before fillers, higher priority first, then largest
+    // area first; equal ones in the declared order.
+    let class = |i: usize| {
+        (
+            request.parts[i].fill,
+            std::cmp::Reverse(request.parts[i].priority),
+        )
+    };
     let mut order: Vec<usize> = request
         .parts
         .iter()
@@ -877,8 +1019,9 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
         .flat_map(|(i, p)| std::iter::repeat_n(i, p.quantity as usize))
         .collect();
     order.sort_by(|&a, &b| {
-        planner.areas[b]
-            .total_cmp(&planner.areas[a])
+        class(a)
+            .cmp(&class(b))
+            .then(planner.areas[b].total_cmp(&planner.areas[a]))
             .then(a.cmp(&b))
     });
     let mut best = planner.fill(&order)?;
@@ -888,7 +1031,9 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
         for _ in 0..request.search_iterations {
             let i = (next_random(&mut state) % order.len() as u64) as usize;
             let j = (next_random(&mut state) % order.len() as u64) as usize;
-            if order[i] == order[j] {
+            // An exchange never crosses a priority or puts a filler
+            // before a required part.
+            if order[i] == order[j] || class(order[i]) != class(order[j]) {
                 continue;
             }
             order.swap(i, j);
@@ -913,7 +1058,13 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
                 copy: copies[part],
                 rotation_deg: shape.rotation_deg,
                 mirrored: shape.mirrored,
-                translation_mm: [x, y],
+                // Out of the planning frame (the rotation and the mirror
+                // flag are the sheet's already: see `Frame`).
+                translation_mm: if frame.identity() {
+                    [x, y]
+                } else {
+                    frame.from([x, y])
+                },
             });
             copies[part] += 1;
         }
@@ -923,7 +1074,7 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
         .parts
         .iter()
         .enumerate()
-        .filter(|(i, p)| copies[*i] < p.quantity)
+        .filter(|(i, p)| !p.fill && copies[*i] < p.quantity)
         .map(|(i, p)| Unplaced {
             part: i,
             quantity: p.quantity - copies[i],
@@ -1004,7 +1155,119 @@ pub fn nest(request: &NestRequest, cancel: &impl CancelSignal) -> Result<NestRes
         check,
         search_iterations: request.search_iterations,
         search_improvements: improvements,
+        filled: request
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.fill)
+            .map(|(i, _)| (i, copies[i]))
+            .collect(),
         diagnostics,
+    })
+}
+
+/// One sheet of a nest over several sheets.
+#[derive(Clone, Debug, Serialize)]
+pub struct SheetNest {
+    /// Index into the sheets given.
+    pub sheet: usize,
+    /// The nest on that sheet; its placements and unplaced parts name the
+    /// request's parts by their own indices.
+    pub nest: NestResult,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SheetsResult {
+    /// The sheets that took parts, in the order given.
+    pub sheets: Vec<SheetNest>,
+    /// Required parts left over after the last sheet (only with
+    /// `allow_unplaced`).
+    pub unplaced: Vec<Unplaced>,
+}
+
+/// Nests the request's parts over `sheets` in the order given (the
+/// request's own sheet is not used): each sheet takes what fits of what is
+/// left, the next takes the rest. A filler part fills every sheet that is
+/// used. Required parts left after the last sheet are refused, naming them,
+/// or listed with `allow_unplaced`; none is dropped. A sheet reached with
+/// nothing required left is not used.
+pub fn nest_sheets(
+    request: &NestRequest,
+    sheets: &[PlanarRegion],
+    cancel: &impl CancelSignal,
+) -> Result<SheetsResult, String> {
+    if sheets.is_empty() {
+        return Err("nest: give at least one sheet".into());
+    }
+    let mut left: Vec<u32> = request.parts.iter().map(|p| p.quantity).collect();
+    let mut used = vec![];
+    for (s, sheet) in sheets.iter().enumerate() {
+        // The parts still wanted, with where each stands in the request.
+        let wanted: Vec<usize> = (0..request.parts.len()).filter(|&i| left[i] > 0).collect();
+        if !wanted.iter().any(|&i| !request.parts[i].fill) {
+            break;
+        }
+        let mut one = request.clone();
+        one.sheet = sheet.clone();
+        one.allow_unplaced = true;
+        one.parts = wanted
+            .iter()
+            .map(|&i| NestPart {
+                quantity: left[i],
+                ..request.parts[i].clone()
+            })
+            .collect();
+        let mut result = nest(&one, cancel).map_err(|e| format!("sheet {s}: {e}"))?;
+        // Back to the request's part indices.
+        for p in &mut result.placements {
+            p.part = wanted[p.part];
+        }
+        for u in &mut result.unplaced {
+            u.part = wanted[u.part];
+        }
+        for f in &mut result.filled {
+            f.0 = wanted[f.0];
+        }
+        for &i in &wanted {
+            if request.parts[i].fill {
+                continue;
+            }
+            let placed = result.placements.iter().filter(|p| p.part == i).count() as u32;
+            left[i] -= placed;
+        }
+        if !result.placements.is_empty() {
+            used.push(SheetNest {
+                sheet: s,
+                nest: result,
+            });
+        }
+    }
+    let unplaced: Vec<Unplaced> = (0..request.parts.len())
+        .filter(|&i| !request.parts[i].fill && left[i] > 0)
+        .map(|i| Unplaced {
+            part: i,
+            quantity: left[i],
+        })
+        .collect();
+    if !unplaced.is_empty() && !request.allow_unplaced {
+        let list: Vec<String> = unplaced
+            .iter()
+            .map(|u| {
+                format!(
+                    "part {}: {} of {}",
+                    u.part, u.quantity, request.parts[u.part].quantity
+                )
+            })
+            .collect();
+        return Err(format!(
+            "nest: these parts are left over after {} sheet(s) ({}); give more sheets or fewer parts, or set allow_unplaced to get the nests with the rest listed",
+            sheets.len(),
+            list.join(", ")
+        ));
+    }
+    Ok(SheetsResult {
+        sheets: used,
+        unplaced,
     })
 }
 

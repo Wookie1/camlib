@@ -39,6 +39,8 @@ fn part(region: PlanarRegion, quantity: u32, rotations_deg: &[f64]) -> NestPart 
         quantity,
         rotations_deg: rotations_deg.to_vec(),
         mirror: false,
+        priority: 0,
+        fill: false,
     }
 }
 /// A plate with a large round hole, a slot with rounded ends and a bolt hole.
@@ -533,4 +535,169 @@ fn a_nest_feeds_a_thermal_cut_whose_leads_stay_in_their_reserved_room() {
         }
     }
     assert!(leads_beyond_kerf > 0 && worst > KERF, "leads were exercised: {worst}");
+}
+
+/// One 40 x 20 rectangle (no rotation) on a 400 x 250 sheet.
+fn one_block() -> NestRequest {
+    request(
+        region(rect(0., 0., 400., 250.), vec![]),
+        vec![part(region(rect(0., 0., 40., 20.), vec![]), 1, &[0.])],
+    )
+}
+
+#[test]
+fn a_nest_starts_from_the_declared_corner() {
+    use camlib::nesting::StartCorner::*;
+    // Everything cut for a part stays edge_margin_mm from the sheet's edge:
+    // the part itself lies cut_reach + margin from the two edges of its
+    // start corner (within the planner's column spacing and slack).
+    let mut r = one_block();
+    let inset = cut_reach(&r) + r.edge_margin_mm;
+    let default = run(&r).unwrap();
+    for (corner, left, low) in [
+        (LowerLeft, true, true),
+        (LowerRight, false, true),
+        (UpperLeft, true, false),
+        (UpperRight, false, false),
+    ] {
+        r.start_corner = corner;
+        let result = run(&r).unwrap();
+        assert_eq!(result.check.status, "proven", "{corner:?}");
+        let b = result.used_bounds_mm.unwrap();
+        let x_gap = if left { b[0] } else { 400. - b[2] };
+        let y_gap = if low { b[1] } else { 250. - b[3] };
+        for gap in [x_gap, y_gap] {
+            assert!(gap >= inset - 1e-9 && gap <= inset + r.resolution_mm + 0.01, "{corner:?}: {b:?}");
+        }
+        // The part is not turned or mirrored by the corner.
+        assert_eq!(result.placements[0].rotation_deg, 0.);
+        assert!(!result.placements[0].mirrored);
+        assert!((b[2] - b[0] - 40.).abs() < 1e-9 && (b[3] - b[1] - 20.).abs() < 1e-9);
+        if corner == LowerLeft {
+            assert_eq!(result.placements, default.placements);
+            assert_eq!(result.region, default.region);
+        }
+    }
+}
+
+#[test]
+fn the_fill_axis_stacks_parts_along_y_or_along_x() {
+    use camlib::nesting::{FillAxis, StartCorner};
+    let mut r = one_block();
+    r.parts[0].quantity = 3;
+    // Along y (the default): three blocks in one column.
+    let columns = run(&r).unwrap();
+    let b = columns.used_bounds_mm.unwrap();
+    assert!((b[2] - b[0] - 40.).abs() < 1e-9 && b[3] - b[1] > 3. * 20., "{b:?}");
+    // Along x: three blocks in one row.
+    r.fill_axis = FillAxis::X;
+    let rows = run(&r).unwrap();
+    let b = rows.used_bounds_mm.unwrap();
+    assert!((b[3] - b[1] - 20.).abs() < 1e-9 && b[2] - b[0] > 3. * 40., "{b:?}");
+    assert_eq!(rows.check.status, "proven");
+    // From the upper right, along x: the row hangs from the top edge and
+    // runs leftward from the right edge.
+    r.start_corner = StartCorner::UpperRight;
+    let result = run(&r).unwrap();
+    let b = result.used_bounds_mm.unwrap();
+    let inset = cut_reach(&r) + r.edge_margin_mm;
+    assert!(400. - b[2] <= inset + r.resolution_mm + 0.01 && 250. - b[3] <= inset + r.resolution_mm + 0.01, "{b:?}");
+    assert!((b[3] - b[1] - 20.).abs() < 1e-9, "{b:?}");
+}
+
+#[test]
+fn every_corner_and_axis_nests_the_mixed_parts_with_the_distances_proven() {
+    use camlib::nesting::{FillAxis, StartCorner::*};
+    // Arcs, holes, rotations, parts in holes: the independent check runs on
+    // the sheet itself for each of the eight frames.
+    let base = mixed();
+    let placed = run(&base).unwrap().placements.len();
+    for corner in [LowerLeft, LowerRight, UpperLeft, UpperRight] {
+        for axis in [FillAxis::Y, FillAxis::X] {
+            let mut r = mixed();
+            r.start_corner = corner;
+            r.fill_axis = axis;
+            let result = run(&r).unwrap();
+            assert_eq!(result.check.status, "proven", "{corner:?} {axis:?}");
+            assert_eq!(result.placements.len(), placed, "{corner:?} {axis:?}");
+            // Only declared rotations, never a mirror image.
+            for p in &result.placements {
+                assert!(r.parts[p.part].rotations_deg.contains(&p.rotation_deg) && !p.mirrored);
+            }
+            // The layout verifies as a layout from anywhere does.
+            verify(&r, &result.placements, &result.region).unwrap();
+        }
+    }
+}
+
+#[test]
+fn priority_parts_go_first_and_fillers_take_what_is_left() {
+    // Small blocks with priority are placed before the large plate, so they
+    // sit at the start corner; without it the plate does.
+    let small = || region(rect(0., 0., 30., 20.), vec![]);
+    let mut r = request(
+        region(rect(0., 0., 400., 250.), vec![]),
+        vec![part(plate(), 1, &[0.]), part(small(), 2, &[0.])],
+    );
+    let corner_of = |result: &NestResult, part: usize| {
+        let p = result.placements.iter().find(|p| p.part == part).unwrap();
+        p.translation_mm[0].hypot(p.translation_mm[1])
+    };
+    let plain = run(&r).unwrap();
+    assert!(corner_of(&plain, 0) < corner_of(&plain, 1));
+    r.parts[1].priority = 1;
+    let first = run(&r).unwrap();
+    assert!(corner_of(&first, 1) < corner_of(&first, 0));
+    assert_eq!(first.check.status, "proven");
+    // A filler: as many as fit, after the required parts; what does not fit
+    // is not a refusal, and a required part that does not fit still is.
+    let mut r = request(
+        region(rect(0., 0., 200., 120.), vec![]),
+        vec![part(plate(), 1, &[0.]), part(small(), 500, &[0., 90.])],
+    );
+    assert!(run(&r).unwrap_err().contains("part 1"));
+    r.parts[1].fill = true;
+    let filled = run(&r).unwrap();
+    assert!(filled.unplaced.is_empty());
+    let (which, copies) = filled.filled[0];
+    assert_eq!(which, 1);
+    assert!(copies > 0 && copies < 500, "{copies}");
+    assert_eq!(filled.placements.iter().filter(|p| p.part == 1).count() as u32, copies);
+    assert_eq!(filled.check.status, "proven");
+    r.parts[0].quantity = 9;
+    assert!(run(&r).unwrap_err().contains("part 0: "));
+}
+
+#[test]
+fn parts_that_overflow_a_sheet_go_on_the_next_one() {
+    use camlib::nesting::nest_sheets;
+    let cancel = AtomicBool::new(false);
+    let small = region(rect(0., 0., 200., 120.), vec![]);
+    let mut r = request(small.clone(), vec![part(plate(), 5, &[0., 90.]), part(washer(), 4, &[0.])]);
+    // One plate fits a 200 x 120 sheet: one sheet is not enough.
+    assert!(run(&r).is_err());
+    let sheets = vec![small.clone(), region(rect(0., 0., 400., 250.), vec![]), small.clone(), small];
+    let result = nest_sheets(&r, &sheets, &cancel).unwrap();
+    assert!(result.unplaced.is_empty());
+    let mut placed = [0u32; 2];
+    for sheet in &result.sheets {
+        assert_eq!(sheet.nest.check.status, "proven");
+        for p in &sheet.nest.placements {
+            placed[p.part] += 1;
+        }
+        // Each sheet's layout verifies on its own sheet, with the parts as the request names them.
+        let mut one = r.clone();
+        one.sheet = sheets[sheet.sheet].clone();
+        verify(&one, &sheet.nest.placements, &sheet.nest.region).unwrap();
+    }
+    assert_eq!(placed, [5, 4]);
+    // The sheets are used in the order given, and one that is not needed is left alone.
+    assert_eq!(result.sheets[0].sheet, 0);
+    assert!(result.sheets.len() < sheets.len() || result.sheets.last().unwrap().sheet == 3);
+    // Not enough sheets: refused naming what is left, or listed.
+    let error = nest_sheets(&r, &sheets[..1], &cancel).unwrap_err();
+    assert!(error.contains("left over after 1 sheet(s)") && error.contains("part 0: 4 of 5"), "{error}");
+    r.allow_unplaced = true;
+    let partial = nest_sheets(&r, &sheets[..1], &cancel).unwrap();
+    assert_eq!(partial.unplaced.iter().map(|u| (u.part, u.quantity)).collect::<Vec<_>>()[0], (0, 4));
 }
