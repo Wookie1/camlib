@@ -30,12 +30,20 @@ class NestPart:
     how many copies (``quantity``) and the rotations it may take
     (``rotations_deg``, counter-clockwise; ``(0,)`` keeps it as drawn, for
     grained or brushed sheet). ``mirror=True`` also allows the part turned
-    over. There are no defaults for the quantity or the rotations."""
+    over. There are no defaults for the quantity or the rotations.
+
+    ``priority``: parts of a higher priority are placed first, so nearest the
+    start corner (within a priority, largest first). ``fill=True`` makes the
+    part a filler: placed after every other part, as many copies as fit up to
+    ``quantity``; copies that do not fit are not a refusal, and the result's
+    ``filled`` says how many were placed."""
 
     region: object
     quantity: int
     rotations_deg: tuple
     mirror: bool = False
+    priority: int = 0
+    fill: bool = False
 
     def to_dict(self):
         return dict(
@@ -43,6 +51,8 @@ class NestPart:
             quantity=self.quantity,
             rotations_deg=list(self.rotations_deg),
             mirror=self.mirror,
+            priority=self.priority,
+            fill=self.fill,
         )
 
 
@@ -88,6 +98,45 @@ class NestResult:
     lead_reach_mm: float
     check: dict
     report: dict
+    # Copies placed of each filler part: ((part, copies), ...).
+    filled: tuple = ()
+
+
+def _nest_result(report):
+    return NestResult(
+        placements=tuple(
+            NestPlacement(p["part"], p["copy"], p["rotation_deg"], p["mirrored"], tuple(p["translation_mm"]))
+            for p in report["placements"]
+        ),
+        unplaced=tuple((u["part"], u["quantity"]) for u in report["unplaced"]),
+        region=PlanarRegion.from_dict(report["region"]),
+        utilisation=report["utilisation"],
+        placed_area_mm2=report["placed_area_mm2"],
+        sheet_area_mm2=report["sheet_area_mm2"],
+        used_bounds_mm=tuple(report["used_bounds_mm"]) if report.get("used_bounds_mm") else None,
+        lead_reach_mm=report["lead_reach_mm"],
+        check=report["check"],
+        report=report,
+        filled=tuple((part, copies) for part, copies in report.get("filled", ())),
+    )
+
+
+@dataclass(frozen=True)
+class Remnant:
+    """What is left of a sheet after a cut (``Nest.remnant``). ``region`` is
+    all of it, in the cut sheet's own coordinates; ``pieces`` are its
+    separate pieces, largest first, each a one-outline ``PlanarRegion`` that
+    can be the ``sheet`` of the next Nest. ``check`` is the engine's check of
+    the result at points of every part's outline."""
+
+    region: object
+    pieces: tuple
+    area_mm2: float
+    sheet_area_mm2: float
+    cut_reach_mm: float
+    remnant_margin_mm: float
+    check: dict
+    report: dict
 
 
 @dataclass(frozen=True)
@@ -110,6 +159,13 @@ class Nest:
     gives the same nest. The result is a heuristic layout, not the densest
     possible one.
 
+    ``start_corner`` ("lower_left", "lower_right", "upper_left" or
+    "upper_right" of the sheet's bounding box) is where the fill starts, and
+    ``fill_axis`` the axis parts are stacked along from there before the nest
+    advances along the other: "y" fills a column, then the next column in x;
+    "x" fills a row, then the next row in y. The remnant is left on the far
+    side. Neither turns or mirrors a part.
+
     ``run()`` returns a NestResult whose distances are proven by a check
     that is independent of the planner. Parts that do not fit are refused
     with a ValueError naming them, or listed in the result with
@@ -128,6 +184,8 @@ class Nest:
     allow_unplaced: bool = False
     search_iterations: int = 0
     seed: int = 0
+    start_corner: str = "lower_left"
+    fill_axis: str = "y"
     boundary_tolerance_mm: float = 0.01
     tolerance_mm: float = 1e-5
 
@@ -165,6 +223,8 @@ class Nest:
             allow_unplaced=self.allow_unplaced,
             search_iterations=self.search_iterations,
             seed=self.seed,
+            start_corner=self.start_corner,
+            fill_axis=self.fill_axis,
             boundary_tolerance_mm=self.boundary_tolerance_mm,
             tolerance_mm=self.tolerance_mm,
         )
@@ -175,19 +235,65 @@ class Nest:
     def run(self):
         """Plan and prove the nest. Raises ValueError when the request is
         invalid or parts do not fit (unless ``allow_unplaced``)."""
-        report = _request("nest", nest=self.to_dict())
-        return NestResult(
-            placements=tuple(
-                NestPlacement(p["part"], p["copy"], p["rotation_deg"], p["mirrored"], tuple(p["translation_mm"]))
-                for p in report["placements"]
+        return _nest_result(_request("nest", nest=self.to_dict()))
+
+    def run_sheets(self, sheets):
+        """Nest the parts over several ``sheets`` (PlanarRegions: full sheets
+        and remnants) in the order given; this nest's own ``sheet`` is not
+        used. Each sheet takes what fits of what is left. Returns
+        ``((sheet index, NestResult), ...)`` for the sheets that took parts
+        and the required parts left over as ``((part, quantity), ...)``:
+        refused, naming them, unless ``allow_unplaced``. A filler part fills
+        every sheet that is used."""
+        report = _request("nest_sheets", nest=self.to_dict(), sheets=[_region(s) for s in sheets])
+        return (
+            tuple((entry["sheet"], _nest_result(entry["nest"])) for entry in report["sheets"]),
+            tuple((u["part"], u["quantity"]) for u in report["unplaced"]),
+        )
+
+    def remnant(self, parts, *, remnant_margin_mm):
+        """What is left of the sheet after ``parts`` (a NestResult, or the
+        ``PlanarRegion`` a ThermalCut cut) are cut from it with this nest's
+        kerf and leads: a ``Remnant`` whose ``region`` is the sheet less every
+        part grown by all its cut can reach (kerf, leads, pierce craters) and
+        by ``remnant_margin_mm`` (no default: the edge you give up for heat,
+        dross and how exactly the sheet is put back). It is in the sheet's own
+        coordinates, so it is the ``sheet`` of the next Nest when the remnant
+        is put back against the same reference; ``camlib.dxf.write_regions``
+        saves it as a DXF."""
+        region = parts.region if isinstance(parts, NestResult) else parts
+        fields = self.to_dict()
+        report = _request(
+            "remnant",
+            remnant=dict(
+                sheet=fields["sheet"],
+                parts=_region(region),
+                remnant_margin_mm=remnant_margin_mm,
+                **{
+                    key: fields[key]
+                    for key in (
+                        "kerf_mm",
+                        "lead_in",
+                        "lead_out",
+                        "pierce_clearance_mm",
+                        "boundary_tolerance_mm",
+                        "tolerance_mm",
+                    )
+                    if key in fields
+                },
             ),
-            unplaced=tuple((u["part"], u["quantity"]) for u in report["unplaced"]),
-            region=PlanarRegion.from_dict(report["region"]),
-            utilisation=report["utilisation"],
-            placed_area_mm2=report["placed_area_mm2"],
+        )
+        whole = PlanarRegion.from_dict(report["region"])
+        return Remnant(
+            region=whole,
+            pieces=tuple(
+                PlanarRegion(f"{whole.name}-{k + 1}", (component,), whole.boundary_error_mm, whole.source)
+                for k, component in enumerate(whole.components)
+            ),
+            area_mm2=report["area_mm2"],
             sheet_area_mm2=report["sheet_area_mm2"],
-            used_bounds_mm=tuple(report["used_bounds_mm"]) if report.get("used_bounds_mm") else None,
-            lead_reach_mm=report["lead_reach_mm"],
+            cut_reach_mm=report["cut_reach_mm"],
+            remnant_margin_mm=report["remnant_margin_mm"],
             check=report["check"],
             report=report,
         )
