@@ -1872,9 +1872,9 @@ impl ParallelPlan {
             .map_or(0., |r| {
                 (self.heights.feed - entry).max(0.) / r.angle_rad.tan()
             });
-        let mut chain = vec![];
+        // The path, up to the length a ramp from the feed height would need.
+        let mut segments = vec![];
         let mut length = 0.;
-        let mut top = entry + excess;
         for w in line.windows(2) {
             let (p, q) = (w[0], w[1]);
             let d = (q[0] - p[0]).hypot(q[1] - p[1]);
@@ -1887,17 +1887,61 @@ impl ParallelPlan {
                 1.
             };
             let q = [p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])];
-            top = top.max(crate::flat::segment_stock_top(
-                stock,
-                p,
-                q,
-                self.radius,
-                cancel,
-            )?);
-            chain.push(crate::pocket::Stroke::line(p, q));
+            segments.push((p, q));
             length += f * d;
             if f < 1. {
                 break;
+            }
+        }
+        let chain: Vec<_> = segments
+            .iter()
+            .map(|&(p, q)| crate::pocket::Stroke::line(p, q))
+            .collect();
+        // The stock's top over the ramp's own footprint: the stretch of the
+        // path a ramp from that height needs (the whole path when it must
+        // reverse), raised until it no longer grows.
+        let over = |span: f64| -> Result<f64, String> {
+            let mut top = f64::MIN;
+            let mut walked = 0.;
+            for &(p, q) in &segments {
+                let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+                let f = if walked + d > span {
+                    ((span - walked) / d).clamp(0., 1.)
+                } else {
+                    1.
+                };
+                let q = [p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])];
+                top = top.max(crate::flat::segment_stock_top(
+                    stock,
+                    p,
+                    q,
+                    self.radius,
+                    cancel,
+                )?);
+                walked += f * d;
+                if f < 1. {
+                    break;
+                }
+            }
+            Ok(top)
+        };
+        let mut top = entry + excess;
+        if let Some(ramp) = self.op.entry.as_ref().and_then(|e| e.ramp())
+            && !segments.is_empty()
+        {
+            let tan = ramp.angle_rad.tan();
+            let mut settled = false;
+            for _ in 0..32 {
+                let span = ((top - entry) / tan).min(length);
+                let next = over(span)?.max(entry + excess);
+                if next <= top {
+                    settled = true;
+                    break;
+                }
+                top = next;
+            }
+            if !settled {
+                top = top.max(over(length)?);
             }
         }
         let b = line.last().copied().unwrap_or(a);

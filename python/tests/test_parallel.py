@@ -395,8 +395,7 @@ class RowEntryTest(unittest.TestCase):
 
     def wedge_rows(self, entry):
         # A 40 deg slope rising from the foot of a vertical wall, under fresh
-        # stock to Z12: rows start at the wall foot and climb the slope, so a
-        # 10 deg ramp down the row line would cut into the slope.
+        # stock to Z12: rows start at the wall foot and climb the slope.
         import cadquery as cq
         import camlib
         from camlib.cadquery import export_surface_mesh
@@ -512,12 +511,26 @@ class RowEntryTest(unittest.TestCase):
         ):
             self.run_op(tool, op, stock)
 
-    def test_a_ramp_that_is_not_clear_of_the_part_is_refused_not_plunged(self):
+    def test_a_ramp_up_a_slope_follows_the_part_and_no_plunge_enters_stock(self):
+        # Rows start at the foot of a vertical wall and climb a 40 deg slope
+        # under fresh stock: a planar 10 deg ramp down the row line would cut
+        # into the slope, so the ramp is kept on the part's contact along it
+        # and every move proven clear. Independently of the plan, no entry
+        # plunge ends with more than a tolerance of stock above the ball.
         import camlib
 
         tool, op, stock = self.wedge_rows(camlib.RampEntry(angle_deg=10, min_length_mm=1))
-        with self.assertRaisesRegex(Exception, "not clear of the part"):
-            self.run_op(tool, op, stock, initial=16)
+        previous, plunges = [], []
+
+        def watch(m, s, heights):
+            if m["kind"] == "plunge" and previous and previous[-1]["kind"] == "rapid":
+                plunges.append(m)
+                self.assertLessEqual(self.plunge_cut(m, s, heights), op.tolerance_mm + 1e-9, m)
+            previous.append(m)
+
+        report, _ = self.run_op(tool, op, stock, initial=16, watch=watch)
+        self.assertGreater(len(plunges), 0)
+        self.assertGreater(report["ramped_entries"], 0)
 
     def test_a_ramp_that_does_not_fit_is_refused_not_plunged(self):
         import camlib
