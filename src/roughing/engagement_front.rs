@@ -22,7 +22,8 @@
 use crate::{
     Point,
     engagement::{
-        ClearedSweep, EngagementOptions, EngagementScene, EngagementStatus, UnresolvedReason,
+        ClearedSweep, EngagementOptions, EngagementReport, EngagementScene, EngagementStatus,
+        UnresolvedReason,
     },
     entry::{EntryPolicy, PocketEntry},
     heights::Heights,
@@ -267,7 +268,17 @@ struct Near {
     first_row: usize,
 }
 impl Near {
-    fn new(bits: &[u64], stride: usize, i: [usize; 2], j: [usize; 2], cells2: usize) -> Self {
+    /// The growth observes cancellation every 64 source rows (#312): on a
+    /// whole grid this is a whole-grid dilation, and a fired signal must
+    /// stop it rather than let it run to the last row.
+    fn new(
+        bits: &[u64],
+        stride: usize,
+        i: [usize; 2],
+        j: [usize; 2],
+        cells2: usize,
+        cancel: &dyn CancelSignal,
+    ) -> Result<Self, String> {
         let (w0, w1) = (i[0] / 64, i[1] / 64);
         let (words, rows) = (w1 - w0 + 1, j[1] - j[0] + 1);
         let radius = cells2.isqrt();
@@ -279,6 +290,9 @@ impl Near {
         let mut grown = vec![0u64; words * rows];
         let mut cur = vec![0u64; words];
         for s in 0..rows {
+            if s.is_multiple_of(64) && cancel.is_cancelled() {
+                return Err("engagement_front planning cancelled".into());
+            }
             let from = (j[0] + s) * stride + w0;
             cur.copy_from_slice(&bits[from..from + words]);
             cur[0] &= u64::MAX << (i[0] % 64);
@@ -307,12 +321,12 @@ impl Near {
                 }
             }
         }
-        Self {
+        Ok(Self {
             grown,
             words,
             first_word: w0,
             first_row: j[0],
-        }
+        })
     }
     /// Whether cell (`i`, `j`) of the window is near a set cell.
     fn at(&self, i: usize, j: usize) -> bool {
@@ -946,12 +960,19 @@ impl Layer {
             });
         }
         let order = open.as_mut().unwrap();
+        // Cached cells only leave (cut, or marked dead): the scan skips them
+        // and observes cancellation while it does (#312).
+        let mut skipped = 0usize;
         while order
             .cells
             .get(order.next)
             .is_some_and(|&(_, k)| self.dead[k] || !self.material(k))
         {
             order.next += 1;
+            skipped += 1;
+            if skipped.is_multiple_of(4096) && cancel.is_cancelled() {
+                return Err("engagement_front planning cancelled".into());
+            }
         }
         let best = order.cells.get(order.next).copied();
         #[cfg(test)]
@@ -1134,6 +1155,7 @@ impl Layer {
     /// goal whose shortest path over those cells, counted that way
     /// (`cells_within`), is longer than that is therefore not returned: its
     /// distance exceeds the limit, or it was never reached.
+    #[allow(clippy::too_many_arguments)]
     fn link_reach(
         &self,
         start: (usize, usize),
@@ -1142,11 +1164,13 @@ impl Layer {
         i: [usize; 2],
         j: [usize; 2],
         max_len: f64,
-    ) -> LinkReach {
+        cancel: &impl CancelSignal,
+    ) -> Result<LinkReach, String> {
         let g = &self.g;
         let stride = self.bits.stride;
-        let near =
-            cells2_within(g.c, tight, false).map(|d2| Near::new(&self.bits.any, stride, i, j, d2));
+        let near = cells2_within(g.c, tight, false)
+            .map(|d2| Near::new(&self.bits.any, stride, i, j, d2, cancel))
+            .transpose()?;
         let (w0, words, rows) = (i[0] / 64, i[1] / 64 - i[0] / 64 + 1, j[1] - j[0] + 1);
         let mut pass = vec![0u64; words * rows];
         for row in 0..rows {
@@ -1161,7 +1185,7 @@ impl Layer {
                 pass[(row - j[0]) * words + col / 64 - w0] |= 1 << (col % 64);
             }
         }
-        LinkReach {
+        Ok(LinkReach {
             version: self.bits.version,
             start: g.idx(start.0, start.1),
             max_len: max_len.to_bits(),
@@ -1175,7 +1199,7 @@ impl Layer {
                 (max_len / g.c * 1024. * (1. + 1e-9)).ceil() as u64 + 1,
             ),
             words,
-        }
+        })
     }
     /// What a `for_disk(p, rad)` scan keeping the first cell of the smallest
     /// distance finds among the cells whose bit is set in `bits`: that
@@ -2218,11 +2242,21 @@ fn shortcut_taken(which: usize) {
     });
 }
 
-/// The exact proof's status for a stroke: its bound in degrees and, when
-/// unresolved, why the query stopped. The reason decides what an unproven
-/// stroke may become: only a bound the wider query proves can classify a
-/// stroke as confined entry motion (#309).
-type Proved = (EngagementStatus, f64, Option<UnresolvedReason>);
+/// What the exact proof returned for one stroke: the whole engagement
+/// report, so the status, the bound, the reason an unresolved query stopped
+/// and the work counters all survive the memo and the retry decisions
+/// (#309).
+type Proved = EngagementReport;
+
+/// A stroke whose bound neither query settled: where it starts, the limit
+/// query's report and the wider (180 degree) query's report, reasons and
+/// work counters included. The level is refused rather than cutting the
+/// stroke at the cutting feed or entering it as entry motion (#309).
+struct UnresolvedStroke {
+    at: [f64; 3],
+    limit: EngagementReport,
+    wider: EngagementReport,
+}
 
 /// How the confined retry reads the wider (half-circle) bound query of a
 /// stroke the limit query left unresolved (#309).
@@ -2235,19 +2269,21 @@ enum Confine {
     /// confined case (an entry move at the entry feed).
     Entry(f64),
     /// Even the wider query stopped without a bound. Nothing establishes a
-    /// contact angle, so the stroke is not reported as confined material
-    /// with a proven bound; it is still made an entry move, because that is
-    /// the conservative move (the entry feed, never the cutting feed), and
-    /// is counted in `confined_unproven_mm` with the reason it stayed
-    /// unresolved.
+    /// contact angle. When it stopped on `Work` or `Depth` the proof was
+    /// not allowed to finish, so nothing authorizes entry motion either:
+    /// the stroke stays as it was queued and the level is refused. When it
+    /// stopped on `Resolution` the entry-motion deviation recorded on #309
+    /// applies (entry feed, `confined_unproven_mm`).
     Unproven,
 }
 
-fn confine(bound: (EngagementStatus, f64), limit: f64) -> Confine {
-    match bound {
-        (EngagementStatus::Bounded, angle) if angle <= limit => Confine::Proven(angle),
-        (EngagementStatus::Bounded, angle) => Confine::Entry(angle),
-        (EngagementStatus::Unresolved, _) => Confine::Unproven,
+fn confine(bound: &EngagementReport, limit: f64) -> Confine {
+    match bound.status {
+        EngagementStatus::Bounded if bound.upper_angle_deg <= limit => {
+            Confine::Proven(bound.upper_angle_deg)
+        }
+        EngagementStatus::Bounded => Confine::Entry(bound.upper_angle_deg),
+        EngagementStatus::Unresolved => Confine::Unproven,
     }
 }
 
@@ -2341,6 +2377,12 @@ pub(crate) struct EngagementFrontPlan {
     ramp_slots: Vec<(Point, Point)>,
     /// Proofs of the strokes queued for the pass being planned.
     proof_memo: ProofMemo,
+    /// A stroke the confined retry left unresolved: the wider query stopped
+    /// on `Work` or `Depth`, so nothing authorizes entry motion and the
+    /// level refuses (#309). `prove` sets this and leaves the stroke as it
+    /// was queued; the confined callers read it and refuse, naming both
+    /// queries' reasons and the proof's counters.
+    unresolved: Option<UnresolvedStroke>,
     /// Where links from the current position can reach (`routed_link`),
     /// and the start and material state of the last link search that did
     /// not reach its goal.
@@ -2510,6 +2552,7 @@ impl EngagementFrontPlan {
             area_mm2: None,
             ramp_slots: vec![],
             proof_memo: ProofMemo::default(),
+            unresolved: None,
             link_reach: std::cell::RefCell::new(None),
             link_failed: std::cell::Cell::new(None),
             refuse_unentered: false,
@@ -2807,19 +2850,25 @@ impl EngagementFrontPlan {
             bits
         };
         let whole = ([0, g.nx - 1], [0, g.ny - 1]);
-        let grown = |cells: &[bool], cells2: Option<usize>| -> Vec<bool> {
+        let grown = |cells: &[bool],
+                     cells2: Option<usize>,
+                     cancel: &dyn CancelSignal|
+         -> Result<Vec<bool>, String> {
             match cells2 {
                 Some(d2) => {
-                    let near = Near::new(&pack(cells), stride, whole.0, whole.1, d2);
-                    (0..n).map(|k| near.at(k % g.nx, k / g.nx)).collect()
+                    let near = Near::new(&pack(cells), stride, whole.0, whole.1, d2, cancel)?;
+                    Ok((0..n).map(|k| near.at(k % g.nx, k / g.nx)).collect())
                 }
-                None => vec![false; n],
+                None => Ok(vec![false; n]),
             }
         };
         let too_near = cells2_where(g.c, need, |d| ((d as f32) as f64) < need);
-        let allowed: Vec<bool> = grown(&outside, too_near).iter().map(|b| !b).collect();
+        let allowed: Vec<bool> = grown(&outside, too_near, cancel)?
+            .iter()
+            .map(|b| !b)
+            .collect();
         let reach_limit = self.r - 0.5 * g.c;
-        let reachable = grown(&allowed, cells2_within(g.c, reach_limit, true));
+        let reachable = grown(&allowed, cells2_within(g.c, reach_limit, true), cancel)?;
         #[cfg(test)]
         {
             let room: Vec<f32> = edt(&g, &outside, &NeverCancelled)
@@ -2912,12 +2961,16 @@ impl EngagementFrontPlan {
         let left = cells as f64 * g.c * g.c;
         let whole = ([0, g.nx - 1], [0, g.ny - 1]);
         // Material within r + c blocks a start; reachable material within
-        // r + 3 c makes one.
-        let near = |bits: &[u64], t: f64| {
-            cells2_within(g.c, t, true).map(|d2| Near::new(bits, stride, whole.0, whole.1, d2))
-        };
-        let blocked = near(&layer.bits.any, r + g.c);
-        let beside = near(&layer.bits.reach, r + 3. * g.c);
+        // r + 3 c makes one. Both are whole-grid dilations and observe
+        // cancellation (#312).
+        let near =
+            |bits: &[u64], t: f64, cancel: &dyn CancelSignal| -> Result<Option<Near>, String> {
+                cells2_within(g.c, t, true)
+                    .map(|d2| Near::new(bits, stride, whole.0, whole.1, d2, cancel))
+                    .transpose()
+            };
+        let blocked = near(&layer.bits.any, r + g.c, cancel)?;
+        let beside = near(&layer.bits.reach, r + 3. * g.c, cancel)?;
         let mut candidates = vec![];
         if let Some(beside) = &beside {
             for j in 0..g.ny {
@@ -3391,11 +3444,24 @@ impl EngagementFrontPlan {
         // Material of the window nearer than a distance, from the material
         // bits (`Near`): what `dmat[k] < t` says of the window's distance
         // transform `dmat`, which used to be computed for every link.
-        let nearer = |t: f64| {
+        let nearer = |t: f64, cancel: &dyn CancelSignal| -> Result<Option<Near>, String> {
             cells2_within(c, t, false)
-                .map(|d2| Near::new(&layer.bits.any, layer.bits.stride, [i0, i1], [j0, j1], d2))
+                .map(|d2| {
+                    Near::new(
+                        &layer.bits.any,
+                        layer.bits.stride,
+                        [i0, i1],
+                        [j0, j1],
+                        d2,
+                        cancel,
+                    )
+                })
+                .transpose()
         };
-        let (tight, loose) = (nearer(r - 0.5 * self.width), nearer(r - self.width));
+        let (tight, loose) = (
+            nearer(r - 0.5 * self.width, cancel)?,
+            nearer(r - self.width, cancel)?,
+        );
         // (By window column and row: the search below knows them.)
         let clear = |near: &Option<Near>, i: usize, j: usize| {
             !near.as_ref().is_some_and(|n| n.at(i0 + i, j0 + j))
@@ -3531,7 +3597,8 @@ impl EngagementFrontPlan {
                         [i0.saturating_sub(AROUND), (i1 + AROUND).min(g.nx - 1)],
                         [j0.saturating_sub(AROUND), (j1 + AROUND).min(g.ny - 1)],
                         max_len,
-                    ));
+                        cancel,
+                    )?);
                 }
             }
         }
@@ -4258,6 +4325,9 @@ impl EngagementFrontPlan {
                     .map_or(Ok(()), |(_, detail)| {
                         Err(format!("engagement_front: {detail}"))
                     })?;
+                if let Some((_, detail)) = self.unresolved_refusal() {
+                    return Err(format!("engagement_front: {detail}"));
+                }
                 kept.extend(pts.into_iter().skip(usize::from(!kept.is_empty())));
                 return Ok(Some(kept));
             }
@@ -4289,10 +4359,13 @@ impl EngagementFrontPlan {
     /// (`EngagementScene::check_leading`) and shares nothing with the
     /// steering grid. Returns where the first unproven stroke starts and
     /// what was not proven, or `None`. With
-    /// `confined`, an unproven stroke becomes an entry move at the entry
-    /// feed (see `EngagementFrontReport::confined_strokes`) and nothing is
-    /// returned. Strokes before `unproven_from` were proven by an earlier
-    /// call and are premises only.
+    /// `confined`, an unproven stroke whose bound the wider query proves
+    /// past the limit becomes an entry move at the entry feed (see
+    /// `EngagementFrontReport::confined_strokes`) and nothing is returned;
+    /// one whose wider query stopped on `Work` or `Depth` is left as it was
+    /// queued, recorded in `unresolved`, and the caller refuses
+    /// (`unresolved_refusal`). Strokes before `unproven_from` were proven by
+    /// an earlier call and are premises only.
     fn prove(
         &mut self,
         stock: &Stock,
@@ -4302,6 +4375,9 @@ impl EngagementFrontPlan {
         cancel: &impl CancelSignal,
     ) -> Result<Option<(Point, String)>, String> {
         let tolerance = self.op.tolerance_mm;
+        // Each call classifies afresh; the previous call's unresolved stroke,
+        // if its caller refused, is gone with the plan.
+        self.unresolved = None;
         let (mut scene, mut cursor) = match self.proof.take() {
             Some(held) => held,
             None => (
@@ -4344,7 +4420,9 @@ impl EngagementFrontPlan {
             // record; otherwise the record ends here and is written anew.
             let slot = index - from;
             let known = match self.proof_memo.strokes.get(slot) {
-                Some((c, k, result)) if recorded && same_curve(c, &curve) && *k == kind => *result,
+                Some((c, k, result)) if recorded && same_curve(c, &curve) && *k == kind => {
+                    result.clone()
+                }
                 _ => {
                     recorded = false;
                     if !confined {
@@ -4376,28 +4454,32 @@ impl EngagementFrontPlan {
             };
             if index >= unproven_from && matches!(kind, MoveKind::Cut | MoveKind::Link) {
                 let check = || {
-                    scene
-                        .check_leading(&motion, self.r, limit, EngagementOptions::default(), cancel)
-                        .map(|report| (report.status, report.upper_angle_deg, report.reason))
+                    #[cfg(test)]
+                    if let Some((reason, _)) = tests::review_reasons() {
+                        return Ok(tests::forced_report(reason));
+                    }
+                    scene.check_leading(
+                        &motion,
+                        self.r,
+                        limit,
+                        EngagementOptions::default(),
+                        cancel,
+                    )
                 };
-                let (status, upper_angle_deg, reason) = match known {
+                let proof = match known {
                     Some(result) => {
                         #[cfg(test)]
                         {
                             shortcut_taken(0);
                             let again = check()?;
-                            assert_eq!(
-                                (result.0, result.1.to_bits(), result.2),
-                                (again.0, again.1.to_bits(), again.2),
-                                "recorded proof of {curve:?}"
-                            );
+                            assert_eq!(result, again, "recorded proof of {curve:?}");
                         }
                         result
                     }
                     None => {
                         let result = check()?;
                         if !confined {
-                            self.proof_memo.strokes[slot].2 = Some(result);
+                            self.proof_memo.strokes[slot].2 = Some(result.clone());
                         }
                         result
                     }
@@ -4405,7 +4487,7 @@ impl EngagementFrontPlan {
                 // An unproven straight stroke is halved until the unproven
                 // part is no longer than an eighth of the cutter radius, so only the
                 // stretch that is not proven becomes entry motion.
-                if matches!(status, EngagementStatus::Unresolved)
+                if matches!(proof.status, EngagementStatus::Unresolved)
                     && confined
                     && let Curve::Line { start, end } = curve
                     && (end[0] - start[0]).hypot(end[1] - start[1]) > self.r / 8.
@@ -4421,19 +4503,28 @@ impl EngagementFrontPlan {
                     recorded = false;
                     continue;
                 }
-                if matches!(status, EngagementStatus::Unresolved) && confined {
+                if matches!(proof.status, EngagementStatus::Unresolved) && confined {
                     // The confined retry (#309): only what the wider query
                     // proves classifies the stroke. A second unresolved
                     // result establishes neither a confined bound nor a
-                    // safe cut, and is refused rather than entered.
-                    let bound = scene.check_leading(
-                        &motion,
-                        self.r,
-                        180.,
-                        EngagementOptions::default(),
-                        cancel,
-                    )?;
-                    match confine((bound.status, bound.upper_angle_deg), limit) {
+                    // safe cut.
+                    let bound = {
+                        let bound = scene.check_leading(
+                            &motion,
+                            self.r,
+                            180.,
+                            EngagementOptions::default(),
+                            cancel,
+                        )?;
+                        #[cfg(test)]
+                        let bound = if let Some((_, reason)) = tests::review_reasons() {
+                            tests::forced_report_over(reason, bound)
+                        } else {
+                            bound
+                        };
+                        bound
+                    };
+                    match confine(&bound, limit) {
                         Confine::Proven(angle) => {
                             proved += 1;
                             upper = upper.max(angle);
@@ -4447,32 +4538,91 @@ impl EngagementFrontPlan {
                                 self.report.confined_max_engagement_deg.max(angle);
                         }
                         Confine::Unproven => {
-                            // No bound from either query: entry motion (the
-                            // conservative move, never a cut at the cutting
-                            // feed), reported as unproven with the reason the
-                            // wider query stopped (#309).
+                            // Even the wider query stopped without a bound.
                             let length = curve.prepare(tolerance)?.length_mm();
-                            let first = self.report.confined_unproven_mm == 0.;
-                            self.pending[index].1 = MoveKind::Lead;
-                            self.pending[index].2 = Some(entry_feed);
-                            self.report.confined_strokes += 1;
-                            self.report.confined_stroke_mm += length;
-                            self.report.confined_unproven_mm += length;
-                            self.report.confined_max_engagement_deg =
-                                self.report.confined_max_engagement_deg.max(360.);
-                            if first {
-                                self.report.diagnostics.push(format!(
-                                    "some confined entry strokes here have no proven contact bound: the \
-                                     query within the limit and the wider query within 180 degrees both \
-                                     stopped without one ({}), so they are cut as entry moves at the \
-                                     entry feed and counted in confined_unproven_mm rather than reported \
-                                     as material proven confined",
-                                    reason_text(reason)
-                                ));
+                            match bound.reason {
+                                // The resolution limit is the deviation
+                                // recorded on #309: the query refined to its
+                                // resolution without settling a certificate,
+                                // in material that must keep being cut, so
+                                // the stroke is still made entry motion - the
+                                // conservative move, never a cut at the
+                                // cutting feed - and reported as unproven
+                                // rather than as material proven confined.
+                                Some(UnresolvedReason::Resolution) => {
+                                    let first = self.report.confined_unproven_mm == 0.;
+                                    self.pending[index].1 = MoveKind::Lead;
+                                    self.pending[index].2 = Some(entry_feed);
+                                    self.report.confined_strokes += 1;
+                                    self.report.confined_stroke_mm += length;
+                                    self.report.confined_unproven_mm += length;
+                                    self.report.confined_max_engagement_deg =
+                                        self.report.confined_max_engagement_deg.max(360.);
+                                    if first {
+                                        self.report.diagnostics.push(format!(
+                                            "some confined entry strokes here have no proven contact \
+                                             bound: the query within the limit stopped ({}; nodes {}, \
+                                             support tests {}, index visits {}, depth {}) and the wider \
+                                             query within 180 degrees stopped too ({}; nodes {}, support \
+                                             tests {}, index visits {}, depth {}), so they are cut as \
+                                             entry moves at the entry feed and counted in \
+                                             confined_unproven_mm rather than reported as material \
+                                             proven confined",
+                                            reason_text(proof.reason),
+                                            proof.nodes,
+                                            proof.support_tests,
+                                            proof.index_visits,
+                                            proof.maximum_depth,
+                                            reason_text(bound.reason),
+                                            bound.nodes,
+                                            bound.support_tests,
+                                            bound.index_visits,
+                                            bound.maximum_depth,
+                                        ));
+                                    }
+                                }
+                                // Work or Depth: the proof was not allowed to
+                                // finish, so nothing authorizes entry motion
+                                // either. The stroke stays as it was queued,
+                                // the outcome (both queries' reports, counters
+                                // included) is kept for the retry, and the
+                                // level is refused (#309).
+                                _ => {
+                                    if self.unresolved.is_none() {
+                                        self.report.diagnostics.push(format!(
+                                            "the stroke from ({:.3}, {:.3}) onwards at Z{:.3} has no \
+                                             proven contact bound: the query within the limit stopped \
+                                             ({}; nodes {}, support tests {}, index visits {}, depth {}) \
+                                             and the wider query within 180 degrees stopped too ({}; \
+                                             nodes {}, support tests {}, index visits {}, depth {}), so \
+                                             the level is refused rather than cutting the stroke as \
+                                             entry motion",
+                                            curve.start()[0],
+                                            curve.start()[1],
+                                            curve.start()[2],
+                                            reason_text(proof.reason),
+                                            proof.nodes,
+                                            proof.support_tests,
+                                            proof.index_visits,
+                                            proof.maximum_depth,
+                                            reason_text(bound.reason),
+                                            bound.nodes,
+                                            bound.support_tests,
+                                            bound.index_visits,
+                                            bound.maximum_depth,
+                                        ));
+                                        self.unresolved = Some(UnresolvedStroke {
+                                            at: curve.start(),
+                                            limit: proof.clone(),
+                                            wider: bound,
+                                        });
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
-                } else if matches!(status, EngagementStatus::Unresolved) {
+                } else if matches!(proof.status, EngagementStatus::Unresolved) {
                     let (a, b) = (curve.start(), curve.end());
                     failed = Some((
                         [a[0], a[1]],
@@ -4484,15 +4634,15 @@ impl EngagementFrontPlan {
                             b[0],
                             b[1],
                             a[2],
-                            reason_text(reason),
+                            reason_text(proof.reason),
                             self.width
                         ),
                     ));
                     break;
                 }
-                if matches!(status, EngagementStatus::Bounded) {
+                if matches!(proof.status, EngagementStatus::Bounded) {
                     proved += 1;
-                    upper = upper.max(upper_angle_deg);
+                    upper = upper.max(proof.upper_angle_deg);
                 }
             }
             scene.append(ClearedSweep::from_motion(&motion, self.r, tolerance)?)?;
@@ -4529,13 +4679,44 @@ impl EngagementFrontPlan {
         Ok(failed)
     }
 
+    /// The refusal for a stroke the confined retry left unresolved, if the
+    /// last `prove` recorded one (#309): where the stroke starts, why each
+    /// query stopped, and the work counters both carried.
+    fn unresolved_refusal(&self) -> Option<([f64; 3], String)> {
+        let u = self.unresolved.as_ref()?;
+        let (limit, wider) = (&u.limit, &u.wider);
+        Some((
+            u.at,
+            format!(
+                "the contact angle of the stroke from ({:.3}, {:.3}) onwards at Z{:.3} is not proven: \
+                 the query within the limit stopped ({}; nodes {}, support tests {}, index visits {}, \
+                 depth {}) and the wider query within 180 degrees stopped too ({}; nodes {}, support \
+                 tests {}, index visits {}, depth {}), so the stroke is left as it was queued and the \
+                 level is refused rather than cutting it as entry motion (#309)",
+                u.at[0],
+                u.at[1],
+                u.at[2],
+                reason_text(limit.reason),
+                limit.nodes,
+                limit.support_tests,
+                limit.index_visits,
+                limit.maximum_depth,
+                reason_text(wider.reason),
+                wider.nodes,
+                wider.support_tests,
+                wider.index_visits,
+                wider.maximum_depth,
+            ),
+        ))
+    }
+
     /// Mark the steering grid's material cleared along the queued Cut and
     /// Lead strokes from `from` on: a committed wall pass cuts beside the
     /// walls, where no pass's steps ever marked, and the residual report
     /// reads this grid (#311). Like a pass's own marks this is a plan-time
     /// estimate for the report — cells whose centre the cutter's sweep
     /// certainly covers — and the exact engagement proof is untouched.
-    fn mark_pending_cuts(&mut self, from: usize) {
+    fn mark_pending_cuts(&mut self, from: usize, cancel: &impl CancelSignal) -> Result<(), String> {
         let (tolerance, r) = (self.op.tolerance_mm, self.r);
         let curves: Vec<Curve> = self
             .pending
@@ -4546,17 +4727,23 @@ impl EngagementFrontPlan {
             .collect();
         let layer = self.layer.as_mut().unwrap();
         let c = layer.g.c;
+        let mut steps_done = 0usize;
         for curve in curves {
             let Ok(path) = curve.prepare(tolerance) else {
                 continue;
             };
             let steps = (path.length_mm() / (0.5 * c)).ceil().max(1.) as usize;
             for i in 0..=steps {
+                if steps_done.is_multiple_of(4096) && cancel.is_cancelled() {
+                    return Err("engagement_front planning cancelled".into());
+                }
+                steps_done += 1;
                 if let Ok(q) = path.position(i as f64 / steps as f64) {
                     layer.cut([q[0], q[1]], r);
                 }
             }
         }
+        Ok(())
     }
 
     /// One pass along every wall loop of the region (`with_wall_pass`).
@@ -4668,8 +4855,11 @@ impl EngagementFrontPlan {
                     .map_or(Ok(()), |(_, detail)| {
                         Err(format!("engagement_front: {detail}"))
                     })?;
+                if let Some((_, detail)) = self.unresolved_refusal() {
+                    return Err(format!("engagement_front: {detail}"));
+                }
             }
-            self.mark_pending_cuts(from);
+            self.mark_pending_cuts(from, cancel)?;
             self.position = [start[0], start[1], z];
             self.report.wall_passes += 1;
         }
@@ -5005,8 +5195,11 @@ impl EngagementFrontPlan {
                     .map_or(Ok(()), |(_, detail)| {
                         Err(format!("engagement_front: {detail}"))
                     })?;
+                if let Some((_, detail)) = self.unresolved_refusal() {
+                    return Err(format!("engagement_front: {detail}"));
+                }
             }
-            self.mark_pending_cuts(from);
+            self.mark_pending_cuts(from, cancel)?;
             let end = strokes.last().unwrap().b;
             self.position = [end[0], end[1], z];
             self.report.wall_passes += 1;
@@ -5397,6 +5590,9 @@ impl EngagementFrontPlan {
             }
             if self.prove(stock, from, from, false, cancel)?.is_some() {
                 self.prove(stock, from, from, true, cancel)?;
+                if let Some((_, detail)) = self.unresolved_refusal() {
+                    return Err(format!("engagement_front: {detail}"));
+                }
             }
             self.report.lifts += 1;
             self.report.stock_edge_entries += 1;
@@ -5438,7 +5634,19 @@ impl EngagementFrontPlan {
     /// At the start of the level: list the areas no entry reaches, and
     /// refuse with the first where the operation asks for that.
     fn note_unentered(&mut self, cancel: &impl CancelSignal) -> Result<(), String> {
-        self.report.unentered_areas = self.unentered_areas(cancel)?;
+        let (areas, cells) = self.unentered_areas(cancel)?;
+        // An area nothing enters is out of the entry search from now on: its
+        // candidate cells are dead, so the entry search never proposes a
+        // start in it and `helix_pass` never visits it (#310). Dead is not
+        // cleared: the material stays and is counted in the level's residual
+        // area, exactly as before.
+        let layer = self.layer.as_mut().unwrap();
+        for area in &cells {
+            for &k in area {
+                layer.dead[k] = true;
+            }
+        }
+        self.report.unentered_areas = areas;
         match self.report.unentered_areas.first() {
             Some(area) if self.refuse_unentered => Err(area.message(&self.op.id)),
             _ => Ok(()),
@@ -5476,10 +5684,11 @@ impl EngagementFrontPlan {
     fn unentered_areas(
         &self,
         cancel: &impl CancelSignal,
-    ) -> Result<Vec<crate::entry::UnenteredArea>, String> {
+    ) -> Result<(Vec<crate::entry::UnenteredArea>, Vec<Vec<usize>>), String> {
         let mut found = self.unresolved_areas(cancel)?;
+        let mut components = vec![];
         let Some(helix) = self.entry.helix() else {
-            return Ok(found);
+            return Ok((found, components));
         };
         let layer = self.layer.as_ref().unwrap();
         let g = layer.g;
@@ -5509,6 +5718,7 @@ impl EngagementFrontPlan {
             // material, and its extent.
             let mut way_in = false;
             let mut best: Option<(f64, usize)> = None;
+            let mut cells: Vec<usize> = vec![];
             let (mut low, mut high) = (g.center(start), g.center(start));
             seen[start] = true;
             open.push(start);
@@ -5523,6 +5733,7 @@ impl EngagementFrontPlan {
                 high = [high[0].max(p[0]), high[1].max(p[1])];
                 way_in |= clear[k] > self.r + g.c || layer.cleared[k] <= layer.z;
                 if material[k] {
+                    cells.push(k);
                     let room = layer.room()[k] as f64 - need;
                     if best.is_none_or(|(b, _)| room > b) {
                         best = Some((room, k));
@@ -5539,6 +5750,7 @@ impl EngagementFrontPlan {
             if way_in || (helix_allowed && radii.iter().any(|&h| h <= room - g.c && h > 4. * g.c)) {
                 continue;
             }
+            components.push(cells);
             found.push(crate::entry::UnenteredArea {
                 reason: if self.entry.policy() == EntryPolicy::StockEdge {
                     "no_helix_allowed"
@@ -5555,7 +5767,7 @@ impl EngagementFrontPlan {
                 available_mm: Some(room - g.c),
             });
         }
-        Ok(found)
+        Ok((found, components))
     }
 
     /// Areas with material where the cutter fits the region exactly but
@@ -5871,16 +6083,29 @@ mod tests {
         // #309: only a bound the wider query proves classifies a stroke, and
         // the reason a query stopped survives into the text that refuses it.
         let limit = 60.;
+        let bound = |angle: f64, reason: Option<UnresolvedReason>| EngagementReport {
+            status: if angle.is_finite() && angle < 360. {
+                EngagementStatus::Bounded
+            } else {
+                EngagementStatus::Unresolved
+            },
+            upper_angle_deg: angle,
+            reason,
+            nodes: 0,
+            support_tests: 0,
+            index_visits: 0,
+            maximum_depth: 0,
+        };
         assert!(matches!(
-            confine((EngagementStatus::Bounded, 40.), limit),
+            confine(&bound(40., None), limit),
             Confine::Proven(a) if a == 40.
         ));
         assert!(matches!(
-            confine((EngagementStatus::Bounded, 90.), limit),
+            confine(&bound(90., None), limit),
             Confine::Entry(a) if a == 90.
         ));
         assert!(matches!(
-            confine((EngagementStatus::Unresolved, 360.), limit),
+            confine(&bound(360., Some(UnresolvedReason::Resolution)), limit),
             Confine::Unproven
         ));
         // Each reason says what it is; none of them claims confinement.
@@ -6775,9 +7000,19 @@ mod tests {
                         20. * c - 0.6,
                     ] {
                         for inclusive in [false, true] {
-                            let near = cells2_within(c, t, inclusive).map(|d2| {
-                                Near::new(&layer.bits.reach, layer.bits.stride, i, j, d2)
-                            });
+                            let near = cells2_within(c, t, inclusive)
+                                .map(|d2| {
+                                    Near::new(
+                                        &layer.bits.reach,
+                                        layer.bits.stride,
+                                        i,
+                                        j,
+                                        d2,
+                                        &NeverCancelled,
+                                    )
+                                })
+                                .transpose()
+                                .expect("uncancelled");
                             for (k, &d) in distance.iter().enumerate() {
                                 let want = if inclusive { d <= t } else { d < t };
                                 let got = near
@@ -7030,5 +7265,633 @@ mod tests {
             assert_eq!(ceil(x).to_bits(), x.ceil().to_bits(), "ceil {x}");
         }
         assert!(floor(f64::NAN).is_nan() && ceil(f64::NAN).is_nan());
+    }
+
+    // --- Forced query outcomes for #309's acceptance (test-only hooks; no
+    // --- production knob): the limit and wider queries come back unresolved
+    // --- with chosen reasons and counters, for a chosen number of queries.
+
+    thread_local! {
+        static REVIEW_REASONS: std::cell::Cell<Option<(UnresolvedReason, UnresolvedReason)>> =
+            const { std::cell::Cell::new(None) };
+        static FORCED_QUERIES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(usize::MAX) };
+        static FORCED_SKIP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The reasons to force, and one query fewer left to force. Queries
+    /// before `FORCED_SKIP` answer really, so a test can prove an earlier
+    /// stroke and force a later one.
+    pub(super) fn review_reasons() -> Option<(UnresolvedReason, UnresolvedReason)> {
+        let skip = FORCED_SKIP.with(|s| s.get());
+        if skip > 0 {
+            FORCED_SKIP.with(|s| s.set(skip - 1));
+            return None;
+        }
+        let reasons = REVIEW_REASONS.with(|r| r.get())?;
+        let left = FORCED_QUERIES.with(|l| l.get());
+        if left == 0 {
+            return None;
+        }
+        FORCED_QUERIES.with(|l| l.set(left - 1));
+        Some(reasons)
+    }
+
+    /// Force every query to come back unresolved with these reasons.
+    fn force(reasons: Option<(UnresolvedReason, UnresolvedReason)>) {
+        force_after(0, reasons);
+    }
+
+    /// Force the queries from the `skip`th on (0: all of them).
+    fn force_after(skip: usize, reasons: Option<(UnresolvedReason, UnresolvedReason)>) {
+        FORCED_SKIP.with(|s| s.set(skip));
+        FORCED_QUERIES.with(|l| l.set(usize::MAX));
+        REVIEW_REASONS.with(|r| r.set(reasons));
+    }
+
+    /// An unresolved report with the reason and distinct non-zero counters,
+    /// so a test can see the counters travel with the outcome.
+    pub(super) fn forced_report(reason: UnresolvedReason) -> EngagementReport {
+        let (nodes, support, visits, depth) = match reason {
+            UnresolvedReason::Work => (11, 13, 17, 1),
+            UnresolvedReason::Resolution => (19, 23, 29, 2),
+            UnresolvedReason::Depth => (31, 37, 41, 3),
+        };
+        EngagementReport {
+            status: EngagementStatus::Unresolved,
+            upper_angle_deg: 360.,
+            reason: Some(reason),
+            nodes,
+            support_tests: support,
+            index_visits: visits,
+            maximum_depth: depth,
+        }
+    }
+
+    /// The wider query's outcome, overridden to unresolved with `reason`: its
+    /// own counters stand, because the override replaces what the query
+    /// concluded, not the work it did.
+    pub(super) fn forced_report_over(
+        reason: UnresolvedReason,
+        mut report: EngagementReport,
+    ) -> EngagementReport {
+        report.status = EngagementStatus::Unresolved;
+        report.upper_angle_deg = 360.;
+        report.reason = Some(reason);
+        report
+    }
+
+    /// A plan on the adaptive-pocket fixture with one short cutting stroke
+    /// queued, proved with both queries forced unresolved.
+    fn review_proof(reason: UnresolvedReason, wider: UnresolvedReason) -> EngagementFrontPlan {
+        let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+            "../../fixtures/operations/adaptive-pocket.json"
+        ))
+        .unwrap();
+        let crate::pocket::Operation::AdaptivePocket(mut op) = m.operations.remove(0) else {
+            panic!("fixture");
+        };
+        op.pocket.entry = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+            }))
+            .unwrap(),
+        );
+        let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = EngagementFrontPlan::prepare(
+            op.pocket,
+            &m.tools[0],
+            stock.spec(),
+            m.initial_position_mm,
+            0.5,
+            true,
+            &NeverCancelled,
+        )
+        .unwrap();
+        plan.queue(
+            Curve::Line {
+                start: [6., 6., 8.],
+                end: [6.1, 6., 8.],
+            },
+            MoveKind::Cut,
+            None,
+        );
+        force(Some((reason, wider)));
+        let result = plan.prove(&stock, 0, 0, true, &NeverCancelled);
+        force(None);
+        assert!(result.unwrap().is_none());
+        plan
+    }
+
+    #[test]
+    fn review_work_exhaustion_must_not_authorize_entry() {
+        let plan = review_proof(UnresolvedReason::Work, UnresolvedReason::Work);
+        assert_ne!(
+            plan.pending[0].1,
+            MoveKind::Lead,
+            "{:?}",
+            plan.report.diagnostics
+        );
+        // The stroke stays as it was queued, and the outcome carries both
+        // queries' reasons and counters for the refusal.
+        assert_eq!(plan.pending[0].1, MoveKind::Cut);
+        let u = plan.unresolved.as_ref().expect("an unresolved stroke");
+        assert_eq!(u.limit.reason, Some(UnresolvedReason::Work));
+        assert_eq!(u.limit.nodes, 11);
+        assert_eq!(u.wider.reason, Some(UnresolvedReason::Work));
+    }
+
+    #[test]
+    fn review_depth_exhaustion_must_not_authorize_entry() {
+        let plan = review_proof(UnresolvedReason::Depth, UnresolvedReason::Depth);
+        assert_ne!(
+            plan.pending[0].1,
+            MoveKind::Lead,
+            "{:?}",
+            plan.report.diagnostics
+        );
+        let u = plan.unresolved.as_ref().expect("an unresolved stroke");
+        assert_eq!(u.wider.reason, Some(UnresolvedReason::Depth));
+        // The limit query's forced counters travel with the outcome; the
+        // wider override replaces what the query concluded, not the work it
+        // did.
+        assert_eq!(u.limit.reason, Some(UnresolvedReason::Depth));
+        assert_eq!(u.limit.maximum_depth, 3);
+    }
+
+    #[test]
+    fn review_diagnostic_must_name_wider_query_reason() {
+        let plan = review_proof(UnresolvedReason::Resolution, UnresolvedReason::Work);
+        assert!(
+            plan.report
+                .diagnostics
+                .iter()
+                .any(|s| s.contains("work budget")),
+            "{:?}",
+            plan.report.diagnostics
+        );
+    }
+
+    #[test]
+    fn review_cached_entry_scan_must_observe_cancel() {
+        let g = Grid {
+            x0: 0.,
+            y0: 0.,
+            c: 0.1,
+            nx: 400,
+            ny: 400,
+        };
+        let mut layer = layer_of(g, |_| true, |_| true);
+        layer.most_open(1., &NeverCancelled).unwrap();
+        layer.dead.fill(true);
+        let result = layer.most_open(1., &CancelAfter(AtomicUsize::new(0)));
+        assert!(
+            result.is_err(),
+            "160000 cached cells scanned despite cancellation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_level_whose_wider_query_stops_on_work_or_depth_is_refused() {
+        for reason in [UnresolvedReason::Work, UnresolvedReason::Depth] {
+            let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+                "../../fixtures/operations/adaptive-pocket.json"
+            ))
+            .unwrap();
+            m.validate().unwrap();
+            let tool = m.tools[0].prepare().unwrap();
+            let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+            let mut op = m.operations.remove(0);
+            if let crate::pocket::Operation::AdaptivePocket(ref mut adaptive) = op {
+                adaptive.path_strategy = crate::adaptive::AdaptivePathStrategy::EngagementFront;
+            }
+            let mut plan = crate::operation::OperationPlan::prepare_with_stock(
+                op,
+                &m.tools[0],
+                &stock,
+                m.initial_position_mm,
+                1,
+                &|| false,
+            )
+            .unwrap();
+            force(Some((reason, reason)));
+            let error = loop {
+                match plan.next_motion_with_stock(&stock, &|| false) {
+                    Err(error) => break error,
+                    Ok(Some(motion)) => {
+                        let delta = stock
+                            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+                            .unwrap();
+                        stock.apply_delta(&delta).unwrap();
+                    }
+                    Ok(None) => panic!("the level completed without refusing"),
+                }
+            };
+            force(None);
+            assert!(error.contains(reason_text(Some(reason))), "{error}");
+            assert!(error.contains("refused rather than cutting"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_recorded_proof_replays_with_its_reason_and_counters() {
+        let mut plan = {
+            let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+                "../../fixtures/operations/adaptive-pocket.json"
+            ))
+            .unwrap();
+            let crate::pocket::Operation::AdaptivePocket(mut op) = m.operations.remove(0) else {
+                panic!("fixture");
+            };
+            op.pocket.entry = Some(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+                }))
+                .unwrap(),
+            );
+            let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+            let mut plan = EngagementFrontPlan::prepare(
+                op.pocket,
+                &m.tools[0],
+                stock.spec(),
+                m.initial_position_mm,
+                0.5,
+                true,
+                &NeverCancelled,
+            )
+            .unwrap();
+            plan.queue(
+                Curve::Line {
+                    start: [6., 6., 8.],
+                    end: [6.1, 6., 8.],
+                },
+                MoveKind::Cut,
+                None,
+            );
+            (plan, stock)
+        };
+        // The first proof is forced unresolved and recorded; the hook stays
+        // forced so the replay check compares like with like.
+        force(Some((UnresolvedReason::Work, UnresolvedReason::Work)));
+        let first = plan.0.prove(&plan.1, 0, 0, false, &NeverCancelled).unwrap();
+        assert!(first.is_some(), "an unresolved stroke fails the pass");
+        let recorded = plan.0.proof_memo.strokes[0]
+            .2
+            .as_ref()
+            .expect("recorded")
+            .clone();
+        assert_eq!(recorded.reason, Some(UnresolvedReason::Work));
+        assert_eq!(recorded.nodes, 11);
+        // The same queue again: the record replays instead of computing, and
+        // the outcome is the same unresolved one, counters included.
+        let before = SHORTCUTS.with(|taken| taken.get()[0]);
+        let again = plan.0.prove(&plan.1, 0, 0, false, &NeverCancelled).unwrap();
+        let after = SHORTCUTS.with(|taken| taken.get()[0]);
+        force(None);
+        assert!(again.is_some());
+        assert!(after > before, "the recorded proof was not replayed");
+        assert_eq!(plan.0.proof_memo.strokes[0].2.as_ref().unwrap(), &recorded);
+    }
+
+    #[test]
+    fn a_proven_prefix_stands_and_an_unproven_suffix_fails_the_pass() {
+        let (mut plan, stock) = {
+            let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+                "../../fixtures/operations/adaptive-pocket.json"
+            ))
+            .unwrap();
+            let crate::pocket::Operation::AdaptivePocket(mut op) = m.operations.remove(0) else {
+                panic!("fixture");
+            };
+            op.pocket.entry = Some(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+                }))
+                .unwrap(),
+            );
+            let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+            let mut plan = EngagementFrontPlan::prepare(
+                op.pocket,
+                &m.tools[0],
+                stock.spec(),
+                m.initial_position_mm,
+                0.5,
+                true,
+                &NeverCancelled,
+            )
+            .unwrap();
+            // Above the stock the first stroke's query proves really (in
+            // air); the second is forced unresolved: the prefix stands, the
+            // suffix fails the pass.
+            plan.queue(
+                Curve::Line {
+                    start: [6., 6., 12.],
+                    end: [6.1, 6., 12.],
+                },
+                MoveKind::Cut,
+                None,
+            );
+            plan.queue(
+                Curve::Line {
+                    start: [6.1, 6., 12.],
+                    end: [6.2, 6., 12.],
+                },
+                MoveKind::Cut,
+                None,
+            );
+            (plan, stock)
+        };
+        force_after(1, Some((UnresolvedReason::Work, UnresolvedReason::Work)));
+        let failed = plan.prove(&stock, 0, 0, false, &NeverCancelled).unwrap();
+        force(None);
+        let (at, detail) = failed.expect("the suffix fails the pass");
+        assert_eq!(at, [6.1, 6.], "the failure is at the second stroke");
+        assert!(detail.contains("work budget"), "{detail}");
+        // The prefix's proof is recorded, and so is the suffix's unresolved
+        // outcome, reason and all: the retry reads it from the memo.
+        assert!(plan.proof_memo.strokes[0].2.is_some());
+        let suffix = plan.proof_memo.strokes[1].2.as_ref().expect("recorded");
+        assert_eq!(suffix.reason, Some(UnresolvedReason::Work));
+        assert_eq!(suffix.nodes, 11);
+    }
+
+    #[test]
+    fn a_cancelled_report_is_an_error_and_publishes_nothing() {
+        let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+            "../../fixtures/operations/adaptive-pocket.json"
+        ))
+        .unwrap();
+        m.validate().unwrap();
+        let tool = m.tools[0].prepare().unwrap();
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut op = m.operations.remove(0);
+        if let crate::pocket::Operation::AdaptivePocket(ref mut adaptive) = op {
+            adaptive.path_strategy = crate::adaptive::AdaptivePathStrategy::EngagementFront;
+        }
+        let crate::pocket::Operation::AdaptivePocket(mut pocket) = op else {
+            panic!("fixture");
+        };
+        pocket.pocket.entry = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+            }))
+            .unwrap(),
+        );
+        let mut plan = EngagementFrontPlan::prepare(
+            pocket.pocket,
+            &m.tools[0],
+            stock.spec(),
+            m.initial_position_mm,
+            0.5,
+            true,
+            &NeverCancelled,
+        )
+        .unwrap();
+        while let Some(motion) = plan
+            .next_motion_with_stock(&stock, &NeverCancelled)
+            .unwrap()
+        {
+            let delta = stock
+                .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+                .unwrap();
+            stock.apply_delta(&delta).unwrap();
+        }
+        // A report whose scan is cancelled is an error, and publishes no
+        // residual: the status stays pending, not half-estimated.
+        assert!(
+            plan.finish_report(&CancelAfter(AtomicUsize::new(1)))
+                .is_err()
+        );
+        assert_eq!(
+            plan.report.geometric_residual_status,
+            crate::pocket::ResidualStatus::Pending
+        );
+        // The uncancelled report answers, and is published.
+        plan.finish_report(&NeverCancelled).unwrap();
+        assert_eq!(
+            plan.report.geometric_residual_status,
+            crate::pocket::ResidualStatus::Estimated
+        );
+    }
+
+    #[test]
+    fn an_area_reported_unentered_is_excluded_from_the_entry_search() {
+        // The adaptive pocket is one enclosed area a helix fits: with the
+        // helix allowed it is usable, and with `StockEdgeEntry`
+        // (helix=None) it is reported `no_helix_allowed` and excluded.
+        let plan_with = |entry: serde_json::Value| -> EngagementFrontPlan {
+            let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+                "../../fixtures/operations/adaptive-pocket.json"
+            ))
+            .unwrap();
+            let crate::pocket::Operation::AdaptivePocket(mut p) = m.operations.remove(0) else {
+                panic!("fixture");
+            };
+            p.pocket.entry = Some(serde_json::from_value(entry).unwrap());
+            let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+            let mut plan = EngagementFrontPlan::prepare(
+                p.pocket,
+                &m.tools[0],
+                stock.spec(),
+                m.initial_position_mm,
+                0.5,
+                true,
+                &NeverCancelled,
+            )
+            .unwrap();
+            plan.build_layer(&stock, &NeverCancelled).unwrap();
+            plan.note_unentered(&NeverCancelled).unwrap();
+            plan
+        };
+        // Every start the entry search still offers, consumed one by one.
+        let starts = |plan: &mut EngagementFrontPlan| -> Vec<Point> {
+            let g = plan.layer.as_ref().unwrap().g;
+            let need = plan.grid_clearance(g.c);
+            let mut proposed = vec![];
+            while let Some((_, k)) = plan
+                .layer
+                .as_ref()
+                .unwrap()
+                .most_open(need, &NeverCancelled)
+                .unwrap()
+            {
+                proposed.push(g.center(k));
+                plan.layer.as_mut().unwrap().dead[k] = true;
+            }
+            proposed
+        };
+
+        // The helix is allowed: the area is not reported, and its starts
+        // stand.
+        let mut plan = plan_with(serde_json::json!({
+            "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+        }));
+        assert!(
+            plan.report.unentered_areas.is_empty(),
+            "{:?}",
+            plan.report.unentered_areas
+        );
+        let usable = starts(&mut plan);
+        assert!(!usable.is_empty(), "a usable area offers starts");
+
+        // The helix is forbidden: the area is reported, and the entry search
+        // never proposes a start in it again.
+        let mut plan = plan_with(serde_json::json!({ "kind": "stock_edge" }));
+        let areas = &plan.report.unentered_areas;
+        assert_eq!(areas.len(), 1, "{areas:?}");
+        assert_eq!(areas[0].reason, "no_helix_allowed");
+        let layer = plan.layer.as_ref().unwrap();
+        let material_before = (0..layer.top.len()).filter(|&k| layer.material(k)).count();
+        let excluded = starts(&mut plan);
+        assert!(
+            excluded.is_empty(),
+            "starts offered inside the reported area: {excluded:?}"
+        );
+        // Dead is not cleared: the material stands and is counted as before.
+        let layer = plan.layer.as_ref().unwrap();
+        let material_after = (0..layer.top.len()).filter(|&k| layer.material(k)).count();
+        assert_eq!(material_before, material_after);
+    }
+
+    /// A plan on the fixture pocket with the level's passes run and
+    /// committed, its wall phase left for the caller (`walls_done`), so a
+    /// test can attempt the walls itself under a forced outcome.
+    fn pocket_with_walls_pending(
+        entry: serde_json::Value,
+        runs: bool,
+    ) -> (EngagementFrontPlan, Stock) {
+        let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+            "../../fixtures/operations/adaptive-pocket.json"
+        ))
+        .unwrap();
+        let crate::pocket::Operation::AdaptivePocket(mut p) = m.operations.remove(0) else {
+            panic!("fixture");
+        };
+        p.pocket.entry = Some(serde_json::from_value(entry).unwrap());
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = EngagementFrontPlan::prepare(
+            p.pocket,
+            &m.tools[0],
+            stock.spec(),
+            m.initial_position_mm,
+            0.5,
+            true,
+            &NeverCancelled,
+        )
+        .unwrap()
+        .with_wall_runs(runs);
+        // The wall phase is the caller's; the passes run and commit here.
+        plan.walls_done = true;
+        let tool = m.tools[0].prepare().unwrap();
+        while let Some(motion) = plan
+            .next_motion_with_stock(&stock, &NeverCancelled)
+            .unwrap()
+        {
+            let delta = stock
+                .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+                .unwrap();
+            stock.apply_delta(&delta).unwrap();
+        }
+        (plan, stock)
+    }
+
+    fn material_cells(plan: &EngagementFrontPlan) -> usize {
+        let layer = plan.layer.as_ref().unwrap();
+        (0..layer.top.len()).filter(|&k| layer.material(k)).count()
+    }
+
+    #[test]
+    fn a_rolled_back_wall_loop_marks_nothing() {
+        // `StockEdgeEntry` (helix=None) leaves the wall loop no entry motion:
+        // an unproven wall loop rolls back and is skipped, and marks nothing
+        // (#311).
+        let (mut plan, stock) =
+            pocket_with_walls_pending(serde_json::json!({ "kind": "stock_edge" }), false);
+        plan.finish_report(&NeverCancelled).unwrap();
+        let before = material_cells(&plan);
+        let reported_before = plan.report.geometric_residual_area_mm2;
+        let pending_before = plan.pending.len();
+        force(Some((UnresolvedReason::Work, UnresolvedReason::Work)));
+        plan.plan_walls(&stock, &NeverCancelled).unwrap();
+        force(None);
+        assert_eq!(plan.report.wall_passes, 0, "{:?}", plan.report.diagnostics);
+        assert!(
+            plan.report.wall_passes_skipped >= 1,
+            "{:?}",
+            plan.report.diagnostics
+        );
+        assert_eq!(plan.pending.len(), pending_before, "the queue is restored");
+        assert_eq!(material_cells(&plan), before, "the grid is restored");
+        assert_eq!(
+            plan.report.geometric_residual_area_mm2, reported_before,
+            "a rolled-back wall attempt changes no report"
+        );
+    }
+
+    #[test]
+    fn a_wall_loop_whose_wider_query_stops_on_work_is_refused() {
+        // With an entry that allows entry motion, an unproven wall loop is
+        // the confined retry: a wider query that stops on `Work` refuses the
+        // level rather than entering (#309), in wall mode like in a pass.
+        let (mut plan, stock) = pocket_with_walls_pending(
+            serde_json::json!({
+                "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+            }),
+            false,
+        );
+        force(Some((UnresolvedReason::Work, UnresolvedReason::Work)));
+        let error = plan
+            .plan_walls(&stock, &NeverCancelled)
+            .expect_err("the wall loop is refused");
+        force(None);
+        assert!(error.contains("work budget"), "{error}");
+        assert!(error.contains("refused rather than cutting"), "{error}");
+    }
+
+    #[test]
+    fn a_rolled_back_wall_run_marks_nothing() {
+        // `StockEdgeEntry` (helix=None): an unproven wall run rolls back and
+        // is skipped, and marks nothing (#311), like a wall loop.
+        let (mut plan, stock) =
+            pocket_with_walls_pending(serde_json::json!({ "kind": "stock_edge" }), true);
+        plan.finish_report(&NeverCancelled).unwrap();
+        let before = material_cells(&plan);
+        let reported_before = plan.report.geometric_residual_area_mm2;
+        force(Some((UnresolvedReason::Work, UnresolvedReason::Work)));
+        plan.plan_wall_runs(&stock, &NeverCancelled).unwrap();
+        force(None);
+        assert_eq!(plan.report.wall_passes, 0, "{:?}", plan.report.diagnostics);
+        assert!(
+            plan.report.wall_passes_skipped >= 1,
+            "{:?}",
+            plan.report.diagnostics
+        );
+        assert_eq!(material_cells(&plan), before, "the grid is restored");
+        assert_eq!(
+            plan.report.geometric_residual_area_mm2, reported_before,
+            "a rolled-back run changes no report"
+        );
+    }
+
+    #[test]
+    fn a_committed_wall_run_marks_the_skin_it_cut() {
+        let (mut plan, stock) = pocket_with_walls_pending(
+            serde_json::json!({
+                "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+            }),
+            true,
+        );
+        plan.finish_report(&NeverCancelled).unwrap();
+        let before = material_cells(&plan);
+        plan.plan_wall_runs(&stock, &NeverCancelled).unwrap();
+        assert!(
+            plan.report.wall_passes >= 1,
+            "{:?}",
+            plan.report.diagnostics
+        );
+        assert!(
+            material_cells(&plan) < before,
+            "a committed run marks the skin it cut; the report reads this              grid (see the square and curved pocket regressions)"
+        );
     }
 }

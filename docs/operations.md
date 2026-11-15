@@ -579,19 +579,24 @@ refused with its location: export the mesh with shared edge vertices
   - **Confined material is entry motion.** In a pocket barely wider than the
     cutter no step width keeps the contact within the limit, just as the
     helix that opens it cuts a full slot. Strokes still unproven at half the
-    declared width are cut as lead moves at the entry feed (the helix feed,
-    else the plunge feed) and counted (`confined_strokes`,
-    `confined_stroke_mm`, `confined_max_engagement_deg`). This needs an entry
-    that allows a helix or a ramp; with `StockEdgeEntry(helix=None)` the
-    operation stops and names the place. Its message says the material *may
-    be* confined, because what it names is a stroke the proof could not
-    settle: a bound the wider query proves past the limit is what shows
-    confinement. A stroke whose bound even the half-circle query leaves
-    unresolved is still entry motion, never a cut at the cutting feed, but
-    nothing establishes a contact angle for it: it is counted in
-    `confined_unproven_mm` and said once in the layer's diagnostics, and
-    `confined_max_engagement_deg` keeps its `360` sentinel for it rather
-    than claiming a bound it never proved.
+    declared width are classified by what the wider (180°) query proves: a
+    bound past the limit is the confined case — cut as lead moves at the
+    entry feed (the helix feed, else the plunge feed) and counted
+    (`confined_strokes`, `confined_stroke_mm`, `confined_max_engagement_deg`).
+    This needs an entry that allows a helix or a ramp; with
+    `StockEdgeEntry(helix=None)` the operation stops and names the place. Its
+    message says the material *may be* confined, because what it names is a
+    stroke the proof could not settle: a proven bound is what shows
+    confinement. A stroke whose bound the wider query leaves unresolved is
+    never cut at the cutting feed. When the wider query stopped because it
+    refined to its resolution without settling (#309's recorded deviation)
+    the stroke is still entry motion, counted in `confined_unproven_mm` and
+    said once in the layer's diagnostics, with `confined_max_engagement_deg`
+    keeping its `360` sentinel rather than claiming a bound nobody proved.
+    When it stopped on its work budget or recursion depth the proof was not
+    allowed to finish, so nothing authorizes entry motion either: the stroke
+    stays as it was queued and the level is refused, naming both queries'
+    reasons and the proof's counters.
   - **Each layer ends with a pass along the walls**, where stock still
     stands beside them. The front's passes end at a wall a stepover apart,
     which leaves a cusp between every two pass ends, well over the
@@ -641,7 +646,11 @@ refused with its location: export the mesh with shared edge vertices
     the entry policy's answer, not the geometry's: an enclosed area whose
     only way in is a helix that `StockEdgeEntry(helix=None)` forbids is
     listed like this and left for a smaller cutter, a ramp or an earlier
-    operation, while the layer cuts everything else it can reach (#310).
+    operation, while the layer cuts everything else it can reach (#310). A
+    listed area is out of the entry search from then on: its candidate
+    centres are dead, so no start is proposed inside it and no helix is
+    tried there again — dead is not cleared, and its stock is counted as
+    before.
   - **Roughing that would make no motion at all** because of such an area
     is refused, with the first area's place and the options, instead of
     planning nothing. Roughing with nothing left to cut is not an error.

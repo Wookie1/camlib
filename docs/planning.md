@@ -84,8 +84,9 @@ report digest is tagged `preparation_interrupted`, rather than claiming a
 compiled-candidate identity. No evaluation starts until all common premises
 match. Individual native operations observe cancellation cooperatively.
 The engagement front checks the signal through its whole-grid work: the
-distance transforms, the open-cell order the entry search reads, the routed
-link searches and the area reports. A cancelled link search is an error, not
+distance transforms, the whole-grid dilations of the entry search and its
+cached candidate order, the routed link searches, the wall-pass marking and
+the area reports and final report. A cancelled link search is an error, not
 a missing link: the plan cannot go quietly another way, and a cancelled level
 ends the run with nothing selected.
 

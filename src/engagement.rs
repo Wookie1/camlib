@@ -421,7 +421,7 @@ pub enum UnresolvedReason {
     Resolution,
     Depth,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EngagementReport {
     pub status: EngagementStatus,
     pub upper_angle_deg: f64,
