@@ -21,7 +21,9 @@
 //! - the stream verifier still checks the run against stock, part and machine.
 use crate::{
     Point,
-    engagement::{ClearedSweep, EngagementOptions, EngagementScene, EngagementStatus},
+    engagement::{
+        ClearedSweep, EngagementOptions, EngagementScene, EngagementStatus, UnresolvedReason,
+    },
     entry::{EntryPolicy, PocketEntry},
     heights::Heights,
     motion::{Curve, Event, Motion, MoveKind, Vec3},
@@ -381,11 +383,25 @@ impl LinkQueue for LinkBuckets {
 /// reached from, and the goal's distance in the queue if the search ended
 /// by taking the goal from it.
 ///
+/// A stay-down link once routed: the waypoints after the start, the samples
+/// to cut along them, and the widest step between two of its samples.
+type Link = (Vec<Point>, Vec<Point>, f64);
+
+/// What a link search answers: the settled distance of every cell (in cells,
+/// `INFINITY` for one it never reached), the cell each was reached from
+/// (`usize::MAX` for one it never reached), and the distance at the goal when
+/// the search settled it (`None`: it stopped short).
+type LinkSearch = (Vec<f64>, Vec<usize>, Option<f64>);
+
 /// A cell's distance in the queue is in 1/1024 of a cell, rounded down, and
 /// its neighbours' distances are counted on from that rounded value. So a
 /// cell is queued at least 1024 (a straight step) or 1448 (a diagonal one:
 /// 1024 times the square root of 2, rounded down) beyond the cell it was
 /// reached from: `LINK_DIAGONAL` names the latter.
+///
+/// The search takes cells until it ends; cancellation is observed every
+/// 4096 cells (#312). A cancelled search is an error, never a missing link:
+/// the plan must not silently choose a different, longer travel.
 fn link_search(
     mut queue: impl LinkQueue,
     size: [usize; 2],
@@ -393,14 +409,20 @@ fn link_search(
     goal: usize,
     limit: f64,
     enter: impl Fn(usize, usize, f64) -> bool,
-) -> (Vec<f64>, Vec<usize>, Option<f64>) {
+    cancel: &impl CancelSignal,
+) -> Result<LinkSearch, String> {
     let n = size[0] * size[1];
     let mut dist = vec![f64::INFINITY; n];
     let mut prev = vec![usize::MAX; n];
     let mut at_goal = None;
     dist[start] = 0.;
     queue.push(0, start);
+    let mut taken = 0usize;
     while let Some((d, k)) = queue.pop() {
+        taken += 1;
+        if taken.is_multiple_of(4096) && cancel.is_cancelled() {
+            return Err("engagement_front link search cancelled".into());
+        }
         let d = d as f64 / 1024.;
         if d > dist[k] + 1e-9 {
             continue;
@@ -438,7 +460,7 @@ fn link_search(
             queue.push((nd * 1024.) as u64, nk);
         }
     }
-    (dist, prev, at_goal)
+    Ok((dist, prev, at_goal))
 }
 
 /// What a diagonal step adds at least to a cell's distance in a link
@@ -617,8 +639,19 @@ pub struct EngagementFrontReport {
     pub confined_strokes: usize,
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub confined_stroke_mm: f64,
+    /// Largest contact bound proven for a confined stroke. `360` is the
+    /// sentinel for one whose bound even the half-circle query did not
+    /// prove (see `confined_unproven_mm`).
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub confined_max_engagement_deg: f64,
+    /// Of the confined entry strokes, the length of those whose bound stayed
+    /// unresolved: the wider query stopped without a bound too (#309). They
+    /// are still entry moves at the entry feed — never a cut at the cutting
+    /// feed — but nothing establishes a contact angle for them, so they are
+    /// not counted as proven confined material and
+    /// `confined_max_engagement_deg` carries its sentinel for them.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub confined_unproven_mm: f64,
     /// Largest radial width the steering grid predicted for a planned step.
     /// A grid estimate (see `engagement_grid_mm`); the proven bound is
     /// `proven_max_engagement_deg`.
@@ -749,6 +782,7 @@ impl Default for EngagementFrontReport {
             confined_strokes: 0,
             confined_stroke_mm: 0.,
             confined_max_engagement_deg: 0.,
+            confined_unproven_mm: 0.,
             max_estimated_engagement_mm: 0.,
             engagement_grid_mm: 0.,
             passes: 0,
@@ -843,9 +877,26 @@ struct Layer {
     open: std::cell::RefCell<Option<OpenOrder>>,
 }
 impl Layer {
+    /// Work out `room` (a whole-grid distance transform), observing
+    /// cancellation while it does (#312). `room` answers it without work
+    /// once built.
+    fn room_init(&self, cancel: &impl CancelSignal) -> Result<(), String> {
+        if self.room.get().is_none() {
+            let d = edt(&self.g, &self.outside, cancel)?
+                .into_iter()
+                .map(|d| d as f32)
+                .collect();
+            let _ = self.room.set(d);
+        }
+        Ok(())
+    }
+    /// The room to the walls per cell: `room_init` builds it interruptibly;
+    /// every planning caller has initialised it before asking, so this only
+    /// answers the built value (the init fallback keeps it total).
     fn room(&self) -> &[f32] {
         self.room.get_or_init(|| {
-            edt(&self.g, &self.outside)
+            edt(&self.g, &self.outside, &NeverCancelled)
+                .expect("an uncancelled transform does not fail")
                 .into_iter()
                 .map(|d| d as f32)
                 .collect()
@@ -861,14 +912,24 @@ impl Layer {
     /// time). The allowed cells with material are put in order once, most
     /// room first (`OpenOrder`), and the answer is the first of them that
     /// still has material and is not dead: cells only leave (cut, or marked
-    /// dead) except where `reopened` is told of one coming back.
-    fn most_open(&self, need: f64) -> Option<(f64, usize)> {
+    /// dead) except where `reopened` is told of one coming back. Building
+    /// the order (a whole-grid scan, after the room transform) observes
+    /// cancellation (#312).
+    fn most_open(
+        &self,
+        need: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<(f64, usize)>, String> {
+        self.room_init(cancel)?;
         let room = self.room();
         let mut open = self.open.borrow_mut();
         if open.as_ref().is_none_or(|o| o.need != need.to_bits()) {
             let stride = self.bits.stride;
             let mut cells = vec![];
             for (w, (any, allowed)) in self.bits.any.iter().zip(&self.bits.allowed).enumerate() {
+                if w.is_multiple_of(512) && cancel.is_cancelled() {
+                    return Err("engagement_front planning cancelled".into());
+                }
                 let mut word = any & allowed;
                 while word != 0 {
                     let i = (w % stride) * 64 + word.trailing_zeros() as usize;
@@ -910,7 +971,7 @@ impl Layer {
                 scan.map(|(room, k)| (room.to_bits(), k))
             );
         }
-        best
+        Ok(best)
     }
     /// Cell `k` may have material and be alive again (an undone cut, a
     /// revived start): `most_open` looks at it again.
@@ -1734,10 +1795,21 @@ fn step_load_plain(cells: &[Point], p: Point, u: Point, r: f64, c: f64) -> (f64,
     (inside * c * c, ring * c / (r + c / 2.))
 }
 
+/// A signal that never fires: for a transform whose caller cannot cancel
+/// it (the `Layer::room` fallback, which its planning callers have all
+/// initialised with a real signal first, #312) and for tests.
+pub(crate) struct NeverCancelled;
+impl CancelSignal for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 /// Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher,
 /// "Distance Transforms of Sampled Functions", 2012): distance in mm from each
-/// cell centre to the nearest `true` cell centre (1e9 when none).
-fn edt(g: &Grid, mask: &[bool]) -> Vec<f64> {
+/// cell centre to the nearest `true` cell centre (1e9 when none). One pass per
+/// column and row of the grid; cancellation is observed every 64 of them (#312).
+fn edt(g: &Grid, mask: &[bool], cancel: &impl CancelSignal) -> Result<Vec<f64>, String> {
     const INF: f64 = 1e20;
     fn pass(f: &[f64], out: &mut [f64], v: &mut [usize], z: &mut [f64]) {
         let n = f.len();
@@ -1782,6 +1854,9 @@ fn edt(g: &Grid, mask: &[bool]) -> Vec<f64> {
     let (mut v, mut zz) = (vec![0usize; n], vec![0f64; n + 1]);
     let (mut col, mut out) = (vec![0f64; ny], vec![0f64; ny]);
     for i in 0..nx {
+        if i.is_multiple_of(64) && cancel.is_cancelled() {
+            return Err("engagement_front planning cancelled".into());
+        }
         for j in 0..ny {
             col[j] = f[j * nx + i];
         }
@@ -1793,13 +1868,16 @@ fn edt(g: &Grid, mask: &[bool]) -> Vec<f64> {
     let mut row = vec![0f64; nx];
     let mut out = vec![0f64; nx];
     for j in 0..ny {
+        if j.is_multiple_of(64) && cancel.is_cancelled() {
+            return Err("engagement_front planning cancelled".into());
+        }
         row.copy_from_slice(&f[j * nx..(j + 1) * nx]);
         pass(&row, &mut out, &mut v, &mut zz);
         f[j * nx..(j + 1) * nx].copy_from_slice(&out);
     }
-    f.iter()
+    Ok(f.iter()
         .map(|&d| if d >= INF / 2. { 1e9 } else { d.sqrt() * g.c })
-        .collect()
+        .collect())
 }
 
 /// Flatten a region boundary to straight segments with sagitta <= `sag`.
@@ -2140,8 +2218,51 @@ fn shortcut_taken(which: usize) {
     });
 }
 
-/// The exact proof's status for a stroke and its bound in degrees.
-type Proved = (EngagementStatus, f64);
+/// The exact proof's status for a stroke: its bound in degrees and, when
+/// unresolved, why the query stopped. The reason decides what an unproven
+/// stroke may become: only a bound the wider query proves can classify a
+/// stroke as confined entry motion (#309).
+type Proved = (EngagementStatus, f64, Option<UnresolvedReason>);
+
+/// How the confined retry reads the wider (half-circle) bound query of a
+/// stroke the limit query left unresolved (#309).
+enum Confine {
+    /// The wider query proved a bound within the limit: the stroke may be
+    /// cut after all, the limit query merely failed to settle.
+    Proven(f64),
+    /// The wider query proved a bound past the limit: the material engages
+    /// the cutter beyond what a cutting stroke may take, the documented
+    /// confined case (an entry move at the entry feed).
+    Entry(f64),
+    /// Even the wider query stopped without a bound. Nothing establishes a
+    /// contact angle, so the stroke is not reported as confined material
+    /// with a proven bound; it is still made an entry move, because that is
+    /// the conservative move (the entry feed, never the cutting feed), and
+    /// is counted in `confined_unproven_mm` with the reason it stayed
+    /// unresolved.
+    Unproven,
+}
+
+fn confine(bound: (EngagementStatus, f64), limit: f64) -> Confine {
+    match bound {
+        (EngagementStatus::Bounded, angle) if angle <= limit => Confine::Proven(angle),
+        (EngagementStatus::Bounded, angle) => Confine::Entry(angle),
+        (EngagementStatus::Unresolved, _) => Confine::Unproven,
+    }
+}
+
+/// Why an unresolved query stopped, for a refusal that must not claim a
+/// geometric fact the query never established (#309).
+fn reason_text(reason: Option<UnresolvedReason>) -> &'static str {
+    match reason {
+        Some(UnresolvedReason::Work) => "the query reached its work budget",
+        Some(UnresolvedReason::Resolution) => {
+            "the query could not resolve its boundary certificate"
+        }
+        Some(UnresolvedReason::Depth) => "the query reached its recursion depth",
+        None => "the query stopped without a bound",
+    }
+}
 
 /// What the exact proof found for the strokes queued from `from` on, in
 /// order: each stroke as it was queued, and the proof's status and bound
@@ -2319,12 +2440,13 @@ impl EngagementFrontPlan {
             spec.max_mm[2].max(op.top_z_mm),
             guard,
         )?;
-        let guides = if entry.ramp().is_some() {
-            // No pass of the guide plan is cut, so none needs a ramp.
-            PocketPlan::prepare_region_guides(op.clone(), tool, spec, initial, 1, cancel)?
-        } else {
-            PocketPlan::prepare(op.clone(), tool, spec, initial, 1, cancel)?
-        };
+        let guides = PocketPlan::prepare_region_guides(op.clone(), tool, spec, initial, 1, cancel)?;
+        // Region guides, not a full pocket plan: engagement_front cuts none
+        // of the pocket's raster passes, and it admits entries itself, per
+        // layer (#310). An area no entry reaches is listed in the report
+        // (`unentered_areas`) and left, as roughing's partial coverage asks;
+        // the pocket's source-admission of its own guide routes would refuse
+        // the whole operation for an area it never plans to cut.
         let z = guides.report().target_z_mm;
         let ramped = entry.ramp().is_some();
         let mut report = EngagementFrontReport {
@@ -2527,9 +2649,12 @@ impl EngagementFrontPlan {
                                 && layer.room()[k] as f64 >= self.r + self.op.radial_allowance_mm
                         })
                         .collect();
-                    let to_fit = edt(&g, &fits);
+                    let to_fit = edt(&g, &fits, cancel)?;
                     let mut left = [0usize; 3];
                     for k in 0..layer.top.len() {
+                        if k.is_multiple_of(8192) && cancel.is_cancelled() {
+                            return Err("engagement_front report cancelled".into());
+                        }
                         if !layer.material(k) {
                             continue;
                         }
@@ -2600,7 +2725,7 @@ impl EngagementFrontPlan {
         let mut inside = vec![false; n];
         let mut xs = vec![];
         for j in 0..g.ny {
-            if j % 256 == 0 && cancel.is_cancelled() {
+            if j.is_multiple_of(256) && cancel.is_cancelled() {
                 return Err("engagement_front planning cancelled".into());
             }
             let y = g.y0 + (j as f64 + 0.5) * g.c;
@@ -2697,10 +2822,15 @@ impl EngagementFrontPlan {
         let reachable = grown(&allowed, cells2_within(g.c, reach_limit, true));
         #[cfg(test)]
         {
-            let room: Vec<f32> = edt(&g, &outside).into_iter().map(|d| d as f32).collect();
+            let room: Vec<f32> = edt(&g, &outside, &NeverCancelled)
+                .expect("uncancelled")
+                .into_iter()
+                .map(|d| d as f32)
+                .collect();
             let by_distance: Vec<bool> = room.iter().map(|&d| d as f64 >= need).collect();
             assert!(allowed == by_distance, "allowed centres");
-            let by_distance: Vec<bool> = edt(&g, &allowed)
+            let by_distance: Vec<bool> = edt(&g, &allowed, &NeverCancelled)
+                .expect("uncancelled")
                 .iter()
                 .map(|&d| d <= reach_limit)
                 .collect();
@@ -2766,8 +2896,9 @@ impl EngagementFrontPlan {
     ///
     /// The two distances are asked of the material bits grown by a disk
     /// (`Near`) rather than of two distance transforms of the whole grid;
-    /// `refresh_scan` is the definition by distance transforms.
-    fn refresh(&mut self) -> f64 {
+    /// `refresh_scan` is the definition by distance transforms. The scan
+    /// over the grown grid observes cancellation every 256 rows (#312).
+    fn refresh(&mut self, cancel: &impl CancelSignal) -> Result<f64, String> {
         let r = self.r;
         let layer = self.layer.as_mut().unwrap();
         let g = layer.g;
@@ -2790,6 +2921,9 @@ impl EngagementFrontPlan {
         let mut candidates = vec![];
         if let Some(beside) = &beside {
             for j in 0..g.ny {
+                if j.is_multiple_of(256) && cancel.is_cancelled() {
+                    return Err("engagement_front planning cancelled".into());
+                }
                 for w in 0..stride {
                     let mut word = beside.grown[j * stride + w];
                     if let Some(blocked) = &blocked {
@@ -2815,7 +2949,7 @@ impl EngagementFrontPlan {
         }
         layer.candidates = candidates;
         self.report.grid_refreshes += 1;
-        left
+        Ok(left)
     }
 
     /// `refresh` by two distance transforms of the whole grid: the area
@@ -2827,8 +2961,8 @@ impl EngagementFrontPlan {
         let mat: Vec<bool> = (0..n).map(|k| layer.material(k)).collect();
         let reach: Vec<bool> = (0..n).map(|k| mat[k] && layer.reachable[k]).collect();
         let left = reach.iter().filter(|&&b| b).count() as f64 * g.c * g.c;
-        let dmat = edt(&g, &mat);
-        let dk = edt(&g, &reach);
+        let dmat = edt(&g, &mat, &NeverCancelled).expect("uncancelled");
+        let dk = edt(&g, &reach, &NeverCancelled).expect("uncancelled");
         let candidates = (0..n)
             .filter(|&k| {
                 layer.allowed[k] && !layer.dead[k] && dmat[k] > r + g.c && dk[k] <= r + 3. * g.c
@@ -2948,8 +3082,14 @@ impl EngagementFrontPlan {
     /// wall was nibbled by a hundred short passes (#167). Walking back
     /// along the front, against the travel direction, until the material
     /// ends finds the start from which one pass cuts the whole strip. A
-    /// front that closes on itself has no end: the candidate stands.
-    fn upstream(&self, k: usize, dir: Point) -> (usize, Point) {
+    /// front that closes on itself has no end: the candidate stands. The
+    /// walk observes cancellation every 32 steps (#312).
+    fn upstream(
+        &self,
+        k: usize,
+        dir: Point,
+        cancel: &impl CancelSignal,
+    ) -> Result<(usize, Point), String> {
         let layer = self.layer.as_ref().unwrap();
         let g = layer.g;
         let (r, c) = (self.r, g.c);
@@ -2962,6 +3102,9 @@ impl EngagementFrontPlan {
         let mut along = dir;
         let limit = 2 * (g.nx + g.ny);
         for i in 0..limit {
+            if i.is_multiple_of(32) && cancel.is_cancelled() {
+                return Err("engagement_front planning cancelled".into());
+            }
             // Step back against the travel direction, then stand off the
             // nearest material again.
             let heading = [-side * along[1], side * along[0]];
@@ -2980,13 +3123,13 @@ impl EngagementFrontPlan {
             };
             if i > 2 && (q[0] - origin[0]).hypot(q[1] - origin[1]) < step {
                 // Back where it began: a closed front.
-                return (k, dir);
+                return Ok((k, dir));
             }
             best = (cell, found);
             p = g.center(cell);
             along = found;
         }
-        best
+        Ok(best)
     }
 
     fn mark_dead(&mut self, p: Point, cells: i64) {
@@ -3006,14 +3149,17 @@ impl EngagementFrontPlan {
     }
 
     /// Follow the material front from `start`. Returns the centre polyline
-    /// (first point = start) and whether any material was cut.
+    /// (first point = start) and whether any material was cut. Steps are
+    /// bounded by `PROOF_CHUNK`; cancellation is still observed every 256
+    /// of them (#312).
     fn follow(
         &mut self,
         start: Point,
         heading: f64,
         approach: bool,
         narrow: f64,
-    ) -> (Vec<Point>, bool, bool) {
+        cancel: &impl CancelSignal,
+    ) -> Result<(Vec<Point>, bool, bool), String> {
         let r = self.r;
         // Steering width: the declared width less what the grid cannot
         // resolve (see `steering_width`), narrowed by `narrow` when an
@@ -3038,7 +3184,10 @@ impl EngagementFrontPlan {
         let mut idle = 0;
         let mut max_eng: f64 = 0.;
         let mut end = 0;
-        for _ in 0..2_000_000 {
+        for step in 0usize..2_000_000 {
+            if step.is_multiple_of(256) && cancel.is_cancelled() {
+                return Err("engagement_front planning cancelled".into());
+            }
             if pts.len() > PROOF_CHUNK {
                 // Enough to prove at once; the pass continues from here.
                 end = 4;
@@ -3178,30 +3327,36 @@ impl EngagementFrontPlan {
         } else {
             pts.truncate(1);
         }
-        (pts, cut_any, end == 4)
+        Ok((pts, cut_any, end == 4))
     }
 
     /// A stay-down link from `a` to `b` through already cleared stock: the
     /// shortest 8-connected grid route whose cutter centres keep material at
     /// least `r - w/2` away, simplified, then re-checked step by step with
     /// [`Self::link_samples`] and certified exactly against the region.
-    /// Returns (waypoints after `a`, samples to cut, widest step).
+    /// Returns [`Link`] (waypoints after `a`, samples to cut, widest step);
+    /// the search observes cancellation (#312).
     fn routed_link(
         &self,
         a: Point,
         b: Point,
         max_len: f64,
-    ) -> Option<(Vec<Point>, Vec<Point>, f64)> {
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Link>, String> {
         let layer = self.layer.as_ref().unwrap();
         let g = layer.g;
         let (r, c) = (self.r, g.c);
         let straight = (b[0] - a[0]).hypot(b[1] - a[1]);
         if straight > max_len {
-            return None;
+            return Ok(None);
         }
         let margin = 2. * r + 0.5 * (max_len - straight).min(straight) + 4. * c;
-        let (ia, ja) = g.cell(a)?;
-        let (ib, jb) = g.cell(b)?;
+        let Some((ia, ja)) = g.cell(a) else {
+            return Ok(None);
+        };
+        let Some((ib, jb)) = g.cell(b) else {
+            return Ok(None);
+        };
         let m = (margin / c).ceil() as usize;
         let i0 = ia.min(ib).saturating_sub(m);
         let j0 = ja.min(jb).saturating_sub(m);
@@ -3220,7 +3375,7 @@ impl EngagementFrontPlan {
         });
         #[cfg(not(test))]
         if out_of_reach {
-            return None;
+            return Ok(None);
         }
         #[cfg(test)]
         if out_of_reach {
@@ -3259,7 +3414,7 @@ impl EngagementFrontPlan {
             let mat: Vec<bool> = (0..w.nx * w.ny)
                 .map(|k| layer.material(g.idx(i0 + k % w.nx, j0 + k / w.nx)))
                 .collect();
-            let dmat = edt(&w, &mat);
+            let dmat = edt(&w, &mat, &NeverCancelled).expect("uncancelled");
             for (k, &d) in dmat.iter().enumerate() {
                 let (i, j) = (k % w.nx, k / w.nx);
                 assert_eq!(clear(&tight, i, j), d >= r - 0.5 * self.width);
@@ -3269,7 +3424,7 @@ impl EngagementFrontPlan {
         let start = w.idx(ia - i0, ja - j0);
         let goal = w.idx(ib - i0, jb - j0);
         if !passable(ib - i0, jb - j0) {
-            return None;
+            return Ok(None);
         }
         // Dijkstra on the window (the start may still touch the front).
         let limit = max_len / c;
@@ -3316,7 +3471,8 @@ impl EngagementFrontPlan {
             goal,
             limit,
             |i, j, d| inside(i, j) && enter(i, j, d),
-        );
+            cancel,
+        )?;
         let settled = narrow
             .2
             .is_some_and(|d| d <= limit && d * 1024. <= corridor as f64);
@@ -3327,13 +3483,22 @@ impl EngagementFrontPlan {
         let (dist, prev, _) = if settled {
             narrow
         } else {
-            link_search(LinkBuckets::default(), size, start, goal, limit, enter)
+            link_search(
+                LinkBuckets::default(),
+                size,
+                start,
+                goal,
+                limit,
+                enter,
+                cancel,
+            )?
         };
         #[cfg(test)]
         {
             // The definition: the whole window, from a heap.
             let heap = std::collections::BinaryHeap::new();
-            let (d, p, _) = link_search(heap, size, start, goal, limit, enter);
+            let (d, p, _) = link_search(heap, size, start, goal, limit, enter, &NeverCancelled)
+                .expect("uncancelled");
             assert_eq!(dist[goal].to_bits(), d[goal].to_bits());
             if dist[goal].is_finite() {
                 let (mut a, mut b) = (goal, goal);
@@ -3371,7 +3536,7 @@ impl EngagementFrontPlan {
             }
         }
         if !dist[goal].is_finite() || dist[goal] * c > max_len {
-            return None;
+            return Ok(None);
         }
         let mut chain = vec![b];
         let mut k = prev[goal];
@@ -3404,13 +3569,15 @@ impl EngagementFrontPlan {
                 }
                 hi = at + 1 + (hi - at - 1) / 2;
             }
-            let (next, s, wd) = best?;
+            let Some((next, s, wd)) = best else {
+                return Ok(None);
+            };
             samples.extend(s);
             widest = widest.max(wd);
             waypoints.push(chain[next]);
             at = next;
         }
-        Some((waypoints, samples, widest))
+        Ok(Some((waypoints, samples, widest)))
     }
 
     /// Front step length: short against the cutter and the target width.
@@ -3887,14 +4054,14 @@ impl EngagementFrontPlan {
             }
             let Some((k, dir)) = found else {
                 if refreshed {
-                    if self.revive_thin_starts() {
+                    if self.revive_thin_starts(cancel)? {
                         self.remnant = true;
                         continue;
                     }
                     self.remnant = false;
                     return self.helix_pass(stock, cancel);
                 }
-                let left = self.refresh();
+                let left = self.refresh(cancel)?;
                 // Planning progress (#198): what is left against the most
                 // this level has had (a refresh may find more reachable).
                 let start = self.area_mm2.map_or(left, |(_, start)| start.max(left));
@@ -3907,7 +4074,7 @@ impl EngagementFrontPlan {
             };
             // Start where the material this pass will cut begins (see
             // `upstream`), not merely at the nearest point beside it.
-            let (k, dir) = self.upstream(k, dir);
+            let (k, dir) = self.upstream(k, dir, cancel)?;
             let q = self.layer.as_ref().unwrap().g.center(k);
             let here = self.position;
             let at_layer = (here[2] - z).abs() < 1e-9;
@@ -3923,7 +4090,7 @@ impl EngagementFrontPlan {
             {
                 Some((vec![q], samples, widest))
             } else {
-                self.routed_link(from, q, 3. * keep_down)
+                self.routed_link(from, q, 3. * keep_down, cancel)?
             };
             let mut proven = None;
             let mut descent = None;
@@ -4052,7 +4219,7 @@ impl EngagementFrontPlan {
         let mut proven = from;
         loop {
             let mark = self.checkpoint();
-            let (pts, cut, more) = self.follow(start, heading, approach, narrow);
+            let (pts, cut, more) = self.follow(start, heading, approach, narrow, cancel)?;
             if !cut {
                 self.rollback(&mark);
                 return Ok((!kept.is_empty()).then_some(kept));
@@ -4081,13 +4248,16 @@ impl EngagementFrontPlan {
                 // helix that opened it is, where the entry policy allows one.
                 if self.entry.policy() == EntryPolicy::StockEdge {
                     return Err(format!(
-                        "engagement_front: {detail}, even steered at half the declared width: the \
-                         material there is confined (a pocket barely wider than the cutter). \
-                         StockEdgeEntry(helix=None) forbids cutting it as entry motion; allow a \
-                         helical entry, use a smaller tool, or exclude the area"
+                        "engagement_front: {detail}, even steered at half the declared width: \
+                         the material there may be confined (a pocket barely wider than the \
+                         cutter). StockEdgeEntry(helix=None) forbids cutting it as entry \
+                         motion; allow a helical entry, use a smaller tool, or exclude the area"
                     ));
                 }
-                self.prove(stock, from, proven, true, cancel)?;
+                self.prove(stock, from, proven, true, cancel)?
+                    .map_or(Ok(()), |(_, detail)| {
+                        Err(format!("engagement_front: {detail}"))
+                    })?;
                 kept.extend(pts.into_iter().skip(usize::from(!kept.is_empty())));
                 return Ok(Some(kept));
             }
@@ -4208,17 +4378,17 @@ impl EngagementFrontPlan {
                 let check = || {
                     scene
                         .check_leading(&motion, self.r, limit, EngagementOptions::default(), cancel)
-                        .map(|report| (report.status, report.upper_angle_deg))
+                        .map(|report| (report.status, report.upper_angle_deg, report.reason))
                 };
-                let (status, upper_angle_deg) = match known {
+                let (status, upper_angle_deg, reason) = match known {
                     Some(result) => {
                         #[cfg(test)]
                         {
                             shortcut_taken(0);
                             let again = check()?;
                             assert_eq!(
-                                (result.0, result.1.to_bits()),
-                                (again.0, again.1.to_bits()),
+                                (result.0, result.1.to_bits(), result.2),
+                                (again.0, again.1.to_bits(), again.2),
                                 "recorded proof of {curve:?}"
                             );
                         }
@@ -4232,18 +4402,10 @@ impl EngagementFrontPlan {
                         result
                     }
                 };
-                struct Proof {
-                    status: EngagementStatus,
-                    upper_angle_deg: f64,
-                }
-                let report = Proof {
-                    status,
-                    upper_angle_deg,
-                };
                 // An unproven straight stroke is halved until the unproven
                 // part is no longer than an eighth of the cutter radius, so only the
                 // stretch that is not proven becomes entry motion.
-                if matches!(report.status, EngagementStatus::Unresolved)
+                if matches!(status, EngagementStatus::Unresolved)
                     && confined
                     && let Curve::Line { start, end } = curve
                     && (end[0] - start[0]).hypot(end[1] - start[1]) > self.r / 8.
@@ -4259,9 +4421,11 @@ impl EngagementFrontPlan {
                     recorded = false;
                     continue;
                 }
-                if matches!(report.status, EngagementStatus::Unresolved) && confined {
-                    // The bound an entry move is reported with: what a
-                    // half-circle limit proves, or the whole circle.
+                if matches!(status, EngagementStatus::Unresolved) && confined {
+                    // The confined retry (#309): only what the wider query
+                    // proves classifies the stroke. A second unresolved
+                    // result establishes neither a confined bound nor a
+                    // safe cut, and is refused rather than entered.
                     let bound = scene.check_leading(
                         &motion,
                         self.r,
@@ -4269,32 +4433,66 @@ impl EngagementFrontPlan {
                         EngagementOptions::default(),
                         cancel,
                     )?;
-                    self.pending[index].1 = MoveKind::Lead;
-                    self.pending[index].2 = Some(entry_feed);
-                    self.report.confined_strokes += 1;
-                    self.report.confined_stroke_mm += curve.prepare(tolerance)?.length_mm();
-                    self.report.confined_max_engagement_deg = self
-                        .report
-                        .confined_max_engagement_deg
-                        .max(match bound.status {
-                            EngagementStatus::Bounded => bound.upper_angle_deg,
-                            _ => 360.,
-                        });
-                } else if matches!(report.status, EngagementStatus::Unresolved) {
+                    match confine((bound.status, bound.upper_angle_deg), limit) {
+                        Confine::Proven(angle) => {
+                            proved += 1;
+                            upper = upper.max(angle);
+                        }
+                        Confine::Entry(angle) => {
+                            self.pending[index].1 = MoveKind::Lead;
+                            self.pending[index].2 = Some(entry_feed);
+                            self.report.confined_strokes += 1;
+                            self.report.confined_stroke_mm += curve.prepare(tolerance)?.length_mm();
+                            self.report.confined_max_engagement_deg =
+                                self.report.confined_max_engagement_deg.max(angle);
+                        }
+                        Confine::Unproven => {
+                            // No bound from either query: entry motion (the
+                            // conservative move, never a cut at the cutting
+                            // feed), reported as unproven with the reason the
+                            // wider query stopped (#309).
+                            let length = curve.prepare(tolerance)?.length_mm();
+                            let first = self.report.confined_unproven_mm == 0.;
+                            self.pending[index].1 = MoveKind::Lead;
+                            self.pending[index].2 = Some(entry_feed);
+                            self.report.confined_strokes += 1;
+                            self.report.confined_stroke_mm += length;
+                            self.report.confined_unproven_mm += length;
+                            self.report.confined_max_engagement_deg =
+                                self.report.confined_max_engagement_deg.max(360.);
+                            if first {
+                                self.report.diagnostics.push(format!(
+                                    "some confined entry strokes here have no proven contact bound: the \
+                                     query within the limit and the wider query within 180 degrees both \
+                                     stopped without one ({}), so they are cut as entry moves at the \
+                                     entry feed and counted in confined_unproven_mm rather than reported \
+                                     as material proven confined",
+                                    reason_text(reason)
+                                ));
+                            }
+                        }
+                    }
+                } else if matches!(status, EngagementStatus::Unresolved) {
                     let (a, b) = (curve.start(), curve.end());
                     failed = Some((
                         [a[0], a[1]],
                         format!(
                             "the contact angle of the stroke from ({:.3}, {:.3}) to ({:.3}, {:.3}) at Z{:.3} \
-                         is not proven within {limit:.2} degrees (max_radial_engagement_mm {})",
-                            a[0], a[1], b[0], b[1], a[2], self.width
+                             is not proven within {limit:.2} degrees ({}; max_radial_engagement_mm {})",
+                            a[0],
+                            a[1],
+                            b[0],
+                            b[1],
+                            a[2],
+                            reason_text(reason),
+                            self.width
                         ),
                     ));
                     break;
                 }
-                if matches!(report.status, EngagementStatus::Bounded) {
+                if matches!(status, EngagementStatus::Bounded) {
                     proved += 1;
-                    upper = upper.max(report.upper_angle_deg);
+                    upper = upper.max(upper_angle_deg);
                 }
             }
             scene.append(ClearedSweep::from_motion(&motion, self.r, tolerance)?)?;
@@ -4329,6 +4527,36 @@ impl EngagementFrontPlan {
             }
         }
         Ok(failed)
+    }
+
+    /// Mark the steering grid's material cleared along the queued Cut and
+    /// Lead strokes from `from` on: a committed wall pass cuts beside the
+    /// walls, where no pass's steps ever marked, and the residual report
+    /// reads this grid (#311). Like a pass's own marks this is a plan-time
+    /// estimate for the report — cells whose centre the cutter's sweep
+    /// certainly covers — and the exact engagement proof is untouched.
+    fn mark_pending_cuts(&mut self, from: usize) {
+        let (tolerance, r) = (self.op.tolerance_mm, self.r);
+        let curves: Vec<Curve> = self
+            .pending
+            .iter()
+            .skip(from)
+            .filter(|(_, kind, _)| matches!(kind, MoveKind::Cut | MoveKind::Lead))
+            .map(|(curve, _, _)| curve.clone())
+            .collect();
+        let layer = self.layer.as_mut().unwrap();
+        let c = layer.g.c;
+        for curve in curves {
+            let Ok(path) = curve.prepare(tolerance) else {
+                continue;
+            };
+            let steps = (path.length_mm() / (0.5 * c)).ceil().max(1.) as usize;
+            for i in 0..=steps {
+                if let Ok(q) = path.position(i as f64 / steps as f64) {
+                    layer.cut([q[0], q[1]], r);
+                }
+            }
+        }
     }
 
     /// One pass along every wall loop of the region (`with_wall_pass`).
@@ -4436,8 +4664,12 @@ impl EngagementFrontPlan {
                     self.report.wall_passes_skipped += 1;
                     return Ok(());
                 }
-                self.prove(stock, from, from, true, cancel)?;
+                self.prove(stock, from, from, true, cancel)?
+                    .map_or(Ok(()), |(_, detail)| {
+                        Err(format!("engagement_front: {detail}"))
+                    })?;
             }
+            self.mark_pending_cuts(from);
             self.position = [start[0], start[1], z];
             self.report.wall_passes += 1;
         }
@@ -4515,7 +4747,7 @@ impl EngagementFrontPlan {
         {
             Some((vec![q], samples, widest))
         } else {
-            self.routed_link(from, q, 3. * keep_down)
+            self.routed_link(from, q, 3. * keep_down, cancel)?
         };
         if let Some((waypoints, samples, widest)) = link {
             let layer = self.layer.as_mut().unwrap();
@@ -4769,8 +5001,12 @@ impl EngagementFrontPlan {
                     self.report.wall_passes_skipped += 1;
                     continue;
                 }
-                self.prove(stock, from, from, true, cancel)?;
+                self.prove(stock, from, from, true, cancel)?
+                    .map_or(Ok(()), |(_, detail)| {
+                        Err(format!("engagement_front: {detail}"))
+                    })?;
             }
+            self.mark_pending_cuts(from);
             let end = strokes.last().unwrap().b;
             self.position = [end[0], end[1], z];
             self.report.wall_passes += 1;
@@ -4782,23 +5018,26 @@ impl EngagementFrontPlan {
     /// passes started beside it found it too thin to cut, it is a remnant
     /// reachable at depth, not enclosed. Offer those starts again (once
     /// each) as remnant passes. Returns whether any were offered.
-    fn revive_thin_starts(&mut self) -> bool {
+    fn revive_thin_starts(&mut self, cancel: &impl CancelSignal) -> Result<bool, String> {
         let c = self.layer.as_ref().unwrap().g.c;
         let need = self.grid_clearance(c);
         let reach = self.r + 4. * c;
         let layer = self.layer.as_mut().unwrap();
         if layer.thin.is_empty() {
-            return false;
+            return Ok(false);
         }
-        let best = layer.most_open(need);
+        let best = layer.most_open(need, cancel)?;
         let Some((_, k)) = best else {
-            return false;
+            return Ok(false);
         };
         let q = layer.g.center(k);
         let g = layer.g;
         let mut revived = false;
         let thin = std::mem::take(&mut layer.thin);
-        for t in thin {
+        for (n, t) in thin.into_iter().enumerate() {
+            if n.is_multiple_of(256) && cancel.is_cancelled() {
+                return Err("engagement_front planning cancelled".into());
+            }
             if (t[0] - q[0]).hypot(t[1] - q[1]) > reach {
                 layer.thin.push(t);
                 continue;
@@ -4813,7 +5052,7 @@ impl EngagementFrontPlan {
             layer.candidates.push(g.idx(i, j));
             revived = true;
         }
-        revived
+        Ok(revived)
     }
 
     /// The longest straight path through `q`, at most `want` long, that
@@ -4822,11 +5061,19 @@ impl EngagementFrontPlan {
     /// wins), and the path is then certified exactly against the region,
     /// shortened a little at both ends if the grid was optimistic. None:
     /// no straight path through `q` at all.
-    fn ramp_line(&self, q: Point, want: f64) -> Option<(Point, Point)> {
+    /// The free line through `q` a ramp can descend on, at most `want`
+    /// long, taken from the 180 grid directions longest first; the scan
+    /// observes cancellation (#312).
+    fn ramp_line(
+        &self,
+        q: Point,
+        want: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<(Point, Point)>, String> {
         let layer = self.layer.as_ref().unwrap();
         let c = layer.g.c;
         if !layer.allowed_at(q) || !(want.is_finite() && want > 0.) {
-            return None;
+            return Ok(None);
         }
         // Free travel from `q` along `u`, by the grid's allowed centres.
         let reach = |u: Point| {
@@ -4841,14 +5088,16 @@ impl EngagementFrontPlan {
             d
         };
         const DIRECTIONS: usize = 180;
-        let mut found: Vec<(f64, f64, f64, Point)> = (0..DIRECTIONS)
-            .map(|i| {
-                let angle = PI * i as f64 / DIRECTIONS as f64;
-                let u = [angle.cos(), angle.sin()];
-                let (ahead, behind) = (reach(u), reach([-u[0], -u[1]]));
-                ((ahead + behind).min(want), ahead, behind, u)
-            })
-            .collect();
+        let mut found: Vec<(f64, f64, f64, Point)> = vec![];
+        for i in 0..DIRECTIONS {
+            if i.is_multiple_of(30) && cancel.is_cancelled() {
+                return Err("engagement_front ramp search cancelled".into());
+            }
+            let angle = PI * i as f64 / DIRECTIONS as f64;
+            let u = [angle.cos(), angle.sin()];
+            let (ahead, behind) = (reach(u), reach([-u[0], -u[1]]));
+            found.push(((ahead + behind).min(want), ahead, behind, u));
+        }
         // Longest first; equal lengths keep their order (stable sort).
         found.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (length, ahead, behind, u) in found.into_iter().take(8) {
@@ -4867,11 +5116,11 @@ impl EngagementFrontPlan {
                     .guides
                     .stroke_geometry_fits_radius(Stroke::line(a, b), self.r)
                 {
-                    return Some((a, b));
+                    return Ok(Some((a, b)));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Enclosed material with a `RampEntry` (#219): ramp down along a
@@ -4930,7 +5179,7 @@ impl EngagementFrontPlan {
         let layer = self.layer.as_ref().unwrap();
         let c = layer.g.c;
         let need = self.grid_clearance(c);
-        let best = layer.most_open(need);
+        let best = layer.most_open(need, cancel)?;
         let Some((_, k)) = best else {
             return Ok(false);
         };
@@ -4955,7 +5204,7 @@ impl EngagementFrontPlan {
         let tan = ramp.angle_rad.tan();
         let highest = begin_at(self.op.top_z_mm.max(z));
         let (mut a, mut b) = self
-            .ramp_line(q, (highest - z).max(skin) / tan)
+            .ramp_line(q, (highest - z).max(skin) / tan, cancel)?
             .ok_or_else(|| refuse("the cutter has no straight path there".into()))?;
         // The material top along the path, and the path no longer than one
         // leg from there needs: a shorter path has a lower top or the same.
@@ -5188,8 +5437,8 @@ impl EngagementFrontPlan {
     }
     /// At the start of the level: list the areas no entry reaches, and
     /// refuse with the first where the operation asks for that.
-    fn note_unentered(&mut self) -> Result<(), String> {
-        self.report.unentered_areas = self.unentered_areas();
+    fn note_unentered(&mut self, cancel: &impl CancelSignal) -> Result<(), String> {
+        self.report.unentered_areas = self.unentered_areas(cancel)?;
         match self.report.unentered_areas.first() {
             Some(area) if self.refuse_unentered => Err(area.message(&self.op.id)),
             _ => Ok(()),
@@ -5222,24 +5471,39 @@ impl EngagementFrontPlan {
     /// Select points where holes have been drilled to provide clearance
     /// for the cutter to enter the material"). Where none of them is
     /// possible that area cannot be cut as asked, and leaving it without a
-    /// word would be a silent fallback.
-    fn unentered_areas(&self) -> Vec<crate::entry::UnenteredArea> {
-        let mut found = self.unresolved_areas();
+    /// word would be a silent fallback. The floods and transforms observe
+    /// cancellation (#312).
+    fn unentered_areas(
+        &self,
+        cancel: &impl CancelSignal,
+    ) -> Result<Vec<crate::entry::UnenteredArea>, String> {
+        let mut found = self.unresolved_areas(cancel)?;
         let Some(helix) = self.entry.helix() else {
-            return found;
+            return Ok(found);
         };
         let layer = self.layer.as_ref().unwrap();
         let g = layer.g;
         let n = g.nx * g.ny;
         let need = self.grid_clearance(g.c);
         let material: Vec<bool> = (0..n).map(|k| layer.material(k)).collect();
-        let clear = edt(&g, &material);
+        let clear = edt(&g, &material, cancel)?;
+        layer.room_init(cancel)?;
         let radii = helix.radii(self.r, self.r / 2., 0.);
+        // The entry policy is part of eligibility (#310): a helix that
+        // geometrically fits is no entry at all where the policy forbids
+        // one, and an area whose only way in would be such a helix is
+        // listed (`no_helix_allowed`), not entered later.
+        let helix_allowed = self.entry.policy() != EntryPolicy::StockEdge;
         let mut seen = vec![false; n];
         let mut open = vec![];
+        let mut floods = 0usize;
         for start in 0..n {
             if !layer.allowed[start] || seen[start] {
                 continue;
+            }
+            floods += 1;
+            if floods.is_multiple_of(512) && cancel.is_cancelled() {
+                return Err("engagement_front planning cancelled".into());
             }
             // One area: whether it has a way in, its most open position on
             // material, and its extent.
@@ -5248,7 +5512,12 @@ impl EngagementFrontPlan {
             let (mut low, mut high) = (g.center(start), g.center(start));
             seen[start] = true;
             open.push(start);
+            let mut visits = 0usize;
             while let Some(k) = open.pop() {
+                visits += 1;
+                if visits.is_multiple_of(8192) && cancel.is_cancelled() {
+                    return Err("engagement_front planning cancelled".into());
+                }
                 let p = g.center(k);
                 low = [low[0].min(p[0]), low[1].min(p[1])];
                 high = [high[0].max(p[0]), high[1].max(p[1])];
@@ -5267,7 +5536,7 @@ impl EngagementFrontPlan {
                 });
             }
             let Some((room, k)) = best else { continue };
-            if way_in || radii.iter().any(|&h| h <= room - g.c && h > 4. * g.c) {
+            if way_in || (helix_allowed && radii.iter().any(|&h| h <= room - g.c && h > 4. * g.c)) {
                 continue;
             }
             found.push(crate::entry::UnenteredArea {
@@ -5286,7 +5555,7 @@ impl EngagementFrontPlan {
                 available_mm: Some(room - g.c),
             });
         }
-        found
+        Ok(found)
     }
 
     /// Areas with material where the cutter fits the region exactly but
@@ -5302,11 +5571,15 @@ impl EngagementFrontPlan {
     /// does work in (what it leaves there is beside its cuts, and counted
     /// in `residual_unresolved_area_mm2`), but an area it cannot work in
     /// at all.
-    fn unresolved_areas(&self) -> Vec<crate::entry::UnenteredArea> {
+    fn unresolved_areas(
+        &self,
+        cancel: &impl CancelSignal,
+    ) -> Result<Vec<crate::entry::UnenteredArea>, String> {
         let mut found = vec![];
         let Some(layer) = self.layer.as_ref() else {
-            return found;
+            return Ok(found);
         };
+        layer.room_init(cancel)?;
         let g = layer.g;
         // Centres the cutter fits at, to within the grid's resolution.
         let fits = self.r + self.op.radial_allowance_mm - 2. * g.c;
@@ -5335,8 +5608,13 @@ impl EngagementFrontPlan {
                 let mut seen = vec![k];
                 let mut open = vec![k];
                 let mut resolved = false;
+                let mut visits = 0usize;
                 area[k] = 2;
                 while let Some(k) = open.pop() {
+                    visits += 1;
+                    if visits.is_multiple_of(8192) && cancel.is_cancelled() {
+                        return Err("engagement_front planning cancelled".into());
+                    }
                     g.for_neighbours(k, |m| {
                         if area[m] == 1 || layer.allowed[m] {
                             resolved = true;
@@ -5372,7 +5650,7 @@ impl EngagementFrontPlan {
                 });
             }
         }
-        found
+        Ok(found)
     }
 
     /// Enclosed material: helix down at the most open reachable point.
@@ -5389,7 +5667,7 @@ impl EngagementFrontPlan {
             let layer = self.layer.as_ref().unwrap();
             let c = layer.g.c;
             let need = self.grid_clearance(c);
-            let best = layer.most_open(need);
+            let best = layer.most_open(need, cancel)?;
             let Some((room, k)) = best else {
                 return Ok(false);
             };
@@ -5409,10 +5687,12 @@ impl EngagementFrontPlan {
                 continue;
             };
             if self.entry.policy() == EntryPolicy::StockEdge {
-                return Err(format!(
-                    "engagement_front: enclosed material near ({:.3}, {:.3}) at Z{z} needs a helical entry; StockEdgeEntry(helix=None) forbids it",
-                    q[0], q[1]
-                ));
+                // The policy allows no helical entry (#310): like an area
+                // no helix fits, the material stays (listed at level start
+                // as `no_helix_allowed`) and the search moves on; it is
+                // never entered, and the rest of the layer is still cut.
+                self.mark_dead(q, 1);
+                continue;
             }
             for half in [0., PI] {
                 let a = [q[0] + rh * half.cos(), q[1] + rh * half.sin()];
@@ -5518,7 +5798,7 @@ impl EngagementFrontPlan {
         while self.pending.is_empty() && !self.finished {
             if self.layer.is_none() {
                 self.build_layer(stock, cancel)?;
-                self.note_unentered()?;
+                self.note_unentered(cancel)?;
             }
             if !self.plan_pass(stock, cancel)? {
                 if (self.wall_pass || self.wall_runs) && !self.walls_done {
@@ -5562,6 +5842,137 @@ impl EngagementFrontPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A signal that answers "not cancelled" a set number of times, then
+    /// fires: cancellation is tested at a controlled poll count, never by
+    /// sleeping.
+    struct CancelAfter(AtomicUsize);
+    impl CancelSignal for CancelAfter {
+        fn is_cancelled(&self) -> bool {
+            let mut left = self.0.load(Ordering::Relaxed);
+            loop {
+                let Some(next) = left.checked_sub(1) else {
+                    return true;
+                };
+                match self
+                    .0
+                    .compare_exchange_weak(left, next, Ordering::Relaxed, Ordering::Relaxed)
+                {
+                    Ok(_) => return false,
+                    Err(actual) => left = actual,
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unproven_bound_is_classified_by_what_the_wider_query_proved() {
+        // #309: only a bound the wider query proves classifies a stroke, and
+        // the reason a query stopped survives into the text that refuses it.
+        let limit = 60.;
+        assert!(matches!(
+            confine((EngagementStatus::Bounded, 40.), limit),
+            Confine::Proven(a) if a == 40.
+        ));
+        assert!(matches!(
+            confine((EngagementStatus::Bounded, 90.), limit),
+            Confine::Entry(a) if a == 90.
+        ));
+        assert!(matches!(
+            confine((EngagementStatus::Unresolved, 360.), limit),
+            Confine::Unproven
+        ));
+        // Each reason says what it is; none of them claims confinement.
+        let texts = [
+            reason_text(Some(UnresolvedReason::Work)),
+            reason_text(Some(UnresolvedReason::Resolution)),
+            reason_text(Some(UnresolvedReason::Depth)),
+            reason_text(None),
+        ];
+        for text in &texts {
+            assert!(!text.is_empty() && !text.contains("confined"), "{text}");
+        }
+        assert_eq!(
+            texts.len(),
+            texts.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+        assert!(reason_text(Some(UnresolvedReason::Work)).contains("work budget"));
+    }
+
+    #[test]
+    fn the_distance_transform_is_interruptible_and_unchanged_otherwise() {
+        // #312: a whole-grid transform observes the signal at bounded
+        // intervals; without cancellation its answer is bit for bit the one
+        // the uncancelled transform gives.
+        let g = Grid {
+            x0: 0.,
+            y0: 0.,
+            c: 0.25,
+            nx: 600,
+            ny: 600,
+        };
+        let mask: Vec<bool> = (0..g.nx * g.ny).map(|k| k % 9973 == 0).collect();
+        let whole = edt(&g, &mask, &NeverCancelled).expect("uncancelled");
+        // One poll is the first column of the grid: cancelled well before
+        // the transform has run. (A 600 x 600 grid is polled twice every 64
+        // lines: fewer than twenty polls in all.)
+        for left in [0, 1, 8] {
+            let error = edt(&g, &mask, &CancelAfter(AtomicUsize::new(left)))
+                .expect_err("a fired signal ends the transform");
+            assert!(error.contains("cancelled"), "{error}");
+        }
+        // A signal that has not fired at all leaves the answer alone.
+        let same = edt(&g, &mask, &CancelAfter(AtomicUsize::new(1 << 20))).expect("not cancelled");
+        assert_eq!(
+            whole.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
+            same.iter().map(|d| d.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_link_search_is_an_error_not_a_missing_link() {
+        // #312: a route search that is cancelled says so, rather than
+        // returning "no link" and letting the plan travel a different way.
+        let size = [220usize, 220];
+        let (start, goal) = (0usize, size[0] * size[1] - 1);
+        let open = |_: usize, _: usize, _: f64| true;
+        let error = link_search(
+            LinkBuckets::default(),
+            size,
+            start,
+            goal,
+            f64::INFINITY,
+            open,
+            &CancelAfter(AtomicUsize::new(0)),
+        )
+        .expect_err("a fired signal ends the search");
+        assert!(error.contains("cancelled"), "{error}");
+        // Uncancelled it still finds the way, and the answer does not depend
+        // on whether a signal that never fired was asked.
+        let found = link_search(
+            LinkBuckets::default(),
+            size,
+            start,
+            goal,
+            f64::INFINITY,
+            open,
+            &CancelAfter(AtomicUsize::new(1 << 20)),
+        )
+        .expect("not cancelled");
+        let plain = link_search(
+            LinkBuckets::default(),
+            size,
+            start,
+            goal,
+            f64::INFINITY,
+            open,
+            &NeverCancelled,
+        )
+        .expect("uncancelled");
+        assert!(found.2.is_some() && plain.2.is_some());
+        assert_eq!(found.0[goal].to_bits(), plain.0[goal].to_bits());
+    }
 
     #[test]
     fn edt_matches_brute_force() {
@@ -5573,7 +5984,7 @@ mod tests {
             ny: 7,
         };
         let mask: Vec<bool> = (0..63).map(|k| k == 10 || k == 50).collect();
-        let d = edt(&g, &mask);
+        let d = edt(&g, &mask, &NeverCancelled).expect("uncancelled");
         for (k, got) in d.iter().enumerate() {
             let p = g.center(k);
             let want = [10, 50]
@@ -5585,6 +5996,50 @@ mod tests {
                 .fold(f64::INFINITY, f64::min);
             assert!((got - want).abs() < 1e-9, "{k}: {got} vs {want}");
         }
+    }
+
+    /// #312: the entry search's whole-grid work — the room transform and the
+    /// open-cell order built on it — runs under the signal. A cancelled
+    /// attempt says so and leaves nothing half-built: the same question,
+    /// asked of a signal that does not fire, is answered as a plain scan of
+    /// the grid answers it.
+    #[test]
+    fn the_entry_searchs_room_order_is_interruptible() {
+        let g = Grid {
+            x0: 0.,
+            y0: 0.,
+            c: 0.1,
+            nx: 400,
+            ny: 400,
+        };
+        let n = g.nx * g.ny;
+        let mut layer = layer_of(g, |k| k % 3 == 0, |_| true);
+        // Room not yet worked out, and walls to work it out from.
+        layer.room = std::cell::OnceCell::new();
+        layer.outside = (0..n)
+            .map(|k| k % g.nx == 0 || k / g.nx == g.ny - 1)
+            .collect();
+        assert!(
+            layer
+                .most_open(1., &CancelAfter(AtomicUsize::new(0)))
+                .is_err()
+        );
+        let best = layer.most_open(1., &NeverCancelled).expect("uncancelled");
+        let room = layer.room();
+        let mut want: Option<(f64, usize)> = None;
+        for (k, &open_room) in room.iter().enumerate() {
+            if layer.allowed[k] && !layer.dead[k] && layer.material(k) {
+                let open = open_room as f64 - 1.;
+                if want.is_none_or(|(b, _)| open > b) {
+                    want = Some((open, k));
+                }
+            }
+        }
+        assert_eq!(
+            best.map(|(open, k)| (open.to_bits(), k)),
+            want.map(|(open, k)| (open.to_bits(), k)),
+            "the most open cell after a cancelled attempt"
+        );
     }
 
     #[test]
@@ -6089,6 +6544,40 @@ mod tests {
         (motions, serde_json::to_value(plan.report()).unwrap())
     }
 
+    /// Plan a fixture's first operation up to `limit` motions and say why it
+    /// could not be planned: the message an operation refuses with (empty:
+    /// it planned to the limit or its end without error).
+    fn plan_refusal(text: &str, limit: usize) -> String {
+        let m: crate::stream::StreamManifest = serde_json::from_str(text).unwrap();
+        m.validate().unwrap();
+        let tool = m.tools[0].prepare().unwrap();
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = crate::operation::OperationPlan::prepare_with_stock(
+            m.operations[0].clone(),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .unwrap();
+        let mut motions = 0;
+        while motions < limit {
+            match plan.next_motion_with_stock(&stock, &|| false) {
+                Ok(None) => return String::new(),
+                Ok(Some(motion)) => {
+                    let delta = stock
+                        .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
+                        .unwrap();
+                    stock.apply_delta(&delta).unwrap();
+                    motions += 1;
+                }
+                Err(e) => return e,
+            }
+        }
+        String::new()
+    }
+
     /// The twelve triangles of a box.
     fn box_triangles(lo: [f64; 3], hi: [f64; 3]) -> Vec<[[f64; 3]; 3]> {
         let v: Vec<[f64; 3]> = (0..8)
@@ -6113,11 +6602,9 @@ mod tests {
         .collect()
     }
 
-    /// A plate with two bosses and a frame, in the open block's stock:
-    /// links routed around the bosses, goals out of a link's reach, passes
-    /// planned again, candidate refreshes.
-    #[test]
-    fn plate_with_bosses_plan_matches_the_scans_at_every_decision() {
+    /// The plate-with-bosses manifest: an open block whose bosses leave
+    /// pockets barely wider than the cutter between them.
+    fn plate_with_bosses_manifest() -> serde_json::Value {
         let mut m: serde_json::Value = serde_json::from_str(include_str!(
             "../../fixtures/operations/roughing-open-block.json"
         ))
@@ -6136,6 +6623,15 @@ mod tests {
         let op = &mut m["operations"][0];
         op["target"]["triangles"] = serde_json::to_value(triangles).unwrap();
         op["entry"]["kind"] = "stock_edge_or_helix".into();
+        m
+    }
+
+    /// A plate with two bosses and a frame, in the open block's stock:
+    /// links routed around the bosses, goals out of a link's reach, passes
+    /// planned again, candidate refreshes.
+    #[test]
+    fn plate_with_bosses_plan_matches_the_scans_at_every_decision() {
+        let m = plate_with_bosses_manifest();
         let (motions, report) = plan_checked(&m.to_string(), 1500);
         let clearing = &report["layers"][0]["clearing"];
         // Every shortcut was taken, and so compared with its definition.
@@ -6149,6 +6645,55 @@ mod tests {
             motions > 300 && count("engagement_replans") >= 1,
             "{clearing}"
         );
+    }
+
+    /// #309: this plate leaves material the limit query cannot settle, where    /// even the half-circle query stops without a bound. Such a stroke is
+    /// still made entry motion — the conservative move, at the entry feed —
+    /// but nothing establishes a contact angle for it, so it is counted in
+    /// `confined_unproven_mm` and said in the report, not reported as
+    /// material proven confined.
+    #[test]
+    fn a_confined_stroke_with_no_proven_bound_is_reported_as_unproven() {
+        let m = plate_with_bosses_manifest();
+        let (_, report) = plan_checked(&m.to_string(), 1500);
+        let clearing = &report["layers"][0]["clearing"];
+        let unproven = clearing["confined_unproven_mm"].as_f64().unwrap_or(0.);
+        assert!(unproven > 0., "no unproven confined stroke: {clearing}");
+        assert!(
+            clearing["confined_strokes"].as_u64().unwrap_or(0) > 0,
+            "{clearing}"
+        );
+        // The sentinel, not a bound: nothing proved one within 180 degrees.
+        assert_eq!(clearing["confined_max_engagement_deg"].as_f64(), Some(360.));
+        let said = clearing["diagnostics"]
+            .as_array()
+            .map(|d| {
+                d.iter()
+                    .filter(|d| {
+                        d.as_str()
+                            .is_some_and(|d| d.contains("confined_unproven_mm"))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(said, 1, "{clearing}");
+    }
+
+    /// The same plate with an entry that allows no helix keeps refusing that
+    /// material rather than cutting it as entry motion, and no longer claims
+    /// the material *is* confined when no query proved a bound (#309).
+    #[test]
+    fn confined_material_without_a_proven_bound_is_refused_where_no_helix_is_allowed() {
+        let mut m = plate_with_bosses_manifest();
+        m["operations"][0]["entry"]["kind"] = "stock_edge".into();
+        let error = plan_refusal(&m.to_string(), 4000);
+        for part in [
+            "even steered at half the declared width",
+            "may be confined",
+            "StockEdgeEntry(helix=None) forbids cutting it as entry motion",
+        ] {
+            assert!(error.contains(part), "{part:?} not in: {error}");
+        }
     }
 
     #[test]
@@ -6218,7 +6763,7 @@ mod tests {
                     let mask: Vec<bool> = (0..w.nx * w.ny)
                         .map(|k| set[g.idx(i[0] + k % w.nx, j[0] + k / w.nx)])
                         .collect();
-                    let distance = edt(&w, &mask);
+                    let distance = edt(&w, &mask, &NeverCancelled).expect("uncancelled");
                     for t in [
                         0.,
                         c,

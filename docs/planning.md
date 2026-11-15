@@ -83,6 +83,11 @@ metrics or assemblies. Those rows use explicitly request-stage digests; the
 report digest is tagged `preparation_interrupted`, rather than claiming a
 compiled-candidate identity. No evaluation starts until all common premises
 match. Individual native operations observe cancellation cooperatively.
+The engagement front checks the signal through its whole-grid work: the
+distance transforms, the open-cell order the entry search reads, the routed
+link searches and the area reports. A cancelled link search is an error, not
+a missing link: the plan cannot go quietly another way, and a cancelled level
+ends the run with nothing selected.
 
 Use the existing job export APIs separately after choosing a recipe. They
 recheck the exact program to be released. A comparison report grants no release
