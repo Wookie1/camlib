@@ -2138,6 +2138,37 @@ gap = cut.common_line_spacing_mm()   # place the parts this far apart
   `start_mm`, `end_mm`, `shared_length_mm`); `pierces` counts them, `loops` and
   `order` the closed loops (a group's outline is listed under its first part).
 
+### Edge starts (experimental; controller support pending)
+
+`ThermalCut(edge_starts=camlib.EdgeStarts(run_on_mm, max_lead_mm=...,
+from_kerfs=False, delay_s=0))` opts into starting loops in open material.
+The planner extends a straight lead to beyond the stock box by `run_on_mm`,
+or, with `from_kerfs=True`, to an earlier straight kerf in this operation.
+It chooses the shortest candidate within `max_lead_mm` whose lead clears
+all kept parts. Loops without such a candidate use their ordinary pierce.
+This option does not make a thickness beyond the torch's piercing capacity
+safe to program: some loops can still need piercing.
+
+The beam starts at cut height with a distinct `BeamStart` event, followed
+by the declared `delay_s`, without a pierce-height move or pierce delay.
+The report counts `edge_starts` separately from `pierces`. Before releasing
+the start event, the planner checks that its position is outside the sheet
+or its stock cell is completely cut through. Possible remaining material
+is refused. Stock checks use conservative bounds, so a narrow kerf may
+require a finer stock grid to prove it open.
+
+References: Hypertherm, *Thick metal cutting techniques*, white paper
+807850 (torch at cut height off the plate edge, motion delay, then entry);
+US patent 10,195,682 (starts over previously cut paths).
+
+The [WinCNC plasma post](wincnc-plasma-post.md) supports `BeamStart` when
+the machine declares `edge_start_cut_z_mm` and program-controlled THC.
+It uses WinCNC's published cut-height and native torch-on primitives,
+independently decodes the sequence, and keeps ordinary pierces distinct.
+Other supplied posts refuse an edge start unless they implement and check
+a documented controller sequence. Issue #306 also tracks the separate
+scribe work.
+
 ## Plasma and laser marking: `ThermalMark`
 
 Lines traced on the sheet surface with the beam in the machine's marking
