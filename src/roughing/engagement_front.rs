@@ -863,6 +863,68 @@ impl OpenOrder {
     }
 }
 
+/// Sort the entry candidates in deterministic `OpenOrder`, while bounding the
+/// work between cancellation polls. The standard slice sort is one
+/// uninterruptible operation; fixed-size initial runs bound that operation,
+/// then a bottom-up merge polls during every pass.
+fn sort_open_cells(
+    cells: &mut Vec<(f64, usize)>,
+    cancel: &impl CancelSignal,
+) -> Result<(), String> {
+    const RUN: usize = 2048;
+    for chunk in cells.chunks_mut(RUN) {
+        if cancel.is_cancelled() {
+            return Err("engagement_front planning cancelled".into());
+        }
+        chunk.sort_unstable_by(OpenOrder::order);
+        if cancel.is_cancelled() {
+            return Err("engagement_front planning cancelled".into());
+        }
+    }
+    if cells.len() <= RUN {
+        return Ok(());
+    }
+    let mut scratch = cells.clone();
+    let mut width = RUN;
+    let mut source_is_cells = true;
+    while width < cells.len() {
+        let (source, destination) = if source_is_cells {
+            (cells.as_slice(), scratch.as_mut_slice())
+        } else {
+            (scratch.as_slice(), cells.as_mut_slice())
+        };
+        let mut written = 0usize;
+        for first in (0..source.len()).step_by(width.saturating_mul(2)) {
+            let middle = (first + width).min(source.len());
+            let end = (middle + width).min(source.len());
+            let (mut left, mut right) = (first, middle);
+            for output in &mut destination[first..end] {
+                if written.is_multiple_of(4096) && cancel.is_cancelled() {
+                    return Err("engagement_front planning cancelled".into());
+                }
+                let take_left = right == end
+                    || (left < middle && OpenOrder::order(&source[left], &source[right]).is_le());
+                *output = if take_left {
+                    let value = source[left];
+                    left += 1;
+                    value
+                } else {
+                    let value = source[right];
+                    right += 1;
+                    value
+                };
+                written += 1;
+            }
+        }
+        source_is_cells = !source_is_cells;
+        width = width.saturating_mul(2);
+    }
+    if !source_is_cells {
+        cells.copy_from_slice(&scratch);
+    }
+    Ok(())
+}
+
 struct Layer {
     g: Grid,
     /// Top of possible material per fine cell.
@@ -956,12 +1018,7 @@ impl Layer {
                     cells.push((room[k] as f64 - need, k));
                 }
             }
-            cells.sort_unstable_by(OpenOrder::order);
-            // The sort is one operation; a signal that fired during it still
-            // stops the order from being published or answered (#312).
-            if cancel.is_cancelled() {
-                return Err("engagement_front planning cancelled".into());
-            }
+            sort_open_cells(&mut cells, cancel)?;
             *open = Some(OpenOrder {
                 need: need.to_bits(),
                 cells,
@@ -4378,10 +4435,10 @@ impl EngagementFrontPlan {
     /// `confined`, an unproven stroke whose bound the wider query proves
     /// past the limit becomes an entry move at the entry feed (see
     /// `EngagementFrontReport::confined_strokes`) and nothing is returned;
-    /// one whose wider query stopped on `Work` or `Depth` is left as it was
-    /// queued, recorded in `unresolved`, and the caller refuses
-    /// (`unresolved_refusal`). Strokes before `unproven_from` were proven by
-    /// an earlier call and are premises only.
+    /// one whose wider query remains unresolved (`Work`, `Depth` or
+    /// `Resolution`) is left as it was queued, recorded in `unresolved`, and
+    /// the caller refuses (`unresolved_refusal`). Strokes before
+    /// `unproven_from` were proven by an earlier call and are premises only.
     fn prove(
         &mut self,
         stock: &Stock,
@@ -5119,7 +5176,11 @@ impl EngagementFrontPlan {
                     self.wall_loop(&wall, stock, cancel)?;
                     continue;
                 }
-                Wall::Run { before, strokes } => (before, strokes),
+                Wall::Run { before, strokes } => {
+                    #[cfg(test)]
+                    tests::REVIEW_WALL_RUNS.with(|c| c.set(c.get() + 1));
+                    (before, strokes)
+                }
             };
             self.layer.as_mut().unwrap().journal.clear();
             let mark = self.checkpoint();
@@ -5549,6 +5610,7 @@ impl EngagementFrontPlan {
             let here = self.position;
             let from = self.pending.len();
             self.layer.as_mut().unwrap().journal.clear();
+            let mark = self.checkpoint();
             let proven = self
                 .proven(height)
                 .map(|h| h.max(self.guides.cell_entry_height(stock, p)));
@@ -5570,8 +5632,16 @@ impl EngagementFrontPlan {
                 layer.cut([p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f], r);
             }
             if self.prove(stock, from, from, false, cancel)?.is_some() {
-                self.prove(stock, from, from, true, cancel)?;
+                if let Some((_, detail)) = self.prove(stock, from, from, true, cancel)? {
+                    self.rollback(&mark);
+                    return Err(format!("engagement_front: {detail}"));
+                }
                 if let Some((_, detail)) = self.unresolved_refusal() {
+                    // Nothing of a refused slot-side attempt may remain
+                    // publishable: restore its travel, plunge, cut, steering
+                    // marks and staged report before carrying the proof
+                    // failure in the error (#309).
+                    self.rollback(&mark);
                     return Err(format!("engagement_front: {detail}"));
                 }
             }
@@ -7232,6 +7302,8 @@ mod tests {
             const { std::cell::Cell::new(0) };
         pub(super) static REVIEW_WALL_LOOPS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
+        pub(super) static REVIEW_WALL_RUNS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
         static REVIEW_REASONS: std::cell::Cell<Option<(UnresolvedReason, UnresolvedReason)>> =
             const { std::cell::Cell::new(None) };
         static FORCED_QUERIES: std::cell::Cell<usize> =
@@ -7389,6 +7461,75 @@ mod tests {
                 .any(|s| s.contains("work budget")),
             "{:?}",
             plan.report.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_refused_slot_side_entry_restores_its_attempt() {
+        let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+            "../../fixtures/operations/adaptive-pocket.json"
+        ))
+        .unwrap();
+        let crate::pocket::Operation::AdaptivePocket(mut op) = m.operations.remove(0) else {
+            panic!("fixture");
+        };
+        op.pocket.entry = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+            }))
+            .unwrap(),
+        );
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = EngagementFrontPlan::prepare(
+            op.pocket,
+            &m.tools[0],
+            stock.spec(),
+            m.initial_position_mm,
+            0.5,
+            true,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let z = plan.z;
+        let (a, b, q) = ([6., 8.], [10., 8.], [10., 9.]);
+        let slot = Motion {
+            id: 0,
+            operation: "precut-slot".into(),
+            tool: m.tools[0].id.clone(),
+            kind: MoveKind::Cut,
+            curve: Curve::Line {
+                start: [a[0], a[1], z],
+                end: [b[0], b[1], z],
+            },
+            feed_mm_min: Some(600.),
+        };
+        let tool = m.tools[0].prepare().unwrap();
+        let delta = stock
+            .preview_sweep(&tool, &slot, 1., m.sweep, &NeverCancelled)
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+        plan.build_layer(&stock, &NeverCancelled).unwrap();
+        plan.ramp_slots.push((a, b));
+
+        let pending_before = plan.pending.len();
+        let report_before = serde_json::to_value(&plan.report).unwrap();
+        let material_before = material_cells(&plan);
+        force(Some((UnresolvedReason::Work, UnresolvedReason::Work)));
+        let error = plan
+            .slot_side_entry(q, &stock, &NeverCancelled)
+            .expect_err("the slot-side proof is refused");
+        force(None);
+        assert!(error.contains("refused rather than cutting"), "{error}");
+        assert_eq!(plan.pending.len(), pending_before, "the queue is restored");
+        assert_eq!(
+            material_cells(&plan),
+            material_before,
+            "the grid is restored"
+        );
+        assert_eq!(
+            serde_json::to_value(&plan.report).unwrap(),
+            report_before,
+            "the report is restored"
         );
     }
 
@@ -7954,33 +8095,55 @@ mod tests {
     }
 
     #[test]
+    fn the_entry_sort_has_bounded_cancellation_and_the_same_order() {
+        let mut cells: Vec<_> = (0..20_000).map(|k| (((k * 7919) % 97) as f64, k)).collect();
+        let mut expected = cells.clone();
+        expected.sort_unstable_by(OpenOrder::order);
+        sort_open_cells(&mut cells, &NeverCancelled).unwrap();
+        assert_eq!(cells, expected);
+
+        // Two fixed-size runs finish, then the signal fires. The sort must
+        // observe it before sorting the whole 20,000-cell collection.
+        let mut cancelled = expected;
+        let signal = CancelAfter(AtomicUsize::new(4));
+        assert!(
+            sort_open_cells(&mut cancelled, &signal).is_err(),
+            "the candidate sort ran to completion past cancellation"
+        );
+    }
+
+    #[test]
     fn a_rolled_back_wall_run_marks_nothing() {
-        // `StockEdgeEntry` (helix=None): an unproven wall run rolls back and
-        // is skipped, and marks nothing (#311), like a wall loop. The wall
-        // entry is genuinely admitted here, so the skipped attempt is a
-        // proven-failed one.
-        let (mut plan, stock) =
-            pocket_with_walls_pending(serde_json::json!({ "kind": "stock_edge" }), true);
+        // The pre-cut bands produce real `Wall::Run` pieces. A forced
+        // unresolved proof on one of them refuses, rolls that run back, and
+        // marks nothing (#309/#311).
+        let (mut plan, stock) = pocket_with_walls_pending(
+            serde_json::json!({
+                "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+            }),
+            true,
+        );
         plan.finish_report(&NeverCancelled).unwrap();
         let before = material_cells(&plan);
-        let reported_before = plan.report.geometric_residual_area_mm2;
-        tests::REVIEW_ROLLBACKS.with(|c| c.set(0));
+        let pending_before = plan.pending.len();
+        let report_before = serde_json::to_value(&plan.report).unwrap();
+        tests::REVIEW_WALL_RUNS.with(|c| c.set(0));
         force(Some((UnresolvedReason::Work, UnresolvedReason::Work)));
-        plan.plan_wall_runs(&stock, &NeverCancelled).unwrap();
+        let error = plan
+            .plan_wall_runs(&stock, &NeverCancelled)
+            .expect_err("the unproven Wall::Run is refused");
         force(None);
+        assert!(error.contains("refused rather than cutting"), "{error}");
         assert!(
-            tests::REVIEW_ROLLBACKS.with(|c| c.get()) > 0,
-            "the fixture never reached the rollback branch"
+            tests::REVIEW_WALL_RUNS.with(|c| c.get()) > 0,
+            "the fixture never reached Wall::Run"
         );
         assert_eq!(plan.report.wall_passes, 0, "{:?}", plan.report.diagnostics);
-        assert!(
-            plan.report.wall_passes_skipped >= 1,
-            "{:?}",
-            plan.report.diagnostics
-        );
+        assert_eq!(plan.pending.len(), pending_before, "the queue is restored");
         assert_eq!(material_cells(&plan), before, "the grid is restored");
         assert_eq!(
-            plan.report.geometric_residual_area_mm2, reported_before,
+            serde_json::to_value(&plan.report).unwrap(),
+            report_before,
             "a rolled-back run changes no report"
         );
     }
@@ -7997,14 +8160,11 @@ mod tests {
         );
         plan.finish_report(&NeverCancelled).unwrap();
         let before = material_cells(&plan);
-        tests::REVIEW_WALL_LOOPS.with(|c| c.set(0));
+        tests::REVIEW_WALL_RUNS.with(|c| c.set(0));
         plan.plan_wall_runs(&stock, &NeverCancelled).unwrap();
-        let whole = tests::REVIEW_WALL_LOOPS.with(|c| c.get());
         assert!(
-            plan.report.wall_passes > whole,
-            "no Wall::Run branch was exercised: {} passes, {} whole loops",
-            plan.report.wall_passes,
-            whole
+            tests::REVIEW_WALL_RUNS.with(|c| c.get()) > 0,
+            "no Wall::Run branch was exercised"
         );
         assert!(
             material_cells(&plan) < before,

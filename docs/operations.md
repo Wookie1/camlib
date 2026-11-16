@@ -583,6 +583,12 @@ refused with its location: export the mesh with shared edge vertices
     bound past the limit is the confined case — cut as lead moves at the
     entry feed (the helix feed, else the plunge feed) and counted
     (`confined_strokes`, `confined_stroke_mm`, `confined_max_engagement_deg`).
+    For a straight stroke whose start pose the preceding motion certified,
+    the cutter's own correlated trail proves the whole-stroke
+    leading-contact bound is exactly 180° (including the two boundary
+    radii); this is an analytic line certificate, not an angular tolerance
+    or an endpoint check. Curved strokes still need the ordinary whole-stroke
+    query to settle.
     This needs an entry that allows a helix or a ramp; with
     `StockEdgeEntry(helix=None)` the operation stops and names the place. Its
     message says the material *may be* confined, because what it names is a
