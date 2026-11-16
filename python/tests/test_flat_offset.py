@@ -231,16 +231,40 @@ def cached(name):
 
 
 class FlatOffsetTest(unittest.TestCase):
-    def test_each_edge_ring_is_entered_once(self):
-        # Entries are the vertical plunges. A connected flat is entered once
-        # per ring along its edge or a wall it cannot link across: the
-        # stepped part has three (the boss top's edge, the base's outer edge
-        # and the base's ring round the boss). Today: one per raster run.
+    def test_few_entries_and_links_at_depth(self):
+        # Entries are the vertical plunges. The stepped part needs one per
+        # ring along an edge or wall that cannot be linked to (boss top,
+        # base outer edge, ring round the boss) plus one per piece the
+        # offsets split off out of link reach (the base's two side strips
+        # at d = 3): at most 6. Today: one per raster run (39).
         report, motions, *_ = cached("stepped")
         plunges = len(vertical_plunges(motions))
-        self.assertLessEqual(plunges, 3, f"{plunges} entries; runs={report['runs']}")
+        self.assertLessEqual(plunges, 6, f"{plunges} entries; runs={report['runs']}")
         self.assertEqual(plunges, report["runs"])
         self.assertGreater(report.get("links_at_depth", 0), 0)
+
+    def test_no_vertical_plunge_onto_a_finished_face(self):
+        # No plunge marks: a vertical plunge that ends at a flat's cutting
+        # height never has the tool's disk over that flat's face; the tool
+        # comes down beside the face (side entry) or stops above the stock
+        # and ramps.
+        for name, spec in (("stepped", STEPPED), ("island", ISLAND)):
+            _, motions, *_ = cached(name)
+            field = Field(spec)
+            worst = (math.inf, None)
+            for m in vertical_plunges(motions):
+                b = m["curve"]["end"]
+                face = np.abs(field.H - b[2]) < 1e-6
+                if not face.any():
+                    continue
+                d = float(np.min(np.hypot(field.X[face] - b[0], field.Y[face] - b[1])))
+                if d < worst[0]:
+                    worst = (d, [round(v, 4) for v in b])
+            self.assertGreaterEqual(
+                worst[0],
+                R - 1e-6 - field.step,
+                f"{name}: plunge onto a finished face at {worst[1]} ({worst[0]:.4f} mm)",
+            )
 
     def test_open_edges_are_entered_from_the_side_in_air(self):
         # The boss top and the base's outer edge are open: their first ring
