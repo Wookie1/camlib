@@ -1,13 +1,16 @@
 //! Flat-area finishing (the usual Flat/Horizontal strategy): finds the
 //! horizontal faces of a part and finishes each at its exact height with a
-//! flat end mill, in raster rows, entering each run with a vertical plunge.
+//! flat end mill, in contour-parallel passes that offset each flat's tool
+//! centre region inward, outside in, linked at depth where the link is
+//! proven, and entered from the side in air where a pass runs along an open
+//! edge.
 //!
 //! Proof: every cut is a horizontal line at the cut height. It is kept only
 //! where the highest point of the part (and the machining base) under the
 //! tool's swept disk (a capsule in XY) is not above the cut height plus the
 //! tolerance. That maximum is computed exactly per triangle (a linear
 //! function over the convex triangle-capsule intersection peaks at one of its
-//! extreme points); runs that fail are halved until they pass or vanish.
+//! extreme points); chords that fail are halved until they pass or vanish.
 use crate::{
     facing::TraverseAxis,
     motion::{Coolant, Curve, Event, Motion, MoveKind, SpindleDirection, Vec3},
@@ -101,8 +104,15 @@ pub struct FlatReport {
     pub strategy: &'static str,
     pub geometric_residual_status: ResidualStatus,
     pub levels_z_mm: Vec<f64>,
+    /// Loops cut (closed offset loops and the open stretches a loop was split
+    /// into by dropped chords).
     pub rows: usize,
     pub runs: usize,
+    /// Closed offset loops planned, before any chord was dropped.
+    pub loops: usize,
+    /// Links cut at depth between the passes of one chain.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub links_at_depth: usize,
     pub cut_length_mm: f64,
     /// Row length near flats that could not be proven clear and was dropped.
     pub dropped_length_mm: f64,
@@ -1506,11 +1516,52 @@ impl Index {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Run {
-    a: [f64; 2],
-    b: [f64; 2],
-    z: f64,
+/// One cut pass at a fixed height: the flattened polyline of a closed loop
+/// (the last point repeats the first) or of the stretches of a loop that were
+/// proven and allowed (an open piece).
+struct Piece {
+    pts: Vec<Vec3>,
+}
+impl Piece {
+    fn start(&self) -> Vec3 {
+        self.pts[0]
+    }
+    fn end(&self) -> Vec3 {
+        self.pts[self.pts.len() - 1]
+    }
+    fn length(&self) -> f64 {
+        self.pts
+            .windows(2)
+            .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+            .sum()
+    }
+    fn strokes(&self) -> Vec<crate::pocket::Stroke> {
+        self.pts
+            .windows(2)
+            .map(|w| crate::pocket::Stroke::line([w[0][0], w[0][1]], [w[1][0], w[1][1]]))
+            .collect()
+    }
+}
+
+/// One entry and the passes cut before the tool retracts: consecutive passes
+/// are joined by links at depth.
+struct Chain {
+    pieces: Vec<Piece>,
+    /// Side-entry candidates of the first pass: vertices (at most one per
+    /// 1 mm of the pass) with the outward normal, away from the region (right
+    /// of travel).
+    side: Vec<([f64; 2], [f64; 2])>,
+}
+
+/// How the chain is entered, decided against the live stock when reached.
+enum Entry {
+    /// Vertical plunge in air at `p`, then a lead at cutting feed to the
+    /// pass's start.
+    Side { p: [f64; 2] },
+    /// Vertical plunge at the pass's start.
+    Plunge,
+    /// Ramp down the first pass from the stock's top over it.
+    Ramp { top: f64, points: Vec<Vec3> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1518,10 +1569,11 @@ enum Phase {
     Lift,
     Approach,
     Descend,
-    Plunge,
+    Enter,
+    Lead,
     Ramp,
     Cut,
-    Retract,
+    PieceEnd,
     Rise,
     Done,
 }
@@ -1530,10 +1582,17 @@ pub struct FlatPlan {
     op: FlatOperation,
     spec: StockSpec,
     heights: crate::heights::Heights,
-    runs: Vec<Run>,
-    run: usize,
+    index: Index,
+    seen: Vec<u32>,
+    stamp: u32,
+    chains: Vec<Chain>,
+    chain: usize,
+    piece: usize,
+    vertex: usize,
     phase: Phase,
     radius: f64,
+    limits: Option<crate::limits::PreparedLimits>,
+    entry: Option<Entry>,
     ramp: std::collections::VecDeque<Vec3>,
     initial: Vec3,
     position: Vec3,
@@ -1697,148 +1756,145 @@ impl FlatPlan {
                 l.0, cutter.cutting_length_mm
             ));
         }
-        let axis = if op.axis == TraverseAxis::X { 0 } else { 1 };
-        let cross = 1 - axis;
         let region_limits = op
             .limits
             .as_ref()
             .filter(|l| !l.is_empty())
             .map(|l| crate::limits::PreparedLimits::new(l, r, op.tolerance_mm))
             .transpose()?;
-        let mut seen = vec![0u32; index.tris.len()];
+        // The part as a height field over XY, for the per-chord proofs and the
+        // side entries' leads.
+        let target = crate::roughing::PreparedRoughingTarget::prepare(
+            op.surface.clone(),
+            op.tolerance_mm,
+            cancel,
+        )?;
+        let mut seen = vec![0u32; index.len()];
         let mut stamp = 0u32;
-        let mut runs = vec![];
-        let (mut rows, mut dropped) = (0usize, 0f64);
-        for &(level, lo, hi) in &levels {
+        let h = op.stepover_mm.min(r) / 4.;
+        let mut chains: Vec<Chain> = vec![];
+        let (mut rows, mut loops, mut links, mut dropped) = (0usize, 0usize, 0usize, 0f64);
+        let mut tool_xy = [initial[0], initial[1]];
+        for &(level, _, _) in &levels {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
             let z = level + op.stock_to_leave_mm;
-            let (c0, c1) = (lo[cross] - r, hi[cross] + r);
-            let (a0, a1) = (lo[axis] - r, hi[axis] + r);
-            let intervals = ((c1 - c0) / op.stepover_mm).ceil().max(1.) as usize;
-            let pitch = (c1 - c0) / intervals as f64;
-            let h = op.stepover_mm.min(r) / 4.;
-            let samples = ((a1 - a0) / h).ceil().max(1.) as usize;
-            crate::resources::check_memory(
-                (intervals as u128 + 1) * (samples as u128 + 1) * 8,
-                "flat-area rows",
-            )?;
-            for row in 0..=intervals {
-                if cancel.is_cancelled() {
-                    return Err("flat-area planning cancelled".into());
-                }
-                let c = c0 + row as f64 * pitch;
-                let point = |s: usize| {
-                    let mut p = [0.; 2];
-                    p[axis] = a0 + (a1 - a0) * s as f64 / samples as f64;
-                    p[cross] = c;
-                    p
-                };
-                // Samples where the tool rests on this flat.
-                let on = |p: [f64; 2], seen: &mut [u32], stamp: &mut u32| {
-                    let height = index.max_height(p, p, r, seen, stamp);
-                    (height - level).abs() <= op.level_tolerance_mm
-                };
-                let mut row_runs = vec![];
-                let mut start = None;
-                for s in 0..=samples {
-                    let inside = on(point(s), &mut seen, &mut stamp);
-                    match (inside, start) {
-                        (true, None) => start = Some(s),
-                        (false, Some(s0)) => {
-                            if s - 1 > s0 {
-                                row_runs.push((point(s0), point(s - 1)));
-                            }
-                            start = None;
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(s0) = start
-                    && samples > s0
-                {
-                    row_runs.push((point(s0), point(samples)));
-                }
-                if row_runs.is_empty() {
-                    continue;
-                }
-                rows += 1;
-                if rows % 2 == 0 {
-                    row_runs.reverse();
-                    for run in &mut row_runs {
-                        *run = (run.1, run.0);
-                    }
-                }
-                // Prove each run; halve failures down to h / 16.
-                let mut stack: Vec<([f64; 2], [f64; 2], u32)> =
-                    row_runs.into_iter().rev().map(|(a, b)| (a, b, 0)).collect();
-                while let Some((a, b, depth)) = stack.pop() {
-                    let length = (b[0] - a[0]).hypot(b[1] - a[1]);
-                    if index.max_height(a, b, r, &mut seen, &mut stamp) <= z + op.tolerance_mm {
-                        let Some(limits) = &region_limits else {
-                            runs.push(Run { a, b, z });
-                            continue;
-                        };
-                        // Only the stretches proven inside the limits.
-                        let line = crate::motion::Curve::Line {
-                            start: [a[0], a[1], z],
-                            end: [b[0], b[1], z],
-                        };
-                        let mut kept = 0.;
-                        for [t0, t1] in limits.allowed_spans(&line, true)? {
-                            let at = |t: f64| [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
-                            let (p, q) = (at(t0), at(t1));
-                            if (q[0] - p[0]).hypot(q[1] - p[1]) > op.tolerance_mm {
-                                runs.push(Run { a: p, b: q, z });
-                                kept += (t1 - t0) * length;
-                            }
-                        }
-                        dropped += length - kept;
-                        continue;
-                    }
-                    if length <= h / 16. || depth >= 32 {
-                        dropped += length;
-                        continue;
-                    }
-                    let m = [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.];
-                    stack.push((m, b, depth + 1));
-                    stack.push((a, m, depth + 1));
-                }
-            }
-        }
-        // Rejoin halves that were both proven (same line, touching).
-        let mut merged: Vec<Run> = Vec::with_capacity(runs.len());
-        for run in runs {
-            if let Some(last) = merged.last_mut()
-                && last.b == run.a
-                && last.z == run.z
-            {
-                last.b = run.b;
+            // The tool centres resting on this level, as a planar region.
+            let Some(region) =
+                level_region(&target, level, op.level_tolerance_mm, r, op.tolerance_mm, cancel)?
+            else {
                 continue;
+            };
+            // Offset loops per connected component, outside in.
+            let groups = level_loops(&region, r, op.stepover_mm, op.tolerance_mm, cancel)?;
+            let level_chains = chains.len();
+            // Nearest component first.
+            let mut order: Vec<usize> = (0..groups.len()).collect();
+            order.sort_by(|&a, &b| {
+                groups[a]
+                    .distance(tool_xy)
+                    .total_cmp(&groups[b].distance(tool_xy))
+                    .then(a.cmp(&b))
+            });
+            for gi in order {
+                for ring in groups[gi].ordered(tool_xy) {
+                    if cancel.is_cancelled() {
+                        return Err("flat-area planning cancelled".into());
+                    }
+                    loops += 1;
+                    // Each closed loop starts at its vertex nearest the tool.
+                    let ring = rotate_to_nearest(ring, tool_xy);
+                    // Prove each chord; halve failures down to h / 16, keep
+                    // only the stretches inside the limits.
+                    let pieces = prove_ring(
+                        &ring,
+                        z,
+                        r,
+                        &index,
+                        &mut seen,
+                        &mut stamp,
+                        h,
+                        op.tolerance_mm,
+                        region_limits.as_ref(),
+                        &mut dropped,
+                        cancel,
+                    )?;
+                    for piece in pieces {
+                        rows += 1;
+                        // Consecutive passes join into one chain by a link at
+                        // depth when the link is short, proven and allowed;
+                        // otherwise the chain ends and a new one begins.
+                        let linked = chains.len() > level_chains && {
+                            let prev = chains[chains.len() - 1].pieces.last().unwrap().end();
+                            let next = piece.start();
+                            let length = (next[0] - prev[0]).hypot(next[1] - prev[1]);
+                            length <= 2. * op.stepover_mm
+                                && index.max_height(
+                                    [prev[0], prev[1]],
+                                    [next[0], next[1]],
+                                    r,
+                                    &mut seen,
+                                    &mut stamp,
+                                ) <= z + op.tolerance_mm
+                                && allows_segment(
+                                    region_limits.as_ref(),
+                                    [prev[0], prev[1]],
+                                    [next[0], next[1]],
+                                    z,
+                                    op.tolerance_mm,
+                                )?
+                        };
+                        if linked {
+                            let last = chains.len() - 1;
+                            chains[last].pieces.push(piece);
+                            links += 1;
+                        } else {
+                            let side = side_candidates(&piece);
+                            chains.push(Chain {
+                                pieces: vec![piece],
+                                side,
+                            });
+                        }
+                        let end = chains[chains.len() - 1].pieces.last().unwrap().end();
+                        tool_xy = [end[0], end[1]];
+                    }
+                }
             }
-            merged.push(run);
         }
         let report = FlatReport {
             strategy: "flat",
             geometric_residual_status: ResidualStatus::Pending,
             levels_z_mm: levels.iter().map(|l| l.0).collect(),
             rows,
-            runs: merged.len(),
-            cut_length_mm: merged
+            runs: chains.len(),
+            loops,
+            links_at_depth: links,
+            cut_length_mm: chains
                 .iter()
-                .map(|r| (r.b[0] - r.a[0]).hypot(r.b[1] - r.a[1]))
+                .flat_map(|c| c.pieces.iter())
+                .map(Piece::length)
                 .sum(),
             dropped_length_mm: dropped,
             runs_completed: 0,
             ramped_entries: 0,
-            clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; vertical entries above proven runs",
+            clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; contour-parallel offset passes outside in, side entry in air on open edges, links at depth and when chains break",
         };
         Ok(Self {
             op,
             spec: spec.clone(),
             heights,
-            runs: merged,
-            run: 0,
+            index,
+            seen,
+            stamp: 0,
+            chains,
+            chain: 0,
+            piece: 0,
+            vertex: 0,
             phase: Phase::Lift,
             radius: r,
+            limits: region_limits,
+            entry: None,
             ramp: Default::default(),
             initial,
             position: initial,
@@ -1851,35 +1907,37 @@ impl FlatPlan {
     pub fn report(&self) -> &FlatReport {
         &self.report
     }
-    /// What enters the run at `run.a` after the rapid descent: a straight
-    /// plunge where no live stock stands above the run's height there (the
+    /// What enters the pass at its start after the rapid descent: a straight
+    /// plunge where no live stock stands above the pass's height there (the
     /// cells' upper bounds, within a tolerance), otherwise a ramp from the
-    /// stock's top over the whole run, down the run by the declared
-    /// `RampEntry`. Each ramp point lies vertically above the proven run, so
-    /// it clears the part as the run does. A run the ramp does not fit, or
-    /// stock above a run with no entry declared, is refused: a flat end mill
+    /// stock's top over the whole pass, down the pass by the declared
+    /// `RampEntry`. Each ramp point lies vertically above the proven pass, so
+    /// it clears the part as the pass does. A pass the ramp does not fit, or
+    /// stock above a pass with no entry declared, is refused: a flat end mill
     /// is never plunged into stock.
     fn plunge_or_ramp(
         &self,
-        run: Run,
+        piece: &Piece,
         stock: &Stock,
         cancel: &impl CancelSignal,
     ) -> Result<Option<(f64, Vec<Vec3>)>, String> {
-        let at_start = stock.top_under_disk(run.a, self.radius);
-        if at_start <= run.z + self.op.tolerance_mm {
+        let a = piece.start();
+        let at_start = stock.top_under_disk([a[0], a[1]], self.radius);
+        if at_start <= a[2] + self.op.tolerance_mm {
             return Ok(None);
         }
-        let length = (run.b[0] - run.a[0]).hypot(run.b[1] - run.a[1]);
-        let top = run_stock_top(stock, run, self.radius, cancel)?;
+        let length = piece.length();
+        let top = piece_stock_top(piece, stock, self.radius, cancel)?;
+        let b = piece.end();
         let which = format!(
             "flat-area run from ({:.3}, {:.3}) to ({:.3}, {:.3}) at Z{:.3}, {length:.3} mm long, has stock up to Z{top:.3} ({:.3} mm above it, {:.3} mm above it at its start)",
-            run.a[0],
-            run.a[1],
-            run.b[0],
-            run.b[1],
-            run.z,
-            top - run.z,
-            at_start - run.z
+            a[0],
+            a[1],
+            b[0],
+            b[1],
+            a[2],
+            top - a[2],
+            at_start - a[2]
         );
         let Some(entry) = self.op.entry.as_ref().and_then(|e| e.ramp()) else {
             return Err(format!(
@@ -1897,19 +1955,77 @@ impl FlatPlan {
                 self.heights.feed
             ));
         }
-        let chain = [crate::pocket::Stroke::line(run.a, run.b)];
+        let chain = piece.strokes();
         let curves = entry
-            .zigzag(&chain, top, run.z)
+            .zigzag(&chain, top, a[2])
             .map_err(|why| format!("{which}: {why}. Use a steeper declared angle, a longer run, or rough this area first"))?;
         let mut points = vec![];
-        let first = curves.first().map_or(run.a, |c| {
+        let first = curves.first().map_or([a[0], a[1]], |c| {
             let q = c.start();
             [q[0], q[1]]
         });
-        // Over the run at the stock's top, then down the legs.
+        // Over the pass at the stock's top, then down the legs.
         points.push([first[0], first[1], top]);
         points.extend(curves.iter().map(|c| c.end()));
         Ok(Some((top, points)))
+    }
+    /// How the current chain is entered, decided against the live stock: from
+    /// the side in air where the first pass runs along an open edge (the
+    /// plunge point's disk touches no stock above the cut and the lead is
+    /// proven and allowed), otherwise the declared rule (`plunge_or_ramp`).
+    fn decide_entry(&mut self, stock: &Stock, cancel: &impl CancelSignal) -> Result<Entry, String> {
+        let piece = &self.chains[self.chain].pieces[self.piece];
+        let z = piece.start()[2];
+        let tol = self.op.tolerance_mm;
+        let closed = piece.pts.first() == piece.pts.last();
+        let mut best: Option<([f64; 2], [f64; 2])> = None;
+        for (v, n) in &self.chains[self.chain].side {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            if !closed && *v != [piece.pts[0][0], piece.pts[0][1]] {
+                continue;
+            }
+            // Outward, trying the shortest offset first.
+            for l in [0.25 * self.radius, 0.5 * self.radius, self.radius, 1.5 * self.radius, 2. * self.radius] {
+                let p = [v[0] + l * n[0], v[1] + l * n[1]];
+                if stock.top_under_disk(p, self.radius) > z + tol {
+                    continue;
+                }
+                if self.index.max_height(p, *v, self.radius, &mut self.seen, &mut self.stamp)
+                    > z + tol
+                {
+                    continue;
+                }
+                if !allows_segment(self.limits.as_ref(), p, *v, z, tol)? {
+                    continue;
+                }
+                let nearer = best.map_or(true, |(bv, _)| {
+                    (v[0] - self.position[0]).hypot(v[1] - self.position[1])
+                        < (bv[0] - self.position[0]).hypot(bv[1] - self.position[1])
+                });
+                if nearer {
+                    best = Some((*v, p));
+                }
+                break;
+            }
+        }
+        if let Some((v, p)) = best {
+            // The loop is cut from the entry vertex.
+            if closed && (piece.pts[0][0] != v[0] || piece.pts[0][1] != v[1]) {
+                let piece = &mut self.chains[self.chain].pieces[self.piece];
+                rotate_piece(piece, v);
+            }
+            return Ok(Entry::Side { p });
+        }
+        let piece = &self.chains[self.chain].pieces[self.piece];
+        match self.plunge_or_ramp(piece, stock, cancel)? {
+            None => Ok(Entry::Plunge),
+            Some((top, points)) => {
+                self.report.ramped_entries += 1;
+                Ok(Entry::Ramp { top, points })
+            }
+        }
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         vec![
@@ -1977,36 +2093,59 @@ impl FlatPlan {
                 Phase::Lift => (
                     [p[0], p[1], self.heights.clearance],
                     MoveKind::Rapid,
-                    if self.runs.is_empty() {
+                    if self.chains.is_empty() {
                         Phase::Done
                     } else {
                         Phase::Approach
                     },
                 ),
                 Phase::Approach => {
-                    let a = self.runs[self.run].a;
-                    ([a[0], a[1], p[2]], MoveKind::Rapid, Phase::Descend)
+                    // The entry is decided here, against the live stock: the
+                    // rapid goes over the plunge point (a side entry) or the
+                    // pass's start.
+                    let entry = self.decide_entry(stock, cancel)?;
+                    let over = match &entry {
+                        Entry::Side { p: over } => *over,
+                        _ => {
+                            let a = self.chains[self.chain].pieces[self.piece].start();
+                            [a[0], a[1]]
+                        }
+                    };
+                    self.entry = Some(entry);
+                    ([over[0], over[1], p[2]], MoveKind::Rapid, Phase::Descend)
                 }
                 Phase::Descend => (
                     [p[0], p[1], self.heights.feed],
                     MoveKind::Rapid,
-                    Phase::Plunge,
+                    Phase::Enter,
                 ),
-                Phase::Plunge => {
-                    let run = self.runs[self.run];
-                    match self.plunge_or_ramp(run, stock, cancel)? {
-                        Some((top, points)) => {
+                Phase::Enter => {
+                    let a = self.chains[self.chain].pieces[self.piece].start();
+                    match self.entry.take().expect("entry plan") {
+                        Entry::Side { .. } => (
+                            [p[0], p[1], a[2]],
+                            MoveKind::Plunge,
+                            Phase::Lead,
+                        ),
+                        Entry::Plunge => ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Cut),
+                        Entry::Ramp { top, points } => {
                             self.ramp = points.into();
-                            self.report.ramped_entries += 1;
-                            // Down through air to the stock's top over the run.
+                            // Down through air to the stock's top over the pass.
                             (
-                                [p[0], p[1], top.min(p[2]).max(run.z)],
+                                [p[0], p[1], top.min(p[2]).max(a[2])],
                                 MoveKind::Plunge,
-                                Phase::Ramp,
+                                if self.ramp.is_empty() {
+                                    Phase::Cut
+                                } else {
+                                    Phase::Ramp
+                                },
                             )
                         }
-                        None => ([p[0], p[1], run.z], MoveKind::Plunge, Phase::Cut),
                     }
+                }
+                Phase::Lead => {
+                    let a = self.chains[self.chain].pieces[self.piece].start();
+                    ([a[0], a[1], a[2]], MoveKind::Lead, Phase::Cut)
                 }
                 Phase::Ramp => {
                     let end = self.ramp.pop_front().expect("ramp move");
@@ -2028,18 +2167,40 @@ impl FlatPlan {
                     )
                 }
                 Phase::Cut => {
-                    let run = self.runs[self.run];
-                    ([run.b[0], run.b[1], run.z], MoveKind::Cut, Phase::Retract)
+                    let pts = &self.chains[self.chain].pieces[self.piece].pts;
+                    let end = pts[self.vertex + 1];
+                    self.vertex += 1;
+                    (
+                        end,
+                        MoveKind::Cut,
+                        if self.vertex + 1 < pts.len() {
+                            Phase::Cut
+                        } else {
+                            Phase::PieceEnd
+                        },
+                    )
                 }
-                Phase::Retract => (
-                    [p[0], p[1], self.heights.feed.max(p[2])],
-                    MoveKind::Retract,
-                    Phase::Rise,
-                ),
+                Phase::PieceEnd => {
+                    if self.piece + 1 < self.chains[self.chain].pieces.len() {
+                        // A proven link at depth to the next pass.
+                        let next = self.chains[self.chain].pieces[self.piece + 1].start();
+                        self.piece += 1;
+                        self.vertex = 0;
+                        (next, MoveKind::Link, Phase::Cut)
+                    } else {
+                        (
+                            [p[0], p[1], self.heights.feed.max(p[2])],
+                            MoveKind::Retract,
+                            Phase::Rise,
+                        )
+                    }
+                }
                 Phase::Rise => {
-                    self.run += 1;
+                    self.chain += 1;
+                    self.piece = 0;
+                    self.vertex = 0;
                     self.report.runs_completed += 1;
-                    let last = self.run == self.runs.len();
+                    let last = self.chain == self.chains.len();
                     let z = if last {
                         self.heights.clearance
                     } else {
@@ -2079,19 +2240,33 @@ impl FlatPlan {
 }
 
 /// Highest live stock upper bound over the cells the cutter's disk touches
-/// anywhere along a run: sampled at no more than half a cell apart, each
-/// sample's disk widened to cover the capsule between samples.
-fn run_stock_top(
+/// anywhere along a pass: sampled at no more than half a cell apart along
+/// each chord, each sample's disk widened to cover the capsule between
+/// samples.
+fn piece_stock_top(
+    piece: &Piece,
     stock: &Stock,
-    run: Run,
     r: f64,
     cancel: &impl CancelSignal,
 ) -> Result<f64, String> {
-    segment_stock_top(stock, run.a, run.b, r, cancel)
+    let mut top = f64::MIN;
+    for w in piece.pts.windows(2) {
+        if cancel.is_cancelled() {
+            return Err("planning cancelled while reading the stock".into());
+        }
+        top = top.max(segment_stock_top(
+            stock,
+            [w[0][0], w[0][1]],
+            [w[1][0], w[1][1]],
+            r,
+            cancel,
+        )?);
+    }
+    Ok(top)
 }
 
 /// Highest live stock upper bound over the cells a disk of radius `r`
-/// touches anywhere along the segment from `a` to `b` (see `run_stock_top`).
+/// touches anywhere along the segment from `a` to `b` (see `piece_stock_top`).
 pub(crate) fn segment_stock_top(
     stock: &Stock,
     a: [f64; 2],
@@ -2117,6 +2292,416 @@ pub(crate) fn segment_stock_top(
         top = top.max(stock.top_under_disk(xy, wide));
     }
     Ok(top)
+}
+
+/// The region of tool centres resting on the flat level `z`: the shadow of
+/// the part standing above `z - level_tolerance`, grown by the cutter radius
+/// (every position whose disk touches the part within a tolerance below the
+/// level), minus the shadow of the part standing above the level, grown by
+/// the radius plus the shadows' stated errors (the pattern of
+/// `waterline::flat_level_loops`): every position whose disk would reach the
+/// part above the level. The "above" shadow's tip is picked so its
+/// `protected_from_z_mm` is strictly above `z + level_tolerance`; nothing
+/// standing above the level leaves the resting region alone. What is left is
+/// exactly where a cut at `z + stock_to_leave_mm` rests on the level.
+fn level_region(
+    target: &crate::roughing::PreparedRoughingTarget,
+    z: f64,
+    level_tolerance: f64,
+    r: f64,
+    tolerance: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Option<crate::planar::PreparedRegion>, String> {
+    use crate::planar::{Boolean, ConstructionOptions};
+    let options = ConstructionOptions { tolerance_mm: tolerance };
+    let source_error = target.mesh().surface_error_mm;
+    let mut work = 0usize;
+    let below = target
+        .shadow_for_cutter(z - level_tolerance, 0., r, &mut work, cancel)
+        .map_err(|e| format!("flat-area shadow at Z{z}: {e}"))?;
+    if below.region.components.is_empty() {
+        return Ok(None);
+    }
+    // The shadow's numerical reserve, from its own report.
+    let numerical = (z - level_tolerance) - below.report.protected_from_z_mm - source_error;
+    let resting = below
+        .region
+        .prepare(options)
+        .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+        .offset_prepared(-r)
+        .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+        .into_parts()
+        .1;
+    let above_tip = z + level_tolerance + source_error + numerical + 16. * tolerance;
+    let above = target
+        .shadow_for_cutter(above_tip, 0., r, &mut work, cancel)
+        .map_err(|e| format!("flat-area shadow at Z{z}: {e}"))?;
+    let region = if above.region.components.is_empty() {
+        resting
+    } else {
+        let reach = r + (above.report.boundary_error_mm - source_error).max(0.);
+        let blocked = above
+            .region
+            .prepare(options)
+            .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+            .offset_prepared(-reach)
+            .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+            .into_parts()
+            .1;
+        resting
+            .boolean_prepared(&blocked, Boolean::Difference)
+            .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+            .into_parts()
+            .1
+    };
+    if region.definition().components.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(region))
+}
+
+/// The offset loops of one connected component of a level's region: the
+/// outer-boundary loops and the hole loops, each with its inward offset.
+struct LoopGroup {
+    outers: Vec<(f64, Vec<[f64; 2]>)>,
+    holes: Vec<(f64, Vec<[f64; 2]>)>,
+}
+impl LoopGroup {
+    fn distance(&self, p: [f64; 2]) -> f64 {
+        let nearest = |rings: &[(f64, Vec<[f64; 2]>)]| {
+            rings
+                .iter()
+                .flat_map(|(_, ring)| ring.iter())
+                .map(|v| (v[0] - p[0]).hypot(v[1] - p[1]))
+                .fold(f64::INFINITY, f64::min)
+        };
+        nearest(&self.outers).min(nearest(&self.holes))
+    }
+    /// The rings in cut order: outer loops before hole loops, offset
+    /// ascending (outside in), nearest the tool first at the same offset.
+    fn ordered(&self, tool: [f64; 2]) -> Vec<Vec<[f64; 2]>> {
+        let near = |ring: &[[f64; 2]]| {
+            ring.iter()
+                .map(|v| (v[0] - tool[0]).hypot(v[1] - tool[1]))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let sort = |rings: &[(f64, Vec<[f64; 2]>)]| -> Vec<Vec<[f64; 2]>> {
+            let mut order: Vec<usize> = (0..rings.len()).collect();
+            order.sort_by(|&a, &b| {
+                rings[a]
+                    .0
+                    .total_cmp(&rings[b].0)
+                    .then(near(&rings[a].1).total_cmp(&near(&rings[b].1)))
+                    .then(a.cmp(&b))
+            });
+            order.into_iter().map(|i| rings[i].1.clone()).collect()
+        };
+        let mut all = sort(&self.outers);
+        all.extend(sort(&self.holes));
+        all
+    }
+}
+
+/// The offset loops of `region`, grouped per connected component: offsets
+/// inward by 0, stepover, 2 stepover, ... while non-empty, then the core:
+/// after the last non-empty offset `d`, while the region offset by
+/// `d + r - 16 tolerances` is still non-empty, the loops at `d + stepover/2`
+/// are added and the check repeats, so the disk covers every reachable point.
+/// Arcs are flattened to chords with sagitta at most `tolerance`; outer
+/// boundaries end up counter-clockwise and holes clockwise (climb with a
+/// clockwise spindle).
+fn level_loops(
+    region: &crate::planar::PreparedRegion,
+    r: f64,
+    stepover: f64,
+    tolerance: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Vec<LoopGroup>, String> {
+    let options = crate::planar::ConstructionOptions { tolerance_mm: tolerance };
+    let guard = 16. * tolerance;
+    let mut groups = vec![];
+    for component in &region.definition().components {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let single = crate::planar::PlanarRegion {
+            version: 1,
+            units: "mm".into(),
+            name: "flat-level-region".into(),
+            boundary_error_mm: region.definition().boundary_error_mm,
+            components: vec![component.clone()],
+            source: serde_json::Value::Null,
+        };
+        let prepared = single
+            .prepare(options)
+            .map_err(|e| format!("flat-area loop region: {e}"))?;
+        let mut outers: Vec<(f64, Vec<[f64; 2]>)> = vec![];
+        let mut holes: Vec<(f64, Vec<[f64; 2]>)> = vec![];
+        let mut collect = |eroded: &crate::planar::PreparedRegion,
+                           d: f64|
+         -> Result<(), String> {
+            let mut vertices = 0usize;
+            for c in &eroded.definition().components {
+                outers.push((d, flatten_boundary(&c.outer, tolerance, true)?));
+                for hole in &c.holes {
+                    holes.push((d, flatten_boundary(hole, tolerance, false)?));
+                }
+                vertices += c.outer.vertices.len() + c.holes.iter().map(|h| h.vertices.len()).sum::<usize>();
+            }
+            crate::resources::check_memory(vertices as u128 * 24, "flat-area offset loops")?;
+            Ok(())
+        };
+        let mut d = 0.;
+        loop {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let eroded = prepared
+                .offset_prepared(d)
+                .map_err(|e| format!("flat-area loop offset: {e}"))?
+                .into_parts()
+                .1;
+            if eroded.definition().components.is_empty() {
+                break;
+            }
+            collect(&eroded, d)?;
+            d += stepover;
+        }
+        let mut core = d - stepover;
+        loop {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let deeper = prepared
+                .offset_prepared(core + r - guard)
+                .map_err(|e| format!("flat-area loop offset: {e}"))?
+                .into_parts()
+                .1;
+            if deeper.definition().components.is_empty() {
+                break;
+            }
+            let step = core + stepover / 2.;
+            let eroded = prepared
+                .offset_prepared(step)
+                .map_err(|e| format!("flat-area loop offset: {e}"))?
+                .into_parts()
+                .1;
+            collect(&eroded, step)?;
+            core = step;
+        }
+        groups.push(LoopGroup { outers, holes });
+    }
+    Ok(groups)
+}
+
+/// The flattened closed polyline of a boundary: arcs as chords with sagitta
+/// at most `tolerance`, the first point repeated at the end, oriented
+/// counter-clockwise when `ccw` (outer boundaries) and clockwise otherwise
+/// (holes): climb milling with a clockwise spindle.
+fn flatten_boundary(
+    boundary: &crate::planar::Boundary,
+    tolerance: f64,
+    ccw: bool,
+) -> Result<Vec<[f64; 2]>, String> {
+    let n = boundary.vertices.len();
+    if n < 2 {
+        return Err("flat-area loop boundary needs at least two vertices".into());
+    }
+    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(n + 1);
+    for (i, a) in boundary.vertices.iter().enumerate() {
+        let end = boundary.vertices[(i + 1) % n];
+        pts.push([a[0], a[1]]);
+        if a[2] != 0. {
+            // The arc's centre and signed sweep, as `Stroke::from_boundary`.
+            let sweep = 4. * a[2].atan();
+            let factor = (1. - a[2] * a[2]) / (4. * a[2]);
+            let center = [
+                (a[0] + end[0]) / 2. - factor * (end[1] - a[1]),
+                (a[1] + end[1]) / 2. + factor * (end[0] - a[0]),
+            ];
+            let radius = (a[0] - center[0]).hypot(a[1] - center[1]);
+            let start = (a[1] - center[1]).atan2(a[0] - center[0]);
+            // sagitta = radius * (1 - cos(step / 2)) <= tolerance
+            let half = (1. - tolerance / radius).clamp(-1., 1.).acos().max(1e-9);
+            let count = (sweep.abs() / (2. * half)).ceil().max(1.) as usize;
+            for k in 1..count {
+                let t = k as f64 / count as f64;
+                let angle = start + sweep * t;
+                pts.push([center[0] + radius * angle.cos(), center[1] + radius * angle.sin()]);
+            }
+        }
+    }
+    pts.push(pts[0]);
+    if (ccw && signed_area(&pts) < 0.) || (!ccw && signed_area(&pts) > 0.) {
+        pts.reverse();
+    }
+    Ok(pts)
+}
+
+/// Signed area of a closed polyline (the first point repeated at the end).
+fn signed_area(pts: &[[f64; 2]]) -> f64 {
+    let mut area = 0.;
+    for w in pts.windows(2) {
+        area += w[0][0] * w[1][1] - w[1][0] * w[0][1];
+    }
+    area / 2.
+}
+
+/// Rotate a closed piece (the last point repeating the first) so it starts at
+/// the vertex `v` (one of its own points) and ends there too.
+fn rotate_piece(piece: &mut Piece, v: [f64; 2]) {
+    let Some(i) = piece.pts.iter().position(|p| [p[0], p[1]] == v) else {
+        return;
+    };
+    let last = piece.pts.len() - 1;
+    let mut rotated: Vec<Vec3> = piece.pts[i..last].to_vec();
+    rotated.extend_from_slice(&piece.pts[..=i]);
+    piece.pts = rotated;
+}
+
+/// Rotate a closed ring (the last point repeating the first) so it starts at
+/// the vertex nearest `tool` and ends there too.
+fn rotate_to_nearest(mut ring: Vec<[f64; 2]>, tool: [f64; 2]) -> Vec<[f64; 2]> {
+    if ring.first() != ring.last() || ring.len() < 3 {
+        return ring;
+    }
+    let last = ring.len() - 1;
+    let (mut best, mut index) = (f64::INFINITY, 0usize);
+    for (i, v) in ring[..last].iter().enumerate() {
+        let d = (v[0] - tool[0]).hypot(v[1] - tool[1]);
+        if d < best {
+            (best, index) = (d, i);
+        }
+    }
+    if index == 0 {
+        return ring;
+    }
+    let mut rotated: Vec<[f64; 2]> = ring[index..last].to_vec();
+    rotated.extend_from_slice(&ring[..=index]);
+    ring.clear();
+    rotated
+}
+
+/// Prove every chord of `ring` at height `z` (the highest part point under
+/// the swept disk of radius `r` at most `z + tolerance`), halving failures
+/// down to `h / 16`, and keep only the stretches inside the limits. Adjacent
+/// proven chords merge into pieces; what cannot be proven or allowed is
+/// dropped, splitting the loop into open pieces.
+#[allow(clippy::too_many_arguments)]
+fn prove_ring(
+    ring: &[[f64; 2]],
+    z: f64,
+    r: f64,
+    index: &Index,
+    seen: &mut [u32],
+    stamp: &mut u32,
+    h: f64,
+    tolerance: f64,
+    limits: Option<&crate::limits::PreparedLimits>,
+    dropped: &mut f64,
+    cancel: &impl CancelSignal,
+) -> Result<Vec<Piece>, String> {
+    let mut pieces: Vec<Piece> = vec![];
+    fn push(pieces: &mut Vec<Piece>, a: [f64; 2], b: [f64; 2], z: f64) {
+        if let Some(last) = pieces.last_mut()
+            && last.pts.last().is_some_and(|p| [p[0], p[1]] == a)
+        {
+            last.pts.push([b[0], b[1], z]);
+            return;
+        }
+        pieces.push(Piece {
+            pts: vec![[a[0], a[1], z], [b[0], b[1], z]],
+        });
+    }
+    for w in ring.windows(2) {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let (a, b) = ([w[0][0], w[0][1]], [w[1][0], w[1][1]]);
+        let mut stack = vec![(a, b, 0u32)];
+        while let Some((a, b, depth)) = stack.pop() {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            if index.max_height(a, b, r, seen, stamp) <= z + tolerance {
+                match limits {
+                    None => push(&mut pieces, a, b, z),
+                    Some(limits) => {
+                        // Only the stretches proven inside the limits.
+                        let line = crate::motion::Curve::Line {
+                            start: [a[0], a[1], z],
+                            end: [b[0], b[1], z],
+                        };
+                        let mut kept = 0.;
+                        for [t0, t1] in limits.allowed_spans(&line, true)? {
+                            let p = [a[0] + t0 * (b[0] - a[0]), a[1] + t0 * (b[1] - a[1])];
+                            let q = [a[0] + t1 * (b[0] - a[0]), a[1] + t1 * (b[1] - a[1])];
+                            if (q[0] - p[0]).hypot(q[1] - p[1]) > tolerance {
+                                push(&mut pieces, p, q, z);
+                                kept += (t1 - t0) * length;
+                            }
+                        }
+                        *dropped += length - kept;
+                    }
+                }
+                continue;
+            }
+            if length <= h / 16. || depth >= 32 {
+                *dropped += length;
+                continue;
+            }
+            let m = [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.];
+            stack.push((m, b, depth + 1));
+            stack.push((a, m, depth + 1));
+        }
+    }
+    Ok(pieces)
+}
+
+/// Side-entry candidates of a piece: its vertices, at most one per 1 mm of
+/// the piece, each with the outward normal (right of travel: away from the
+/// region on a counter-clockwise outer loop, into the hole on a clockwise
+/// hole loop).
+fn side_candidates(piece: &Piece) -> Vec<([f64; 2], [f64; 2])> {
+    let mut side = vec![];
+    let mut taken: Option<[f64; 2]> = None;
+    for w in piece.pts.windows(2) {
+        let v = [w[0][0], w[0][1]];
+        if taken.is_some_and(|p| (v[0] - p[0]).hypot(v[1] - p[1]) < 1.) {
+            continue;
+        }
+        let d = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+        let n = d[0].hypot(d[1]);
+        if n <= 0. {
+            continue;
+        }
+        side.push((v, [d[1] / n, -d[0] / n]));
+        taken = Some(v);
+    }
+    side
+}
+
+/// Whether a straight move at `z` lies entirely inside the limits (always
+/// true without limits, and for a degenerate move between proven endpoints).
+fn allows_segment(
+    limits: Option<&crate::limits::PreparedLimits>,
+    a: [f64; 2],
+    b: [f64; 2],
+    z: f64,
+    tolerance: f64,
+) -> Result<bool, String> {
+    let Some(limits) = limits else {
+        return Ok(true);
+    };
+    if (b[0] - a[0]).hypot(b[1] - a[1]) <= tolerance {
+        return Ok(true);
+    }
+    let line = crate::motion::Curve::Line {
+        start: [a[0], a[1], z],
+        end: [b[0], b[1], z],
+    };
+    Ok(limits.allowed_spans(&line, true)?.as_slice() == [[0., 1.]])
 }
 
 #[cfg(test)]
