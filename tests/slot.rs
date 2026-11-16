@@ -793,6 +793,24 @@ fn slot_air_feed_arcs_remove_no_stock() {
     let (_, _, p, _) = drive(&op, &mut stock);
     assert_eq!(p.report().stock_clear_advances, 2);
     assert_eq!(p.report().air_fed_arcs, 0);
+    // A piece so short that the stock-clear jump lands within one orbit
+    // diameter of the previous orbit: the proof's predecessor is still not
+    // the adjacent orbit the advance link implies, so the next orbit stays
+    // one full circle.
+    let mut short = operation();
+    short.end_mm = Some([9.5, 12.]);
+    short.air_feed_mm_min = Some(short.feed_mm_min * 4.);
+    let mut snapshot = Stock::new(fixture().stock.height().unwrap().clone())
+        .unwrap()
+        .snapshot();
+    snapshot.cells.fill(HeightBounds {
+        lower_mm: 8.,
+        upper_mm: 8.,
+    });
+    let mut stock = Stock::from_snapshot(snapshot).unwrap();
+    let (_, _, p, _) = drive(&short, &mut stock);
+    assert_eq!(p.report().stock_clear_advances, 2);
+    assert_eq!(p.report().air_fed_arcs, 0);
 }
 
 #[test]
