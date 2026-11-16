@@ -143,13 +143,14 @@ without a word:
   cannot bring the cutter down into: no helix of the entry's radii fits
   (`Pocket`, `RestPocket`; a plunge, `entry=None`, always fits); for
   `AdaptivePocket` no place in that connected area of tool centres is clear
-  of material to enter from and no helix fits, or the area is tighter than
-  the planner resolves (below); for `disk_front` and `stock_front` no orbit
-  fits. The message names the operation, a tool-centre position in the
-  area, the area's extent, what was tried (the helix or orbit radii and what
-  the area leaves) and the options: another entry (`RampEntry`, a plunge, a
-  smaller helix), a smaller cutter, an earlier operation that opens a start
-  there, or a region without that area.
+  of material to enter from and no helix the entry allows fits (a helix the
+  policy forbids, `StockEdgeEntry(helix=None)`, is no way in), or the area is
+  tighter than the planner resolves (below); for `disk_front` and
+  `stock_front` no orbit fits. The message names the operation, a tool-centre
+  position in the area, the area's extent, what was tried (the helix or orbit
+  radii and what the area leaves) and the options: another entry
+  (`RampEntry`, a plunge, a smaller helix), a smaller cutter, an earlier
+  operation that opens a start there, or a region without that area.
 - **A region the cutter fits nowhere in refuses the operation**, since it
   can do nothing it was asked to. (This used to be an empty plan with a
   `CamWarning`.)
@@ -414,8 +415,12 @@ no full-width slotting, for hard materials and high-speed toolpaths.
   tool centres the planner can use. It has a way in where the cutter's
   whole disk is clear of material at one of them (an entry from air or from
   cleared stock, so an earlier operation that opens a start there is one),
-  or where a helix fits at its most open position on material; with neither
-  (a slot barely wider than the cutter) the level is refused when it starts.
+  or where a helix the entry *allows* fits at its most open position on
+  material; with neither (a slot barely wider than the cutter, or an
+  enclosed area whose only way in is a helix `StockEdgeEntry(helix=None)`
+  forbids) the level is refused when it starts. The planner admits its own
+  entries and says so itself, naming the area, what it needs there and the
+  options, rather than being refused by a check of a plan it never cuts.
   `entry=RampEntry(angle_deg)` ramps into such an area instead, and is
   refused by name where no ramp fits.
 - **A slot only a little wider than the cutter** leaves it less play than
@@ -431,7 +436,11 @@ no full-width slotting, for hard materials and high-speed toolpaths.
 - **The residual area of a level** (`layers[].clearing`) counts all the
   stock left in the region at that level, from the region and the stock
   (on the steering grid, with the stock's whole-cell bounds), not from
-  where the planner could stand. `geometric_residual_area_mm2` is the sum
+  where the planner could stand. It is what the level's own wall pass left:
+  the wall pass marks the skin it cuts cleared as it is queued, like a pass's
+  strokes do, so the number is not the deeper hollow the passes before it
+  left (#311). A wall pass that is rolled back, skipped or never committed
+  marks nothing. `geometric_residual_area_mm2` is the sum
   of `residual_reachable_area_mm2` (within reach of the planner's
   positions: slivers too thin to cut), `residual_unresolved_area_mm2` (the
   cutter reaches it in the region but the planner's positions do not: the
@@ -570,11 +579,28 @@ refused with its location: export the mesh with shared edge vertices
   - **Confined material is entry motion.** In a pocket barely wider than the
     cutter no step width keeps the contact within the limit, just as the
     helix that opens it cuts a full slot. Strokes still unproven at half the
-    declared width are cut as lead moves at the entry feed (the helix feed,
-    else the plunge feed) and counted (`confined_strokes`,
-    `confined_stroke_mm`, `confined_max_engagement_deg`). This needs an entry
-    that allows a helix or a ramp; with `StockEdgeEntry(helix=None)` the
-    operation stops and names the place.
+    declared width are classified by what the wider (180°) query proves: a
+    bound past the limit is the confined case — cut as lead moves at the
+    entry feed (the helix feed, else the plunge feed) and counted
+    (`confined_strokes`, `confined_stroke_mm`, `confined_max_engagement_deg`).
+    For a straight stroke whose start pose the preceding motion certified,
+    the cutter's own correlated trail proves the whole-stroke
+    leading-contact bound is exactly 180° (including the two boundary
+    radii); this is an analytic line certificate, not an angular tolerance
+    or an endpoint check. Curved strokes still need the ordinary whole-stroke
+    query to settle.
+    This needs an entry that allows a helix or a ramp; with
+    `StockEdgeEntry(helix=None)` the operation stops and names the place. Its
+    message says the material *may be* confined, because what it names is a
+    stroke the proof could not settle: a proven bound is what shows
+    confinement. A stroke whose bound the wider query leaves unresolved is
+    never cut and never entered, whatever stopped the query (#309): the
+    stroke stays as it was queued, the attempt is rolled back, and the level
+    is refused naming both queries' reasons and the proof's counters. Where
+    that leaves material a working plan used to cut — corner arcs whose
+    certificate does not resolve at default budgets — that is a proof
+    limitation, tracked as one: the fix is a proof improvement or an
+    independently certified alternative path, not an unproven move.
   - **Each layer ends with a pass along the walls**, where stock still
     stands beside them. The front's passes end at a wall a stepover apart,
     which leaves a cusp between every two pass ends, well over the
@@ -620,7 +646,15 @@ refused with its location: export the mesh with shared edge vertices
     layer's residual area, which counts all the stock left in the layer's
     region (the three parts described for `AdaptivePocket`). A layer whose
     region the cutter fits nowhere in says so in its diagnostics, as a
-    pocket plan does, and all its stock is residual.
+    pocket plan does, and all its stock is residual. `no_helix_allowed` is
+    the entry policy's answer, not the geometry's: an enclosed area whose
+    only way in is a helix that `StockEdgeEntry(helix=None)` forbids is
+    listed like this and left for a smaller cutter, a ramp or an earlier
+    operation, while the layer cuts everything else it can reach (#310). A
+    listed area is out of the entry search from then on: its candidate
+    centres are dead, so no start is proposed inside it and no helix is
+    tried there again — dead is not cleared, and its stock is counted as
+    before.
   - **Roughing that would make no motion at all** because of such an area
     is refused, with the first area's place and the options, instead of
     planning nothing. Roughing with nothing left to cut is not an error.
