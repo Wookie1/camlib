@@ -1689,6 +1689,9 @@ impl StreamReceiver {
         Ok(())
     }
     fn check_motion(&self, motion: &Motion) -> Result<(), String> {
+        if motion.kind == MoveKind::Air && matches!(self.stock, RunStock::Turn(_)) {
+            return Err("air intent requires flat-cutter milling stock clearance".into());
+        }
         if self.finished
             || !valid_id(&motion.operation)
             || !self.manifest.tools.iter().any(|t| t.id == motion.tool)
@@ -3173,6 +3176,7 @@ fn put_motion(out: &mut Vec<u8>, m: &Motion) -> Result<(), String> {
             MoveKind::ProbeTouch => 11,
             MoveKind::ProbeReturn => 12,
             MoveKind::Mark => 13,
+            MoveKind::Air => 14,
         },
     );
     put_u8(out, u8::from(m.feed_mm_min.is_some()));
@@ -3325,6 +3329,7 @@ impl<'a> Decoder<'a> {
             11 => MoveKind::ProbeTouch,
             12 => MoveKind::ProbeReturn,
             13 => MoveKind::Mark,
+            14 => MoveKind::Air,
             _ => return Err("invalid binary motion kind".into()),
         };
         let feed_flag = self.u8()?;

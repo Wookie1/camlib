@@ -461,6 +461,9 @@ pub enum MoveKind {
     /// feed-controlled line traverse; None selects unprogrammed rapid speed.
     Rapid,
     Cut,
+    /// Fed flat-cutter motion that must remove no material. Stock replay must
+    /// prove its whole rounded sweep inside committed clearance before accepting it.
+    Air,
     Plunge,
     Lead,
     Link,
@@ -523,12 +526,12 @@ impl MoveKind {
                 | MoveKind::ProbeReturn
         )
     }
-    /// Whether the move may remove material: every fed move except a
-    /// probing move and a beam's marking move. Rapids, oriented shifts,
-    /// probing moves and marking moves never cut, so no removal certificate
+    /// Whether the move may remove material: every fed move except an air,
+    /// probing or beam marking move. Rapids, oriented shifts,
+    /// air, probing and marking moves never cut, so no removal certificate
     /// may be drawn from them.
     pub fn cuts(self) -> bool {
-        !self.is_rapid() && !self.is_probe() && self != MoveKind::Mark
+        !self.is_rapid() && !self.is_probe() && !matches!(self, MoveKind::Mark | MoveKind::Air)
     }
     /// A probing move on which the stylus (or the measured cutter) is
     /// expected to be in contact: only the other assembly parts are checked.
@@ -566,6 +569,19 @@ impl Motion {
     /// Check interpolation/feed semantics independently of stock or program state.
     /// A fed clearance traverse keeps Rapid intent and never authorizes cutting.
     pub fn validate_feed(&self, max_feed_mm_min: Option<f64>) -> Result<(), String> {
+        if self.kind == MoveKind::Air
+            && (self.curve.start()[2] != self.curve.end()[2]
+                || !matches!(
+                    self.curve,
+                    Curve::Line { .. }
+                        | Curve::Arc {
+                            plane: Plane::Xy,
+                            ..
+                        }
+                ))
+        {
+            return Err("air motion requires a horizontal line or XY arc".into());
+        }
         if self.kind.is_rapid() && !matches!(self.curve, Curve::Line { .. }) {
             return Err("rapid clearance requires a line".into());
         }
@@ -1729,7 +1745,11 @@ impl ProgramValidator {
                         }
                         if matches!(
                             m.kind,
-                            MoveKind::Cut | MoveKind::Plunge | MoveKind::Lead | MoveKind::Thread
+                            MoveKind::Cut
+                                | MoveKind::Air
+                                | MoveKind::Plunge
+                                | MoveKind::Lead
+                                | MoveKind::Thread
                         ) {
                             if beam_tool(&active_tool) {
                                 if !beam_on {

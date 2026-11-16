@@ -255,6 +255,88 @@ class CurvedSlotTest(unittest.TestCase):
 class TrochoidalSlotAirFeedTest(unittest.TestCase):
     """#34 part 1: air feed on the proven-air part of each controlled orbit."""
 
+    def posted_air_job(self, decimals):
+        from dataclasses import replace
+
+        from camlib import Job, OperationNode, Setup, StockContactOptions, StreamChecks
+        from camlib.material import Options, Target
+        from camlib.post import ToolSetting
+        from camlib.verification import MaterialCheck
+        from test_post import fixture
+
+        ux, uy = math.cos(math.pi / 6), math.sin(math.pi / 6)
+        op = replace(
+            slot(),
+            air_feed_mm_min=2400.0,
+            floor_z_mm=9.0,
+            width_mm=4.5,
+            start_mm=(8.003, 12.004),
+            end_mm=(8.003 + 6 * ux, 12.004 + 6 * uy),
+        )
+        radius = op.width_mm / 2
+        vertices = tuple(
+            (p[0] - side * radius * uy, p[1] + side * radius * ux, bulge)
+            for p, side, bulge in ((op.start_mm, -1, 0), (op.end_mm, -1, 1), (op.end_mm, 1, 0), (op.start_mm, 1, 1))
+        )
+        region = PlanarRegion('slot', (Component(Boundary(vertices)),))
+        checks = StreamChecks(
+            stock_contact=StockContactOptions(),
+            material=(MaterialCheck(Target('slot', '1', region, 9), options=Options(gouge_tolerance_mm=0.05)),),
+        )
+        job = Job(
+            'air-slot',
+            '1',
+            (
+                Setup(
+                    'top',
+                    stock=StockSpec((0, 0, 0), (24, 24, 10), 0.25),
+                    tools=(tool(),),
+                    operations=(OperationNode(op, sources=()),),
+                    initial_position_mm=(0, 0, 12),
+                    verification=checks,
+                ),
+            ),
+        )
+        _, base = fixture()
+        machine = replace(
+            base,
+            decimals=decimals,
+            tolerance_mm=0.05,
+            tools=(ToolSetting.for_tool(tool(), number=1, length_register=1, position_after_mm=(0, 0, 12)),),
+        )
+        return job, machine
+
+    def test_rounded_air_sweep_cannot_be_exported(self):
+        from tempfile import TemporaryDirectory
+        from camlib.post import LoweringOptions
+
+        job, machine = self.posted_air_job(2)
+        # With ordinary Cut intent the two-decimal fast arc passes all gates,
+        # despite reaching about .01 mm beyond the preceding cutter sweeps.
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / 'slot.nc'
+            with job.post(
+                'top', machine=machine, lowering=LoweringOptions(native_arcs=True, chord_tolerance_mm=0.0005)
+            ) as posted:
+                with self.assertRaisesRegex(SimulationError, 'air motion .*not proven'):
+                    posted.export(output, accept={'unchecked_machine'})
+            self.assertFalse(output.exists())
+
+    def test_precise_air_sweep_keeps_intent_through_checked_export(self):
+        from camlib.post import LoweringOptions
+
+        job, machine = self.posted_air_job(6)
+        with job.post(
+            'top', machine=machine, lowering=LoweringOptions(native_arcs=True, chord_tolerance_mm=0.0005)
+        ) as posted:
+            result = posted.export(accept={'unchecked_machine'})
+            self.assertFalse(result['findings'])
+            self.assertIn('F2400', result['text'])
+            motions = [posted.posted_motion(i)['motion'] for i in range(result['motions'])]
+            air = [m for m in motions if m['kind'] == 'air']
+            self.assertTrue(air)
+            self.assertTrue(all(m['feed_mm_min'] == 2400.0 for m in air))
+
     def test_air_feed_mm_min_round_trips_through_to_dict(self):
         from dataclasses import replace
 

@@ -954,6 +954,7 @@ impl SlotPlan {
                     };
                     let mut motion = self.emit(curve, MoveKind::Cut, false)?;
                     if piece.air {
+                        motion.kind = MoveKind::Air;
                         motion.feed_mm_min = Some(self.op.air_feed_mm_min.unwrap());
                         self.report.air_fed_arcs += 1;
                         self.report.air_fed_mm += self.radius * piece.sweep.abs();

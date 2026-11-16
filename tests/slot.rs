@@ -859,7 +859,7 @@ fn orbit_groups(motions: &[Motion]) -> Vec<(Vec3, Vec3, Vec3, f64, usize)> {
             } => Some((start, end, center, sweep_rad)),
             _ => None,
         };
-        match (m.kind == MoveKind::Cut, arc) {
+        match (matches!(m.kind, MoveKind::Cut | MoveKind::Air), arc) {
             (true, Some((start, end, center, sweep))) => {
                 if prev_cut {
                     let (c, _, last_end, sum, pieces) = out.last_mut().unwrap();
@@ -942,7 +942,7 @@ fn slot_air_feed_same_path() {
             let Curve::Arc { center, .. } = m.curve else {
                 continue;
             };
-            if m.kind != MoveKind::Cut {
+            if !matches!(m.kind, MoveKind::Cut | MoveKind::Air) {
                 continue;
             }
             let on_path = match &path {
@@ -1077,7 +1077,7 @@ fn slot_air_feed_arcs_stay_inside_the_previous_orbit_disk() {
                     end,
                     center,
                     ..
-                } if m.kind == MoveKind::Cut => Some((*start, *end, *center)),
+                } if matches!(m.kind, MoveKind::Cut | MoveKind::Air) => Some((*start, *end, *center)),
                 _ => None,
             };
             match cut_arc {
@@ -1132,4 +1132,53 @@ fn slot_air_feed_arcs_stay_inside_the_previous_orbit_disk() {
         }
         assert!(checked > 0, "{name}: no air-fed arc was checked");
     }
+}
+
+#[test]
+fn air_intent_requires_committed_clearance_and_never_clears_stock() {
+    let cancel = AtomicBool::new(false);
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let tool = fixture().tools[0].prepare().unwrap();
+    let seed = Motion {
+        id: 1,
+        operation: "air-proof".into(),
+        tool: tool.definition().id.clone(),
+        kind: MoveKind::Cut,
+        curve: Curve::Arc {
+            start: [9., 12., 9.], end: [9., 12., 9.],
+            center: [8., 12., 9.], plane: Plane::Xy, sweep_rad: TAU,
+        },
+        feed_mm_min: Some(600.),
+    };
+    let mut air = Motion {
+        id: 2, kind: MoveKind::Air, feed_mm_min: Some(2400.),
+        curve: Curve::Arc {
+            start: [8.6, 12., 9.], end: [7.6, 12., 9.],
+            center: [8.1, 12., 9.], plane: Plane::Xy, sweep_rad: std::f64::consts::PI,
+        },
+        ..seed.clone()
+    };
+    let sweep = SweepOptions::default();
+    let before = stock.generation();
+    assert!(stock.preview_sweep(&tool, &air, 1., sweep, &cancel).unwrap_err().contains("air motion"));
+    assert_eq!(stock.generation(), before);
+    commit(&mut stock, &seed);
+    let delta = stock.preview_sweep(&tool, &air, 1., sweep, &cancel).unwrap();
+    assert!(delta.changes().is_empty());
+    stock.apply_delta(&delta).unwrap();
+    // An in-plane displacement reaching beyond the cleared disk must refuse,
+    // even if its ordinary cutting sweep would be valid.
+    air.curve = Curve::Arc {
+        start: [10., 12., 9.], end: [8., 12., 9.],
+        center: [9., 12., 9.], plane: Plane::Xy, sweep_rad: std::f64::consts::PI,
+    };
+    let before = stock.generation();
+    assert!(stock.preview_sweep(&tool, &air, 1., sweep, &cancel).unwrap_err().contains("air motion"));
+    assert_eq!(stock.generation(), before);
+    air.kind = MoveKind::Cut;
+    assert!(stock.preview_sweep(&tool, &air, 1., sweep, &cancel).is_ok());
+    // Exact horizontal floor contact is allowed; going even slightly below it is not.
+    air.kind = MoveKind::Air;
+    air.curve = Curve::Line { start: [8., 12., 8.999999], end: [8.1, 12., 8.999999] };
+    assert!(stock.preview_sweep(&tool, &air, 1., sweep, &cancel).is_err());
 }

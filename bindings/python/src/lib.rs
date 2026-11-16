@@ -140,7 +140,7 @@ fn decode_committed_chunk<'py>(
     let (feed_flag, feed) = (d.u8()?, d.f64()?);
     let curve_kind = d.u8()?;
     let (a, b) = (d.point()?, d.point()?);
-    if kind > 13 || curve_kind > 2 || feed_flag > 1 || (feed_flag == 0 && feed != 0.) {
+    if kind > 14 || curve_kind > 2 || feed_flag > 1 || (feed_flag == 0 && feed != 0.) {
         return Err(PyValueError::new_err(
             "invalid motion/curve/feed discriminator",
         ));
@@ -212,6 +212,7 @@ fn decode_committed_chunk<'py>(
             "probe_touch",
             "probe_return",
             "mark",
+            "air",
         ][kind as usize],
     )?;
     motion.set_item("feed_mm_min", (feed_flag == 1).then_some(feed))?;

@@ -443,6 +443,14 @@ impl DexelStock {
             ),
             stats,
         };
+        if fraction > 0. && motion.kind == crate::motion::MoveKind::Air {
+            if axis != Axis::PosZ {
+                return Err("air clearance requires the declared flat cutter along stock Z".into());
+            }
+            self.view
+                .require_air_clearance(tool, motion, options, cancel)?;
+            return Ok(empty(stats));
+        }
         if fraction == 0. || motion.kind.is_rapid() {
             return Ok(empty(stats));
         }

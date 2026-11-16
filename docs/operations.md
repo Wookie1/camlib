@@ -1086,8 +1086,12 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
   cleared a disk of radius orbit radius + tool radius, a cutter centre far
   enough inside that disk (by the guard) keeps the whole cutter inside it, so
   that arc runs in air. It must be finite and at least `feed_mm_min`; the arc
-  is shrunk by the tolerance so arc error cannot leave the proven region, and
-  the report counts the arcs and their length (`air_fed_arcs`,
+  is shrunk by the planning tolerance. These moves retain `air` intent through
+  posting and independent decoding. Both native and posted stock replay must
+  prove their whole cutter sweep inside committed clearance; unresolved
+  clearance or rounding into fresh stock refuses the run. Increase output
+  precision or disable the optional air feed to resolve a posting refusal.
+  The report counts the arcs and their length (`air_fed_arcs`,
   `air_fed_mm`). Without it, every orbit stays one full circle at
   `feed_mm_min`.
 

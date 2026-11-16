@@ -84,7 +84,10 @@ impl ControlState {
     }
 
     pub(super) fn check_motion(&self, motion: &Motion) -> Result<(), String> {
-        self.check_tool(&motion.tool, !motion.kind.cuts())
+        self.check_tool(
+            &motion.tool,
+            !motion.kind.cuts() && motion.kind != crate::motion::MoveKind::Air,
+        )
     }
 
     /// `noncutting`: a rapid, oriented shift or probing move, which needs no
