@@ -588,15 +588,13 @@ refused with its location: export the mesh with shared edge vertices
     message says the material *may be* confined, because what it names is a
     stroke the proof could not settle: a proven bound is what shows
     confinement. A stroke whose bound the wider query leaves unresolved is
-    never cut at the cutting feed. When the wider query stopped because it
-    refined to its resolution without settling (#309's recorded deviation)
-    the stroke is still entry motion, counted in `confined_unproven_mm` and
-    said once in the layer's diagnostics, with `confined_max_engagement_deg`
-    keeping its `360` sentinel rather than claiming a bound nobody proved.
-    When it stopped on its work budget or recursion depth the proof was not
-    allowed to finish, so nothing authorizes entry motion either: the stroke
-    stays as it was queued and the level is refused, naming both queries'
-    reasons and the proof's counters.
+    never cut and never entered, whatever stopped the query (#309): the
+    stroke stays as it was queued, the attempt is rolled back, and the level
+    is refused naming both queries' reasons and the proof's counters. Where
+    that leaves material a working plan used to cut — corner arcs whose
+    certificate does not resolve at default budgets — that is a proof
+    limitation, tracked as one: the fix is a proof improvement or an
+    independently certified alternative path, not an unproven move.
   - **Each layer ends with a pass along the walls**, where stock still
     stands beside them. The front's passes end at a wall a stepover apart,
     which leaves a cusp between every two pass ends, well over the
