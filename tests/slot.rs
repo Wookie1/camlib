@@ -1041,3 +1041,95 @@ fn slot_air_feed_must_not_be_below_feed() {
         .is_ok()
     );
 }
+
+/// The proof's own bound, checked from the motion stream alone: every
+/// air-fed arc of a controlled orbit must lie inside the disk the previous
+/// complete orbit cleared, |P - C_prev| <= rho - 16 * tolerance_mm in XY
+/// (the guard g of `air_interval`), sampled along the whole arc. The stock
+/// grid cannot see this bound: g = 1.6e-4 mm is far below one 0.25 mm cell.
+#[test]
+fn slot_air_feed_arcs_stay_inside_the_previous_orbit_disk() {
+    for (name, base) in air_feed_cases() {
+        let mut op = base.clone();
+        op.air_feed_mm_min = Some(base.feed_mm_min * 4.);
+        let air_feed = op.air_feed_mm_min.unwrap();
+        let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let (motions, _, p, _) = drive(&op, &mut stock);
+        let rho = p.report().orbit_radius_mm;
+        let bound = rho - 16. * base.tolerance_mm;
+        // Walk the motion stream only. Consecutive cut arcs form one orbit
+        // (the grouping `orbit_groups` does); when an orbit ends, its centre
+        // becomes the proof's predecessor. Forget that centre when z changes
+        // (a new depth pass starts fresh at its seed orbit) and when a link
+        // longer than the orbit diameter occurs between orbits (a stock-clear
+        // jump leaves the previous orbit's disk behind), so a jump never
+        // counts as "previous".
+        let mut previous: Option<(f64, Vec3)> = None;
+        let mut open: Option<(Vec3, Vec3)> = None; // (centre, last end) of the orbit in progress
+        let mut z_tracked: Option<f64> = None;
+        let mut checked = 0usize;
+        for m in &motions {
+            let z0 = m.curve.start()[2];
+            let z1 = m.curve.end()[2];
+            let cut_arc = match &m.curve {
+                Curve::Arc {
+                    start,
+                    end,
+                    center,
+                    ..
+                } if m.kind == MoveKind::Cut => Some((*start, *end, *center)),
+                _ => None,
+            };
+            match cut_arc {
+                Some((start, end, center)) => match open.as_mut() {
+                    Some((c, last_end)) => {
+                        assert!(close3(*c, center), "{name}: orbit centre changed mid-orbit");
+                        assert!(close3(*last_end, start), "{name}: orbit pieces are disjoint");
+                        *last_end = end;
+                    }
+                    None => open = Some((center, end)),
+                },
+                None => {
+                    if let Some((c, _)) = open.take() {
+                        previous = Some((c[2], c));
+                    }
+                    if m.kind == MoveKind::Link
+                        && m.curve.prepare(1e-5).unwrap().length_mm() > 2. * rho
+                    {
+                        previous = None;
+                    }
+                }
+            }
+            if z_tracked != Some(z0) || z1 != z0 {
+                previous = None;
+            }
+            z_tracked = Some(z1);
+            if m.feed_mm_min == Some(air_feed) {
+                assert!(
+                    previous.is_some(),
+                    "{name}: air-fed motion {} has no remembered previous complete orbit",
+                    m.id
+                );
+                let (prev_z, prev_c) = previous.unwrap();
+                assert_eq!(
+                    prev_z, z0,
+                    "{name}: air-fed motion {} runs at z {z0}, the remembered orbit at {prev_z}",
+                    m.id
+                );
+                let prepared = m.curve.prepare(1e-5).unwrap();
+                for i in 0..=256 {
+                    let q = prepared.position(i as f64 / 256.).unwrap();
+                    let d = distance(prev_c, q);
+                    assert!(
+                        d <= bound + 1e-12,
+                        "{name}: air-fed motion {} sample {i}/256 exceeds the previous orbit's disk by {} mm (|P - C_prev| = {d}, bound = {bound})",
+                        m.id,
+                        d - bound
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "{name}: no air-fed arc was checked");
+    }
+}
