@@ -31,6 +31,7 @@ use crate::{
     tool::{CutterShape, ToolAssembly, valid_id},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::f64::consts::TAU;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +76,11 @@ pub struct TrochoidalSlotOperation {
     /// Containment and avoid areas (clamps, fixtures, features to leave alone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<crate::limits::Limits>,
+    /// Feed (mm/min) on the part of each controlled orbit proven to run
+    /// inside the disk the previous orbit cleared at the same depth. None:
+    /// whole orbits at feed_mm_min (today's output, unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub air_feed_mm_min: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +105,20 @@ pub struct SlotReport {
     pub path_pieces: usize,
     /// Straight links across corners, inside the vertex orbit's disk.
     pub corner_links: usize,
+    /// Controlled-orbit arcs fed at `air_feed_mm_min` because they are
+    /// proven to run inside the disk the previous orbit cleared at the same
+    /// depth, and their total length.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub air_fed_arcs: usize,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub air_fed_mm: f64,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+fn is_zero_f64(n: &f64) -> bool {
+    *n == 0.
 }
 
 /// One piece of the slot centreline.
@@ -299,6 +319,19 @@ fn arc_coverage_half_angle(radius: f64, a: f64, t: f64) -> f64 {
     lo
 }
 
+/// One arc piece of a split controlled orbit: same centre and direction as
+/// the whole orbit, same start and end points joined up; `air` marks the
+/// proven-air piece fed at `air_feed_mm_min`.
+#[derive(Clone, Copy, Debug)]
+struct OrbitPiece {
+    /// Exact end point; the next piece starts here and the last piece ends
+    /// at the orbit start point.
+    end: Vec3,
+    /// Signed sweep from the piece's start to its end.
+    sweep: f64,
+    air: bool,
+}
+
 /// Stores only a scalar path cursor, not a list of generated orbits/motions.
 pub struct SlotPlan {
     op: TrochoidalSlotOperation,
@@ -321,6 +354,15 @@ pub struct SlotPlan {
     phase: u8,
     next_id: u64,
     expected_generation: Option<u64>,
+    /// Centre of the most recent completed orbit at this depth (seed or
+    /// controlled): the predecessor the next controlled orbit's proven-air
+    /// proof needs. None at a new depth pass and after a stock-clear
+    /// advance; corner links keep it (the vertex orbit is the previous
+    /// orbit).
+    prev_center: Option<Vec3>,
+    /// Pending arc pieces of the controlled orbit being emitted (phase 5),
+    /// one motion per call like every other phase.
+    orbit_pieces: VecDeque<OrbitPiece>,
     report: SlotReport,
 }
 
@@ -463,6 +505,15 @@ impl SlotPlan {
                     ),
                 ),
                 (
+                    op.air_feed_mm_min
+                        .is_none_or(|air| air.is_finite() && air >= op.feed_mm_min),
+                    format!(
+                        "air_feed_mm_min {} must be finite and at least feed_mm_min {}",
+                        op.air_feed_mm_min.unwrap_or(f64::NAN),
+                        op.feed_mm_min
+                    ),
+                ),
+                (
                     (1..=9).contains(&op.work_offset),
                     format!("work_offset {} must be 1..9", op.work_offset),
                 ),
@@ -546,6 +597,8 @@ impl SlotPlan {
             stock_query_work_exhausted: false,
             path_pieces: pieces.len(),
             corner_links: 0,
+            air_fed_arcs: 0,
+            air_fed_mm: 0.,
         };
         let heights = crate::heights::Heights::resolve(
             op.clearance_z_mm,
@@ -572,6 +625,8 @@ impl SlotPlan {
             phase: 0,
             next_id: first_motion_id,
             expected_generation: None,
+            prev_center: None,
+            orbit_pieces: VecDeque::new(),
             report,
         })
     }
@@ -638,6 +693,150 @@ impl SlotPlan {
     }
     fn orbit_start(&self, along: f64, z: f64) -> Vec3 {
         self.orbit_start_on(self.piece, along, z)
+    }
+    /// The proven-air interval of the controlled orbit at `center`, as
+    /// (start, length) in the orbit's own parameter t in [0, TAU) measured
+    /// from the orbit start point in the orbit direction. Pure geometry, no
+    /// stock query: the previous motion sequence was a full orbit at
+    /// `prev_center` at the same z, then the advance link, so the previous
+    /// orbit cleared the disk of radius rho + r around `prev_center`. A
+    /// cutter centre P = C + rho*u(theta) keeps its whole cutter disk of
+    /// radius r strictly inside that cleared disk when |P - C_prev| <=
+    /// rho - g. Solving |d + rho*u(theta)| = rho - g with d = C - C_prev
+    /// gives cos(theta - theta_back) = c, theta_back = atan2(-d).
+    fn air_interval(&self, center: Vec3) -> Option<(f64, f64)> {
+        self.op.air_feed_mm_min?;
+        let prev = self.prev_center?;
+        let rho = self.radius;
+        let g = self.guard;
+        let d = [center[0] - prev[0], center[1] - prev[1]];
+        let q = d[0].hypot(d[1]);
+        if q <= g {
+            return None;
+        }
+        let c = (q * q + rho * rho - (rho - g) * (rho - g)) / (2. * rho * q);
+        if c >= 1. {
+            return None;
+        }
+        let beta = c.acos() - self.op.tolerance_mm / rho;
+        if beta <= 0. {
+            return None;
+        }
+        let sign = if self.op.clockwise { -1. } else { 1. };
+        let theta_start = (self.position[1] - center[1]).atan2(self.position[0] - center[0]);
+        let theta_back = (-d[1]).atan2(-d[0]);
+        // Map the interval [theta_back - beta, theta_back + beta] into the
+        // orbit's own parameter t = sign*(theta - theta_start): t runs
+        // against theta for clockwise orbits, so the interval starts at the
+        // theta_back + beta end there and at the theta_back - beta end for
+        // counter-clockwise ones.
+        let start = (sign * (theta_back - sign * beta - theta_start)).rem_euclid(TAU);
+        Some((if start >= TAU { start - TAU } else { start }, 2. * beta))
+    }
+    /// The pieces of the controlled orbit at `center`: cut arcs and, where
+    /// the orbit is proven to run inside the disk the previous orbit
+    /// cleared, arcs at `air_feed_mm_min`. Same centre and direction as
+    /// today's single full circle, same start and end point, total sweep
+    /// exactly one turn. Without a proven-air interval: one full circle
+    /// (today's orbit).
+    fn split_orbit(&self, center: Vec3, z: f64) -> VecDeque<OrbitPiece> {
+        let sign = if self.op.clockwise { -1. } else { 1. };
+        let rho = self.radius;
+        // Contiguous t-spans of the orbit parameter with their feed: air on
+        // the proven-air interval, cut feed elsewhere.
+        let mut spans: Vec<(f64, f64, bool)> = match self.air_interval(center) {
+            Some((t1, len)) if t1 + len <= TAU => {
+                let mut spans = Vec::new();
+                if t1 > 0. {
+                    spans.push((0., t1, false));
+                }
+                spans.push((t1, t1 + len, true));
+                if t1 + len < TAU {
+                    spans.push((t1 + len, TAU, false));
+                }
+                spans
+            }
+            Some((t1, len)) => {
+                // The interval wraps through the orbit start point.
+                let t2 = t1 + len - TAU;
+                let mut spans = Vec::new();
+                if t2 > 0. {
+                    spans.push((0., t2, true));
+                }
+                spans.push((t2, t1, false));
+                spans.push((t1, TAU, true));
+                spans
+            }
+            None => Vec::new(),
+        };
+        if spans.is_empty() {
+            spans.push((0., TAU, false));
+        }
+        // Fold pieces shorter than the guard into a neighbour at the cut
+        // feed; the air arc is never extended (a folded neighbour runs at
+        // the cut feed, so air only ever shrinks).
+        while let Some((i, len)) = spans
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, b, _))| (i, rho * (b - a)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            if spans.len() == 1 || len >= self.guard {
+                break;
+            }
+            let j = if i > 0 && !spans[i - 1].2 {
+                i - 1
+            } else if i + 1 < spans.len() && !spans[i + 1].2 {
+                i + 1
+            } else if i > 0 {
+                i - 1
+            } else {
+                i + 1
+            };
+            let folded = (
+                spans[i].0.min(spans[j].0),
+                spans[i].1.max(spans[j].1),
+                false,
+            );
+            spans[j] = folded;
+            spans.remove(i);
+            // A fold can bring two cut-feed spans together.
+            let mut merged: Vec<(f64, f64, bool)> = Vec::with_capacity(spans.len());
+            for span in spans {
+                match merged.last_mut() {
+                    Some(last) if last.2 == span.2 => last.1 = span.1,
+                    _ => merged.push(span),
+                }
+            }
+            spans = merged;
+        }
+        debug_assert!(
+            spans.len() != 1 || !spans[0].2,
+            "a whole orbit is never proven air"
+        );
+        let theta_start = (self.position[1] - center[1]).atan2(self.position[0] - center[0]);
+        let mut pieces = VecDeque::with_capacity(spans.len());
+        let count = spans.len();
+        for (k, &(t0, t1, air)) in spans.iter().enumerate() {
+            // Exact end points: the last piece ends at the orbit start
+            // point, not at a recomputed one.
+            let end = if k + 1 == count {
+                self.position
+            } else {
+                let theta = theta_start + sign * t1;
+                [
+                    center[0] + rho * theta.cos(),
+                    center[1] + rho * theta.sin(),
+                    z,
+                ]
+            };
+            pieces.push_back(OrbitPiece {
+                end,
+                sweep: sign * (t1 - t0),
+                air,
+            });
+        }
+        pieces
     }
     fn emit(&mut self, curve: Curve, kind: MoveKind, entry: bool) -> Result<Motion, String> {
         curve.prepare(self.op.tolerance_mm)?;
@@ -719,22 +918,50 @@ impl SlotPlan {
                     true,
                     3,
                 ),
-                3 | 5 => {
-                    let seed = self.phase == 3;
+                3 => {
+                    let center = self.center(self.distance, z);
                     let curve = Curve::Arc {
                         start: self.position,
                         end: self.position,
-                        center: self.center(self.distance, z),
+                        center,
                         plane: Plane::Xy,
                         sweep_rad: if self.op.clockwise { -TAU } else { TAU },
                     };
-                    let motion = self.emit(curve, MoveKind::Cut, seed)?;
-                    if seed {
-                        self.report.seed_orbits += 1;
-                    } else {
+                    let motion = self.emit(curve, MoveKind::Cut, true)?;
+                    self.report.seed_orbits += 1;
+                    self.prev_center = Some(center);
+                    self.phase = 4;
+                    self.expected_generation = Some(stock.generation() + 1);
+                    return Ok(Some(motion));
+                }
+                // A controlled orbit: plan its pieces once (one full circle
+                // without a proven-air interval), then emit one per call;
+                // each returned motion is committed before the next call.
+                5 => {
+                    let center = self.center(self.distance, z);
+                    if self.orbit_pieces.is_empty() {
+                        self.orbit_pieces = self.split_orbit(center, z);
                         self.report.controlled_orbits += 1;
                     }
-                    self.phase = 4;
+                    let piece = self.orbit_pieces.pop_front().unwrap();
+                    let last = self.orbit_pieces.is_empty();
+                    let curve = Curve::Arc {
+                        start: self.position,
+                        end: piece.end,
+                        center,
+                        plane: Plane::Xy,
+                        sweep_rad: piece.sweep,
+                    };
+                    let mut motion = self.emit(curve, MoveKind::Cut, false)?;
+                    if piece.air {
+                        motion.feed_mm_min = Some(self.op.air_feed_mm_min.unwrap());
+                        self.report.air_fed_arcs += 1;
+                        self.report.air_fed_mm += self.radius * piece.sweep.abs();
+                    }
+                    if last {
+                        self.phase = 4;
+                        self.prev_center = Some(center);
+                    }
                     self.expected_generation = Some(stock.generation() + 1);
                     return Ok(Some(motion));
                 }
@@ -799,6 +1026,10 @@ impl SlotPlan {
                         self.report.stock_query_work_exhausted |= work == 0;
                         if known_clear {
                             advance = remaining;
+                            // The stock-clear fast path leaves the previous
+                            // orbit's disk behind: the next orbit stays one
+                            // full circle.
+                            self.prev_center = None;
                         }
                     }
                     // Choose exact endpoint when consuming the remainder; no cumulative overshoot.
@@ -885,6 +1116,8 @@ impl SlotPlan {
                 self.pass += 1;
                 self.piece = 0;
                 self.distance = 0.;
+                // A new depth pass: no previous orbit at this z.
+                self.prev_center = None;
                 self.phase = next_phase;
             } else {
                 self.phase = next_phase;

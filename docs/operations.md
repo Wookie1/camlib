@@ -1047,6 +1047,15 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
   otherwise. An arc bending toward that side needs a radius above the orbit
   radius (width/2 − tool radius), otherwise the slot is refused, naming the
   radius. Reverse `clockwise`, or use a narrower slot or a larger tool.
+- `air_feed_mm_min` feeds the part of each controlled orbit that is proven to
+  cut nothing: when a full orbit at the previous station at the same depth
+  cleared a disk of radius orbit radius + tool radius, a cutter centre far
+  enough inside that disk (by the guard) keeps the whole cutter inside it, so
+  that arc runs in air. It must be finite and at least `feed_mm_min`; the arc
+  is shrunk by the tolerance so arc error cannot leave the proven region, and
+  the report counts the arcs and their length (`air_fed_arcs`,
+  `air_fed_mm`). Without it, every orbit stays one full circle at
+  `feed_mm_min`.
 
 ## V-carve: `VCarve`
 

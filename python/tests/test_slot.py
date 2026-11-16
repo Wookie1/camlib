@@ -250,3 +250,34 @@ class CurvedSlotTest(unittest.TestCase):
         with Simulation(**config) as sim:
             with self.assertRaisesRegex(SimulationError, "bends toward the orbit side"):
                 list(sim.run_operations())
+
+
+class TrochoidalSlotAirFeedTest(unittest.TestCase):
+    """#34 part 1: air feed on the proven-air part of each controlled orbit."""
+
+    def test_air_feed_mm_min_round_trips_through_to_dict(self):
+        from dataclasses import replace
+
+        op = slot()
+        self.assertNotIn("air_feed_mm_min", op.to_dict())
+        fed = replace(op, air_feed_mm_min=2400.0)
+        self.assertEqual(fed.to_dict()["air_feed_mm_min"], 2400.0)
+
+    def test_air_feed_runs_and_report_counts_air_arcs(self):
+        from dataclasses import replace
+
+        op = replace(slot(), air_feed_mm_min=2400.0)
+        reports = []
+        with Simulation(
+            StockSpec((0, 0, 0), (24, 24, 10), 0.25),
+            (tool(),),
+            operations=(op,),
+            revision="air-slot",
+            initial_position_mm=(0, 0, 12),
+        ) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, OperationUpdate):
+                    reports.append(update.report)
+        self.assertTrue(sim.state.finished)
+        self.assertGreater(reports[-1]["air_fed_arcs"], 0)
+        self.assertGreater(reports[-1]["air_fed_mm"], 0)

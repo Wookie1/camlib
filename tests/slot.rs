@@ -660,3 +660,366 @@ fn path_and_straight_endpoints_are_exclusive_and_validated() {
             .is_none()
     );
 }
+
+// ---- Air feed on the proven-air part of each controlled orbit (#34) ----
+
+fn close3(a: Vec3, b: Vec3) -> bool {
+    (a[0] - b[0]).hypot(a[1] - b[1]).hypot(a[2] - b[2]) < 1e-9
+}
+
+/// Commits the motion and returns (removed volume measured by the stock,
+/// height uncertainty). The volume is the stock's own cell-bound record of
+/// the commit, independent of the planner.
+fn commit_measured(stock: &mut Stock, m: &Motion) -> (f64, f64) {
+    let t = fixture().tools[0].prepare().unwrap();
+    let d = stock
+        .preview_sweep(&t, m, 1., SweepOptions::default(), &AtomicBool::new(false))
+        .unwrap();
+    let size = stock.spec().cell_size_mm;
+    let removed = d
+        .changes()
+        .iter()
+        .map(|c| (c.before.upper_mm - c.after.upper_mm).max(0.))
+        .sum::<f64>()
+        * size
+        * size;
+    stock.apply_delta(&d).unwrap();
+    (
+        removed,
+        d.stats().max_path_error_mm + d.stats().numerical_guard_mm,
+    )
+}
+
+/// Drives the plan to the end, committing every motion to `stock`. Returns
+/// the motions, the volume each commit removed, the finished plan and the
+/// accumulated height uncertainty.
+fn drive(
+    op: &TrochoidalSlotOperation,
+    stock: &mut Stock,
+) -> (Vec<Motion>, Vec<f64>, SlotPlan, f64) {
+    let cancel = AtomicBool::new(false);
+    let mut p = plan(op.clone());
+    let mut motions = Vec::new();
+    let mut removed = Vec::new();
+    let mut uncertainty = 0f64;
+    let mut last = fixture().initial_position_mm;
+    while let Some(m) = p.next_motion_with_stock(stock, &cancel).unwrap() {
+        assert_eq!(m.curve.start(), last);
+        last = m.curve.end();
+        let (volume, height) = commit_measured(stock, &m);
+        uncertainty = uncertainty.max(height);
+        motions.push(m);
+        removed.push(volume);
+    }
+    p.finish_report(&cancel).unwrap();
+    (motions, removed, p, uncertainty)
+}
+
+/// The straight fixture and the curved/S/corner slots, both senses.
+fn air_feed_cases() -> Vec<(&'static str, TrochoidalSlotOperation)> {
+    let mut cases = Vec::new();
+    for cw in [true, false] {
+        let mut straight = operation();
+        straight.clockwise = cw;
+        cases.push(("straight", straight));
+        cases.push(("arc", curved(vec![[8., 6., -1.], [32., 6., 0.]], cw, 90.)));
+        cases.push((
+            "s",
+            curved(
+                vec![[6., 12., 1.], [20., 12., -1.], [34., 12., 0.]],
+                cw,
+                90.,
+            ),
+        ));
+        cases.push((
+            "corner",
+            curved(vec![[8., 6., 0.], [26., 6., 0.], [26., 20., 0.]], cw, 90.),
+        ));
+    }
+    cases
+}
+
+/// Total swept length of the motions fed at `feed`.
+fn fed_length(motions: &[Motion], feed: f64) -> f64 {
+    motions
+        .iter()
+        .filter(|m| m.feed_mm_min == Some(feed))
+        .map(|m| m.curve.prepare(1e-5).unwrap().length_mm())
+        .sum()
+}
+
+#[test]
+fn slot_air_feed_arcs_remove_no_stock() {
+    for (name, base) in air_feed_cases() {
+        let mut with_air = base.clone();
+        with_air.air_feed_mm_min = Some(base.feed_mm_min * 4.);
+        let air_feed = with_air.air_feed_mm_min.unwrap();
+        let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let (motions, removed, p, _) = drive(&with_air, &mut stock);
+        assert!(p.report().air_fed_arcs > 0, "{name}: no air-fed arcs");
+        assert!(p.report().air_fed_mm > 0., "{name}: no air-fed length");
+        for (m, removed) in motions.iter().zip(&removed) {
+            if m.feed_mm_min == Some(air_feed) {
+                assert_eq!(
+                    *removed, 0.,
+                    "{name}: air-fed motion {} removed {removed} mm3",
+                    m.id
+                );
+            }
+        }
+        // The same job without the air feed, for the cut-feed length.
+        let mut fresh = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let (none_motions, _, _, _) = drive(&base, &mut fresh);
+        let cut_air = fed_length(&motions, base.feed_mm_min);
+        let cut_none = fed_length(&none_motions, base.feed_mm_min);
+        assert!(
+            cut_air <= 0.65 * cut_none,
+            "{name}: cut-feed length {cut_air:.3} is not at least 35% below {cut_none:.3}"
+        );
+    }
+    // The stock-clear corridor scene: both controlled orbits follow a
+    // stock-clear advance, so no orbit has the adjacent previous orbit the
+    // proof needs and none is split.
+    let mut op = operation();
+    op.air_feed_mm_min = Some(op.feed_mm_min * 4.);
+    let mut snapshot = Stock::new(fixture().stock.height().unwrap().clone())
+        .unwrap()
+        .snapshot();
+    snapshot.cells.fill(HeightBounds {
+        lower_mm: 8.,
+        upper_mm: 8.,
+    });
+    let mut stock = Stock::from_snapshot(snapshot).unwrap();
+    let (_, _, p, _) = drive(&op, &mut stock);
+    assert_eq!(p.report().stock_clear_advances, 2);
+    assert_eq!(p.report().air_fed_arcs, 0);
+}
+
+#[test]
+fn slot_air_feed_none_is_unchanged() {
+    let cancel = AtomicBool::new(false);
+    let mut op = operation();
+    op.air_feed_mm_min = None;
+    let mut p = plan(op.clone());
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let mut full_orbits = 0;
+    while let Some(m) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
+        match m.feed_mm_min {
+            None => assert_eq!(m.kind, MoveKind::Rapid, "{m:?}"),
+            Some(feed) => assert!(
+                feed == op.feed_mm_min || feed == op.entry_feed_mm_min,
+                "{m:?}"
+            ),
+        }
+        if let Curve::Arc { sweep_rad, .. } = m.curve
+            && m.kind == MoveKind::Cut
+        {
+            assert_eq!(sweep_rad.abs(), TAU, "{m:?}");
+            full_orbits += 1;
+        }
+        commit(&mut stock, &m);
+    }
+    assert_eq!(
+        full_orbits,
+        p.report().seed_orbits + p.report().controlled_orbits
+    );
+}
+
+/// One record per orbit: consecutive cut arcs (a split orbit emits several
+/// with the same centre). (centre, first start, last end, sweep sum, pieces)
+fn orbit_groups(motions: &[Motion]) -> Vec<(Vec3, Vec3, Vec3, f64, usize)> {
+    let mut out: Vec<(Vec3, Vec3, Vec3, f64, usize)> = Vec::new();
+    let mut prev_cut = false;
+    for m in motions {
+        let arc = match m.curve {
+            Curve::Arc {
+                start,
+                end,
+                center,
+                sweep_rad,
+                ..
+            } => Some((start, end, center, sweep_rad)),
+            _ => None,
+        };
+        match (m.kind == MoveKind::Cut, arc) {
+            (true, Some((start, end, center, sweep))) => {
+                if prev_cut {
+                    let (c, _, last_end, sum, pieces) = out.last_mut().unwrap();
+                    assert!(close3(*c, center), "orbit centre changed mid-orbit");
+                    assert!(close3(*last_end, start), "orbit pieces are disjoint");
+                    *sum += sweep;
+                    *last_end = end;
+                    *pieces += 1;
+                } else {
+                    out.push((center, start, end, sweep, 1));
+                }
+                prev_cut = true;
+            }
+            _ => prev_cut = false,
+        }
+    }
+    out
+}
+
+#[test]
+fn slot_air_feed_same_path() {
+    for (name, base) in air_feed_cases() {
+        let mut with_air = base.clone();
+        with_air.air_feed_mm_min = Some(base.feed_mm_min * 4.);
+        let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let (air_motions, _, air_plan, uncertainty) = drive(&with_air, &mut stock);
+        assert!(air_plan.report().air_fed_arcs > 0, "{name}");
+        let mut fresh = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let (none_motions, _, _, _) = drive(&base, &mut fresh);
+        // The swept path is the same with and without the air feed: the same
+        // orbits, same centres, same start and end points, each orbit's
+        // pieces summing to one full turn and closing at its start.
+        let air_orbits = orbit_groups(&air_motions);
+        let none_orbits = orbit_groups(&none_motions);
+        assert_eq!(air_orbits.len(), none_orbits.len(), "{name}");
+        let turn = if base.clockwise { -TAU } else { TAU };
+        let mut split = 0;
+        for (air, none) in air_orbits.iter().zip(&none_orbits) {
+            let (center, start, end, sweep, pieces) = air;
+            assert!(close3(*center, none.0), "{name}: orbit centre moved");
+            assert!(close3(*start, none.1), "{name}: orbit start moved");
+            assert!(close3(*end, none.2), "{name}: orbit end moved");
+            assert!(
+                (sweep - turn).abs() < 1e-9,
+                "{name}: orbit sweep {sweep} is not one turn"
+            );
+            assert!(close3(*start, *end), "{name}: orbit does not close");
+            if *pieces > 1 {
+                split += 1;
+            }
+        }
+        assert!(split > 0, "{name}: no orbit was split into air-fed pieces");
+        // Engagement and coverage (the existing main test's asserts) with
+        // air feed on: every cutter position inside the slot, every orbit
+        // centred on the centreline and inside the width, the exposed edge
+        // angle against the previous orbit's disk, side-band coverage
+        // between neighbouring disks on lines, and the final stock (interior
+        // to the floor, exterior untouched).
+        let r = 2.;
+        let rho = air_plan.report().orbit_radius_mm;
+        let cleared = rho + r;
+        let path = base.path_mm.clone();
+        let mut previous: Option<Vec3> = None;
+        for m in &air_motions {
+            let prepared = m.curve.prepare(1e-5).unwrap();
+            if m.curve.start()[2] < 10. || m.curve.end()[2] < 10. {
+                for i in 0..=512 {
+                    let q = prepared.position(i as f64 / 512.).unwrap();
+                    let d = match &path {
+                        Some(p) => path_distance([q[0], q[1]], p),
+                        None => axis_distance(q, base.start_mm.unwrap(), base.end_mm.unwrap()),
+                    };
+                    assert!(
+                        d + r <= base.width_mm / 2. + 1e-9,
+                        "{name}: cutter leaves the slot at {q:?} ({:?})",
+                        m.kind
+                    );
+                }
+            }
+            let Curve::Arc { center, .. } = m.curve else {
+                continue;
+            };
+            if m.kind != MoveKind::Cut {
+                continue;
+            }
+            let on_path = match &path {
+                Some(p) => path_distance([center[0], center[1]], p) < 1e-9,
+                None => {
+                    axis_distance(center, base.start_mm.unwrap(), base.end_mm.unwrap()) < 1e-10
+                }
+            };
+            assert!(on_path, "{name}: orbit off the centreline");
+            assert!(rho + r <= base.width_mm / 2.);
+            if let Some(old) = previous.filter(|old| old[2] == center[2]) {
+                // The proof needs the previous orbit at the same depth; a
+                // new pass starts fresh at its seed orbit.
+                let q = distance(old, center) + rho;
+                assert!(
+                    exposed_angle(q, r, cleared) <= base.max_engagement_deg + 1e-8,
+                    "{name}: exposed {} deg",
+                    exposed_angle(q, r, cleared)
+                );
+                if path.is_none() {
+                    let gap = distance(old, center);
+                    let covered = (cleared * cleared - (gap / 2.).powi(2)).sqrt();
+                    assert!(base.width_mm / 2. - covered <= base.boundary_tolerance_mm);
+                }
+            }
+            previous = Some(center);
+        }
+        let cell_guard = stock.spec().cell_size_mm * 2.;
+        for i in 0..stock.cells().len() {
+            let q = stock.cell_center(i).unwrap();
+            let d = match &path {
+                Some(p) => path_distance([q[0], q[1]], p),
+                None => {
+                    axis_distance([q[0], q[1], 0.], base.start_mm.unwrap(), base.end_mm.unwrap())
+                }
+            };
+            let h = stock.cells()[i];
+            if d < base.width_mm / 2. - cell_guard {
+                assert!(
+                    h.upper_mm <= base.floor_z_mm + uncertainty + 1e-9,
+                    "{name}: interior {q:?}: {h:?}"
+                );
+            }
+            if d > base.width_mm / 2. + cell_guard {
+                assert_eq!(h.lower_mm, 10., "{name}: protected exterior {q:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn slot_air_feed_must_not_be_below_feed() {
+    let m = fixture();
+    let mut op = operation();
+    op.air_feed_mm_min = Some(op.feed_mm_min - 1.);
+    let error = SlotPlan::prepare(
+        op.clone(),
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &AtomicBool::new(false),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error.contains(&format!("air_feed_mm_min {}", op.air_feed_mm_min.unwrap()))
+            && error.contains(&format!("feed_mm_min {}", op.feed_mm_min)),
+        "{error}"
+    );
+    let mut op = operation();
+    op.air_feed_mm_min = Some(f64::NAN);
+    assert!(
+        SlotPlan::prepare(
+            op,
+            &m.tools[0],
+            m.stock.height().unwrap(),
+            m.initial_position_mm,
+            1,
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    // Equal to the cutting feed is allowed.
+    let mut op = operation();
+    op.air_feed_mm_min = Some(op.feed_mm_min);
+    assert!(
+        SlotPlan::prepare(
+            op,
+            &m.tools[0],
+            m.stock.height().unwrap(),
+            m.initial_position_mm,
+            1,
+            &AtomicBool::new(false)
+        )
+        .is_ok()
+    );
+}
