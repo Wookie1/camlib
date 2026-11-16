@@ -3,7 +3,8 @@
 //! flat end mill, in contour-parallel passes that offset each flat's tool
 //! centre region inward, outside in, linked at depth where the link is
 //! proven, and entered from the side in air where a pass runs along an open
-//! edge.
+//! edge — the plunge always coming down beside the level's face, never onto
+//! it.
 //!
 //! Proof: every cut is a horizontal line at the cut height. It is kept only
 //! where the highest point of the part (and the machining base) under the
@@ -1551,6 +1552,9 @@ struct Chain {
     /// 1 mm of the pass) with the outward normal, away from the region (right
     /// of travel).
     side: Vec<([f64; 2], [f64; 2])>,
+    /// The level's face (the flat the pass finishes): an entry may only plunge
+    /// down beside it, never onto it.
+    face: std::sync::Arc<crate::planar::PreparedRegion>,
 }
 
 /// How the chain is entered, decided against the live stock when reached.
@@ -1780,8 +1784,9 @@ impl FlatPlan {
                 return Err("flat-area planning cancelled".into());
             }
             let z = level + op.stock_to_leave_mm;
-            // The tool centres resting on this level, as a planar region.
-            let Some(region) =
+            // The tool centres resting on this level, as a planar region, and
+            // the level's face (for keeping entries off it).
+            let Some((region, face)) =
                 level_region(&target, level, op.level_tolerance_mm, r, op.tolerance_mm, cancel)?
             else {
                 continue;
@@ -1854,6 +1859,7 @@ impl FlatPlan {
                             chains.push(Chain {
                                 pieces: vec![piece],
                                 side,
+                                face: std::sync::Arc::clone(&face),
                             });
                         }
                         let end = chains[chains.len() - 1].pieces.last().unwrap().end();
@@ -1878,7 +1884,7 @@ impl FlatPlan {
             dropped_length_mm: dropped,
             runs_completed: 0,
             ramped_entries: 0,
-            clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; contour-parallel offset passes outside in, side entry in air on open edges, links at depth and when chains break",
+            clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; contour-parallel offset passes outside in, side entry in air on open edges and every vertical plunge beside the level's face (a radius outside it, the face region a superset of the flat within the shadows' stated errors), links at depth and when chains break",
         };
         Ok(Self {
             op,
@@ -1909,12 +1915,12 @@ impl FlatPlan {
     }
     /// What enters the pass at its start after the rapid descent: a straight
     /// plunge where no live stock stands above the pass's height there (the
-    /// cells' upper bounds, within a tolerance), otherwise a ramp from the
-    /// stock's top over the whole pass, down the pass by the declared
-    /// `RampEntry`. Each ramp point lies vertically above the proven pass, so
-    /// it clears the part as the pass does. A pass the ramp does not fit, or
-    /// stock above a pass with no entry declared, is refused: a flat end mill
-    /// is never plunged into stock.
+    /// cells' upper bounds, within a tolerance) and the disk comes down beside
+    /// the level's face, otherwise a ramp from the stock's top over the whole
+    /// pass, down the pass by the declared `RampEntry`. Each ramp point lies
+    /// vertically above the proven pass, so it clears the part as the pass
+    /// does. A pass the ramp does not fit, or stock above a pass with no entry
+    /// declared, is refused: a flat end mill is never plunged into stock.
     fn plunge_or_ramp(
         &self,
         piece: &Piece,
@@ -1923,7 +1929,7 @@ impl FlatPlan {
     ) -> Result<Option<(f64, Vec<Vec3>)>, String> {
         let a = piece.start();
         let at_start = stock.top_under_disk([a[0], a[1]], self.radius);
-        if at_start <= a[2] + self.op.tolerance_mm {
+        if at_start <= a[2] + self.op.tolerance_mm && self.beside_face([a[0], a[1]])? {
             return Ok(None);
         }
         let length = piece.length();
@@ -1969,10 +1975,21 @@ impl FlatPlan {
         points.extend(curves.iter().map(|c| c.end()));
         Ok(Some((top, points)))
     }
+    /// Whether the disk at `p` comes down beside this chain's level's face: a
+    /// radius (less the tolerance) outside the face region, so a vertical
+    /// plunge at `p` never rests the disk on the flat the pass finishes. An
+    /// empty face region (no flat at the level) leaves the point free.
+    fn beside_face(&self, p: [f64; 2]) -> Result<bool, String> {
+        let q = self.chains[self.chain].face.query(p)?;
+        Ok(q.signed_clearance_mm
+            .map_or(true, |s| s <= self.op.tolerance_mm - self.radius))
+    }
+
     /// How the current chain is entered, decided against the live stock: from
     /// the side in air where the first pass runs along an open edge (the
-    /// plunge point's disk touches no stock above the cut and the lead is
-    /// proven and allowed), otherwise the declared rule (`plunge_or_ramp`).
+    /// plunge point's disk touches no stock above the cut, stays beside the
+    /// level's face, and the lead is proven and allowed), otherwise the
+    /// declared rule (`plunge_or_ramp`).
     fn decide_entry(&mut self, stock: &Stock, cancel: &impl CancelSignal) -> Result<Entry, String> {
         let piece = &self.chains[self.chain].pieces[self.piece];
         let z = piece.start()[2];
@@ -1990,6 +2007,9 @@ impl FlatPlan {
             for l in [0.25 * self.radius, 0.5 * self.radius, self.radius, 1.5 * self.radius, 2. * self.radius] {
                 let p = [v[0] + l * n[0], v[1] + l * n[1]];
                 if stock.top_under_disk(p, self.radius) > z + tol {
+                    continue;
+                }
+                if !self.beside_face(p)? {
                     continue;
                 }
                 if self.index.max_height(p, *v, self.radius, &mut self.seen, &mut self.stamp)
@@ -2311,7 +2331,8 @@ fn level_region(
     r: f64,
     tolerance: f64,
     cancel: &impl CancelSignal,
-) -> Result<Option<crate::planar::PreparedRegion>, String> {
+) -> Result<Option<(crate::planar::PreparedRegion, std::sync::Arc<crate::planar::PreparedRegion>)>, String>
+{
     use crate::planar::{Boolean, ConstructionOptions};
     let options = ConstructionOptions { tolerance_mm: tolerance };
     let source_error = target.mesh().surface_error_mm;
@@ -2336,8 +2357,12 @@ fn level_region(
     let above = target
         .shadow_for_cutter(above_tip, 0., r, &mut work, cancel)
         .map_err(|e| format!("flat-area shadow at Z{z}: {e}"))?;
-    let region = if above.region.components.is_empty() {
-        resting
+    let (region, face) = if above.region.components.is_empty() {
+        let face = below
+            .region
+            .prepare(options)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?;
+        (resting, face)
     } else {
         let reach = r + (above.report.boundary_error_mm - source_error).max(0.);
         let blocked = above
@@ -2348,16 +2373,39 @@ fn level_region(
             .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
             .into_parts()
             .1;
-        resting
+        let region = resting
             .boolean_prepared(&blocked, Boolean::Difference)
             .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
             .into_parts()
-            .1
+            .1;
+        // The level's face: the flat the pass finishes. The shadow standing
+        // above is eroded by its stated boundary error plus the tolerance
+        // before it is subtracted, so what is removed stays inside the part
+        // that really stands above and the face kept is a superset of the
+        // true flat: a point a radius outside this region is a radius
+        // outside the true face too.
+        let core = above
+            .region
+            .prepare(options)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?
+            .offset_prepared(above.report.boundary_error_mm + tolerance)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?
+            .into_parts()
+            .1;
+        let face = below
+            .region
+            .prepare(options)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?
+            .boolean_prepared(&core, Boolean::Difference)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?
+            .into_parts()
+            .1;
+        (region, face)
     };
     if region.definition().components.is_empty() {
         return Ok(None);
     }
-    Ok(Some(region))
+    Ok(Some((region, std::sync::Arc::new(face))))
 }
 
 /// The offset loops of one connected component of a level's region: the
