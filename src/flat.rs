@@ -2052,6 +2052,25 @@ impl FlatPlan {
             if !closed && *v != first {
                 continue;
             }
+            // Rotating the closed first piece to `v` moves its end, and with
+            // it the chain's link at depth to the next piece: `prepare`
+            // proved that link from the piece's original end, the link from
+            // `v` never was. Accept the candidate only when the new link
+            // passes the same three tests as a link in `prepare`; otherwise
+            // try the next vertex.
+            if self.piece + 1 < self.chains[self.chain].pieces.len() && *v != first {
+                let next = self.chains[self.chain].pieces[self.piece + 1].start();
+                let length = (next[0] - v[0]).hypot(next[1] - v[1]);
+                if length > 2. * self.op.stepover_mm
+                    || self
+                        .index
+                        .max_height(*v, [next[0], next[1]], self.radius, &mut self.seen, &mut self.stamp)
+                        > z + tol
+                    || !allows_segment(self.limits.as_ref(), *v, [next[0], next[1]], z, tol)?
+                {
+                    continue;
+                }
+            }
             // Outward, trying the shortest offset first.
             for l in [
                 0.25 * self.radius,
@@ -2760,8 +2779,6 @@ fn signed_area(pts: &[[f64; 2]]) -> f64 {
 
 /// Rotate a closed piece (the last point repeating the first) so it starts at
 /// the vertex `v` (one of its own points) and ends there too.
-/// Rotate a closed piece (its last segment ending on the first's start) so it
-/// starts at the vertex `v`.
 fn rotate_piece(piece: &mut Piece, v: [f64; 2]) {
     let Some(i) = piece.segs.iter().position(|s| s.a == v) else {
         return;
