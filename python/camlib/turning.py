@@ -430,7 +430,10 @@ class ModelInsertCheck:
     height), ``nose_radius_tolerance_mm`` and ``edge_angle_tolerance_deg``
     (each straight edge at the corner). They must cover the insert mesh's
     own error. A model outside one is refused before any move, as misplaced
-    or as a different insert; it is never fitted. No value has a default."""
+    or as a different insert; it is never fitted. The whole projected convex
+    envelopes are also compared. This requires a single convex declared
+    insert body; nonconvex or multi-piece declarations refuse because a hull
+    can hide extra model material in notches. No value has a default."""
 
     insert: object
     corner_region_mm: float
@@ -476,6 +479,12 @@ class ToolModel:
     ``ModelInsertCheck`` (the model's insert, cross-checked against the
     declared one) or a ``ModelWithoutInsert``.
 
+    ``max_hull_error_mm`` optionally permits bounded slice-hull reduction:
+    at most 32 retained vertices, grown outward to contain the exact hull.
+    The additional outward displacement is within this declared budget;
+    the mesh's own error is applied as well. A budget too small is refused.
+    None retains exact hulls. Reports record ``max_model_hull_error_mm``.
+
     The insert stays the declared one (ISO code or outline, thickness,
     clearance, seat): it is what cuts. Use it as a tool's holder with
     ``Holder.from_model(model)``."""
@@ -484,6 +493,7 @@ class ToolModel:
     placement: ModelPlacement
     axial_resolution_mm: float
     insert_check: object
+    max_hull_error_mm: float | None = None
 
     def __post_init__(self):
         if not isinstance(self.placement, ModelPlacement):
@@ -495,16 +505,19 @@ class ToolModel:
             )
 
     def to_dict(self):
-        return dict(
+        result = dict(
             body=self.body.to_dict(),
             placement=self.placement.to_dict(),
             axial_resolution_mm=float(self.axial_resolution_mm),
             insert_check=self.insert_check.to_dict(),
         )
+        if self.max_hull_error_mm is not None:
+            result["max_hull_error_mm"] = float(self.max_hull_error_mm)
+        return result
 
     def bounds_mm(self):
         """The placed body's extent along the lathe's X, Y and Z from the
-        nose centre (its mesh error included), as ((x0, x1), (y0, y1),
+        nose centre (mesh and optional hull errors included), as ((x0, x1), (y0, y1),
         (z0, z1))."""
         low, high = [float("inf")] * 3, [float("-inf")] * 3
         for triangle in self.body.triangles:
@@ -513,7 +526,7 @@ class ToolModel:
                 for k in range(3):
                     low[k] = min(low[k], placed[k])
                     high[k] = max(high[k], placed[k])
-        error = float(self.body.surface_error_mm)
+        error = float(self.body.surface_error_mm) + float(self.max_hull_error_mm or 0)
         return tuple((low[k] - error, high[k] + error) for k in range(3))
 
 
