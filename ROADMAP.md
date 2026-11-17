@@ -1,84 +1,105 @@
 # Roadmap
 
-The order in which camlib's open issues are closed. Read [AGENTS.md](AGENTS.md)
-first: it says what camlib is, what it is not, and how to work an issue.
+The order of camlib's remaining work. Read [AGENTS.md](AGENTS.md) for the
+engineering and contribution rules. The first-release checklist is
+[issue #21](https://github.com/stevecad/camlib/issues/21).
 
 ## How to use this roadmap
 
-- **Work the lowest open phase first**, and inside a phase, top to bottom.
-  Each phase is a GitHub milestone, so `gh issue list --milestone "Phase 2:
-  Complete milling"` lists its issues.
-- **Never start an issue whose dependencies are open.** Each issue lists its
-  dependencies; the order below already respects them.
-- **Correctness bugs jump the queue.** A bug that makes camlib produce a wrong,
-  unsafe or refused-but-valid program goes into Phase 1 and is fixed before
-  anything else.
-- **"Any time" issues** may run in parallel with the current phase.
-- **This file lists open issues only, and feature PRs don't edit it.** An
-  issue is done when its PR closes it (`Closes #N`); the milestone shows
-  progress. Keeping feature PRs out of this file keeps them from conflicting
-  with each other here. It changes only to place new issues or change the
-  order, in a roadmap-only PR, which also sweeps out closed issues.
+- Until v0.1.0, follow the release order below. The phase lists also retain
+  later work; an open feature or optimization is not automatically a release gate.
+- Correctness defects in the release scope take priority. Respect existing
+  claims, explicit parked status and each issue's dependencies. Independent
+  release/workflow tasks may proceed while an owned fix is in progress.
+- **Next feature task: #288, face mills and high-feed mills.** It is the
+  remaining Phase 2 issue and already has the maintainer's claim. Resume its
+  recorded design from current main; confirm the manufacturer sources before
+  implementation. The remaining #245 work stays with its current owner.
+- Phase milestones describe the backlog. Closed work is omitted; refresh
+  this file in roadmap-only PRs, never alongside toolpath implementation.
+- New evidence of unsafe output or a broken advertised workflow promotes an
+  otherwise deferred issue into the release gates. No tolerance or verification
+  check is weakened to meet a release date.
 
-## Why this order
+## Ordered work for v0.1.0
 
-camlib already covers three-axis milling, turning and plasma/laser. What's left
-is ordered by real dependency, not by size:
+Scope: three-axis milling, turning and the implemented plasma/laser operations,
+with the Python `camlib` API distributed as `cam-engine`. Multi-axis and the
+broad optimization round follow the first release.
 
-1. **Correctness before features.** A program camlib refuses or gets wrong
-   matters more than anything new.
-2. **Finish one process before the next.** Milling comes first: its pieces
-   (cutter compensation, tabs, avoid areas, the 3D stock) feed the others, and a
-   complete, testable process is worth more than three partial ones.
-3. **Then turning, then plasma/laser.** Each needs only the shared core.
-4. **Multi-axis builds on foundations.** The 3D stock (#1, Phase 2) and machine
-   kinematics (#2) come first; everything rotary depends on them.
-5. **The optimization round is last.** Features first, then make every toolpath
-   faster and better against the published benchmark (`docs/benchmarks.md`).
+1. **Correctness closure:** merge #330 after its checks, retaining the explicit
+   nonconvex-insert refusal; complete #245's remaining numerical-decision and
+   platform-evidence work with its owner. Document causes of remaining
+   differences; do not round output to hide them.
+2. **Complete milling tools (#288):** profiles and independent geometry tests;
+   entry, depth and body limits; Facing and layered Pocket/Roughing; Python,
+   documentation and measured benchmarks. This independent feature work can
+   proceed while the owned correctness work finishes.
+3. **Benchmark workflow (#329):** per-workload reviewed expectations,
+   per-PR CI reports and a permanent report from successful main builds.
+   Contributors do not commit generated tables or machine-specific timings.
+   This independent workflow change may run alongside steps 1–2.
+4. **Release contracts (#188, #222):** settle retract/offset semantics and
+   insert-tolerance premises for the advertised scope. Proposal C in #188 was
+   withdrawn; it is not an implemented interval guarantee. Use sourced models,
+   explicit premises or named refusals, and update the capability/post docs.
+5. **Candidate and package qualification (#21):** select the exact main commit;
+   pass required CI and benchmarks; rehearse clean installed-package tests for
+   Linux x86_64/aarch64, Windows x64 and the sdist without publishing. Verify
+   publishing configuration. Existing `v*` tags trigger publication, not a dry run.
+6. **Machine proving (#20):** document the existing SYIL/LNC milling evidence
+   with its limited coverage and complete the lathe/plasma family reports.
+   Prepare fixtures and operator coordination earlier; final proving uses the
+   qualified candidate. Record interpreter, air-run and measured-cut evidence
+   separately, and requalify changed behavior.
+7. **Publication (#21):** reconcile the final changelog, capability matrix and
+   installation docs with that evidence, then publish the maintainer-selected
+   `v0.1.0` commit and verify a clean public-package installation.
+
+The detailed completion gates live in #21. This work list does not tag or
+publish a release. #20 remains broader than validation of one controller.
 
 ## Phase 1: Correctness
 
-Refused-but-valid programs first, the most common setups first.
+- #245 Cross-platform numerical decisions: remaining entry, pocket-routing,
+  simplification and material-bound differences after #308 (claimed).
 
-- #167 Roughing with AdaptiveClearing: no entry found, or the posted journal grows past 1 GB
-- #160 Roughing: the shank/holder guard can't prove clearance cleared by earlier layers unless a move exactly repeats one
-- #168 Tool change: no mode for a controller whose M6 doesn't move (LinuxCNC T M6 G43 H)
-- #176 Machine travel: one tip box per scene doesn't fit tools of different gauge lengths
+Parked, as recorded in the issue:
+
+- #252 Turning rub-check arc pieces and stale end bins: conservative refusals;
+  resume when a real job supplies a reproducer. The saved WIP over-claims
+  clearance and regresses performance; it is not qualified code to merge.
 
 ## Phase 2: Complete milling
 
-Entry, tab and path options shops expect, then the larger additions.
-
-- #171 Pocket and Contour: ramp entry along the path
-- #172 Tabs at given positions
-- #174 Trace with a side offset (an open chain of edges, cutter on one side)
-- #175 Parallel: rows all cut one way
-- #173 Contour following the part's outline at each depth (silhouette)
-- #157 Milling: an operation that runs a caller-supplied toolpath through the same simulation, checks and posting
-- #288 Milling tools: face mills and high-feed mills (real cutter profiles, depth-of-cut and entry limits)
+- #288 Face mills and high-feed mills: declared profiles, depth-of-cut and
+  entry limits, body checks and independent material verification (next feature).
 
 ## Phase 3: Complete turning
 
-- #14 Turning: post profile arcs as native G2/G3 instead of chords
-- #110 Tool and holder bodies from supplied models (mesh in the engine; STEP via the CadQuery adapter)
-- #113 Turning: apply the insert's in-plane size tolerance (ISO 1832 d and m) to its body
-- #170 Turning tools: one clearance angle for every side of the insert
-- #114 Turning: solid (one-piece) boring bars with a ground head on a round bar
+Follow-ups to the completed turning feature issues:
+
+- #221 Supplied tool bodies: bounded hulls and model checks (PR #330 in flight).
+- #222 Insert nose-radius and corner-angle tolerance: resolve the release
+  contract under step 4; geometry extensions may follow if premises/refusals
+  accurately delimit v0.1.0. Its parked branch is not qualified for merging.
+- #331 Nonconvex supplied-insert comparison: subsequent work; #330 refuses
+  unsupported comparisons rather than certifying a convex hull as the outline.
 
 ## Phase 4: Complete plasma/laser
 
-- #16 Plasma/laser: automatic part nesting
-- #17 Plasma/laser: common-line cutting (needs #16 for automatic placements)
-- #18 Plasma/laser: marking and etching
-- #296 Plasma: what standard sheet cutting still needs (tip-up avoidance, cut order, DXF in, part labels, remnants,
-  nesting options, fewer pierces): in the issue's order
-- #306 Plasma: edge starts and a scribe tool (each needs a controller that documents it; can wait for one)
-- #305 Laser cutting: per-feature power and feed, corner ramps, fly cutting (each needs a controller that
-  documents it)
+Standard plasma sheet cutting and edge starts are delivered. These additions
+are subsequent work, not gates on the already supported release scope:
+
+- #306 Second-tool scribe/marker support with a declared offset and documented
+  controller behavior; the edge-start item is already complete.
+- #305 Laser per-feature power/feed, then corner ramps; fly cutting where
+  documented by the controller. Respect the issue's internal dependencies.
 
 ## Phase 5: Multi-axis
 
-In dependency order: kinematics, then indexed work, then continuous motion.
+Subsequent releases, in dependency order: kinematics, then indexed work,
+then continuous motion.
 
 - #2 Machine kinematics: rotary axes (A/B/C), table and head configurations
 - #3 4th axis: indexed (3+1) machining (needs #2)
@@ -90,6 +111,12 @@ In dependency order: kinematics, then indexed work, then continuous motion.
 
 ## Phase 6: Optimization
 
+Subsequent work in the existing operation order. #190's default planner change
+is delivered; its removal of `disk_front` and pocket-specific independent
+coverage remain. #191 follows #190. #328 bounds small regions on large stock;
+#193 still addresses a genuinely large active front. Existing claims, including
+#34 and #323, stay with their owners.
+
 Every toolpath, measured against the published baseline (`bench/`). The
 shared machinery comes first because most toolpaths use it. Then milling (by
 use: 2D, holes, 3D), turning and thermal.
@@ -100,7 +127,6 @@ use: 2D, holes, 3D), turning and thermal.
 - #26 Optimize AdaptivePocket and adaptive clearing
 - #190 AdaptivePocket: plan from the stock (engagement_front), then remove disk_front
 - #191 Retire the stock_front development strategy
-- #192 engagement_front: planning time and time to the first move
 - #193 engagement_front: multi-resolution steering grid for small cutters on large stock
 - #28 Optimize Contour (and Tabs)
 - #34 Optimize TrochoidalSlot
@@ -108,6 +134,7 @@ use: 2D, holes, 3D), turning and thermal.
 - #36 Optimize Trace (engrave)
 - #37 Optimize VCarve
 - #29 Optimize Drilling
+- #323 Drilling: bounded nearest-neighbour multi-start ordering (follow-up to #319; existing claim)
 - #30 Optimize Bore (helical bore milling)
 - #31 Optimize Reaming and fine boring
 - #32 Optimize Tapping
@@ -137,13 +164,11 @@ use: 2D, holes, 3D), turning and thermal.
 
 ## Any time
 
-These can run in parallel with any phase.
+Independent release and developer-workflow tasks:
 
-- #20 Validate every controller post on real machines (start with the LinuxCNC simulator in CI)
-- #21 Release: PyPI distribution name and published wheels
-- #188 Checking retracts to the top of Z travel: exact setup values, or a bound?
-- #194 CI: the Windows Rust test job takes about an hour, twice per merge
-- #95 Siemens 808D posts: tapping (CYCLE84 / G331, ISO G84/G74)
-- #97 Haas NGC post: G86 needs a source for spindle restart
-- #169 Arc radius check at zero tolerance depends on the platform's hypot
-- #177 FANUC 0i-MB post with several tools needs measured tip positions
+- #20 Controller validation evidence: LinuxCNC interpreter checks are in CI;
+  hardware coverage and documented reports remain.
+- #21 First-release work list, package qualification and publication.
+- #188 Retract/offset contract decision: see release step 4 and the issue's
+  latest discussion, including withdrawal of the proposed interval design.
+- #329 Per-workload expectations, permanent benchmark page and CI reports.
