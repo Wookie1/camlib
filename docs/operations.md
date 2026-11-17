@@ -1619,59 +1619,61 @@ Required: `surface`, `floor_z_mm`, `stepover_mm`, `clearance_z_mm`. Finds the
 horizontal faces above `floor_z_mm` (faces within `level_tolerance_mm`, 0.001,
 form one level) and finishes each level at its exact height plus
 `stock_to_leave_mm`, top level first, with a flat center-cutting end mill in
-contour-parallel offset passes, outside in. The region of tool centres resting
-on a level is the level's shadow grown by the cutter radius minus the shadow of
-everything standing above it grown by the radius plus its stated errors, so
-near walls the tool stays a radius away. Its inward offsets 0, `stepover_mm`,
-2 `stepover_mm`, ... are the passes; after the last one, a core deeper than a
-radius is covered by half-step passes while it lasts, and where an offset
-pinches off in a corner between two boundaries of the region (the surviving
-ring stretches more than a diameter apart) a half-step pass is added too, so
-the disk covers every reachable flat point at stepovers up to the cutter
-diameter. Offset loops are cut as arcs (the offsets' cavalier bulges), an arc
-proven by its chords, each chord held to the same proof with radius
-r + sagitta, and emitted as arc blocks when every chord proves; a chord that
-cannot be proven is halved down to a sixteenth of the loop, and what still
-fails is dropped into `dropped_length_mm`, the loop continuing as open
-pieces. A cut is kept only where the highest point of the part under the
-tool's swept disk is not above the cut (computed exactly per facet). Per
-connected component, nearest first, the passes are cut at growing offset
-depth (the outermost ring first); at the same depth outer boundary loops
-before hole loops, then nearest first, and each loop starts at its vertex
-nearest the tool. Outer boundary loops run clockwise and hole loops counter-clockwise: the
-stock still to cut lies inward of each ring (the passes go outside in), on the
-right of travel, so the passes climb mill with a clockwise spindle. Kernel
-artefacts are not cut as moves of their own: a run of strokes on one circle
-(straight chords, or chords mixed with micro-arcs) is refitted as one arc, and
-a straight stub under 0.005 mm is absorbed into its straight neighbour. Consecutive pieces join into one chain by a straight link
-at the cut height and cutting feed when the link is at most two stepovers
-long, passes the same proof and lies inside the machine limits; otherwise the
-chain ends (retract, new entry). A chain is entered beside the level's face
-where the flat is open (side entry in air): the tool rapids over a point a
-quarter to two radii outside the chain's first loop, away from the region,
-where no stock stands within the disk above the cut, plunges vertically
-through air to the cut height and leads in at cutting feed. Where no such
-point exists it plunges vertically at the chain's start when no live stock
-stands above its height there (within `tolerance_mm`). Where stock does
-(roughing left it, or the stock was not cut there yet), the chain is entered
-by a ramp, and only if the operation declares `entry=RampEntry(angle_deg,
-...)`: the tool plunges through air to the top of the live stock over the
-chain's first loop (the highest cell bound anywhere along it, not just at its
-start), then zigzags down along that loop at no more than the declared angle
-and at the entry's `feed_mm_min` (default the plunge feed); a zigzag that has
-to reverse needs the entry's `min_length_mm`. Every ramp point lies above the
-proven loop, so it clears the part like the loop does; the report counts
-ramped chains as `ramped_entries`. Nothing is plunged into stock on any path:
-a chain with stock above it and no declared entry, a ramp that does not fit
-(too short a loop, an angle too shallow for the loop, or stock above the feed
-height) is refused, naming the chain, its length and the stock above it. The
-`flat` benchmark runs on a blank roughed to 0.1 mm over the flats and declares
-a 3 degree entry. The report gives the levels, `loops` (closed offset loops
-planned), `rows` (loops cut, counting the open pieces a split loop leaves),
-`runs` (chains), `links_at_depth`, cut length, `runs_completed`,
-`ramped_entries`, and any length that could not be proven clear
-(`dropped_length_mm`). `axis` is still accepted so old jobs load, but no
-longer orders anything.
+contour-parallel offset passes, outside in. Every pass is climb milled with a
+clockwise spindle: cut outside in, the stock still to cut lies inward of each
+ring, so outer loops run clockwise and hole loops counter-clockwise, keeping it
+on the right of travel. The region of tool centres resting on a level is the
+level's shadow grown by the cutter radius minus the shadow of everything
+standing above it grown by the radius plus its stated errors, so near walls the
+tool stays a radius away. Its inward offsets 0, `stepover_mm`, 2 `stepover_mm`,
+... are the passes; after the last one, a core deeper than a radius is covered
+by half-step passes while it lasts, and where an offset pinches off in a corner
+between two boundaries of the region (the surviving ring stretches more than a
+diameter apart) a half-step pass is added too, so the disk covers every
+reachable flat point at stepovers up to the cutter diameter. Offset loops are
+cut as arcs (the offsets' cavalier bulges), an arc proven by its chords, each
+chord held to the same proof with radius r + sagitta, and emitted as arc blocks
+when every chord proves; when a chord fails, the arc's circumscribed polygon
+(tangent edges whose vertices stray at most 0.005 mm outside the arc) is tried
+next, each edge proven as a straight cut, before falling back to the chords; a
+chord that cannot be proven is halved down to a sixteenth of the loop, and what
+still fails is dropped into `dropped_length_mm`, the loop continuing as open
+pieces. A cut is kept only where the highest point of the part under the tool's
+swept disk is not above the cut (computed exactly per facet). Per connected
+component, nearest first, the passes are cut at growing offset depth (the
+outermost ring first); at the same depth outer boundary loops before hole
+loops, then nearest first, and each loop starts at its vertex nearest the tool.
+Kernel artefacts are not cut as moves of their own: a run of strokes on one
+circle (straight chords, or chords mixed with micro-arcs) is refitted as one
+arc, and a straight stub under 0.005 mm is absorbed into its straight
+neighbour. Consecutive pieces join into one chain by a straight link at the cut
+height and cutting feed when the link is at most two stepovers long, passes the
+same proof and lies inside the machine limits; otherwise the chain ends
+(retract, new entry). A chain is entered beside the level's face where the flat
+is open (side entry in air): the tool rapids over a point a quarter to two
+radii outside the chain's first loop, away from the region, where no stock
+stands within the disk above the cut, plunges vertically through air to the cut
+height and leads in at cutting feed. Where no such point exists it plunges
+vertically at the chain's start when no live stock stands above its height
+there (within `tolerance_mm`). Where stock does (roughing left it, or the stock
+was not cut there yet), the chain is entered by a ramp, and only if the
+operation declares `entry=RampEntry(angle_deg, ...)`: the tool plunges through
+air to the top of the live stock over the chain's first loop (the highest cell
+bound anywhere along it, not just at its start), then zigzags down along that
+loop at no more than the declared angle and at the entry's `feed_mm_min`
+(default the plunge feed); a zigzag that has to reverse needs the entry's
+`min_length_mm`. Every ramp point lies above the proven loop, so it clears the
+part like the loop does; the report counts ramped chains as `ramped_entries`.
+Nothing is plunged into stock on any path: a chain with stock above it and no
+declared entry, a ramp that does not fit (too short a loop, an angle too
+shallow for the loop, or stock above the feed height) is refused, naming the
+chain, its length and the stock above it. The `flat` benchmark runs on a blank
+roughed to 0.1 mm over the flats and declares a 3 degree entry. The report
+gives the levels, `loops` (closed offset loops planned), `rows` (loops cut,
+counting the open pieces a split loop leaves), `runs` (chains),
+`links_at_depth`, cut length, `runs_completed`, `ramped_entries`, and any
+length that could not be proven clear (`dropped_length_mm`). `axis` is still
+accepted so old jobs load, but no longer orders anything.
 
 ## Spiral, radial and project finishing: `Spiral`, `Radial`, `Project`
 
