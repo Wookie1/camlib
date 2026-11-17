@@ -2534,8 +2534,12 @@ impl LoopGroup {
 /// after the last non-empty offset `d`, while the region offset by
 /// `d + r - 16 tolerances` is still non-empty, the loops at `d + stepover/2`
 /// are added and the check repeats, so the disk covers every reachable point.
-/// Each loop keeps its arcs (cavalier contours' bulges); outer boundaries end
-/// up counter-clockwise and holes clockwise (climb with a clockwise spindle).
+/// With a stepover above the radius, an interval whose next offset pinched
+/// off (a corner between two boundaries of the region) also gets a ring at
+/// half the stepover, so the disk covers every reachable point there too
+/// (stepover up to the cutter diameter). Each loop keeps its arcs (cavalier
+/// contours' bulges); outer boundaries end up counter-clockwise and holes
+/// clockwise (climb with a clockwise spindle).
 fn level_loops(
     region: &crate::planar::PreparedRegion,
     r: f64,
@@ -2543,6 +2547,7 @@ fn level_loops(
     tolerance: f64,
     cancel: &impl CancelSignal,
 ) -> Result<Vec<LoopGroup>, String> {
+    use crate::planar::Boolean;
     let options = crate::planar::ConstructionOptions { tolerance_mm: tolerance };
     let guard = 16. * tolerance;
     let mut groups = vec![];
@@ -2584,20 +2589,73 @@ fn level_loops(
             Ok(())
         };
         let mut d = 0.;
-        loop {
+        let mut eroded = prepared
+            .offset_prepared(d)
+            .map_err(|e| format!("flat-area loop offset: {e}"))?
+            .into_parts()
+            .1;
+        while !eroded.definition().components.is_empty() {
             if cancel.is_cancelled() {
                 return Err("flat-area planning cancelled".into());
             }
-            let eroded = prepared
-                .offset_prepared(d)
+            collect(&eroded, d)?;
+            let next = prepared
+                .offset_prepared(d + stepover)
                 .map_err(|e| format!("flat-area loop offset: {e}"))?
                 .into_parts()
                 .1;
-            if eroded.definition().components.is_empty() {
-                break;
+            if stepover > r && !next.definition().components.is_empty() {
+                // With the stepover above the radius, points deeper than
+                // d + r but shallower than the next ring at d + stepover are
+                // covered by that ring from below only where its offset
+                // survives; where the offset pinched off (a corner between
+                // two boundaries of the region) the surviving ring stretches
+                // on either side can be more than 2r apart and such points
+                // are out of reach of every ring. They are exactly the band
+                // deeper than d + r - guard, outside the next offset, and
+                // farther than r from the next offset's area (the disk
+                // cannot reach them from there either): halve the gap with a
+                // ring at d + stepover/2, which lies at or below their depth
+                // (stepover <= 2r) and within stepover/2 <= r of them along
+                // their ray to the boundary. At a stepover at or below the
+                // radius no interval is deeper than d + r before the next
+                // ring, so this never fires.
+                let shallow = prepared
+                    .offset_prepared(d + r - guard)
+                    .map_err(|e| format!("flat-area loop offset: {e}"))?
+                    .into_parts()
+                    .1;
+                let band = shallow
+                    .boolean_prepared(&next, Boolean::Difference)
+                    .map_err(|e| format!("flat-area loop offset: {e}"))?
+                    .into_parts()
+                    .1;
+                if !band.definition().components.is_empty() {
+                    let reach = next
+                        .offset_prepared(-r)
+                        .map_err(|e| format!("flat-area loop offset: {e}"))?
+                        .into_parts()
+                        .1;
+                    let gap = band
+                        .boolean_prepared(&reach, Boolean::Difference)
+                        .map_err(|e| format!("flat-area loop offset: {e}"))?
+                        .into_parts()
+                        .1;
+                    if !gap.definition().components.is_empty() {
+                        let half = d + stepover / 2.;
+                        let mid = prepared
+                            .offset_prepared(half)
+                            .map_err(|e| format!("flat-area loop offset: {e}"))?
+                            .into_parts()
+                            .1;
+                        if !mid.definition().components.is_empty() {
+                            collect(&mid, half)?;
+                        }
+                    }
+                }
             }
-            collect(&eroded, d)?;
             d += stepover;
+            eroded = next;
         }
         let mut core = d - stepover;
         loop {
