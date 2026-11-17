@@ -362,7 +362,6 @@ class FlatOffsetTest(unittest.TestCase):
                     worst = max(worst, lowest - final[2 * (j * nx + i) + 1])
             self.assertLessEqual(worst, 1e-6, f"{name}: stock cut {worst:.4f} mm below the part")
 
-
     def test_no_moves_of_kernel_artefacts(self):
         # A kernel's flattened circle (chords mixed with micro-arcs) and its
         # snapped corner stubs are not cut as moves of their own: no cut,
