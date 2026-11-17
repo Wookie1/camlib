@@ -1970,10 +1970,16 @@ impl FlatPlan {
     /// plunge where no live stock stands above the pass's height there (the
     /// cells' upper bounds, within a tolerance) and the disk comes down beside
     /// the level's face, otherwise a ramp from the stock's top over the whole
-    /// pass, down the pass by the declared `RampEntry`. Each ramp point lies
-    /// vertically above the proven pass, so it clears the part as the pass
-    /// does. A pass the ramp does not fit, or stock above a pass with no entry
-    /// declared, is refused: a flat end mill is never plunged into stock.
+    /// pass, down the pass by the declared `RampEntry`. When the pass starts
+    /// over the level's face with no stock above (so the plain plunge is
+    /// refused) and the stock over the pass is that face's already-cut floor,
+    /// the ramp leaves from the cut height plus the depth the declared ramp
+    /// drops over its `min_length_mm` instead: the descent stops in air above
+    /// the face and the ramp comes down along the pass, never straight onto
+    /// the finished flat. Each ramp point lies vertically above the proven
+    /// pass, so it clears the part as the pass does. A pass the ramp does not
+    /// fit, or stock above a pass with no entry declared, is refused: a flat
+    /// end mill is never plunged into stock.
     fn plunge_or_ramp(
         &self,
         piece: &Piece,
@@ -2008,20 +2014,39 @@ impl FlatPlan {
                 "{which}: the run is shorter than 16 tolerances, too short to ramp on. Rough or rest-rough this area first"
             ));
         }
-        if top > self.heights.feed {
+        // Reaching here with no stock above the start means the start is over
+        // the level's face (the plain plunge above refused it for that). When
+        // the stock over the whole pass is that face's already-cut floor (the
+        // cells' upper bounds sit a tolerance above the cut height after a
+        // cut), a ramp from the stock top has no depth: the descent to it
+        // would end straight down on the finished face. The ramp then leaves
+        // from the cut height plus the depth the declared ramp drops over its
+        // `min_length_mm` — `min_length_mm * tan(angle)`, the drop of one leg
+        // at the declared angle over the shortest span the tool may ramp on
+        // (the whole pass when none is declared: a one-leg ramp reverses on
+        // no span) — and descends along the pass as for stock. The stock top
+        // wins when it is higher (real stock along the pass): the descent to
+        // it stops at or above every stock cell under the pass, in air.
+        let target = if at_start <= a[2] + self.op.tolerance_mm {
+            let span = entry.min_length_mm.unwrap_or(length);
+            (a[2] + span * entry.angle_rad.tan()).max(top)
+        } else {
+            top
+        };
+        if target > self.heights.feed {
             return Err(format!(
-                "{which}, above the feed height Z{:.3}: raise feed_z_mm/retract_z_mm or rough this area first",
+                "{which}, ramp start Z{target:.3} above the feed height Z{:.3}: raise feed_z_mm/retract_z_mm or rough this area first",
                 self.heights.feed
             ));
         }
         let chain = piece.strokes();
         let curves = entry
-            .zigzag(&chain, top, a[2])
+            .zigzag(&chain, target, a[2])
             .map_err(|why| format!("{which}: {why}. Use a steeper declared angle, a longer run, or rough this area first"))?;
-        // The curves run from the ramp's start (at the stock's top) to the
-        // pass's start; the vertical descent to the ramp's start happens in
-        // `next_motion_with_stock`.
-        Ok(Some((top, curves)))
+        // The curves run from the ramp's start (at the ramp's start height)
+        // to the pass's start; the vertical descent to the ramp's start
+        // happens in `next_motion_with_stock`.
+        Ok(Some((target, curves)))
     }
     /// Whether the disk at `p` comes down beside this chain's level's face: a
     /// radius (less the tolerance) outside the face region, so a vertical
@@ -2616,12 +2641,12 @@ fn level_loops(
         let mut collect = |eroded: &crate::planar::PreparedRegion, d: f64| -> Result<(), String> {
             let mut vertices = 0usize;
             for c in &eroded.definition().components {
-                let outer = boundary_strokes(&c.outer, true)?;
+                let outer = boundary_strokes(&c.outer, true, tolerance)?;
                 if !outer.is_empty() {
                     outers.push((d, outer));
                 }
                 for hole in &c.holes {
-                    let strokes = boundary_strokes(hole, false)?;
+                    let strokes = boundary_strokes(hole, false, tolerance)?;
                     if !strokes.is_empty() {
                         holes.push((d, strokes));
                     }
@@ -2732,10 +2757,14 @@ fn level_loops(
 /// contours' bulges, as `Stroke::from_boundary`), oriented counter-clockwise
 /// when `ccw` (outer boundaries) and clockwise otherwise (holes): climb
 /// milling with a clockwise spindle. Degenerate segments (zero length or zero
-/// sweep) carry no geometry and are dropped or straightened.
+/// sweep) carry no geometry and are dropped or straightened. Arcs a boolean
+/// or offset kernel flattened to a chord polygon are refitted from their
+/// chords (`refit_arcs`) so a ring along them is one proven move instead of
+/// one move per chord.
 fn boundary_strokes(
     boundary: &crate::planar::Boundary,
     ccw: bool,
+    tolerance: f64,
 ) -> Result<Vec<crate::pocket::Stroke>, String> {
     let n = boundary.vertices.len();
     if n < 2 {
@@ -2758,14 +2787,136 @@ fn boundary_strokes(
     // arcs' orientation).
     let mut pts: Vec<[f64; 2]> = segs.iter().map(|s| s.a).collect();
     pts.push(segs[0].a);
-    if (ccw && signed_area(&pts) < 0.) || (!ccw && signed_area(&pts) > 0.) {
-        return Ok(segs
-            .into_iter()
+    let flipped = (ccw && signed_area(&pts) < 0.) || (!ccw && signed_area(&pts) > 0.);
+    let segs = if flipped {
+        segs.into_iter()
             .rev()
             .map(crate::pocket::Stroke::reversed)
-            .collect());
+            .collect()
+    } else {
+        segs
+    };
+    Ok(refit_arcs(segs, tolerance / 4.))
+}
+
+/// Refit the arcs a boolean or offset kernel flattened to a chord polygon: a
+/// maximal run of straight strokes whose vertices share one circle (within
+/// `fit`) becomes one arc stroke again, so a ring along it is one proven move
+/// — or the circumscribed polygon of the arc — instead of one move per
+/// flattened chord. Only runs fully on the circle, with chords short against
+/// the radius, a steady one-sided turn and a sweep under a full circle are
+/// accepted; anything else stays chords, and every emitted piece is still
+/// proven against the part before it is cut.
+fn refit_arcs(segs: Vec<crate::pocket::Stroke>, fit: f64) -> Vec<crate::pocket::Stroke> {
+    const MIN_RUN: usize = 4;
+    if segs.len() < MIN_RUN {
+        return segs;
     }
-    Ok(segs)
+    let mut pts: Vec<[f64; 2]> = segs.iter().map(|s| s.a).collect();
+    pts.push(segs[segs.len() - 1].b);
+    let mut out: Vec<crate::pocket::Stroke> = Vec::with_capacity(segs.len());
+    let mut i = 0;
+    while i < segs.len() {
+        if segs[i].arc.is_some() {
+            out.push(segs[i]);
+            i += 1;
+            continue;
+        }
+        // The longest run of line strokes from `i` whose vertices share one
+        // circle: extend while the whole run still fits, and keep the last
+        // fit (it was checked against every vertex of the accepted run).
+        let mut j = i;
+        let mut fitted: Option<([f64; 2], f64)> = None;
+        while j + 1 < segs.len()
+            && segs[j + 1].arc.is_none()
+            && let Some(f) = fit_circle_run(&pts[i..=j + 2], fit)
+        {
+            fitted = Some(f);
+            j += 1;
+        }
+        if j - i + 1 >= MIN_RUN
+            && let Some((centre, sweep)) = fitted
+        {
+            out.push(crate::pocket::Stroke {
+                a: pts[i],
+                b: pts[j + 1],
+                arc: Some((centre, sweep)),
+            });
+            i = j + 1;
+            continue;
+        }
+        out.push(segs[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The circle through the first, middle and last of `pts`, when every point
+/// sits on it within `fit`, the chords are short against the radius, the turn
+/// is steady and one-sided and the sweep stays under a full circle: the
+/// centre and the signed sweep from the first to the last point.
+fn fit_circle_run(pts: &[[f64; 2]], fit: f64) -> Option<([f64; 2], f64)> {
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+    let (p, q, r) = (pts[0], pts[n / 2], pts[n - 1]);
+    let cross = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    let long = (q[0] - p[0]).hypot(q[1] - p[1]) * (r[0] - p[0]).hypot(r[1] - p[1]);
+    // Collinear to the same 1e-9 rad a merged straight stretch may keep.
+    if long <= 0. || cross.abs() <= 1e-9 * long {
+        return None;
+    }
+    let (p2, q2, r2) = (
+        p[0] * p[0] + p[1] * p[1],
+        q[0] * q[0] + q[1] * q[1],
+        r[0] * r[0] + r[1] * r[1],
+    );
+    let centre = [
+        (p2 * (q[1] - r[1]) + q2 * (r[1] - p[1]) + r2 * (p[1] - q[1])) / (2. * cross),
+        (p2 * (r[0] - q[0]) + q2 * (p[0] - r[0]) + r2 * (q[0] - p[0])) / (2. * cross),
+    ];
+    let radius = (p[0] - centre[0]).hypot(p[1] - centre[1]);
+    if !radius.is_finite() || !(1e-9..=1e6).contains(&radius) {
+        return None;
+    }
+    // Every vertex on the circle, every chord short against the radius.
+    for s in pts {
+        if ((s[0] - centre[0]).hypot(s[1] - centre[1]) - radius).abs() > fit {
+            return None;
+        }
+    }
+    for w in pts.windows(2) {
+        if (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]) > 0.1 * radius {
+            return None;
+        }
+    }
+    // A steady one-sided turn: no chord turns against the run's direction.
+    let mut side = 0i32;
+    for w in pts.windows(3) {
+        let t = (w[1][0] - w[0][0]) * (w[2][1] - w[1][1])
+            - (w[1][1] - w[0][1]) * (w[2][0] - w[1][0]);
+        let sign = t.signum() as i32;
+        if sign != 0 {
+            if side == 0 {
+                side = sign;
+            } else if side != sign {
+                return None;
+            }
+        }
+    }
+    // The signed sweep from the first to the last point around the centre.
+    let mut sweep = 0.;
+    let mut prev = [pts[0][0] - centre[0], pts[0][1] - centre[1]];
+    for &s in &pts[1..] {
+        let cur = [s[0] - centre[0], s[1] - centre[1]];
+        sweep += (prev[0] * cur[1] - prev[1] * cur[0]).atan2(prev[0] * cur[0] + prev[1] * cur[1]);
+        prev = cur;
+    }
+    if !sweep.is_finite() || sweep.abs() >= 2. * std::f64::consts::PI {
+        return None;
+    }
+    Some((centre, sweep))
 }
 
 /// Signed area of a closed polyline (the first point repeated at the end).
@@ -2832,6 +2983,7 @@ fn prove_ring(
     cancel: &impl CancelSignal,
 ) -> Result<Vec<Piece>, String> {
     let mut pieces: Vec<Piece> = vec![];
+
     // Append a segment, merging consecutive collinear chords of the same loop
     // (direction change below 1e-9 rad, both proven, one straight move): a
     // proven straight edge is not split into many chords.
@@ -2993,6 +3145,53 @@ fn prove_ring(
             // arc, every piece of it included.
             for sub in split_arc(seg, ARC_MOVE_SAGITTA) {
                 push(&mut pieces, sub, z);
+            }
+            continue;
+        }
+        // Before the chord fallback: the arc's circumscribed polygon. Its
+        // `sides + 1` edges are the tangents at start + k*sweep/sides
+        // (k = 0..sides), so the path runs a -> the intersections of
+        // consecutive tangents (at the mid angles, radius
+        // rho / cos(sweep/(2*sides))) -> b, touching the circle at the
+        // tangent points and ending on the arc's own endpoints. For an arc
+        // whose centre is on the obstacle side (a convex corner of the
+        // blocked region, as round the grown shadow of a boss standing
+        // above) every edge stays on or outside the circle, away from the
+        // centre, so the disk along an edge keeps at least the clearance the
+        // planned arc's own disk has, and the edge proves as a straight cut
+        // at radius r with no sagitta: the move IS the segment. The polygon
+        // strays from the planned ring at most
+        // rho * (1/cos(sweep/(2*sides)) - 1) at its vertices, held to
+        // `ARC_MOVE_SAGITTA` through `sides`. An edge that fails the proof
+        // (the centre on the region side, the polygon bulging toward the
+        // obstacle) sends the arc to the chords below.
+        let sides = {
+            let step = (rho / (rho + ARC_MOVE_SAGITTA)).acos().max(1e-9);
+            ((sweep.abs() / (2. * step)).ceil().max(1.) as usize).max(1)
+        };
+        let reach = rho / (sweep.abs() / (2. * sides as f64)).cos();
+        let mut points = Vec::with_capacity(sides + 2);
+        points.push(seg.a);
+        for k in 0..sides {
+            let mid = start + sweep * (k as f64 + 0.5) / sides as f64;
+            points.push([c[0] + reach * mid.cos(), c[1] + reach * mid.sin()]);
+        }
+        points.push(seg.b);
+        let mut circumscribed = true;
+        for pair in points.windows(2) {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            if index.max_height(pair[0], pair[1], r, seen, stamp) > z + tolerance
+                || !allows_segment(limits, pair[0], pair[1], z, tolerance)?
+            {
+                circumscribed = false;
+                break;
+            }
+        }
+        if circumscribed {
+            for pair in points.windows(2) {
+                push(&mut pieces, crate::pocket::Stroke::line(pair[0], pair[1]), z);
             }
             continue;
         }
