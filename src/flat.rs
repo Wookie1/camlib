@@ -29,6 +29,47 @@ fn level_tolerance() -> f64 {
     0.001
 }
 
+/// Emitted arc moves are split so each move's chord stays within this of the
+/// arc: the arc itself is exact, but moves are checked (and posted programs
+/// read) through their endpoints, so a move must not sweep so far that its
+/// chord cuts the corner its endpoints describe.
+const ARC_MOVE_SAGITTA: f64 = 0.005;
+
+/// The arc stroke split into equal sub-arcs whose chords stay within
+/// `sagitta` of the arc (a straight stroke passes through unchanged).
+fn split_arc(seg: &crate::pocket::Stroke, sagitta: f64) -> Vec<crate::pocket::Stroke> {
+    let Some((c, sweep)) = seg.arc else {
+        return vec![*seg];
+    };
+    let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+    let half = (1. - sagitta / rho).clamp(-1., 1.).acos().max(1e-9);
+    let n = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).max(1);
+    let start = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t0 = i as f64 / n as f64;
+        let t1 = (i + 1) as f64 / n as f64;
+        let p = if i == 0 {
+            seg.a
+        } else {
+            let angle = start + sweep * t0;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        };
+        let b = if i + 1 == n {
+            seg.b
+        } else {
+            let angle = start + sweep * t1;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        };
+        out.push(crate::pocket::Stroke {
+            a: p,
+            b,
+            arc: Some((c, sweep * (t1 - t0))),
+        });
+    }
+    out
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlatOperation<G = SurfaceMesh> {
@@ -1517,29 +1558,33 @@ impl Index {
     }
 }
 
-/// One cut pass at a fixed height: the flattened polyline of a closed loop
-/// (the last point repeats the first) or of the stretches of a loop that were
-/// proven and allowed (an open piece).
+/// One cut pass at a fixed height: the segments of a closed loop in travel
+/// order (an open piece when only stretches of the loop were proven and
+/// allowed). A segment is a straight chord or an arc of the offset loop
+/// (cavalier contours' bulge), proven as a whole or as its chords.
 struct Piece {
-    pts: Vec<Vec3>,
+    /// The pass's height; every segment runs at this Z.
+    z: f64,
+    segs: Vec<crate::pocket::Stroke>,
 }
 impl Piece {
     fn start(&self) -> Vec3 {
-        self.pts[0]
+        let a = self.segs[0].a;
+        [a[0], a[1], self.z]
     }
     fn end(&self) -> Vec3 {
-        self.pts[self.pts.len() - 1]
+        let b = self.segs[self.segs.len() - 1].b;
+        [b[0], b[1], self.z]
     }
     fn length(&self) -> f64 {
-        self.pts
-            .windows(2)
-            .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
-            .sum()
+        self.segs.iter().map(crate::profiles::stroke_length).sum()
     }
     fn strokes(&self) -> Vec<crate::pocket::Stroke> {
-        self.pts
-            .windows(2)
-            .map(|w| crate::pocket::Stroke::line([w[0][0], w[0][1]], [w[1][0], w[1][1]]))
+        // The ramp walks the pass stroke by stroke; its arcs are split like
+        // the cut moves so no ramp leg sweeps a chord that cuts its corner.
+        self.segs
+            .iter()
+            .flat_map(|s| split_arc(s, ARC_MOVE_SAGITTA))
             .collect()
     }
 }
@@ -1564,8 +1609,10 @@ enum Entry {
     Side { p: [f64; 2] },
     /// Vertical plunge at the pass's start.
     Plunge,
-    /// Ramp down the first pass from the stock's top over it.
-    Ramp { top: f64, points: Vec<Vec3> },
+    /// Ramp down the first pass from the stock's top over it: the zigzag's
+    /// curves (lines and arcs on the pass, helices where a leg descends
+    /// along an arc), ending at the pass's start.
+    Ramp { top: f64, curves: Vec<Curve> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1592,12 +1639,12 @@ pub struct FlatPlan {
     chains: Vec<Chain>,
     chain: usize,
     piece: usize,
-    vertex: usize,
+    seg: usize,
     phase: Phase,
     radius: f64,
     limits: Option<crate::limits::PreparedLimits>,
     entry: Option<Entry>,
-    ramp: std::collections::VecDeque<Vec3>,
+    ramp: std::collections::VecDeque<Curve>,
     initial: Vec3,
     position: Vec3,
     next_id: u64,
@@ -1896,7 +1943,7 @@ impl FlatPlan {
             chains,
             chain: 0,
             piece: 0,
-            vertex: 0,
+            seg: 0,
             phase: Phase::Lift,
             radius: r,
             limits: region_limits,
@@ -1926,7 +1973,7 @@ impl FlatPlan {
         piece: &Piece,
         stock: &Stock,
         cancel: &impl CancelSignal,
-    ) -> Result<Option<(f64, Vec<Vec3>)>, String> {
+    ) -> Result<Option<(f64, Vec<Curve>)>, String> {
         let a = piece.start();
         let at_start = stock.top_under_disk([a[0], a[1]], self.radius);
         if at_start <= a[2] + self.op.tolerance_mm && self.beside_face([a[0], a[1]])? {
@@ -1965,15 +2012,10 @@ impl FlatPlan {
         let curves = entry
             .zigzag(&chain, top, a[2])
             .map_err(|why| format!("{which}: {why}. Use a steeper declared angle, a longer run, or rough this area first"))?;
-        let mut points = vec![];
-        let first = curves.first().map_or([a[0], a[1]], |c| {
-            let q = c.start();
-            [q[0], q[1]]
-        });
-        // Over the pass at the stock's top, then down the legs.
-        points.push([first[0], first[1], top]);
-        points.extend(curves.iter().map(|c| c.end()));
-        Ok(Some((top, points)))
+        // The curves run from the ramp's start (at the stock's top) to the
+        // pass's start; the vertical descent to the ramp's start happens in
+        // `next_motion_with_stock`.
+        Ok(Some((top, curves)))
     }
     /// Whether the disk at `p` comes down beside this chain's level's face: a
     /// radius (less the tolerance) outside the face region, so a vertical
@@ -1994,13 +2036,14 @@ impl FlatPlan {
         let piece = &self.chains[self.chain].pieces[self.piece];
         let z = piece.start()[2];
         let tol = self.op.tolerance_mm;
-        let closed = piece.pts.first() == piece.pts.last();
+        let first = piece.segs[0].a;
+        let closed = piece.segs.last().is_some_and(|s| s.b == first);
         let mut best: Option<([f64; 2], [f64; 2])> = None;
         for (v, n) in &self.chains[self.chain].side {
             if cancel.is_cancelled() {
                 return Err("flat-area planning cancelled".into());
             }
-            if !closed && *v != [piece.pts[0][0], piece.pts[0][1]] {
+            if !closed && *v != first {
                 continue;
             }
             // Outward, trying the shortest offset first.
@@ -2032,7 +2075,7 @@ impl FlatPlan {
         }
         if let Some((v, p)) = best {
             // The loop is cut from the entry vertex.
-            if closed && (piece.pts[0][0] != v[0] || piece.pts[0][1] != v[1]) {
+            if closed && (first[0] != v[0] || first[1] != v[1]) {
                 let piece = &mut self.chains[self.chain].pieces[self.piece];
                 rotate_piece(piece, v);
             }
@@ -2041,9 +2084,9 @@ impl FlatPlan {
         let piece = &self.chains[self.chain].pieces[self.piece];
         match self.plunge_or_ramp(piece, stock, cancel)? {
             None => Ok(Entry::Plunge),
-            Some((top, points)) => {
+            Some((top, curves)) => {
                 self.report.ramped_entries += 1;
-                Ok(Entry::Ramp { top, points })
+                Ok(Entry::Ramp { top, curves })
             }
         }
     }
@@ -2105,7 +2148,9 @@ impl FlatPlan {
             }
             let p = self.position;
             let mut ramp_feed = None;
-            let (end, kind, next) = match self.phase {
+            // The move's curve: a straight line from the current position
+            // unless the phase carries one (a ramp leg or an arc of the pass).
+            let (end, kind, next, carried) = match self.phase {
                 Phase::Done => {
                     self.drained = true;
                     return Ok(None);
@@ -2118,26 +2163,32 @@ impl FlatPlan {
                     } else {
                         Phase::Approach
                     },
+                    None,
                 ),
                 Phase::Approach => {
                     // The entry is decided here, against the live stock: the
-                    // rapid goes over the plunge point (a side entry) or the
-                    // pass's start.
+                    // rapid goes over the plunge point (a side entry), the
+                    // ramp's start, or the pass's start.
                     let entry = self.decide_entry(stock, cancel)?;
                     let over = match &entry {
                         Entry::Side { p: over } => *over,
-                        _ => {
+                        Entry::Ramp { curves, .. } => {
+                            let f = curves[0].start();
+                            [f[0], f[1]]
+                        }
+                        Entry::Plunge => {
                             let a = self.chains[self.chain].pieces[self.piece].start();
                             [a[0], a[1]]
                         }
                     };
                     self.entry = Some(entry);
-                    ([over[0], over[1], p[2]], MoveKind::Rapid, Phase::Descend)
+                    ([over[0], over[1], p[2]], MoveKind::Rapid, Phase::Descend, None)
                 }
                 Phase::Descend => (
                     [p[0], p[1], self.heights.feed],
                     MoveKind::Rapid,
                     Phase::Enter,
+                    None,
                 ),
                 Phase::Enter => {
                     let a = self.chains[self.chain].pieces[self.piece].start();
@@ -2146,11 +2197,13 @@ impl FlatPlan {
                             [p[0], p[1], a[2]],
                             MoveKind::Plunge,
                             Phase::Lead,
+                            None,
                         ),
-                        Entry::Plunge => ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Cut),
-                        Entry::Ramp { top, points } => {
-                            self.ramp = points.into();
-                            // Down through air to the stock's top over the pass.
+                        Entry::Plunge => ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Cut, None),
+                        Entry::Ramp { top, curves } => {
+                            self.ramp = curves.into();
+                            // Down through air to the stock's top over the
+                            // pass, where the ramp's first curve begins.
                             (
                                 [p[0], p[1], top.min(p[2]).max(a[2])],
                                 MoveKind::Plunge,
@@ -2159,16 +2212,17 @@ impl FlatPlan {
                                 } else {
                                     Phase::Ramp
                                 },
+                                None,
                             )
                         }
                     }
                 }
                 Phase::Lead => {
                     let a = self.chains[self.chain].pieces[self.piece].start();
-                    ([a[0], a[1], a[2]], MoveKind::Lead, Phase::Cut)
+                    ([a[0], a[1], a[2]], MoveKind::Lead, Phase::Cut, None)
                 }
                 Phase::Ramp => {
-                    let end = self.ramp.pop_front().expect("ramp move");
+                    let curve = self.ramp.pop_front().expect("ramp move");
                     ramp_feed = Some(
                         self.op
                             .entry
@@ -2176,6 +2230,7 @@ impl FlatPlan {
                             .and_then(|e| e.feed_mm_min())
                             .unwrap_or(self.op.plunge_mm_min),
                     );
+                    let end = curve.end();
                     (
                         end,
                         MoveKind::Plunge,
@@ -2184,20 +2239,24 @@ impl FlatPlan {
                         } else {
                             Phase::Ramp
                         },
+                        Some(curve),
                     )
                 }
                 Phase::Cut => {
-                    let pts = &self.chains[self.chain].pieces[self.piece].pts;
-                    let end = pts[self.vertex + 1];
-                    self.vertex += 1;
+                    let piece = &self.chains[self.chain].pieces[self.piece];
+                    let seg = piece.segs[self.seg];
+                    let end = [seg.b[0], seg.b[1], piece.z];
+                    let curve = Some(seg.curve(piece.z));
+                    self.seg += 1;
                     (
                         end,
                         MoveKind::Cut,
-                        if self.vertex + 1 < pts.len() {
+                        if self.seg < piece.segs.len() {
                             Phase::Cut
                         } else {
                             Phase::PieceEnd
                         },
+                        curve,
                     )
                 }
                 Phase::PieceEnd => {
@@ -2205,20 +2264,21 @@ impl FlatPlan {
                         // A proven link at depth to the next pass.
                         let next = self.chains[self.chain].pieces[self.piece + 1].start();
                         self.piece += 1;
-                        self.vertex = 0;
-                        (next, MoveKind::Link, Phase::Cut)
+                        self.seg = 0;
+                        (next, MoveKind::Link, Phase::Cut, None)
                     } else {
                         (
                             [p[0], p[1], self.heights.feed.max(p[2])],
                             MoveKind::Retract,
                             Phase::Rise,
+                            None,
                         )
                     }
                 }
                 Phase::Rise => {
                     self.chain += 1;
                     self.piece = 0;
-                    self.vertex = 0;
+                    self.seg = 0;
                     self.report.runs_completed += 1;
                     let last = self.chain == self.chains.len();
                     let z = if last {
@@ -2230,6 +2290,7 @@ impl FlatPlan {
                         [p[0], p[1], z.max(p[2])],
                         MoveKind::Rapid,
                         if last { Phase::Done } else { Phase::Approach },
+                        None,
                     )
                 }
             };
@@ -2237,7 +2298,7 @@ impl FlatPlan {
             if end == p {
                 continue;
             }
-            let curve = Curve::Line { start: p, end };
+            let curve = carried.unwrap_or(Curve::Line { start: p, end });
             curve.prepare(self.op.tolerance_mm)?;
             let motion = Motion {
                 id: self.next_id,
@@ -2269,18 +2330,36 @@ fn piece_stock_top(
     r: f64,
     cancel: &impl CancelSignal,
 ) -> Result<f64, String> {
+    let [wx, wy] = stock.cell_widths_mm();
+    let step = 0.5 * wx.min(wy);
     let mut top = f64::MIN;
-    for w in piece.pts.windows(2) {
+    for seg in &piece.segs {
         if cancel.is_cancelled() {
             return Err("planning cancelled while reading the stock".into());
         }
-        top = top.max(segment_stock_top(
-            stock,
-            [w[0][0], w[0][1]],
-            [w[1][0], w[1][1]],
-            r,
-            cancel,
-        )?);
+        match seg.arc {
+            None => {
+                top = top.max(segment_stock_top(stock, seg.a, seg.b, r, cancel)?);
+            }
+            Some((c, sweep)) => {
+                // The disk the tool sweeps along a sub-arc is contained in the
+                // capsule of radius r + sagitta around its chord, so the stock
+                // is read over each chord with that wider radius.
+                let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+                let length = rho * sweep.abs();
+                let n = (length / step).ceil().max(1.) as usize;
+                let start = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]);
+                let mut a = seg.a;
+                for i in 1..=n {
+                    let angle = start + sweep * (i as f64 / n as f64);
+                    let b = [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()];
+                    let half = sweep.abs() / (2. * n as f64);
+                    let sagitta = rho * (1. - half.cos());
+                    top = top.max(segment_stock_top(stock, a, b, r + sagitta, cancel)?);
+                    a = b;
+                }
+            }
+        }
     }
     Ok(top)
 }
@@ -2411,29 +2490,29 @@ fn level_region(
 /// The offset loops of one connected component of a level's region: the
 /// outer-boundary loops and the hole loops, each with its inward offset.
 struct LoopGroup {
-    outers: Vec<(f64, Vec<[f64; 2]>)>,
-    holes: Vec<(f64, Vec<[f64; 2]>)>,
+    outers: Vec<(f64, Vec<crate::pocket::Stroke>)>,
+    holes: Vec<(f64, Vec<crate::pocket::Stroke>)>,
 }
 impl LoopGroup {
     fn distance(&self, p: [f64; 2]) -> f64 {
-        let nearest = |rings: &[(f64, Vec<[f64; 2]>)]| {
+        let nearest = |rings: &[(f64, Vec<crate::pocket::Stroke>)]| {
             rings
                 .iter()
                 .flat_map(|(_, ring)| ring.iter())
-                .map(|v| (v[0] - p[0]).hypot(v[1] - p[1]))
+                .map(|s| (s.a[0] - p[0]).hypot(s.a[1] - p[1]))
                 .fold(f64::INFINITY, f64::min)
         };
         nearest(&self.outers).min(nearest(&self.holes))
     }
     /// The rings in cut order: outer loops before hole loops, offset
     /// ascending (outside in), nearest the tool first at the same offset.
-    fn ordered(&self, tool: [f64; 2]) -> Vec<Vec<[f64; 2]>> {
-        let near = |ring: &[[f64; 2]]| {
+    fn ordered(&self, tool: [f64; 2]) -> Vec<Vec<crate::pocket::Stroke>> {
+        let near = |ring: &[crate::pocket::Stroke]| {
             ring.iter()
-                .map(|v| (v[0] - tool[0]).hypot(v[1] - tool[1]))
+                .map(|s| (s.a[0] - tool[0]).hypot(s.a[1] - tool[1]))
                 .fold(f64::INFINITY, f64::min)
         };
-        let sort = |rings: &[(f64, Vec<[f64; 2]>)]| -> Vec<Vec<[f64; 2]>> {
+        let sort = |rings: &[(f64, Vec<crate::pocket::Stroke>)]| -> Vec<Vec<crate::pocket::Stroke>> {
             let mut order: Vec<usize> = (0..rings.len()).collect();
             order.sort_by(|&a, &b| {
                 rings[a]
@@ -2455,9 +2534,8 @@ impl LoopGroup {
 /// after the last non-empty offset `d`, while the region offset by
 /// `d + r - 16 tolerances` is still non-empty, the loops at `d + stepover/2`
 /// are added and the check repeats, so the disk covers every reachable point.
-/// Arcs are flattened to chords with sagitta at most `tolerance`; outer
-/// boundaries end up counter-clockwise and holes clockwise (climb with a
-/// clockwise spindle).
+/// Each loop keeps its arcs (cavalier contours' bulges); outer boundaries end
+/// up counter-clockwise and holes clockwise (climb with a clockwise spindle).
 fn level_loops(
     region: &crate::planar::PreparedRegion,
     r: f64,
@@ -2483,16 +2561,22 @@ fn level_loops(
         let prepared = single
             .prepare(options)
             .map_err(|e| format!("flat-area loop region: {e}"))?;
-        let mut outers: Vec<(f64, Vec<[f64; 2]>)> = vec![];
-        let mut holes: Vec<(f64, Vec<[f64; 2]>)> = vec![];
+        let mut outers: Vec<(f64, Vec<crate::pocket::Stroke>)> = vec![];
+        let mut holes: Vec<(f64, Vec<crate::pocket::Stroke>)> = vec![];
         let mut collect = |eroded: &crate::planar::PreparedRegion,
                            d: f64|
          -> Result<(), String> {
             let mut vertices = 0usize;
             for c in &eroded.definition().components {
-                outers.push((d, flatten_boundary(&c.outer, tolerance, true)?));
+                let outer = boundary_strokes(&c.outer, true)?;
+                if !outer.is_empty() {
+                    outers.push((d, outer));
+                }
                 for hole in &c.holes {
-                    holes.push((d, flatten_boundary(hole, tolerance, false)?));
+                    let strokes = boundary_strokes(hole, false)?;
+                    if !strokes.is_empty() {
+                        holes.push((d, strokes));
+                    }
                 }
                 vertices += c.outer.vertices.len() + c.holes.iter().map(|h| h.vertices.len()).sum::<usize>();
             }
@@ -2542,48 +2626,40 @@ fn level_loops(
     Ok(groups)
 }
 
-/// The flattened closed polyline of a boundary: arcs as chords with sagitta
-/// at most `tolerance`, the first point repeated at the end, oriented
-/// counter-clockwise when `ccw` (outer boundaries) and clockwise otherwise
-/// (holes): climb milling with a clockwise spindle.
-fn flatten_boundary(
+/// The closed segment loop of a boundary: straight chords and arcs (cavalier
+/// contours' bulges, as `Stroke::from_boundary`), oriented counter-clockwise
+/// when `ccw` (outer boundaries) and clockwise otherwise (holes): climb
+/// milling with a clockwise spindle. Degenerate segments (zero length or zero
+/// sweep) carry no geometry and are dropped or straightened.
+fn boundary_strokes(
     boundary: &crate::planar::Boundary,
-    tolerance: f64,
     ccw: bool,
-) -> Result<Vec<[f64; 2]>, String> {
+) -> Result<Vec<crate::pocket::Stroke>, String> {
     let n = boundary.vertices.len();
     if n < 2 {
         return Err("flat-area loop boundary needs at least two vertices".into());
     }
-    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(n + 1);
-    for (i, a) in boundary.vertices.iter().enumerate() {
-        let end = boundary.vertices[(i + 1) % n];
-        pts.push([a[0], a[1]]);
-        if a[2] != 0. {
-            // The arc's centre and signed sweep, as `Stroke::from_boundary`.
-            let sweep = 4. * a[2].atan();
-            let factor = (1. - a[2] * a[2]) / (4. * a[2]);
-            let center = [
-                (a[0] + end[0]) / 2. - factor * (end[1] - a[1]),
-                (a[1] + end[1]) / 2. + factor * (end[0] - a[0]),
-            ];
-            let radius = (a[0] - center[0]).hypot(a[1] - center[1]);
-            let start = (a[1] - center[1]).atan2(a[0] - center[0]);
-            // sagitta = radius * (1 - cos(step / 2)) <= tolerance
-            let half = (1. - tolerance / radius).clamp(-1., 1.).acos().max(1e-9);
-            let count = (sweep.abs() / (2. * half)).ceil().max(1.) as usize;
-            for k in 1..count {
-                let t = k as f64 / count as f64;
-                let angle = start + sweep * t;
-                pts.push([center[0] + radius * angle.cos(), center[1] + radius * angle.sin()]);
+    let segs: Vec<crate::pocket::Stroke> = crate::pocket::Stroke::from_boundary(boundary)
+        .into_iter()
+        .filter(|s| (s.b[0] - s.a[0]).hypot(s.b[1] - s.a[1]) > 1e-12)
+        .map(|mut s| {
+            if s.arc.is_some_and(|(_, sweep)| sweep.abs() < 1e-9) {
+                s.arc = None;
             }
-        }
+            s
+        })
+        .collect();
+    if segs.len() < 2 {
+        return Ok(vec![]);
     }
-    pts.push(pts[0]);
+    // Orientation from the closed chord polygon (an inscribed polygon has the
+    // arcs' orientation).
+    let mut pts: Vec<[f64; 2]> = segs.iter().map(|s| s.a).collect();
+    pts.push(segs[0].a);
     if (ccw && signed_area(&pts) < 0.) || (!ccw && signed_area(&pts) > 0.) {
-        pts.reverse();
+        return Ok(segs.into_iter().rev().map(crate::pocket::Stroke::reversed).collect());
     }
-    Ok(pts)
+    Ok(segs)
 }
 
 /// Signed area of a closed polyline (the first point repeated at the end).
@@ -2597,26 +2673,26 @@ fn signed_area(pts: &[[f64; 2]]) -> f64 {
 
 /// Rotate a closed piece (the last point repeating the first) so it starts at
 /// the vertex `v` (one of its own points) and ends there too.
+/// Rotate a closed piece (its last segment ending on the first's start) so it
+/// starts at the vertex `v`.
 fn rotate_piece(piece: &mut Piece, v: [f64; 2]) {
-    let Some(i) = piece.pts.iter().position(|p| [p[0], p[1]] == v) else {
+    let Some(i) = piece.segs.iter().position(|s| s.a == v) else {
         return;
     };
-    let last = piece.pts.len() - 1;
-    let mut rotated: Vec<Vec3> = piece.pts[i..last].to_vec();
-    rotated.extend_from_slice(&piece.pts[..=i]);
-    piece.pts = rotated;
+    let mut rotated: Vec<crate::pocket::Stroke> = piece.segs[i..].to_vec();
+    rotated.extend_from_slice(&piece.segs[..i]);
+    piece.segs = rotated;
 }
 
-/// Rotate a closed ring (the last point repeating the first) so it starts at
-/// the vertex nearest `tool` and ends there too.
-fn rotate_to_nearest(mut ring: Vec<[f64; 2]>, tool: [f64; 2]) -> Vec<[f64; 2]> {
-    if ring.first() != ring.last() || ring.len() < 3 {
+/// Rotate a closed ring of segments (the last ending on the first's start) so
+/// it starts at the vertex nearest `tool` and ends there too.
+fn rotate_to_nearest(ring: Vec<crate::pocket::Stroke>, tool: [f64; 2]) -> Vec<crate::pocket::Stroke> {
+    if ring.len() < 2 {
         return ring;
     }
-    let last = ring.len() - 1;
     let (mut best, mut index) = (f64::INFINITY, 0usize);
-    for (i, v) in ring[..last].iter().enumerate() {
-        let d = (v[0] - tool[0]).hypot(v[1] - tool[1]);
+    for (i, s) in ring.iter().enumerate() {
+        let d = (s.a[0] - tool[0]).hypot(s.a[1] - tool[1]);
         if d < best {
             (best, index) = (d, i);
         }
@@ -2624,9 +2700,8 @@ fn rotate_to_nearest(mut ring: Vec<[f64; 2]>, tool: [f64; 2]) -> Vec<[f64; 2]> {
     if index == 0 {
         return ring;
     }
-    let mut rotated: Vec<[f64; 2]> = ring[index..last].to_vec();
-    rotated.extend_from_slice(&ring[..=index]);
-    ring.clear();
+    let mut rotated: Vec<crate::pocket::Stroke> = ring[index..].to_vec();
+    rotated.extend_from_slice(&ring[..index]);
     rotated
 }
 
@@ -2637,7 +2712,7 @@ fn rotate_to_nearest(mut ring: Vec<[f64; 2]>, tool: [f64; 2]) -> Vec<[f64; 2]> {
 /// dropped, splitting the loop into open pieces.
 #[allow(clippy::too_many_arguments)]
 fn prove_ring(
-    ring: &[[f64; 2]],
+    ring: &[crate::pocket::Stroke],
     z: f64,
     r: f64,
     index: &Index,
@@ -2650,31 +2725,61 @@ fn prove_ring(
     cancel: &impl CancelSignal,
 ) -> Result<Vec<Piece>, String> {
     let mut pieces: Vec<Piece> = vec![];
-    fn push(pieces: &mut Vec<Piece>, a: [f64; 2], b: [f64; 2], z: f64) {
+    // Append a segment, merging consecutive collinear chords of the same loop
+    // (direction change below 1e-9 rad, both proven, one straight move): a
+    // proven straight edge is not split into many chords.
+    fn push(pieces: &mut Vec<Piece>, seg: crate::pocket::Stroke, z: f64) {
         if let Some(last) = pieces.last_mut()
-            && last.pts.last().is_some_and(|p| [p[0], p[1]] == a)
+            && last.z == z
+            && last.segs.last().is_some_and(|s| s.b == seg.a)
         {
-            last.pts.push([b[0], b[1], z]);
+            let l = last.segs.last_mut().unwrap();
+            if l.arc.is_none() && seg.arc.is_none() {
+                let d0 = [l.b[0] - l.a[0], l.b[1] - l.a[1]];
+                let d1 = [seg.b[0] - seg.a[0], seg.b[1] - seg.a[1]];
+                let (l0, l1) = (d0[0].hypot(d0[1]), d1[0].hypot(d1[1]));
+                if l0 > 0.
+                    && l1 > 0.
+                    && (d0[0] * d1[1] - d0[1] * d1[0]).abs() <= 1e-9 * l0 * l1
+                    && d0[0] * d1[0] + d0[1] * d1[1] > 0.
+                {
+                    l.b = seg.b;
+                    return;
+                }
+            }
+            last.segs.push(seg);
             return;
         }
-        pieces.push(Piece {
-            pts: vec![[a[0], a[1], z], [b[0], b[1], z]],
-        });
+        pieces.push(Piece { z, segs: vec![seg] });
     }
-    for w in ring.windows(2) {
-        if cancel.is_cancelled() {
-            return Err("flat-area planning cancelled".into());
-        }
-        let (a, b) = ([w[0][0], w[0][1]], [w[1][0], w[1][1]]);
+    // Prove the straight stretch from `a` to `b` with the capsule radius `rc`:
+    // kept where the highest part point under the capsule is not above the cut
+    // height plus the tolerance (split by the limits into kept spans), halved
+    // down to h / 16 otherwise, what cannot be proven dropped.
+    fn prove_line(
+        pieces: &mut Vec<Piece>,
+        index: &Index,
+        seen: &mut [u32],
+        stamp: &mut u32,
+        a: [f64; 2],
+        b: [f64; 2],
+        rc: f64,
+        z: f64,
+        h: f64,
+        tolerance: f64,
+        limits: Option<&crate::limits::PreparedLimits>,
+        dropped: &mut f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<(), String> {
         let mut stack = vec![(a, b, 0u32)];
         while let Some((a, b, depth)) = stack.pop() {
             if cancel.is_cancelled() {
                 return Err("flat-area planning cancelled".into());
             }
             let length = (b[0] - a[0]).hypot(b[1] - a[1]);
-            if index.max_height(a, b, r, seen, stamp) <= z + tolerance {
+            if index.max_height(a, b, rc, seen, stamp) <= z + tolerance {
                 match limits {
-                    None => push(&mut pieces, a, b, z),
+                    None => push(pieces, crate::pocket::Stroke::line(a, b), z),
                     Some(limits) => {
                         // Only the stretches proven inside the limits.
                         let line = crate::motion::Curve::Line {
@@ -2686,7 +2791,7 @@ fn prove_ring(
                             let p = [a[0] + t0 * (b[0] - a[0]), a[1] + t0 * (b[1] - a[1])];
                             let q = [a[0] + t1 * (b[0] - a[0]), a[1] + t1 * (b[1] - a[1])];
                             if (q[0] - p[0]).hypot(q[1] - p[1]) > tolerance {
-                                push(&mut pieces, p, q, z);
+                                push(pieces, crate::pocket::Stroke::line(p, q), z);
                                 kept += (t1 - t0) * length;
                             }
                         }
@@ -2703,28 +2808,110 @@ fn prove_ring(
             stack.push((m, b, depth + 1));
             stack.push((a, m, depth + 1));
         }
+        Ok(())
+    }
+    for seg in ring {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let Some((c, sweep)) = seg.arc else {
+            prove_line(
+                &mut pieces, index, seen, stamp, seg.a, seg.b, r, z, h, tolerance, limits,
+                dropped, cancel,
+            )?;
+            continue;
+        };
+        // An arc of the offset loop: covered by its chords (sagitta at most
+        // the tolerance, refined while chords fail), each proven with the
+        // capsule of radius r + sagitta, which contains the arc's swept disk.
+        // Every chord proven, the arc is one move; otherwise the proven
+        // chords stand in for it.
+        let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+        let start = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]);
+        // Chords no shorter than the halving floor, so the refinement (and the
+        // fallback's chords) stay above what a straight chord could prove.
+        let count_cap =
+            ((sweep.abs() * rho / (h / 16.)).ceil() as usize).max(1).next_power_of_two();
+        let mut count = {
+            let half = (1. - tolerance / rho).clamp(-1., 1.).acos().max(1e-9);
+            ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(count_cap)
+        };
+        let chord = |i: usize, count: usize| {
+            let t0 = i as f64 / count as f64;
+            let t1 = (i + 1) as f64 / count as f64;
+            let p = [
+                c[0] + rho * (start + sweep * t0).cos(),
+                c[1] + rho * (start + sweep * t0).sin(),
+            ];
+            let q = [
+                c[0] + rho * (start + sweep * t1).cos(),
+                c[1] + rho * (start + sweep * t1).sin(),
+            ];
+            let sagitta = rho * (1. - (sweep.abs() / (2. * count as f64)).cos());
+            (p, q, sagitta)
+        };
+        let mut proven = false;
+        while count <= count_cap {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let all_clear = (0..count).all(|i| {
+                let (p, q, sagitta) = chord(i, count);
+                index.max_height(p, q, r + sagitta, seen, stamp) <= z + tolerance
+            });
+            if all_clear {
+                proven = true;
+                break;
+            }
+            count *= 2;
+        }
+        // The whole arc must also sit inside the limits; otherwise its chords
+        // are checked against them one by one below.
+        let allowed = limits.map_or(Ok(true), |l| {
+            l.allows_curve(&seg.curve(z), true)
+        })?;
+        if proven && allowed {
+            // One proven arc piece, split so every move's chord stays within
+            // `ARC_MOVE_SAGITTA` of the arc; the proof above covers the whole
+            // arc, every piece of it included.
+            for sub in split_arc(seg, ARC_MOVE_SAGITTA) {
+                push(&mut pieces, sub, z);
+            }
+            continue;
+        }
+        // The arc's chords at the tolerance's sagitta, each proven with the
+        // arc's capsule radius; failures are halved like straight chords.
+        let half = (1. - tolerance / rho).clamp(-1., 1.).acos().max(1e-9);
+        let count = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(count_cap);
+        let sagitta = rho * (1. - (sweep.abs() / (2. * count as f64)).cos());
+        for i in 0..count {
+            let (p, q, _) = chord(i, count);
+            prove_line(
+                &mut pieces, index, seen, stamp, p, q, r + sagitta, z, h, tolerance, limits,
+                dropped, cancel,
+            )?;
+        }
     }
     Ok(pieces)
 }
 
-/// Side-entry candidates of a piece: its vertices, at most one per 1 mm of
-/// the piece, each with the outward normal (right of travel: away from the
+/// Side-entry candidates of a piece: its segment starts, at most one per 1 mm
+/// of the piece, each with the outward normal (right of travel: away from the
 /// region on a counter-clockwise outer loop, into the hole on a clockwise
-/// hole loop).
+/// hole loop). On an arc the tangent at its start stands in for the chord.
 fn side_candidates(piece: &Piece) -> Vec<([f64; 2], [f64; 2])> {
     let mut side = vec![];
     let mut taken: Option<[f64; 2]> = None;
-    for w in piece.pts.windows(2) {
-        let v = [w[0][0], w[0][1]];
+    for seg in &piece.segs {
+        let v = seg.a;
         if taken.is_some_and(|p| (v[0] - p[0]).hypot(v[1] - p[1]) < 1.) {
             continue;
         }
-        let d = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
-        let n = d[0].hypot(d[1]);
-        if n <= 0. {
+        let d = seg.tangent(false);
+        if !(d[0]).is_finite() || d[0].hypot(d[1]) <= 0. {
             continue;
         }
-        side.push((v, [d[1] / n, -d[0] / n]));
+        side.push((v, [d[1], -d[0]]));
         taken = Some(v);
     }
     side
