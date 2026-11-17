@@ -52,6 +52,19 @@ def bore(radius, bar_tool):
 
 
 class CodeTest(unittest.TestCase):
+    def test_round_diameter_range_changes_the_cutting_radius(self):
+        insert = camlib.TurningInsert.iso_code("RCMT10T3M0", approach_angle_deg=95)
+        t = tool(
+            "round",
+            insert,
+            nose_radius_mm=insert.nose_radius_mm,
+            width_mm=20,
+            length_mm=100,
+            insert_size_tolerance_mm=(0.02, 0),
+        )
+        with self.assertRaisesRegex(ValueError, "round insert.*cutting nose radius"):
+            t.validate()
+
     def test_the_class_gives_the_tolerance(self):
         for code, expected in (
             ("CNMG120408", (0.08, 0.13)),  # class M, 12.7 mm (table 4)
