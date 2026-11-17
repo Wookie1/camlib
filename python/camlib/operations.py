@@ -2616,6 +2616,10 @@ class TrochoidalSlot:
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
     path_mm: tuple | None = field(default=None, kw_only=True)
+    # Feed (mm/min) on the part of each controlled orbit proven to run inside
+    # the disk the previous orbit cleared at the same depth. None: whole
+    # orbits at feed_mm_min (today's output, unchanged).
+    air_feed_mm_min: float | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.path_mm is not None:
@@ -2632,7 +2636,7 @@ class TrochoidalSlot:
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
         result.update(kind="trochoidal_slot", tool=getattr(self.tool, "id", self.tool))
-        for key in ('retract_z_mm', 'feed_z_mm', 'start_mm', 'end_mm', 'path_mm'):
+        for key in ('retract_z_mm', 'feed_z_mm', 'start_mm', 'end_mm', 'path_mm', 'air_feed_mm_min'):
             if result[key] is None:
                 result.pop(key)
         if "path_mm" in result:

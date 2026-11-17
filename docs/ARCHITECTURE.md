@@ -209,6 +209,13 @@ refuses a mark over a cell that is or may be cut through, or beyond the
 sheet, so a mark after the cut around it fails in the planned run and in the
 replay of the decoded program.
 
+A flat cutter's `MoveKind::Air` also removes nothing. It retains its role through
+posting and decoding. Before accepting it, native stock replay proves the whole
+horizontal cutter sweep inside previously committed clearance, using the decoded
+curves for posted output. Touching an already cut flat floor is allowed; XY path
+errors remain part of the containment proof. Missing proof or exhausted proof
+work refuses the move, independent of optional verification settings.
+
 ## Verification
 
 - **Per move** (`src/stream_verification.rs`, records of kind 8): scene bodies

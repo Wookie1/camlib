@@ -316,6 +316,34 @@ pub(crate) fn contains(
     work: &mut u64,
     cancel: &impl CancelSignal,
 ) -> Result<bool, String> {
+    contains_impl(supports, section, stock, work, cancel, false)
+}
+
+/// No *new removal* by a flat cutter at a constant declared Z. Unlike assembly
+/// clearance, touching the previously cut floor is allowed: horizontal lines
+/// and XY arcs have exact constant Z; their endpoint/radius error is in XY only.
+/// The XY sweep is still expanded/shrunk by both curves' full errors.
+pub(crate) fn contains_flat_cut(
+    supports: &[&ClearedSweep],
+    section: Section<'_>,
+    stock: [Point; 2],
+    work: &mut u64,
+    cancel: &impl CancelSignal,
+) -> Result<bool, String> {
+    if !super::flat(section.curve) {
+        return Ok(false);
+    }
+    contains_impl(supports, section, stock, work, cancel, true)
+}
+
+fn contains_impl(
+    supports: &[&ClearedSweep],
+    section: Section<'_>,
+    stock: [Point; 2],
+    work: &mut u64,
+    cancel: &impl CancelSignal,
+    flat_cut: bool,
+) -> Result<bool, String> {
     let Section {
         curve,
         radius,
@@ -334,7 +362,7 @@ pub(crate) fn contains(
     let eligible: Vec<&ClearedSweep> = supports
         .iter()
         .copied()
-        .filter(|s| bottom >= s.floor + s.error)
+        .filter(|s| bottom >= if flat_cut { s.floor } else { s.floor + s.error })
         .collect();
     if eligible.iter().any(|s| s.repeats(curve, radius, bottom)) {
         return Ok(true);

@@ -965,6 +965,18 @@ impl Stock {
         work: &mut u64,
         cancel: &impl CancelSignal,
     ) -> Result<bool, String> {
+        self.history_clearance_impl(motion, radius, height, work, cancel, false)
+    }
+
+    fn history_clearance_impl(
+        &self,
+        motion: &Motion,
+        radius: f64,
+        height: f64,
+        work: &mut u64,
+        cancel: &impl CancelSignal,
+        flat_cut: bool,
+    ) -> Result<bool, String> {
         cancelled(cancel)?;
         if self.heightfield_unproven || self.committed_columns.count == 0 {
             return Ok(false);
@@ -1010,7 +1022,7 @@ impl Stock {
                 min_clear_from,
                 ..
             } = node.reach();
-            if min_clear_from > bottom
+            if (!flat_cut && min_clear_from > bottom)
                 || (0..2).any(|k| bounds[0][k] > hi[k] + pad || bounds[1][k] < lo[k] - pad)
             {
                 continue;
@@ -1023,7 +1035,12 @@ impl Stock {
                 }
             }
         }
-        crate::engagement::cover::contains(
+        let contains = if flat_cut {
+            crate::engagement::cover::contains_flat_cut
+        } else {
+            crate::engagement::cover::contains
+        };
+        contains(
             &sweeps,
             crate::engagement::cover::Section {
                 curve: &motion.curve,
@@ -1404,6 +1421,7 @@ impl Stock {
         }
         let path = motion.curve.prepare(options.tolerance_mm)?;
         motion.validate_feed(None)?;
+        self.require_air_clearance(tool, motion, options, cancel)?;
         let mut stats = ReplayClearanceStats::default();
         let mut column = None;
         let mut undercut = false;
@@ -1569,6 +1587,9 @@ impl Stock {
         }
         let prepared = motion.curve.prepare(options.tolerance_mm)?;
         motion.validate_feed(None)?;
+        if fraction > 0. {
+            self.require_air_clearance(tool, motion, options, cancel)?;
+        }
         let mut delta = StockDelta {
             spec: self.spec.clone(),
             base_generation: self.generation,
@@ -1592,7 +1613,7 @@ impl Stock {
                 })
             }),
         };
-        // Rapids, oriented shifts, probing moves and a beam's marking moves
+        // Rapids, oriented shifts, proven air, probing and beam marking moves
         // never remove stock.
         if fraction == 0. || !motion.kind.cuts() {
             if motion.kind == MoveKind::Mark && fraction > 0. {
@@ -1946,6 +1967,37 @@ impl Stock {
         Ok(delta)
     }
 
+    /// Air intent is mandatory, independent of optional stock-contact findings.
+    /// Only native, committed flat-cutter columns can authorize the next sweep.
+    pub(crate) fn require_air_clearance(
+        &self,
+        tool: &PreparedAssembly,
+        motion: &Motion,
+        options: SweepOptions,
+        cancel: &impl CancelSignal,
+    ) -> Result<(), String> {
+        if motion.kind != MoveKind::Air {
+            return Ok(());
+        }
+        let mut work = options.max_cell_visits;
+        if !matches!(tool.cutter().definition().shape, CutterShape::Flat)
+            || !self.history_clearance_impl(
+                motion,
+                tool.cutter().definition().diameter_mm / 2.,
+                0.,
+                &mut work,
+                cancel,
+                true,
+            )?
+        {
+            return Err(format!(
+                "air motion {} is not proven inside committed cutter clearance; increase output precision or disable air_feed_mm_min",
+                motion.id
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether the whole footprint of cell `index` is cleared from height `z`
     /// up by this flat constant-height move (`axis`, `radius`, `error`)
     /// together with committed cleared passes of the same operation at or
@@ -2096,7 +2148,7 @@ impl Stock {
                 })
             }),
         };
-        if records && fraction == 1. && !motion.kind.is_rapid() {
+        if records && fraction == 1. && !motion.kind.is_rapid() && motion.kind != MoveKind::Air {
             delta.axial_column = AxialColumn::from_motion(tool, motion, self.spec.max_mm[2]);
             delta.departure = Some((motion.tool.clone(), motion.curve.end()));
             if analytic {

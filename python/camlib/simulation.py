@@ -57,6 +57,7 @@ _MOVE_KINDS = (
     "probe_touch",
     "probe_return",
     "mark",
+    "air",
 )
 
 

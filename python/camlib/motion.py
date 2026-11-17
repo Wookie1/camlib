@@ -53,7 +53,10 @@ class Motion:
     spindle stopped at its oriented angle (fine boring, after
     :class:`SpindleOrient`). ``kind='mark'`` is a beam tool's marking move
     (after :class:`BeamMark`): a line or XY arc at one height that removes no
-    stock, over sheet that is still whole. Other roles require a positive feed.
+    stock, over sheet that is still whole. ``kind='air'`` is a fed flat-cutter
+    line or XY arc at constant Z: native and posted stock replay must prove
+    that its entire sweep removes no new material before accepting it.
+    Other roles require a positive feed.
     """
 
     id: int
