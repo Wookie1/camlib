@@ -2640,14 +2640,27 @@ fn level_loops(
         let mut holes: Vec<(f64, Vec<crate::pocket::Stroke>)> = vec![];
         let mut collect = |eroded: &crate::planar::PreparedRegion, d: f64| -> Result<(), String> {
             let mut vertices = 0usize;
+            // A loop the kernel vouches no geometry for is not cut: shorter
+            // than the guard (16 tolerances), or — the offset kernel
+            // quantizes vertices to its construction grid (32 tolerances per
+            // coordinate), so an offset that pinches to a point comes back as
+            // a square of side 4 * guard, 16 times the guard — every extent
+            // of the loop fits inside the kernel's own stated boundary error
+            // for this offset (8.027e-4 mm against the square's 6.4e-4 on the
+            // stepped test part's boss top at d = 6). Such a loop is the
+            // kernel's representation of a point or line, not a feature. Its
+            // points lie at depth d, within the stepover (at most the radius)
+            // of the ring at d - stepover along their ray to the boundary, so
+            // the disk covers them from that ring.
+            let error = eroded.definition().boundary_error_mm;
             for c in &eroded.definition().components {
                 let outer = boundary_strokes(&c.outer, true, tolerance)?;
-                if !outer.is_empty() {
+                if !outer.is_empty() && !degenerate_loop(&outer, guard, error) {
                     outers.push((d, outer));
                 }
                 for hole in &c.holes {
                     let strokes = boundary_strokes(hole, false, tolerance)?;
-                    if !strokes.is_empty() {
+                    if !strokes.is_empty() && !degenerate_loop(&strokes, guard, error) {
                         holes.push((d, strokes));
                     }
                 }
@@ -2751,6 +2764,48 @@ fn level_loops(
         groups.push(LoopGroup { outers, holes });
     }
     Ok(groups)
+}
+
+/// Whether a loop carries no geometry the kernel vouches for: its total
+/// length is below `guard` (16 tolerances), or every extent of the loop fits
+/// inside `error`, the kernel's own stated boundary error for the
+/// construction (see `collect` in `level_loops`). Extents cover the stroke
+/// endpoints and, for arcs, the cardinal directions the sweep crosses — an
+/// arc bulges past its endpoints' bounding box.
+fn degenerate_loop(strokes: &[crate::pocket::Stroke], guard: f64, error: f64) -> bool {
+    let mut total = 0.;
+    let mut min = [f64::INFINITY; 2];
+    let mut max = [f64::NEG_INFINITY; 2];
+    for s in strokes {
+        total += crate::profiles::stroke_length(s);
+        for p in [s.a, s.b] {
+            for k in 0..2 {
+                min[k] = min[k].min(p[k]);
+                max[k] = max[k].max(p[k]);
+            }
+        }
+        if let Some((c, sweep)) = s.arc {
+            let rho = (s.a[0] - c[0]).hypot(s.a[1] - c[1]);
+            let start = (s.a[1] - c[1]).atan2(s.a[0] - c[0]);
+            let tau = 2. * std::f64::consts::PI;
+            for k in 0..4 {
+                let angle = k as f64 * std::f64::consts::FRAC_PI_2;
+                let forward = if sweep >= 0. {
+                    (angle - start).rem_euclid(tau)
+                } else {
+                    (start - angle).rem_euclid(tau)
+                };
+                if forward <= sweep.abs() {
+                    let p = [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()];
+                    for k in 0..2 {
+                        min[k] = min[k].min(p[k]);
+                        max[k] = max[k].max(p[k]);
+                    }
+                }
+            }
+        }
+    }
+    total < guard || (max[0] - min[0]).max(max[1] - min[1]) <= error
 }
 
 /// The closed segment loop of a boundary: straight chords and arcs (cavalier
