@@ -2087,10 +2087,13 @@ impl FlatPlan {
                 let next = self.chains[self.chain].pieces[self.piece + 1].start();
                 let length = (next[0] - v[0]).hypot(next[1] - v[1]);
                 if length > 2. * self.op.stepover_mm
-                    || self
-                        .index
-                        .max_height(*v, [next[0], next[1]], self.radius, &mut self.seen, &mut self.stamp)
-                        > z + tol
+                    || self.index.max_height(
+                        *v,
+                        [next[0], next[1]],
+                        self.radius,
+                        &mut self.seen,
+                        &mut self.stamp,
+                    ) > z + tol
                     || !allows_segment(self.limits.as_ref(), *v, [next[0], next[1]], z, tol)?
                 {
                     continue;
@@ -2949,8 +2952,8 @@ fn fit_circle_run(pts: &[[f64; 2]], fit: f64) -> Option<([f64; 2], f64)> {
     // A steady one-sided turn: no chord turns against the run's direction.
     let mut side = 0i32;
     for w in pts.windows(3) {
-        let t = (w[1][0] - w[0][0]) * (w[2][1] - w[1][1])
-            - (w[1][1] - w[0][1]) * (w[2][0] - w[1][0]);
+        let t =
+            (w[1][0] - w[0][0]) * (w[2][1] - w[1][1]) - (w[1][1] - w[0][1]) * (w[2][0] - w[1][0]);
         let sign = t.signum() as i32;
         if sign != 0 {
             if side == 0 {
@@ -3246,7 +3249,11 @@ fn prove_ring(
         }
         if circumscribed {
             for pair in points.windows(2) {
-                push(&mut pieces, crate::pocket::Stroke::line(pair[0], pair[1]), z);
+                push(
+                    &mut pieces,
+                    crate::pocket::Stroke::line(pair[0], pair[1]),
+                    z,
+                );
             }
             continue;
         }
