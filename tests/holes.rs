@@ -52,6 +52,178 @@ fn commit(stock: &mut Stock, m: &Motion) {
     stock.apply_delta(&d).unwrap();
 }
 
+fn ordering(max_work: usize) -> camlib::ordering::HoleOrdering {
+    use camlib::dynamics::{JunctionMode, Policy, Settings};
+    camlib::ordering::HoleOrdering {
+        nearest_neighbor: false,
+        settings: Settings {
+            policy: Policy {
+                tangential_accel_mm_s2: 100.,
+                rapid_feed_mm_min: 6000.,
+                junction_mode: JunctionMode::ExactStop,
+                feed_reserve_fraction: 0.,
+            },
+            max_feed_mm_min: 6000.,
+            max_normal_accel_mm_s2: None,
+            max_axis_feed_mm_min: None,
+            work_to_machine: WorkFrame::identity(),
+            feed_quantum_mm_min: 0.001,
+            adjust_feeds: false,
+        },
+        max_work,
+    }
+}
+
+fn preparation_fixture() -> StreamManifest {
+    use camlib::tool::CutterShape;
+    let mut m = fixture();
+    let mut final_op = drilling();
+    final_op.id = "final".into();
+    final_op.peck_mm = None;
+    let mut spot = final_op.clone();
+    spot.id = "spot".into();
+    spot.tool = "spot6".into();
+    spot.depth_z_mm = 10. - 1. / 75_f64.to_radians().tan();
+    let mut pilot = final_op.clone();
+    pilot.id = "pilot".into();
+    pilot.tool = "pilot2".into();
+    pilot.depth_z_mm = 8.5;
+    pilot.depth_reference = DepthReference::FullDiameter;
+    for (id, diameter, angle) in [("spot6", 6., 150_f64), ("pilot2", 2., 140_f64)] {
+        let mut t = m.tools[0].clone();
+        t.id = id.into();
+        t.cutter.diameter_mm = diameter;
+        t.cutter.shape = CutterShape::Drill { point_angle_rad: angle.to_radians() };
+        m.tools.push(t);
+    }
+    final_op.preparation = Some(DrillingPreparation { spot: Some("spot".into()), spot_diameter_mm: Some(2.), pilot: Some("pilot".into()) });
+    m.operations = vec![Operation::Drilling(spot), Operation::Drilling(pilot), Operation::Drilling(final_op)];
+    m
+}
+
+#[test]
+fn drilling_preparation_checks_source_geometry_coverage_order_and_cancel() {
+    let m = preparation_fixture();
+    let cancel = AtomicBool::new(false);
+    let report = preparation_report(&m, 2, &cancel).unwrap().unwrap();
+    assert_eq!(report.holes, drilling().centers_mm.len());
+    assert!((report.spot.unwrap().diameter_mm - 2.).abs() < 1e-12);
+    assert!((report.pilot.unwrap().full_diameter_depth_mm - 1.5).abs() < 1e-12);
+    assert!(preparation_report(&m, 2, &AtomicBool::new(true)).unwrap_err().contains("cancelled"));
+    let mut bad = m.clone();
+    bad.operations.swap(0, 1);
+    assert!(preparation_report(&bad, 2, &cancel).unwrap_err().contains("order"));
+    let mut bad = m.clone();
+    let Operation::Drilling(spot) = &mut bad.operations[0] else { unreachable!() };
+    spot.centers_mm.pop();
+    assert!(preparation_report(&bad, 2, &cancel).unwrap_err().contains("cover"));
+    let Operation::Drilling(final_op) = &m.operations[2] else { unreachable!() };
+    assert!(DrillingPlan::prepare(final_op.clone(), &m.tools[0], m.stock.height().unwrap(), m.initial_position_mm, 1, &cancel).err().unwrap().contains("run"));
+}
+
+#[test]
+fn drilling_preparation_no_metadata_default_and_duplicate_occurrences_are_not_skipped() {
+    assert!(serde_json::to_value(drilling()).unwrap().get("preparation").is_none());
+    let mut m = preparation_fixture();
+    let Operation::Drilling(final_op) = &mut m.operations[2] else { unreachable!() };
+    final_op.centers_mm.push(final_op.centers_mm[0]);
+    assert!(preparation_report(&m, 2, &AtomicBool::new(false)).unwrap_err().contains("duplicate"));
+}
+
+#[test]
+fn bounded_drilling_order_changes_only_clearance_travel_and_keeps_stock_and_exit() {
+    let centers = vec![[34., 18.], [6., 6.], [34., 6.], [6., 18.], [20., 6.], [20., 18.]];
+    for canned in [false, true] {
+        let run = |ordered: bool| {
+            let mut op = drilling();
+            op.centers_mm = centers.clone();
+            op.canned_cycle = canned;
+            op.reentry_clearance_mm = 0.254;
+            op.chip_break_lift_mm = 0.254;
+            op.ordering = ordered.then(|| ordering(10_000));
+            let mut plan = drill_plan(op).unwrap();
+            let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+            let mut paths = Vec::new();
+            while let Some(motion) = plan.next_motion_with_stock(&stock, &AtomicBool::new(false)).unwrap() {
+                commit(&mut stock, &motion);
+                paths.push(motion);
+            }
+            plan.finish_report(&AtomicBool::new(false)).unwrap();
+            (plan, stock, paths)
+        };
+        let (given, old_stock, old_moves) = run(false);
+        let (ordered, new_stock, new_moves) = run(true);
+        let report = ordered.report().ordering.as_ref().unwrap();
+        assert!(given.report().ordering.is_none());
+        assert!(report.ordered_seconds < 0.8 * report.given_seconds);
+        assert_eq!(*report.order.last().unwrap(), centers.len() - 1);
+        let mut permutation = report.order.clone();
+        permutation.sort_unstable();
+        assert_eq!(permutation, (0..centers.len()).collect::<Vec<_>>());
+        assert!(report.work <= 10_000 && !report.work_limit_reached);
+        assert_eq!(old_moves.last().unwrap().curve.end(), new_moves.last().unwrap().curve.end());
+        assert_eq!(given.report().cut_pecks, ordered.report().cut_pecks);
+        assert_eq!(given.report().completed_holes, ordered.report().completed_holes);
+        for (a, b) in old_stock.cells().iter().zip(new_stock.cells()) {
+            assert_eq!((a.lower_mm, a.upper_mm), (b.lower_mm, b.upper_mm));
+        }
+        // Compare the actual fed paths independently, without the ordering report.
+        let cutting = |moves: &[Motion]| {
+            let mut result: Vec<_> = moves.iter().filter(|m| !m.kind.is_rapid()).map(|m| {
+                let a = m.curve.start(); let b = m.curve.end();
+                assert_eq!([a[0], a[1]], [b[0], b[1]]);
+                serde_json::to_string(&(m.kind, &m.curve, m.feed_mm_min)).unwrap()
+            }).collect();
+            result.sort();
+            result
+        };
+        assert_eq!(cutting(&old_moves), cutting(&new_moves));
+        let rapid_time = |moves: &[Motion]| -> f64 {
+            moves.iter().filter(|m| m.kind.is_rapid() && m.curve.start()[..2] != m.curve.end()[..2]).map(|m| {
+                let a=m.curve.start(); let b=m.curve.end();
+                if a[..2] != b[..2] {
+                    assert!(a[2] >= 12. && b[2] >= 12.);
+                }
+                let length = (0..3).map(|k| (b[k]-a[k]).powi(2)).sum::<f64>().sqrt();
+                // Independent exact-stop triangle/trapezoid, v=100 mm/s, a=100 mm/s².
+                if length <= 100. { 2. * (length / 100.).sqrt() } else { 2. + (length - 100.) / 100. }
+            }).sum()
+        };
+        assert!(rapid_time(&new_moves) < 0.8 * rapid_time(&old_moves));
+    }
+}
+
+#[test]
+fn drilling_order_budget_settings_ties_and_cancellation_are_explicit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CancelAfter(AtomicUsize);
+    impl CancelSignal for CancelAfter {
+        fn is_cancelled(&self) -> bool { self.0.fetch_add(1, Ordering::Relaxed) >= 12 }
+    }
+    let mut op=drilling();
+    op.centers_mm=vec![[34.,18.],[6.,6.],[34.,6.],[6.,18.],[20.,6.],[20.,18.]];
+    op.ordering=Some(ordering(24));
+    let plan=drill_plan(op.clone()).unwrap();
+    let report=plan.report().ordering.as_ref().unwrap();
+    assert_eq!(report.order, (0..6).collect::<Vec<_>>());
+    assert!(report.work_limit_reached && report.work == 24);
+    op.ordering=Some(ordering(23));
+    assert!(drill_plan(op.clone()).err().unwrap().contains("max_work"));
+    op.ordering=Some(ordering(10000));
+    let f=fixture();
+    let result=DrillingPlan::prepare(op.clone(), &f.tools[0], f.stock.height().unwrap(), f.initial_position_mm, 1, &CancelAfter(AtomicUsize::new(0)));
+    assert!(result.err().unwrap().contains("cancelled"));
+    op.ordering.as_mut().unwrap().settings.policy.tangential_accel_mm_s2=f64::NAN;
+    assert!(drill_plan(op.clone()).is_err());
+    op.ordering=Some(ordering(10000));
+    op.centers_mm=vec![[10.,12.],[10.,12.],[28.,12.]];
+    let a=drill_plan(op.clone()).unwrap(); let b=drill_plan(op).unwrap();
+    let a=a.report().ordering.as_ref().unwrap(); let b=b.report().ordering.as_ref().unwrap();
+    assert_eq!(a.order, vec![0,1,2]);
+    assert_eq!(a.order,b.order);
+    assert_eq!(a.given_seconds,a.ordered_seconds);
+}
+
 #[test]
 fn drilling_tip_shoulder_peck_modes_and_whole_cell_cone_oracle_agree() {
     let cancel = AtomicBool::new(false);
@@ -659,6 +831,111 @@ fn stock_position(_: &Stock, initial: Vec3) -> Vec3 {
     [c[0], c[1], d.clearance_z_mm]
 }
 
+fn checked_drill(op: DrillingOperation) -> (DrillingPlan, Stock, Vec<Motion>) {
+    let cancel = AtomicBool::new(false);
+    let f = fixture();
+    let tool = f.tools[0].prepare().unwrap();
+    let mut stock = Stock::new(f.stock.height().unwrap().clone()).unwrap();
+    stock.enable_contact_queries(&cancel).unwrap();
+    let mut plan = drill_plan(op).unwrap();
+    let mut moves = Vec::new();
+    while let Some(m) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if m.kind.is_rapid() && m.curve.start()[..2] != m.curve.end()[..2] {
+            let proof = camlib::stock_contact::check(&stock, &tool, &m, Default::default(), &cancel).unwrap();
+            assert_eq!(proof.status, camlib::verification::Status::Clear);
+        }
+        commit(&mut stock, &m);
+        moves.push(m);
+    }
+    plan.finish_report(&cancel).unwrap();
+    (plan, stock, moves)
+}
+
+#[test]
+fn r_plane_drilling_keeps_plunges_stock_and_exit_and_uses_checked_low_rapids() {
+    for canned in [false, true] {
+        for mode in [PeckMode::FullRetract, PeckMode::ChipBreak] {
+            let mut op = drilling();
+            op.canned_cycle = canned;
+            op.peck_mode = mode;
+            let (_, old, before) = checked_drill(op.clone());
+            op.r_plane_travel = true;
+            let (plan, new, after) = checked_drill(op);
+            assert_eq!(before.last().unwrap().curve.end(), after.last().unwrap().curve.end());
+            let plunges = |rows: &[Motion]| rows.iter().filter(|m| m.kind == MoveKind::Plunge)
+                .map(|m| serde_json::to_string(&(&m.curve, m.feed_mm_min)).unwrap()).collect::<Vec<_>>();
+            assert_eq!(plunges(&before), plunges(&after));
+            for (a, b) in old.cells().iter().zip(new.cells()) {
+                assert_eq!((a.lower_mm, a.upper_mm), (b.lower_mm, b.upper_mm));
+            }
+            let report = plan.report().r_plane_travel.as_ref().unwrap();
+            assert_eq!(report.candidate_links, 1);
+            assert_eq!(report.z_mm, 11.);
+        }
+    }
+}
+
+#[test]
+fn decreasing_pecks_keep_full_depth_and_stock_in_both_retract_modes() {
+    for mode in [PeckMode::FullRetract, PeckMode::ChipBreak] {
+        let mut op = drilling();
+        op.peck_mode = mode;
+        op.peck_mm = Some(1.);
+        let (_, old, _) = checked_drill(op.clone());
+        op.peck_mm = None;
+        op.peck_schedule = Some(PeckSchedule { first_mm: 3., decrement_mm: 1., minimum_mm: 1., max_pecks: 10 });
+        let (plan, new, moves) = checked_drill(op.clone());
+        assert_eq!(moves.iter().filter(|m| m.kind == MoveKind::Plunge).map(|m| m.curve.end()[2]).collect::<Vec<_>>(), vec![7.,5.,4.,7.,5.,4.]);
+        assert_eq!(plan.report().pecks_per_hole, 3);
+        assert_eq!(plan.report().peck_returns, 4);
+        for (a, b) in old.cells().iter().zip(new.cells()) {
+            assert_eq!((a.lower_mm, a.upper_mm), (b.lower_mm, b.upper_mm));
+        }
+        op.peck_schedule = Some(PeckSchedule { first_mm: 4., decrement_mm: 1., minimum_mm: 3., max_pecks: 10 });
+        let (_, _, moves) = checked_drill(op);
+        assert_eq!(moves.iter().filter(|m| m.kind == MoveKind::Plunge).map(|m| m.curve.end()[2]).collect::<Vec<_>>(), vec![6.,4.,6.,4.]);
+    }
+}
+
+#[test]
+fn peck_schedules_are_bounded_validated_and_cancellable_before_motion() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CancelAfter(AtomicUsize);
+    impl CancelSignal for CancelAfter {
+        fn is_cancelled(&self) -> bool { self.0.fetch_add(1, Ordering::Relaxed) >= 2 }
+    }
+    let mut op = drilling();
+    op.peck_mm = None;
+    for schedule in [
+        PeckSchedule { first_mm: 1., decrement_mm: 0., minimum_mm: 1., max_pecks: 2 },
+        PeckSchedule { first_mm: 1., decrement_mm: -1., minimum_mm: 1., max_pecks: 10 },
+        PeckSchedule { first_mm: 1., decrement_mm: 0., minimum_mm: 2., max_pecks: 10 },
+    ] {
+        op.peck_schedule = Some(schedule);
+        assert!(drill_plan(op.clone()).is_err());
+    }
+    op.peck_schedule = Some(PeckSchedule { first_mm: 1., decrement_mm: 0., minimum_mm: 1., max_pecks: 10 });
+    let f = fixture();
+    let prepare = |op| DrillingPlan::prepare(op, &f.tools[0], f.stock.height().unwrap(), f.initial_position_mm, 1, &CancelAfter(AtomicUsize::new(0)));
+    assert!(prepare(op.clone()).err().unwrap().contains("peck schedule cancelled"));
+    op.canned_cycle = true;
+    assert!(drill_plan(op.clone()).err().unwrap().contains("explicit drilling"));
+    op.peck_schedule = None;
+    op.peck_mm = Some(0.001);
+    // Valid controller returns must reach the inner preparation loop, not
+    // be rejected by the existing return-distance guard first.
+    op.reentry_clearance_mm = 0.0002;
+    op.chip_break_lift_mm = 0.0002;
+    let error = prepare(op.clone()).err().unwrap();
+    assert!(error.contains("canned peck schedule cancelled"), "{error}");
+    op.tolerance_mm = 1e-7;
+    op.peck_mm = Some(0.000002);
+    op.reentry_clearance_mm = 0.0000018;
+    op.chip_break_lift_mm = 0.0000018;
+    let error = drill_plan(op).err().unwrap();
+    assert!(error.contains("covered-event limit"), "{error}");
+}
+
 fn boring_bar(f: &StreamManifest) -> camlib::tool::ToolAssembly {
     // 6 mm bore, 3 mm bar 20 mm long (inside the 4 mm pilot), 10 mm shank.
     let mut t = f.tools[1].clone();
@@ -953,4 +1230,34 @@ fn oriented_shift_is_certified_only_inside_its_own_bore() {
         ),
         Status::Clear
     );
+}
+
+
+#[test]
+fn multistart_drilling_preserves_actual_cuts_stock_and_final_pose() {
+    let run=|nearest| {
+        let mut manifest=fixture();
+        let spec=manifest.stock.height_mut().unwrap();
+        spec.max_mm=[100.,100.,10.]; spec.cell_size_mm=0.5;
+        let mut op=drilling();
+        op.centers_mm=vec![[46.,62.],[38.,86.],[38.,30.],[62.,70.],[14.,54.],
+            [94.,46.],[70.,38.],[22.,6.],[62.,38.]];
+        let mut settings=ordering(100_000); settings.nearest_neighbor=nearest; op.ordering=Some(settings);
+        let cancel=AtomicBool::new(false);
+        let mut plan=DrillingPlan::prepare(op,&manifest.tools[0],manifest.stock.height().unwrap(),manifest.initial_position_mm,1,&cancel).unwrap();
+        let mut stock=Stock::new(manifest.stock.height().unwrap().clone()).unwrap();
+        let mut moves=Vec::new();
+        while let Some(m)=plan.next_motion_with_stock(&stock,&cancel).unwrap() { commit(&mut stock,&m); moves.push(m); }
+        plan.finish_report(&cancel).unwrap();
+        (plan,stock,moves)
+    };
+    let (old,a,am)=run(false); let (new,b,bm)=run(true);
+    let old=old.report(); let new=new.report();
+    assert!(new.ordering.as_ref().unwrap().ordered_seconds < 0.95*old.ordering.as_ref().unwrap().ordered_seconds);
+    assert_eq!(old.cut_pecks,new.cut_pecks); assert_eq!(old.completed_holes,new.completed_holes);
+    assert_eq!(am.last().unwrap().curve.end(),bm.last().unwrap().curve.end());
+    for (a,b) in a.cells().iter().zip(b.cells()) { assert_eq!((a.lower_mm,a.upper_mm),(b.lower_mm,b.upper_mm)); }
+    let cuts=|moves: &[Motion]| { let mut values:Vec<_>=moves.iter().filter(|m| !m.kind.is_rapid()).map(|m|serde_json::to_string(&(m.kind,&m.curve,m.feed_mm_min)).unwrap()).collect();values.sort();values };
+    assert_eq!(cuts(&am),cuts(&bm));
+    for m in bm.iter().filter(|m|m.kind.is_rapid() && m.curve.start()[..2]!=m.curve.end()[..2]) { assert!(m.curve.start()[2]>=12. && m.curve.end()[2]>=12.); }
 }

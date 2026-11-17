@@ -5,7 +5,7 @@ center-cutting end mill. A native iterator plans all passes and feeds the stock
 stream directly; Python does not generate or transmit individual path edges.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import itertools
 import math
 
@@ -1013,6 +1013,83 @@ def _freeze_hole_centers(values):
 
 
 @dataclass(frozen=True)
+class HoleOrdering:
+    """Opt-in bounded drilling order from a Machine's explicit motion policy.
+
+    Keeps the last supplied center fixed. The budget counts model evaluations
+    and route summation; at least four work units per center are required.
+    """
+
+    machine: object
+    max_work: int
+    nearest_neighbor: bool = field(default=False, kw_only=True)
+
+    def to_dict(self):
+        from .dynamics import MotionPolicy, _settings
+
+        if not isinstance(self.machine.motion_policy, MotionPolicy):
+            raise ValueError("hole ordering requires an explicit Machine.motion_policy")
+        if type(self.max_work) is not int or self.max_work <= 0:
+            raise ValueError("hole ordering max_work must be a positive integer")
+        if type(self.nearest_neighbor) is not bool:
+            raise ValueError("hole ordering nearest_neighbor must be a boolean")
+        result = {"settings": _settings(self.machine, False), "max_work": self.max_work}
+        if self.nearest_neighbor:
+            result["nearest_neighbor"] = True
+        return result
+
+
+@dataclass(frozen=True)
+class PeckSchedule:
+    """Caller-declared decreasing explicit pecks (first, decrement, minimum)."""
+
+    first_mm: float
+    decrement_mm: float
+    minimum_mm: float
+    max_pecks: int = 10_000
+
+    def to_dict(self):
+        import math
+
+        values = (self.first_mm, self.decrement_mm, self.minimum_mm)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
+            raise ValueError("peck_schedule dimensions must be finite numbers")
+        if not self.first_mm >= self.minimum_mm > 0 or self.decrement_mm < 0:
+            raise ValueError("peck_schedule needs first_mm >= minimum_mm > 0 and decrement_mm >= 0")
+        if type(self.max_pecks) is not int or not 1 <= self.max_pecks <= 1_000_000:
+            raise ValueError("peck_schedule max_pecks must be an integer in 1..1000000")
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DrillingPreparation:
+    """Source operation IDs, checked by the native run before any motion.
+
+    Spot diameter is the requested circle at the stock top. Prerequisites
+    cover every final center; their own stock/scene/material checks still apply.
+    """
+
+    spot: str | None = None
+    spot_diameter_mm: float | None = None
+    pilot: str | None = None
+
+    def to_dict(self):
+        if (self.spot is None) != (self.spot_diameter_mm is None) or self.spot is None and self.pilot is None:
+            raise ValueError("preparation needs spot and/or pilot IDs and a diameter exactly when a spot is named")
+        for value in (self.spot, self.pilot):
+            if value is not None and (not isinstance(value, str) or not value or len(value) > 128):
+                raise ValueError("preparation IDs must be nonempty strings of at most 128 characters")
+        if self.spot_diameter_mm is not None and (
+            isinstance(self.spot_diameter_mm, bool)
+            or not isinstance(self.spot_diameter_mm, (int, float))
+            or not math.isfinite(self.spot_diameter_mm)
+            or self.spot_diameter_mm <= 0
+        ):
+            raise ValueError("spot_diameter_mm must be a finite positive diameter")
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+
+@dataclass(frozen=True)
 class Drilling:
     """Explicit axial moves; depth_z_mm is tip Z unless full_diameter is chosen."""
 
@@ -1046,6 +1123,10 @@ class Drilling:
     # reentry_clearance_mm / chip_break_lift_mm must equal the controller's
     # return amount (LinuxCNC: 0.254 mm).
     canned_cycle: bool = False
+    ordering: HoleOrdering | None = field(default=None, kw_only=True)
+    r_plane_travel: bool = field(default=False, kw_only=True)
+    peck_schedule: PeckSchedule | None = field(default=None, kw_only=True)
+    preparation: DrillingPreparation | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         object.__setattr__(self, "centers_mm", _freeze_hole_centers(self.centers_mm))
@@ -1057,7 +1138,69 @@ class Drilling:
             del result["dwell_s"]
         if not result["canned_cycle"]:
             del result["canned_cycle"]
+        if self.ordering is None:
+            del result["ordering"]
+        else:
+            result["ordering"] = self.ordering.to_dict()
+        if type(self.r_plane_travel) is not bool:
+            raise ValueError("r_plane_travel must be a boolean")
+        if not self.r_plane_travel:
+            del result["r_plane_travel"]
+        if self.peck_schedule is None:
+            del result["peck_schedule"]
+        else:
+            result["peck_schedule"] = self.peck_schedule.to_dict()
+        if self.preparation is None:
+            del result["preparation"]
+        else:
+            result["preparation"] = self.preparation.to_dict()
         return result
+
+
+@dataclass(frozen=True)
+class DrillingSequence:
+    """Expand explicit stages into ordinary Setup operations, in dependency order.
+
+    Each stage supplies its own tool and cutting data. The native manifest
+    checks the geometry; this helper grants no clearance or entry shortcut.
+    """
+
+    drill: Drilling
+    spot: Drilling | None = None
+    pilot: Drilling | None = None
+    spot_diameter_mm: float | None = None
+
+    def operations(self):
+        stages = tuple(op for op in (self.spot, self.pilot, self.drill) if op is not None)
+        if any(not isinstance(op, Drilling) or op.preparation is not None for op in stages):
+            raise ValueError(
+                "DrillingSequence needs unbound Drilling stages; existing prerequisites must not be replaced"
+            )
+        if len({op.id for op in stages}) != len(stages):
+            raise ValueError("DrillingSequence stage IDs must be distinct")
+        preparation = DrillingPreparation(
+            spot=self.spot.id if self.spot else None,
+            spot_diameter_mm=self.spot_diameter_mm,
+            pilot=self.pilot.id if self.pilot else None,
+        )
+        preparation.to_dict()
+        result = []
+        if self.spot:
+            result.append(self.spot)
+        if self.pilot:
+            result.append(
+                replace(
+                    self.pilot,
+                    preparation=DrillingPreparation(
+                        spot=self.spot.id,
+                        spot_diameter_mm=self.spot_diameter_mm,
+                    ),
+                )
+                if self.spot
+                else self.pilot
+            )
+        result.append(replace(self.drill, preparation=preparation))
+        return tuple(result)
 
 
 @dataclass(frozen=True)

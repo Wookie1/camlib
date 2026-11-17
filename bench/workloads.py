@@ -66,6 +66,104 @@ def _support(name):
     return importlib.import_module(f"support.{name}")
 
 
+def _drilling_order(optimized):
+    """The independent motion/stock/post regression's six-hole pattern."""
+
+    def build():
+        from camlib import HoleOrdering, OperationNode
+        from camlib.dynamics import MotionPolicy
+        from test_hole_ordering import fixture
+
+        given, _, machine = fixture()
+        if not optimized:
+            return _options(given)
+        # The same declared scalar dynamics as bench/run.py's timing model.
+        machine = replace(machine, motion_policy=MotionPolicy(1000, 6000))
+        setup = given.setups[0]
+        operation = replace(setup.operations[0].operation, ordering=HoleOrdering(machine, 10_000))
+        return _options(replace(given, setups=(replace(setup, operations=(OperationNode(operation, sources=()),)),)))
+
+    return build
+
+
+def _drilling_multistart(nearest):
+    """Matched hard-pattern control: baseline 2-opt versus its extra seed."""
+
+    def build():
+        from camlib import HoleOrdering, OperationNode, StockSpec
+        from camlib.dynamics import MotionPolicy
+        from test_hole_ordering import fixture
+
+        given, _, machine = fixture()
+        machine = replace(machine, motion_policy=MotionPolicy(1000, 6000))
+        setup = given.setups[0]
+        operation = replace(
+            setup.operations[0].operation,
+            centers_mm=((6, 6), (78, 78), (54, 38), (78, 38), (46, 54), (30, 6), (86, 54), (86, 46), (54, 86)),
+            ordering=HoleOrdering(machine, 100_000, nearest_neighbor=nearest),
+        )
+        setup = replace(
+            setup, stock=StockSpec((0, 0, 0), (100, 100, 10), 0.5), operations=(OperationNode(operation, sources=()),)
+        )
+        return _options(replace(given, setups=(setup,)))
+
+    return build
+
+
+def _drilling_cycle(*, r_plane=False, decreasing=False, canned=False):
+    """Matched declared drilling controls; keep scene/stock proofs in every variant."""
+
+    def build():
+        from camlib import OperationNode, PeckSchedule
+        from test_drilling_options import fixture
+
+        source = fixture(
+            canned_cycle=canned,
+            r_plane_travel=r_plane,
+            **({"peck_schedule": PeckSchedule(3, 1, 1)} if decreasing else {"peck_mm": 1}),
+        )
+        setup = source.setups[0]
+        op = replace(setup.operations[0].operation, clearance_z_mm=20)
+        setup = replace(setup, initial_position_mm=(0, 0, 20), operations=(OperationNode(op, sources=()),))
+        return replace(source, setups=(setup,)).compile().setup("top").simulation_options()
+
+    return build
+
+
+def _drilling_preparation(declared):
+    def build():
+        from test_drilling_preparation import job
+
+        return job(declared=declared).compile().setup("top").simulation_options()
+
+    return build
+
+
+def _drilling_recommendations(declared):
+    def build():
+        from camlib import OperationNode
+        from test_drilling_options import fixture
+        from test_drilling_recommendations import recommendation
+
+        source = fixture(peck_mm=None)
+        setup = source.setups[0]
+        operation = setup.operations[0].operation
+        if declared:
+            selected = recommendation(source).candidates[0]
+            rpm, feed = selected.cutting.spindle_rpm, selected.cutting.feed_mm_min
+        else:
+            rpm, feed = 2000.0, 160.0  # Same synthetic declared rates, written explicitly.
+        operation = replace(operation, spindle_rpm=rpm, feed_mm_min=feed)
+        return (
+            replace(source, setups=(replace(setup, operations=(OperationNode(operation, sources=()),)),))
+            .compile()
+            .setup("top")
+            .simulation_options()
+        )
+
+    return build
+
+
 def _solid(module, name="cadquery_target"):
     def target():
         shape = getattr(_support(module), name)()
@@ -701,6 +799,34 @@ def _lathe_face_groove():
 
 
 WORKLOADS = (
+    Workload(
+        "drilling-data-manual",
+        "holes",
+        "Synthetic declared drill rates written explicitly",
+        {"holes": ("drilling", 29)},
+        _drilling_recommendations(False),
+    ),
+    Workload(
+        "drilling-data-recommended",
+        "holes",
+        "Same synthetic rates selected from declared tool/material data",
+        {"holes": ("drilling", 29)},
+        _drilling_recommendations(True),
+    ),
+    Workload(
+        "drilling-preparation-manual",
+        "holes",
+        "Explicit spot, pilot and final stages without preparation metadata",
+        {"spot": ("drilling", 29), "pilot": ("drilling", 29), "holes": ("drilling", 29)},
+        _drilling_preparation(False),
+    ),
+    Workload(
+        "drilling-preparation-bound",
+        "holes",
+        "The same stages with checked source-bound preparation",
+        {"spot": ("drilling", 29), "pilot": ("drilling", 29), "holes": ("drilling", 29)},
+        _drilling_preparation(True),
+    ),
     Workload("facing", "mill", "Face a 40 x 24 block 2 mm", {"face": ("Facing", 24)}, _facing, _solid("facing")),
     Workload(
         "pocket",
@@ -773,6 +899,69 @@ WORKLOADS = (
         {"pilot": ("Drilling", 29), "finish-holes": ("Bore", 30)},
         _holes,
         _solid("holes"),
+    ),
+    Workload(
+        "drilling-given-order",
+        "mill",
+        "Six-hole given-order control with fixed final hole",
+        {"holes": ("Drilling", 29)},
+        _drilling_order(False),
+    ),
+    Workload(
+        "drilling-ordered",
+        "mill",
+        "Same six-hole pattern with bounded dynamics-aware 2-opt",
+        {"holes": ("Drilling", 29)},
+        _drilling_order(True),
+    ),
+    Workload(
+        "drilling-multistart-baseline",
+        "mill",
+        "Nine-hole baseline 2-opt with fixed final hole",
+        {"holes": ("Drilling", 29)},
+        _drilling_multistart(False),
+    ),
+    Workload(
+        "drilling-multistart-nearest",
+        "mill",
+        "Same nine-hole pattern with bounded nearest-neighbour multi-start",
+        {"holes": ("Drilling", 29)},
+        _drilling_multistart(True),
+    ),
+    Workload(
+        "drilling-clearance-pecks",
+        "mill",
+        "Declared fixed explicit pecks, clearance travel with scene/stock checks",
+        {"holes": ("Drilling", 29)},
+        _drilling_cycle(),
+    ),
+    Workload(
+        "drilling-r-plane-pecks",
+        "mill",
+        "Same fixed explicit pecks with proven R-plane travel",
+        {"holes": ("Drilling", 29)},
+        _drilling_cycle(r_plane=True),
+    ),
+    Workload(
+        "drilling-decreasing-pecks",
+        "mill",
+        "Same R-plane pattern with caller-declared decreasing explicit pecks",
+        {"holes": ("Drilling", 29)},
+        _drilling_cycle(r_plane=True, decreasing=True),
+    ),
+    Workload(
+        "drilling-g98",
+        "mill",
+        "Declared fixed canned pecks, G98 clearance return with scene/stock checks",
+        {"holes": ("Drilling", 29)},
+        _drilling_cycle(canned=True),
+    ),
+    Workload(
+        "drilling-g99",
+        "mill",
+        "Same fixed canned pecks with G99 and proven R-plane travel",
+        {"holes": ("Drilling", 29)},
+        _drilling_cycle(canned=True, r_plane=True),
     ),
     Workload(
         "reaming", "mill", "Drill then ream two holes", {"drill": ("Drilling", 29), "bore": ("Reaming", 31)}, _reaming

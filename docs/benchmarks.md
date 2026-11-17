@@ -79,6 +79,23 @@ comparable only on the same machine; CI runs the same benchmark on every push.
 | Roughing | [#27](https://github.com/stevecad/camlib/issues/27) | `roughing-raster` (rough) | 2169 | 27414 | 21241 (77%) | 614 | 13 | 24 | 5803 | 7932.3 / 7931.6 | 0.064 |
 | Contour | [#28](https://github.com/stevecad/camlib/issues/28) | `chamfer` (rough-profile) | 40 | 358 | 0 (0%) | 148 | 8 | 8 | 2243 | 55.8 / 55.7 | 0.016 |
 | Contour | [#28](https://github.com/stevecad/camlib/issues/28) | `contour` (profile) | 40 | 358 | 0 (0%) | 148 | 8 | 8 | 2192 | 55.8 / 55.7 | 0.007 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-clearance-pecks` (holes) | 38 | 126 | 109 (87%) | 41 | 12 | 12 | 184 | 18.6 / 18.6 | 0.004 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-data-manual` (holes) | 8 | 14 | 0 (0%) | 41 | 2 | 2 | 184 | 6.2 / 6.2 | 0.001 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-data-recommended` (holes) | 8 | 14 | 0 (0%) | 41 | 2 | 2 | 184 | 6.2 / 6.2 | 0.001 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-decreasing-pecks` (holes) | 19 | 77 | 62 (80%) | 32 | 6 | 6 | 184 | 12.9 / 12.9 | 0.004 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-g98` (holes) | 44 | 17 | 0 (0%) | 154 | 14 | 14 | 184 | 10.9 / 10.9 | 0.003 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-g99` (holes) | 44 | 17 | 0 (0%) | 136 | 14 | 15 | 184 | 10.7 / 10.7 | 0.003 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-given-order` (holes) | 60 | 186 | 141 (76%) | 164 | 18 | 18 | 525 | 35.0 / 35.0 | 0.003 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-multistart-baseline` (holes) | 90 | 279 | 211 (76%) | 223 | 27 | 27 | 582 | 52.3 / 52.2 | 0.002 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-multistart-nearest` (holes) | 90 | 279 | 211 (76%) | 204 | 27 | 27 | 582 | 52.1 / 52.1 | 0.002 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-ordered` (holes) | 60 | 186 | 141 (76%) | 85 | 18 | 18 | 525 | 34.2 / 34.2 | 0.004 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-preparation-bound` (holes) | 8 | 30 | 16 (53%) | 26 | 2 | 2 | 175 | 7.8 / 7.8 | 0.002 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-preparation-bound` (pilot) | 8 | 13 | 8 (57%) | 26 | 2 | 2 | 8 | 3.7 / 3.7 | 0.001 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-preparation-bound` (spot) | 8 | 7 | 5 (64%) | 25 | 2 | 2 | 0 | 2.1 / 2.1 | 0.003 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-preparation-manual` (holes) | 8 | 30 | 16 (53%) | 26 | 2 | 2 | 175 | 7.8 / 7.8 | 0.002 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-preparation-manual` (pilot) | 8 | 13 | 8 (57%) | 26 | 2 | 2 | 8 | 3.7 / 3.7 | 0.001 |
+| drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-preparation-manual` (spot) | 8 | 7 | 5 (64%) | 25 | 2 | 2 | 0 | 2.1 / 2.1 | 0.002 |
+| Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `drilling-r-plane-pecks` (holes) | 37 | 117 | 100 (86%) | 32 | 12 | 12 | 184 | 17.5 / 17.5 | 0.008 |
 | Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `holes` (pilot) | 20 | 62 | 46 (74%) | 36 | 6 | 6 | 111 | 11.8 / 11.8 | 0.002 |
 | Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `reaming` (drill) | 8 | 44 | 23 (52%) | 25 | 2 | 2 | 313 | 11.3 / 11.3 | 0.003 |
 | Drilling | [#29](https://github.com/stevecad/camlib/issues/29) | `tapping` (drill) | 8 | 44 | 23 (52%) | 25 | 2 | 2 | 313 | 11.3 / 11.3 | 0.002 |
@@ -214,3 +231,22 @@ limit the cutter actually runs, measured from the streamed moves alone
 | `lathe-thread` | Turn and single-point thread M30 x 2 | 77 | 124.5 / 124.5 | 109 | 0.9 / 194.2 | 0.0 / 0.0 | 0.051 | 0.009 | 0.015 | 46 |
 | `lathe-bore` | Drill on the axis, rough and finish bore | 29 | 63.8 / 63.8 | 61 | 9596.7 / 10035.8 | 0.0 / 0.0 | 0.032 | 0.011 | 0.005 | 46 |
 | `lathe-face-groove` | Face and cut a face groove | 35 | 83.3 / 83.3 | 66 | 3122.0 / 3254.7 | 0.0 / 0.0 | 0.021 | 0.010 | 0.009 | 46 |
+| `drilling-given-order` | Six-hole given-order control with fixed final hole | 60 | 35.0 / 35.0 | 83 | – | – | 0.030 | 0.027 | 0.004 | 5 |
+| `drilling-ordered` | Same six-hole pattern with bounded dynamics-aware 2-opt | 60 | 34.2 / 34.2 | 83 | – | – | 0.084 | 0.080 | 0.002 | 5 |
+| `drilling-clearance-pecks` | Declared fixed explicit pecks, clearance travel with scene/stock checks | 38 | 18.6 / 18.6 | 61 | – | – | 0.011 | 0.007 | 0.002 | 7 |
+| `drilling-r-plane-pecks` | Same fixed explicit pecks with proven R-plane travel | 37 | 17.5 / 17.5 | 60 | – | – | 0.018 | 0.010 | 0.002 | 7 |
+| `drilling-decreasing-pecks` | Same R-plane pattern with caller-declared decreasing explicit pecks | 19 | 12.9 / 12.9 | 42 | – | – | 0.011 | 0.007 | 0.003 | 7 |
+| `drilling-g98` | Declared fixed canned pecks, G98 clearance return with scene/stock checks | 44 | 10.9 / 10.9 | 27 | – | – | 0.011 | 0.008 | 0.003 | 7 |
+| `drilling-g99` | Same fixed canned pecks with G99 and proven R-plane travel | 44 | 10.7 / 10.7 | 28 | – | – | 0.010 | 0.007 | 0.003 | 7 |
+| `drilling-preparation-manual` | Explicit spot, pilot and final stages without preparation metadata | 24 | 13.5 / 13.5 | 63 | – | – | 0.015 | 0.009 | 0.002 | 7 |
+| `drilling-preparation-bound` | The same stages with checked source-bound preparation | 24 | 13.5 / 13.5 | 63 | – | – | 0.020 | 0.014 | 0.002 | 7 |
+| `drilling-data-manual` | Synthetic declared drill rates written explicitly | 8 | 6.2 / 6.2 | 27 | – | – | 0.006 | 0.005 | 0.002 | 6 |
+| `drilling-data-recommended` | Same synthetic rates selected from declared tool/material data | 8 | 6.2 / 6.2 | 27 | – | – | 0.006 | 0.005 | 0.002 | 6 |
+| `drilling-multistart-baseline` | Nine-hole baseline 2-opt with fixed final hole | 90 | 52.3 / 52.2 | 113 | – | – | 0.007 | 0.006 | 0.003 | 5 |
+| `drilling-multistart-nearest` | Same nine-hole pattern with bounded nearest-neighbour multi-start | 90 | 52.1 / 52.1 | 113 | – | – | 0.007 | 0.006 | 0.004 | 5 |
+
+## Baseline provenance
+
+- Only `drilling-given-order` and `drilling-ordered` were introduced by #317 on macOS 26.5.1 arm64, Python 3.12.14, Rust 1.99.1, from three sequential repeats with the declared benchmark dynamics (6000 mm/min rapid, 1000 mm/s² acceleration). The existing 44 workload records and their original host provenance are unchanged. Engine wall times from different hosts must not be compared.
+- Only the five #320 controls (drilling-clearance-pecks, drilling-r-plane-pecks, drilling-decreasing-pecks, drilling-g98 and drilling-g99) were added on macOS 26.5.1 arm64, Python 3.12.14, Rust 1.99.1, with three sequential repeats and the declared benchmark dynamics. All 46 inherited records and their host provenance are unchanged. Every new control retains scene and stock checks. Engine wall times from different hosts must not be compared.
+- Only the two #321 controls (drilling-preparation-manual and drilling-preparation-bound) were added on macOS 26.5.1 arm64, Python 3.12.14, Rust 1.99.1, from three sequential repeats with the declared benchmark dynamics. All 51 inherited records and their host provenance are unchanged. Preparation grants no clearance credit and retains scene/stock checks. Engine wall times from different hosts must not be compared.

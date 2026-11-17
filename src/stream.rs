@@ -537,6 +537,24 @@ impl StreamManifest {
         if let Some(config) = &self.verification {
             config.validate(&self.operations)?;
         }
+        for index in 0..self.operations.len() {
+            crate::holes::preparation_report(
+                self,
+                index,
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+        }
+        if self
+            .operations
+            .iter()
+            .any(|op| matches!(op, Operation::Drilling(d) if d.r_plane_travel))
+            && !self
+                .verification
+                .as_ref()
+                .is_some_and(|v| v.scene.is_some() && v.stock_contact.is_some())
+        {
+            return Err("R-plane drilling travel requires both scene and stock contact checks; configure StreamChecks(scene=..., stock_contact=StockContactOptions()) or use clearance travel".into());
+        }
         // No planner proof stands behind a supplied toolpath's rapids, links,
         // shank or holder (#157): the run must check them against the stock.
         if let Some(op) = self
