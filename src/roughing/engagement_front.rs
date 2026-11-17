@@ -4267,7 +4267,8 @@ impl EngagementFrontPlan {
                 for w in waypoints {
                     self.report.certified_strokes += 1;
                     let next = [w[0], w[1], z];
-                    self.link(stock, at, next, cancel)?;
+                    self.link(stock, at, next, cancel)
+                        .inspect_err(|_| self.rollback(&base))?;
                     at = next;
                 }
             } else if let Some((p, proven_p, samples)) = descent {
@@ -4280,7 +4281,8 @@ impl EngagementFrontPlan {
                     layer.cut(s, r);
                 }
                 self.report.certified_strokes += 1;
-                self.link(stock, [p[0], p[1], z], [q[0], q[1], z], cancel)?;
+                self.link(stock, [p[0], p[1], z], [q[0], q[1], z], cancel)
+                    .inspect_err(|_| self.rollback(&base))?;
                 self.report.lifts += 1;
                 self.report.stock_edge_entries += 1;
                 self.report.offset_descents += 1;
@@ -4290,7 +4292,10 @@ impl EngagementFrontPlan {
                 self.report.lifts += 1;
                 self.report.stock_edge_entries += 1;
             }
-            let Some(pts) = self.proven_pass(stock, q, heading, true, base.pending, cancel)? else {
+            let Some(pts) = self
+                .proven_pass(stock, q, heading, true, base.pending, cancel)
+                .inspect_err(|_| self.rollback(&base))?
+            else {
                 self.rollback(&base);
                 if !self.remnant {
                     self.layer.as_mut().unwrap().thin.push(q);
@@ -4354,13 +4359,22 @@ impl EngagementFrontPlan {
         let mut proven = from;
         loop {
             let mark = self.checkpoint();
-            let (pts, cut, more) = self.follow(start, heading, approach, narrow, cancel)?;
+            // Every error below leaves the attempt: what follow, emit_cuts
+            // and prove queued since the mark is undone first, so neither a
+            // refusal nor a propagated proof or cancellation error can leave
+            // an unproven stroke to drain on a later call (#309, the review
+            // of 6163295).
+            let (pts, cut, more) = self
+                .follow(start, heading, approach, narrow, cancel)
+                .inspect_err(|_| self.rollback(&mark))?;
             if !cut {
                 self.rollback(&mark);
                 return Ok((!kept.is_empty()).then_some(kept));
             }
-            self.emit_cuts(&pts)?;
-            let proved = self.prove(stock, from, proven, false, cancel)?;
+            self.emit_cuts(&pts).inspect_err(|_| self.rollback(&mark))?;
+            let proved = self
+                .prove(stock, from, proven, false, cancel)
+                .inspect_err(|_| self.rollback(&mark))?;
             let Some((at, detail)) = proved else {
                 let (n, first) = (pts.len(), kept.is_empty());
                 let (before, last) = (pts[n - 2], pts[n - 1]);
@@ -4382,6 +4396,10 @@ impl EngagementFrontPlan {
                 // between walls within the limit. It is entry motion, as the
                 // helix that opened it is, where the entry policy allows one.
                 if self.entry.policy() == EntryPolicy::StockEdge {
+                    // The refusal leaves the attempt: nothing of it stays
+                    // queued, so the stroke it names cannot be drained
+                    // unproven on the next call (the review of 6163295).
+                    self.rollback(&mark);
                     return Err(format!(
                         "engagement_front: {detail}, even steered at half the declared width: \
                          the material there may be confined (a pocket barely wider than the \
@@ -4389,8 +4407,10 @@ impl EngagementFrontPlan {
                          motion; allow a helical entry, use a smaller tool, or exclude the area"
                     ));
                 }
-                self.prove(stock, from, proven, true, cancel)?
+                self.prove(stock, from, proven, true, cancel)
+                    .inspect_err(|_| self.rollback(&mark))?
                     .map_or(Ok(()), |(_, detail)| {
+                        self.rollback(&mark);
                         Err(format!("engagement_front: {detail}"))
                     })?;
                 if let Some((_, detail)) = self.unresolved_refusal() {
@@ -4854,7 +4874,10 @@ impl EngagementFrontPlan {
             let mut entry = None;
             for k in order {
                 let (first, second) = halves(wall[k]);
-                if self.wall_entry(second, stock, cancel)? {
+                if self
+                    .wall_entry(second, stock, cancel)
+                    .inspect_err(|_| self.rollback(&mark))?
+                {
                     entry = Some((k, first, second));
                     break;
                 }
@@ -4868,13 +4891,17 @@ impl EngagementFrontPlan {
                 .chain((1..wall.len()).map(|i| wall[(k + i) % wall.len()]))
                 .chain(std::iter::once(first));
             for s in round {
-                self.certify(s)?;
+                self.certify(s).inspect_err(|_| self.rollback(&mark))?;
                 if s.arc.is_some() {
                     self.report.arcs += 1;
                 }
                 self.queue(s.curve(z), MoveKind::Cut, None);
             }
-            if self.prove(stock, from, from, false, cancel)?.is_some() {
+            if self
+                .prove(stock, from, from, false, cancel)
+                .inspect_err(|_| self.rollback(&mark))?
+                .is_some()
+            {
                 if self.entry.policy() == EntryPolicy::StockEdge {
                     self.rollback(&mark);
                     self.report.wall_passes_skipped += 1;
@@ -4882,8 +4909,10 @@ impl EngagementFrontPlan {
                     tests::REVIEW_ROLLBACKS.with(|c| c.set(c.get() + 1));
                     return Ok(());
                 }
-                self.prove(stock, from, from, true, cancel)?
+                self.prove(stock, from, from, true, cancel)
+                    .inspect_err(|_| self.rollback(&mark))?
                     .map_or(Ok(()), |(_, detail)| {
+                        self.rollback(&mark);
                         Err(format!("engagement_front: {detail}"))
                     })?;
                 if let Some((_, detail)) = self.unresolved_refusal() {
@@ -4893,7 +4922,8 @@ impl EngagementFrontPlan {
                     return Err(format!("engagement_front: {detail}"));
                 }
             }
-            self.mark_pending_cuts(from, cancel)?;
+            self.mark_pending_cuts(from, cancel)
+                .inspect_err(|_| self.rollback(&mark))?;
             self.position = [start[0], start[1], z];
             self.report.wall_passes += 1;
         }
@@ -5185,7 +5215,9 @@ impl EngagementFrontPlan {
             self.layer.as_mut().unwrap().journal.clear();
             let mark = self.checkpoint();
             let from = self.pending.len();
-            let mut entered = self.wall_entry(strokes[0], stock, cancel)?;
+            let mut entered = self
+                .wall_entry(strokes[0], stock, cancel)
+                .inspect_err(|_| self.rollback(&mark))?;
             if !entered {
                 // No lead-in arc fits or is reached: start on the loop, in
                 // the air before the run, at the nearest point whose column
@@ -5193,9 +5225,10 @@ impl EngagementFrontPlan {
                 for back in [0.25, 0.5, 0.75, 1.] {
                     let lead = stroke_part(before, 1. - back, 1.);
                     let q = lead.a;
-                    let (height, _) =
-                        self.guides
-                            .cleared_entry_start(q, 0., z, Some(stock), cancel)?;
+                    let (height, _) = self
+                        .guides
+                        .cleared_entry_start(q, 0., z, Some(stock), cancel)
+                        .inspect_err(|_| self.rollback(&mark))?;
                     if height - z > crate::entry::skin(self.op.tolerance_mm) {
                         continue;
                     }
@@ -5205,7 +5238,7 @@ impl EngagementFrontPlan {
                     let above = self.travel(stock, here, q, proven, z);
                     self.line(above, [q[0], q[1], z], MoveKind::Plunge);
                     self.report.lifts += 1;
-                    self.certify(lead)?;
+                    self.certify(lead).inspect_err(|_| self.rollback(&mark))?;
                     if lead.arc.is_some() {
                         self.report.arcs += 1;
                     }
@@ -5219,20 +5252,26 @@ impl EngagementFrontPlan {
                 continue;
             }
             for &s in &strokes {
-                self.certify(s)?;
+                self.certify(s).inspect_err(|_| self.rollback(&mark))?;
                 if s.arc.is_some() {
                     self.report.arcs += 1;
                 }
                 self.queue(s.curve(z), MoveKind::Cut, None);
             }
-            if self.prove(stock, from, from, false, cancel)?.is_some() {
+            if self
+                .prove(stock, from, from, false, cancel)
+                .inspect_err(|_| self.rollback(&mark))?
+                .is_some()
+            {
                 if self.entry.policy() == EntryPolicy::StockEdge {
                     self.rollback(&mark);
                     self.report.wall_passes_skipped += 1;
                     continue;
                 }
-                self.prove(stock, from, from, true, cancel)?
+                self.prove(stock, from, from, true, cancel)
+                    .inspect_err(|_| self.rollback(&mark))?
                     .map_or(Ok(()), |(_, detail)| {
+                        self.rollback(&mark);
                         Err(format!("engagement_front: {detail}"))
                     })?;
                 if let Some((_, detail)) = self.unresolved_refusal() {
@@ -5241,7 +5280,8 @@ impl EngagementFrontPlan {
                     return Err(format!("engagement_front: {detail}"));
                 }
             }
-            self.mark_pending_cuts(from, cancel)?;
+            self.mark_pending_cuts(from, cancel)
+                .inspect_err(|_| self.rollback(&mark))?;
             let end = strokes.last().unwrap().b;
             self.position = [end[0], end[1], z];
             self.report.wall_passes += 1;
@@ -5616,7 +5656,8 @@ impl EngagementFrontPlan {
                 .map(|h| h.max(self.guides.cell_entry_height(stock, p)));
             let above = self.travel(stock, here, p, proven, z);
             self.line(above, [p[0], p[1], z], MoveKind::Plunge);
-            self.certify(Stroke::line(p, q))?;
+            self.certify(Stroke::line(p, q))
+                .inspect_err(|_| self.rollback(&mark))?;
             self.queue(
                 Curve::Line {
                     start: [p[0], p[1], z],
@@ -5631,8 +5672,15 @@ impl EngagementFrontPlan {
                 let f = i as f64 / steps as f64;
                 layer.cut([p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f], r);
             }
-            if self.prove(stock, from, from, false, cancel)?.is_some() {
-                if let Some((_, detail)) = self.prove(stock, from, from, true, cancel)? {
+            if self
+                .prove(stock, from, from, false, cancel)
+                .inspect_err(|_| self.rollback(&mark))?
+                .is_some()
+            {
+                if let Some((_, detail)) = self
+                    .prove(stock, from, from, true, cancel)
+                    .inspect_err(|_| self.rollback(&mark))?
+                {
                     self.rollback(&mark);
                     return Err(format!("engagement_front: {detail}"));
                 }
@@ -5650,7 +5698,10 @@ impl EngagementFrontPlan {
             self.report.slot_side_entries += 1;
             self.position = [q[0], q[1], z];
             let heading = (q[1] - p[1]).atan2(q[0] - p[0]);
-            if let Some(pts) = self.proven_pass(stock, q, heading, false, from, cancel)? {
+            if let Some(pts) = self
+                .proven_pass(stock, q, heading, false, from, cancel)
+                .inspect_err(|_| self.rollback(&mark))?
+            {
                 let end = *pts.last().unwrap();
                 self.position = [end[0], end[1], z];
             }
@@ -6940,6 +6991,69 @@ mod tests {
             "StockEdgeEntry(helix=None) forbids cutting it as entry motion",
         ] {
             assert!(error.contains(part), "{part:?} not in: {error}");
+        }
+    }
+
+    /// The StockEdge entry-policy refusal restores the attempt it rejects:
+    /// a caller that keeps requesting motions after the error must not be
+    /// handed the stroke the refusal rejected. This is the natural
+    /// refusal — default proof budgets, no forced outcomes — on the
+    /// plate-with-bosses corner no declared width can prove, driven
+    /// through the public `OperationPlan` API with every preceding motion
+    /// committed to stock (the review of 6163295).
+    #[test]
+    fn third_review_stock_edge_refusal_cannot_emit_rejected_cut() {
+        let mut value = plate_with_bosses_manifest();
+        value["operations"][0]["entry"]["kind"] = "stock_edge".into();
+        let m: crate::stream::StreamManifest = serde_json::from_value(value).unwrap();
+        let tool = m.tools[0].prepare().unwrap();
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = crate::operation::OperationPlan::prepare_with_stock(
+            m.operations[0].clone(),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let mut refused = false;
+        for _ in 0..4000 {
+            match plan.next_motion_with_stock(&stock, &NeverCancelled) {
+                Err(e) => {
+                    eprintln!("original refusal: {e}");
+                    assert!(e.contains("forbids cutting it as entry motion"));
+                    refused = true;
+                    break;
+                }
+                Ok(Some(motion)) => {
+                    let delta = stock
+                        .preview_sweep(&tool, &motion, 1., m.sweep, &NeverCancelled)
+                        .unwrap();
+                    stock.apply_delta(&delta).unwrap();
+                }
+                Ok(None) => break,
+            }
+        }
+        assert!(refused);
+        for _ in 0..1000 {
+            match plan.next_motion_with_stock(&stock, &NeverCancelled) {
+                Ok(Some(motion)) => {
+                    eprintln!("published after refusal: {motion:?}");
+                    let start = motion.curve.start();
+                    assert!(
+                        motion.kind != MoveKind::Cut
+                            || (start[0] - 59.30423836596916).abs() > 1e-6
+                            || (start[1] - 24.40582527946715).abs() > 1e-6,
+                        "published the specifically rejected cut: {motion:?}"
+                    );
+                    let delta = stock
+                        .preview_sweep(&tool, &motion, 1., m.sweep, &NeverCancelled)
+                        .unwrap();
+                    stock.apply_delta(&delta).unwrap();
+                }
+                _ => break,
+            }
         }
     }
 
