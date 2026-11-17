@@ -254,7 +254,9 @@ class FlatOffsetTest(unittest.TestCase):
             worst = (math.inf, None)
             for m in vertical_plunges(motions):
                 b = m["curve"]["end"]
-                face = np.abs(field.H - b[2]) < 1e-6
+                # Within the level tolerance: the mesh puts a level a few
+                # 1e-5 off its analytic height (3.00001 for Z3).
+                face = np.abs(field.H - b[2]) <= 1e-3
                 if not face.any():
                     continue
                 d = float(np.min(np.hypot(field.X[face] - b[0], field.Y[face] - b[1])))
