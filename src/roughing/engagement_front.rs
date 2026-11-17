@@ -2789,22 +2789,50 @@ impl EngagementFrontPlan {
         Ok(())
     }
 
-    fn grid_for(&self, stock: &Stock) -> Result<Grid, String> {
+    fn grid_for(&mut self, stock: &Stock) -> Result<Grid, String> {
         let step = stock.cell_widths_mm();
         // Steering resolution: fine enough to resolve the target width.
         let want = (self.r / 20.).min(self.width / 5.);
         let c = step[0] / (step[0] / want).ceil();
         let margin = 3. * self.r + self.op.radial_allowance_mm + 24. * c;
-        let x0 = self.spec.min_mm[0] - (margin / c).ceil() * c;
-        let y0 = self.spec.min_mm[1] - (margin / c).ceil() * c;
-        let nx = ((self.spec.max_mm[0] + margin - x0) / c).ceil() as usize;
-        let ny = ((self.spec.max_mm[1] + margin - y0) / c).ceil() as usize;
-        crate::resources::check_memory((nx * ny) as u128 * 32, "engagement_front steering grid")?;
-        if nx * ny > 64_000_000 {
+        let mut x0 = self.spec.min_mm[0] - (margin / c).ceil() * c;
+        let mut y0 = self.spec.min_mm[1] - (margin / c).ceil() * c;
+        let mut nx = ((self.spec.max_mm[0] + margin - x0) / c).ceil() as usize;
+        let mut ny = ((self.spec.max_mm[1] + margin - y0) / c).ceil() as usize;
+        let cells = |nx: usize, ny: usize| nx as u128 * ny as u128;
+        // Keep every existing fitting grid unchanged. On a large blank, only
+        // the operation region can contain reachable material. Its exact
+        // prepared bounds include arcs; the same exterior margin keeps the
+        // grid border outside all region, cutter and steering queries (#193).
+        if cells(nx, ny) > 64_000_000
+            && let Some(bounds) = self.guides.source_region().bounds()
+        {
+            let lo = [
+                (((bounds[0] - margin - x0) / c).floor() - 1.).max(0.) as usize,
+                (((bounds[1] - margin - y0) / c).floor() - 1.).max(0.) as usize,
+            ];
+            let hi = [
+                (((bounds[2] + margin - x0) / c).ceil() + 1.).min(nx as f64) as usize,
+                (((bounds[3] + margin - y0) / c).ceil() + 1.).min(ny as f64) as usize,
+            ];
+            // Integer offsets retain the stock-aligned fine lattice.
+            let cropped = [hi[0].saturating_sub(lo[0]), hi[1].saturating_sub(lo[1])];
+            if cropped[0] > 0 && cropped[1] > 0 && cells(cropped[0], cropped[1]) < cells(nx, ny) {
+                self.report.diagnostics.push(format!(
+                        "steering grid bounded to the operation region: {nx} x {ny} -> {} x {} cells at unchanged {c} mm resolution",
+                        cropped[0], cropped[1]
+                    ));
+                x0 += lo[0] as f64 * c;
+                y0 += lo[1] as f64 * c;
+                [nx, ny] = cropped;
+            }
+        }
+        if cells(nx, ny) > 64_000_000 {
             return Err(format!(
-                "engagement_front steering grid of {nx} x {ny} cells exceeds 64M; use a larger tool or split the stock"
+                "engagement_front steering grid of {nx} x {ny} cells exceeds 64M even when bounded to the operation; use a larger tool or split the operation region"
             ));
         }
+        crate::resources::check_memory(cells(nx, ny) * 32, "engagement_front steering grid")?;
         Ok(Grid { x0, y0, c, nx, ny })
     }
 
@@ -8170,6 +8198,116 @@ mod tests {
             material_cells(&plan) < before,
             "a committed run marks the skin it cut; the report reads this \
              grid (see the square and curved pocket regressions)"
+        );
+    }
+    fn bounded_grid_plan(
+        side: f64,
+        vertices: Option<serde_json::Value>,
+    ) -> (EngagementFrontPlan, Stock) {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/operations/adaptive-pocket.json"
+        ))
+        .unwrap();
+        value["stock"]["min_mm"] = serde_json::json!([0., 0., 0.]);
+        value["stock"]["max_mm"] = serde_json::json!([side, side, 10.]);
+        value["stock"]["cell_size_mm"] = 5.into();
+        if let Some(vertices) = vertices {
+            value["operations"][0]["region"]["components"][0]["outer"]["vertices"] = vertices;
+        }
+        let m: crate::stream::StreamManifest = serde_json::from_value(value).unwrap();
+        let crate::pocket::Operation::AdaptivePocket(op) = m.operations[0].clone() else {
+            panic!("fixture changed")
+        };
+        let mut op = op.pocket;
+        op.entry = Some(PocketEntry::StockEdgeOrHelix(
+            crate::entry::HelicalEntry::default(),
+        ));
+        let spec = m.stock.height().unwrap();
+        let plan = EngagementFrontPlan::prepare(
+            op,
+            &m.tools[0],
+            spec,
+            m.initial_position_mm,
+            1.5,
+            true,
+            &|| false,
+        )
+        .unwrap();
+        (plan, Stock::new(spec.clone()).unwrap())
+    }
+
+    #[test]
+    fn bounded_steering_grid_keeps_fitting_grids_exactly_and_large_stock_resolution() {
+        let (mut small, stock) = bounded_grid_plan(25., None);
+        let g = small.grid_for(&stock).unwrap();
+        let c = stock.cell_widths_mm()[0] / (stock.cell_widths_mm()[0] / 0.1).ceil();
+        let margin = 3. * small.r + small.op.radial_allowance_mm + 24. * c;
+        let x0 = -(margin / c).ceil() * c;
+        let n = ((25. + margin - x0) / c).ceil() as usize;
+        assert_eq!(
+            g,
+            Grid {
+                x0,
+                y0: x0,
+                c,
+                nx: n,
+                ny: n
+            }
+        );
+        assert!(
+            !small
+                .report
+                .diagnostics
+                .iter()
+                .any(|s| s.contains("bounded to"))
+        );
+
+        let (mut large, stock) = bounded_grid_plan(1000., None);
+        let grid = large.grid_for(&stock).unwrap();
+        assert_eq!(grid.c, c);
+        assert!(grid.nx * grid.ny < 200_000);
+        let bounds = large.guides.source_region().bounds().unwrap();
+        for axis in 0..2 {
+            let origin = [grid.x0, grid.y0][axis];
+            let size = [grid.nx, grid.ny][axis];
+            assert!(origin <= bounds[axis] - margin);
+            assert!(origin + size as f64 * c >= bounds[axis + 2] + margin);
+            let index = (origin - x0) / c;
+            assert!((index - index.round()).abs() < 1e-9);
+        }
+        assert!(
+            large
+                .report
+                .diagnostics
+                .iter()
+                .any(|s| s.contains("unchanged"))
+        );
+    }
+
+    #[test]
+    fn bounded_steering_grid_encloses_arc_extrema_and_keeps_the_active_region_cap() {
+        // The two vertices have x=10; the semicircles reach x=0 and x=20.
+        let (mut circle, stock) = bounded_grid_plan(
+            1000.,
+            Some(serde_json::json!([[10., 0., 1.], [10., 20., 1.]])),
+        );
+        let g = circle.grid_for(&stock).unwrap();
+        let margin = 3. * circle.r + circle.op.radial_allowance_mm + 24. * g.c;
+        assert!(g.x0 <= -margin && g.x0 + g.nx as f64 * g.c >= 20. + margin);
+        let (mut whole, stock) = bounded_grid_plan(
+            1000.,
+            Some(serde_json::json!([
+                [0., 0., 0.],
+                [1000., 0., 0.],
+                [1000., 1000., 0.],
+                [0., 1000., 0.]
+            ])),
+        );
+        assert!(
+            whole
+                .grid_for(&stock)
+                .unwrap_err()
+                .contains("exceeds 64M even when bounded")
         );
     }
 }
