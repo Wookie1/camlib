@@ -747,14 +747,23 @@ class ThreadMilling:
 class Flat:
     """Flat-area finishing: finds the horizontal faces of ``surface`` above
     ``floor_z_mm`` and finishes each at its exact height (plus
-    ``stock_to_leave_mm``) with a flat, center-cutting end mill, in raster
-    rows ``stepover_mm`` apart along ``axis``. Each cut is kept only where
-    the part under the tool's swept disk is proven not above it. A run with no
-    stock above its height is entered with a vertical plunge. A run with
-    stock above it is refused unless ``entry=RampEntry(angle_deg, ...)`` is
-    declared: the tool then plunges to the stock's top over the whole run and
-    ramps down along the run (Z-flat tools are never plunged into stock). Faces
-    within ``level_tolerance_mm`` form one level."""
+    ``stock_to_leave_mm``) with a flat, center-cutting end mill, in
+    contour-parallel offset passes worked outside in: the outermost ring of
+    each level first, the core last, with half-step rings where an offset
+    pinches off in a corner between two boundaries, so the disk covers every
+    reachable flat point at stepovers up to the cutter diameter. Offset
+    loops are cut as arcs, each proven by chords at radius r + sagitta like
+    the straight cuts. Every cut is kept only where the part under the tool's
+    swept disk is proven not above it. A chain of passes is entered beside
+    the level's face in air where the flat is open (a vertical plunge through
+    air, then a lead-in at cutting feed), else by a vertical plunge where no
+    stock stands above it. A chain with stock above it is refused unless
+    ``entry=RampEntry(angle_deg, ...)`` is declared: the tool then plunges to
+    the stock's top over the chain's first loop and ramps down along it
+    (Z-flat tools are never plunged into stock). Consecutive passes join by
+    straight links cut at depth when they are short, proven and inside the
+    machine limits. Faces within ``level_tolerance_mm`` form one level.
+    ``axis`` is accepted so old jobs load but no longer orders anything."""
 
     id: str
     tool: object

@@ -1833,8 +1833,14 @@ impl FlatPlan {
             let z = level + op.stock_to_leave_mm;
             // The tool centres resting on this level, as a planar region, and
             // the level's face (for keeping entries off it).
-            let Some((region, face)) =
-                level_region(&target, level, op.level_tolerance_mm, r, op.tolerance_mm, cancel)?
+            let Some((region, face)) = level_region(
+                &target,
+                level,
+                op.level_tolerance_mm,
+                r,
+                op.tolerance_mm,
+                cancel,
+            )?
             else {
                 continue;
             };
@@ -2024,7 +2030,7 @@ impl FlatPlan {
     fn beside_face(&self, p: [f64; 2]) -> Result<bool, String> {
         let q = self.chains[self.chain].face.query(p)?;
         Ok(q.signed_clearance_mm
-            .map_or(true, |s| s <= self.op.tolerance_mm - self.radius))
+            .is_none_or(|s| s <= self.op.tolerance_mm - self.radius))
     }
 
     /// How the current chain is entered, decided against the live stock: from
@@ -2047,7 +2053,13 @@ impl FlatPlan {
                 continue;
             }
             // Outward, trying the shortest offset first.
-            for l in [0.25 * self.radius, 0.5 * self.radius, self.radius, 1.5 * self.radius, 2. * self.radius] {
+            for l in [
+                0.25 * self.radius,
+                0.5 * self.radius,
+                self.radius,
+                1.5 * self.radius,
+                2. * self.radius,
+            ] {
                 let p = [v[0] + l * n[0], v[1] + l * n[1]];
                 if stock.top_under_disk(p, self.radius) > z + tol {
                     continue;
@@ -2055,7 +2067,9 @@ impl FlatPlan {
                 if !self.beside_face(p)? {
                     continue;
                 }
-                if self.index.max_height(p, *v, self.radius, &mut self.seen, &mut self.stamp)
+                if self
+                    .index
+                    .max_height(p, *v, self.radius, &mut self.seen, &mut self.stamp)
                     > z + tol
                 {
                     continue;
@@ -2063,7 +2077,7 @@ impl FlatPlan {
                 if !allows_segment(self.limits.as_ref(), p, *v, z, tol)? {
                     continue;
                 }
-                let nearer = best.map_or(true, |(bv, _)| {
+                let nearer = best.is_none_or(|(bv, _)| {
                     (v[0] - self.position[0]).hypot(v[1] - self.position[1])
                         < (bv[0] - self.position[0]).hypot(bv[1] - self.position[1])
                 });
@@ -2182,7 +2196,12 @@ impl FlatPlan {
                         }
                     };
                     self.entry = Some(entry);
-                    ([over[0], over[1], p[2]], MoveKind::Rapid, Phase::Descend, None)
+                    (
+                        [over[0], over[1], p[2]],
+                        MoveKind::Rapid,
+                        Phase::Descend,
+                        None,
+                    )
                 }
                 Phase::Descend => (
                     [p[0], p[1], self.heights.feed],
@@ -2193,12 +2212,9 @@ impl FlatPlan {
                 Phase::Enter => {
                     let a = self.chains[self.chain].pieces[self.piece].start();
                     match self.entry.take().expect("entry plan") {
-                        Entry::Side { .. } => (
-                            [p[0], p[1], a[2]],
-                            MoveKind::Plunge,
-                            Phase::Lead,
-                            None,
-                        ),
+                        Entry::Side { .. } => {
+                            ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Lead, None)
+                        }
                         Entry::Plunge => ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Cut, None),
                         Entry::Ramp { top, curves } => {
                             self.ramp = curves.into();
@@ -2410,10 +2426,17 @@ fn level_region(
     r: f64,
     tolerance: f64,
     cancel: &impl CancelSignal,
-) -> Result<Option<(crate::planar::PreparedRegion, std::sync::Arc<crate::planar::PreparedRegion>)>, String>
-{
+) -> Result<
+    Option<(
+        crate::planar::PreparedRegion,
+        std::sync::Arc<crate::planar::PreparedRegion>,
+    )>,
+    String,
+> {
     use crate::planar::{Boolean, ConstructionOptions};
-    let options = ConstructionOptions { tolerance_mm: tolerance };
+    let options = ConstructionOptions {
+        tolerance_mm: tolerance,
+    };
     let source_error = target.mesh().surface_error_mm;
     let mut work = 0usize;
     let below = target
@@ -2512,17 +2535,18 @@ impl LoopGroup {
                 .map(|s| (s.a[0] - tool[0]).hypot(s.a[1] - tool[1]))
                 .fold(f64::INFINITY, f64::min)
         };
-        let sort = |rings: &[(f64, Vec<crate::pocket::Stroke>)]| -> Vec<Vec<crate::pocket::Stroke>> {
-            let mut order: Vec<usize> = (0..rings.len()).collect();
-            order.sort_by(|&a, &b| {
-                rings[a]
-                    .0
-                    .total_cmp(&rings[b].0)
-                    .then(near(&rings[a].1).total_cmp(&near(&rings[b].1)))
-                    .then(a.cmp(&b))
-            });
-            order.into_iter().map(|i| rings[i].1.clone()).collect()
-        };
+        let sort =
+            |rings: &[(f64, Vec<crate::pocket::Stroke>)]| -> Vec<Vec<crate::pocket::Stroke>> {
+                let mut order: Vec<usize> = (0..rings.len()).collect();
+                order.sort_by(|&a, &b| {
+                    rings[a]
+                        .0
+                        .total_cmp(&rings[b].0)
+                        .then(near(&rings[a].1).total_cmp(&near(&rings[b].1)))
+                        .then(a.cmp(&b))
+                });
+                order.into_iter().map(|i| rings[i].1.clone()).collect()
+            };
         let mut all = sort(&self.outers);
         all.extend(sort(&self.holes));
         all
@@ -2548,7 +2572,9 @@ fn level_loops(
     cancel: &impl CancelSignal,
 ) -> Result<Vec<LoopGroup>, String> {
     use crate::planar::Boolean;
-    let options = crate::planar::ConstructionOptions { tolerance_mm: tolerance };
+    let options = crate::planar::ConstructionOptions {
+        tolerance_mm: tolerance,
+    };
     let guard = 16. * tolerance;
     let mut groups = vec![];
     for component in &region.definition().components {
@@ -2568,9 +2594,7 @@ fn level_loops(
             .map_err(|e| format!("flat-area loop region: {e}"))?;
         let mut outers: Vec<(f64, Vec<crate::pocket::Stroke>)> = vec![];
         let mut holes: Vec<(f64, Vec<crate::pocket::Stroke>)> = vec![];
-        let mut collect = |eroded: &crate::planar::PreparedRegion,
-                           d: f64|
-         -> Result<(), String> {
+        let mut collect = |eroded: &crate::planar::PreparedRegion, d: f64| -> Result<(), String> {
             let mut vertices = 0usize;
             for c in &eroded.definition().components {
                 let outer = boundary_strokes(&c.outer, true)?;
@@ -2583,7 +2607,8 @@ fn level_loops(
                         holes.push((d, strokes));
                     }
                 }
-                vertices += c.outer.vertices.len() + c.holes.iter().map(|h| h.vertices.len()).sum::<usize>();
+                vertices += c.outer.vertices.len()
+                    + c.holes.iter().map(|h| h.vertices.len()).sum::<usize>();
             }
             crate::resources::check_memory(vertices as u128 * 24, "flat-area offset loops")?;
             Ok(())
@@ -2715,7 +2740,11 @@ fn boundary_strokes(
     let mut pts: Vec<[f64; 2]> = segs.iter().map(|s| s.a).collect();
     pts.push(segs[0].a);
     if (ccw && signed_area(&pts) < 0.) || (!ccw && signed_area(&pts) > 0.) {
-        return Ok(segs.into_iter().rev().map(crate::pocket::Stroke::reversed).collect());
+        return Ok(segs
+            .into_iter()
+            .rev()
+            .map(crate::pocket::Stroke::reversed)
+            .collect());
     }
     Ok(segs)
 }
@@ -2744,7 +2773,10 @@ fn rotate_piece(piece: &mut Piece, v: [f64; 2]) {
 
 /// Rotate a closed ring of segments (the last ending on the first's start) so
 /// it starts at the vertex nearest `tool` and ends there too.
-fn rotate_to_nearest(ring: Vec<crate::pocket::Stroke>, tool: [f64; 2]) -> Vec<crate::pocket::Stroke> {
+fn rotate_to_nearest(
+    ring: Vec<crate::pocket::Stroke>,
+    tool: [f64; 2],
+) -> Vec<crate::pocket::Stroke> {
     if ring.len() < 2 {
         return ring;
     }
@@ -2874,8 +2906,19 @@ fn prove_ring(
         }
         let Some((c, sweep)) = seg.arc else {
             prove_line(
-                &mut pieces, index, seen, stamp, seg.a, seg.b, r, z, h, tolerance, limits,
-                dropped, cancel,
+                &mut pieces,
+                index,
+                seen,
+                stamp,
+                seg.a,
+                seg.b,
+                r,
+                z,
+                h,
+                tolerance,
+                limits,
+                dropped,
+                cancel,
             )?;
             continue;
         };
@@ -2888,8 +2931,9 @@ fn prove_ring(
         let start = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]);
         // Chords no shorter than the halving floor, so the refinement (and the
         // fallback's chords) stay above what a straight chord could prove.
-        let count_cap =
-            ((sweep.abs() * rho / (h / 16.)).ceil() as usize).max(1).next_power_of_two();
+        let count_cap = ((sweep.abs() * rho / (h / 16.)).ceil() as usize)
+            .max(1)
+            .next_power_of_two();
         let mut count = {
             let half = (1. - tolerance / rho).clamp(-1., 1.).acos().max(1e-9);
             ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(count_cap)
@@ -2925,9 +2969,7 @@ fn prove_ring(
         }
         // The whole arc must also sit inside the limits; otherwise its chords
         // are checked against them one by one below.
-        let allowed = limits.map_or(Ok(true), |l| {
-            l.allows_curve(&seg.curve(z), true)
-        })?;
+        let allowed = limits.map_or(Ok(true), |l| l.allows_curve(&seg.curve(z), true))?;
         if proven && allowed {
             // One proven arc piece, split so every move's chord stays within
             // `ARC_MOVE_SAGITTA` of the arc; the proof above covers the whole
@@ -2945,8 +2987,19 @@ fn prove_ring(
         for i in 0..count {
             let (p, q, _) = chord(i, count);
             prove_line(
-                &mut pieces, index, seen, stamp, p, q, r + sagitta, z, h, tolerance, limits,
-                dropped, cancel,
+                &mut pieces,
+                index,
+                seen,
+                stamp,
+                p,
+                q,
+                r + sagitta,
+                z,
+                h,
+                tolerance,
+                limits,
+                dropped,
+                cancel,
             )?;
         }
     }
