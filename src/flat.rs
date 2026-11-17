@@ -1594,7 +1594,7 @@ impl Piece {
 struct Chain {
     pieces: Vec<Piece>,
     /// Side-entry candidates of the first pass: vertices (at most one per
-    /// 1 mm of the pass) with the outward normal, away from the region (right
+    /// 1 mm of the pass) with the outward normal, away from the region (left
     /// of travel).
     side: Vec<([f64; 2], [f64; 2])>,
     /// The level's face (the flat the pass finishes): an entry may only plunge
@@ -2609,8 +2609,10 @@ impl LoopGroup {
 /// off (a corner between two boundaries of the region) also gets a ring at
 /// half the stepover, so the disk covers every reachable point there too
 /// (stepover up to the cutter diameter). Each loop keeps its arcs (cavalier
-/// contours' bulges); outer boundaries end up counter-clockwise and holes
-/// clockwise (climb with a clockwise spindle).
+/// contours' bulges); outer boundaries end up clockwise and holes
+/// counter-clockwise: the passes run outside in, so the stock still to cut
+/// lies inward of each ring, on the right of travel — climb milling with a
+/// clockwise spindle.
 fn level_loops(
     region: &crate::planar::PreparedRegion,
     r: f64,
@@ -2657,12 +2659,12 @@ fn level_loops(
             // the disk covers them from that ring.
             let error = eroded.definition().boundary_error_mm;
             for c in &eroded.definition().components {
-                let outer = boundary_strokes(&c.outer, true, tolerance)?;
+                let outer = boundary_strokes(&c.outer, false, tolerance)?;
                 if !outer.is_empty() && !degenerate_loop(&outer, guard, error) {
                     outers.push((d, outer));
                 }
                 for hole in &c.holes {
-                    let strokes = boundary_strokes(hole, false, tolerance)?;
+                    let strokes = boundary_strokes(hole, true, tolerance)?;
                     if !strokes.is_empty() && !degenerate_loop(&strokes, guard, error) {
                         holes.push((d, strokes));
                     }
@@ -2813,8 +2815,7 @@ fn degenerate_loop(strokes: &[crate::pocket::Stroke], guard: f64, error: f64) ->
 
 /// The closed segment loop of a boundary: straight chords and arcs (cavalier
 /// contours' bulges, as `Stroke::from_boundary`), oriented counter-clockwise
-/// when `ccw` (outer boundaries) and clockwise otherwise (holes): climb
-/// milling with a clockwise spindle. Degenerate segments (zero length or zero
+/// when `ccw` and clockwise otherwise. Degenerate segments (zero length or zero
 /// sweep) carry no geometry and are dropped or straightened. Arcs a boolean
 /// or offset kernel flattened to a chord polygon are refitted from their
 /// chords (`refit_arcs`) so a ring along them is one proven move instead of
@@ -2854,41 +2855,83 @@ fn boundary_strokes(
     } else {
         segs
     };
-    Ok(refit_arcs(segs, tolerance / 4.))
+    Ok(absorb_stubs(refit_arcs(segs, tolerance / 4.)))
+}
+
+/// Absorb the straight stubs of a closed ring — a stroke shorter than
+/// `ARC_MOVE_SAGITTA`, where a kernel snapped two vertices of one corner a
+/// few microns apart — into a neighbouring straight stroke, which then runs
+/// to (or from) the stub's far end: the ring moves by less than the stub's
+/// length, within what the arcs' moves already stray, and is proven as it
+/// is afterwards. A stub between two arcs stays.
+fn absorb_stubs(mut segs: Vec<crate::pocket::Stroke>) -> Vec<crate::pocket::Stroke> {
+    let mut k = 0;
+    while segs.len() > 3 && k < segs.len() {
+        let s = segs[k];
+        let n = segs.len();
+        if s.arc.is_some() || (s.b[0] - s.a[0]).hypot(s.b[1] - s.a[1]) >= ARC_MOVE_SAGITTA {
+            k += 1;
+            continue;
+        }
+        let (next, prev) = ((k + 1) % n, (k + n - 1) % n);
+        if segs[next].arc.is_none() {
+            segs[next].a = s.a;
+        } else if segs[prev].arc.is_none() {
+            segs[prev].b = s.b;
+        } else {
+            k += 1;
+            continue;
+        }
+        segs.remove(k);
+    }
+    segs
 }
 
 /// Refit the arcs a boolean or offset kernel flattened to a chord polygon: a
-/// maximal run of straight strokes whose vertices share one circle (within
-/// `fit`) becomes one arc stroke again, so a ring along it is one proven move
-/// — or the circumscribed polygon of the arc — instead of one move per
-/// flattened chord. Only runs fully on the circle, with chords short against
-/// the radius, a steady one-sided turn and a sweep under a full circle are
-/// accepted; anything else stays chords, and every emitted piece is still
-/// proven against the part before it is cut.
+/// maximal run of strokes whose vertices share one circle (within `fit`)
+/// becomes one arc stroke again, so a ring along it is one proven move — or
+/// the circumscribed polygon of the arc — instead of one move per flattened
+/// chord. A run may mix straight chords with short arcs (the kernels also
+/// return a flattened circle as alternating micro-arcs and micro-chords): an
+/// arc joins a run through its end and mid points, which must sit on the
+/// fitted circle like every vertex. Only runs fully on the circle, with
+/// chords short against the radius, a steady one-sided turn and a sweep under
+/// a full circle are accepted; anything else stays as it was, and every
+/// emitted piece is still proven against the part before it is cut.
 fn refit_arcs(segs: Vec<crate::pocket::Stroke>, fit: f64) -> Vec<crate::pocket::Stroke> {
     const MIN_RUN: usize = 4;
     if segs.len() < MIN_RUN {
         return segs;
     }
-    let mut pts: Vec<[f64; 2]> = segs.iter().map(|s| s.a).collect();
-    pts.push(segs[segs.len() - 1].b);
+    // A stroke's points before its end: the start, and an arc's mid point.
+    let inner = |s: &crate::pocket::Stroke| -> Vec<[f64; 2]> {
+        match s.arc {
+            None => vec![s.a],
+            Some((c, sweep)) => {
+                let rho = (s.a[0] - c[0]).hypot(s.a[1] - c[1]);
+                let mid = (s.a[1] - c[1]).atan2(s.a[0] - c[0]) + sweep / 2.;
+                vec![s.a, [c[0] + rho * mid.cos(), c[1] + rho * mid.sin()]]
+            }
+        }
+    };
     let mut out: Vec<crate::pocket::Stroke> = Vec::with_capacity(segs.len());
     let mut i = 0;
     while i < segs.len() {
-        if segs[i].arc.is_some() {
-            out.push(segs[i]);
-            i += 1;
-            continue;
-        }
-        // The longest run of line strokes from `i` whose vertices share one
-        // circle: extend while the whole run still fits, and keep the last
-        // fit (it was checked against every vertex of the accepted run).
+        // The longest run of strokes from `i` whose points share one circle:
+        // extend while the whole run still fits, and keep the last fit (it was
+        // checked against every point of the accepted run).
+        let mut pts = inner(&segs[i]);
         let mut j = i;
         let mut fitted: Option<([f64; 2], f64)> = None;
-        while j + 1 < segs.len()
-            && segs[j + 1].arc.is_none()
-            && let Some(f) = fit_circle_run(&pts[i..=j + 2], fit)
-        {
+        while j + 1 < segs.len() {
+            let mut trial = pts.clone();
+            trial.extend(inner(&segs[j + 1]));
+            trial.push(segs[j + 1].b);
+            let Some(f) = fit_circle_run(&trial, fit) else {
+                break;
+            };
+            trial.pop();
+            pts = trial;
             fitted = Some(f);
             j += 1;
         }
@@ -2896,8 +2939,8 @@ fn refit_arcs(segs: Vec<crate::pocket::Stroke>, fit: f64) -> Vec<crate::pocket::
             && let Some((centre, sweep)) = fitted
         {
             out.push(crate::pocket::Stroke {
-                a: pts[i],
-                b: pts[j + 1],
+                a: segs[i].a,
+                b: segs[j].b,
                 arc: Some((centre, sweep)),
             });
             i = j + 1;
@@ -3285,8 +3328,8 @@ fn prove_ring(
 }
 
 /// Side-entry candidates of a piece: its segment starts, at most one per 1 mm
-/// of the piece, each with the outward normal (right of travel: away from the
-/// region on a counter-clockwise outer loop, into the hole on a clockwise
+/// of the piece, each with the outward normal (left of travel: away from the
+/// region on a clockwise outer loop, into the hole on a counter-clockwise
 /// hole loop). On an arc the tangent at its start stands in for the chord.
 fn side_candidates(piece: &Piece) -> Vec<([f64; 2], [f64; 2])> {
     let mut side = vec![];
@@ -3300,7 +3343,7 @@ fn side_candidates(piece: &Piece) -> Vec<([f64; 2], [f64; 2])> {
         if !(d[0]).is_finite() || d[0].hypot(d[1]) <= 0. {
             continue;
         }
-        side.push((v, [d[1], -d[0]]));
+        side.push((v, [-d[1], d[0]]));
         taken = Some(v);
     }
     side

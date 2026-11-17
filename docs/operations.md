@@ -1638,7 +1638,12 @@ tool's swept disk is not above the cut (computed exactly per facet). Per
 connected component, nearest first, the passes are cut at growing offset
 depth (the outermost ring first); at the same depth outer boundary loops
 before hole loops, then nearest first, and each loop starts at its vertex
-nearest the tool. Consecutive pieces join into one chain by a straight link
+nearest the tool. Outer boundary loops run clockwise and hole loops counter-clockwise: the
+stock still to cut lies inward of each ring (the passes go outside in), on the
+right of travel, so the passes climb mill with a clockwise spindle. Kernel
+artefacts are not cut as moves of their own: a run of strokes on one circle
+(straight chords, or chords mixed with micro-arcs) is refitted as one arc, and
+a straight stub under 0.005 mm is absorbed into its straight neighbour. Consecutive pieces join into one chain by a straight link
 at the cut height and cutting feed when the link is at most two stepovers
 long, passes the same proof and lies inside the machine limits; otherwise the
 chain ends (retract, new entry). A chain is entered beside the level's face

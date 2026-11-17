@@ -363,5 +363,51 @@ class FlatOffsetTest(unittest.TestCase):
             self.assertLessEqual(worst, 1e-6, f"{name}: stock cut {worst:.4f} mm below the part")
 
 
+    def test_no_moves_of_kernel_artefacts(self):
+        # A kernel's flattened circle (chords mixed with micro-arcs) and its
+        # snapped corner stubs are not cut as moves of their own: no cut,
+        # link or lead shorter than 5 microns (the arcs' own move sagitta).
+        for name in ("stepped", "island"):
+            _, motions, *_ = cached(name)
+            tiny = [
+                m["id"]
+                for m in motions
+                if m["kind"] in ("cut", "link", "lead")
+                and math.hypot(*(m["curve"]["end"][k] - m["curve"]["start"][k] for k in (0, 1))) < 0.005
+            ]
+            self.assertEqual(tiny, [], f"{name}: moves under 5 microns: {tiny[:10]}")
+
+    def test_passes_climb_mill(self):
+        # With a clockwise spindle a pass climbs when the stock it cuts lies on
+        # the right of travel. Measured on the live stock: just outside the
+        # disk, beside the middle of each straight cut, which side still has
+        # stock above the cut height.
+        for name in ("stepped", "island"):
+            _, motions, before, grid, _ = cached(name)
+            nx, ny, dx, dy, lo = grid
+            side = {"climb": 0.0, "conventional": 0.0}
+            for m, snap in zip(motions, before):
+                c = m["curve"]
+                a, b = c["start"], c["end"]
+                length = math.hypot(b[0] - a[0], b[1] - a[1])
+                if m["kind"] != "cut" or c.get("kind", "line") != "line" or length < 1e-6:
+                    continue
+                tx, ty = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+                mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+
+                def stock(sign):
+                    for d in (R * 0.8, R * 0.95):
+                        x, y = mid[0] + sign * ty * d, mid[1] - sign * tx * d
+                        i, j = int((x - lo[0]) / dx), int((y - lo[1]) / dy)
+                        if 0 <= i < nx and 0 <= j < ny and snap[2 * (j * nx + i) + 1] > a[2] + 0.02:
+                            return True
+                    return False
+
+                right, left = stock(1), stock(-1)
+                if right != left:
+                    side["climb" if right else "conventional"] += length
+            self.assertGreater(side["climb"], 3 * side["conventional"], f"{name}: {side}")
+
+
 if __name__ == "__main__":
     unittest.main()
