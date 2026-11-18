@@ -3282,6 +3282,11 @@ impl EngagementFrontPlan {
         narrow: f64,
         cancel: &impl CancelSignal,
     ) -> Result<(Vec<Point>, bool, bool), String> {
+        // The fourth_review cancellation regression fires only at a poll
+        // taken inside the follow, which `slot_side_entry` reaches after
+        // advancing its position (test-only; no production reading).
+        #[cfg(test)]
+        tests::SLOT_SIDE_STAGE.with(|c| c.set(tests::SLOT_SIDE_IN_FOLLOW));
         let r = self.r;
         // Steering width: the declared width less what the grid cannot
         // resolve (see `steering_width`), narrowed by `narrow` when an
@@ -5706,6 +5711,11 @@ impl EngagementFrontPlan {
             self.report.stock_edge_entries += 1;
             self.report.slot_side_entries += 1;
             self.position = [q[0], q[1], z];
+            // The fourth_review regression pins its cancellation to the
+            // follow this advance feeds: the stage marker tells the signal
+            // where the attempt stands (test-only; no production reading).
+            #[cfg(test)]
+            tests::SLOT_SIDE_STAGE.with(|c| c.set(tests::SLOT_SIDE_ADVANCED));
             let heading = (q[1] - p[1]).atan2(q[0] - p[0]);
             if let Some(pts) = self
                 .proven_pass(stock, q, heading, false, from, cancel)
@@ -7066,7 +7076,7 @@ mod tests {
         }
     }
 
-    /// The slot-side entry attempt used by the cancellation regressions
+    /// The slot-side entry attempt used by the cancellation regression
     /// below: the fixture's first operation, a committed precut slot, the
     /// layer built on it, and the slot offered for a stock-edge-or-helix
     /// entry beside it.
@@ -7120,58 +7130,53 @@ mod tests {
     /// the point the discarded attempt had optimistically advanced to (the
     /// review of 67a7981).
     ///
-    /// The signal is calibrated against the attempt itself, so cancellation
-    /// cannot land before the position advance: a first, uncancelled run
-    /// counts the polls the whole attempt takes, and a second, identical run
-    /// cancels on that attempt's *last* poll — after the across-slot proof
-    /// has succeeded, after the position has advanced beside the slot, and
-    /// inside the follow the proof fed. Every assertion is unconditional:
-    /// the cancellation is required, the restored position is asserted
-    /// immediately, and the retried planner must produce a motion that
-    /// starts where the tool actually is. (Calibration recipe if the poll
-    /// placement ever drifts: the first run's total is the pin — today the
-    /// advance consumes 86 polls and the follow takes the 87th.)
+    /// The signal locates itself instead of trusting a poll count: it fires
+    /// only when a poll is taken with the attempt in its follow stage, which
+    /// `slot_side_entry` reaches only after the across-slot proof has
+    /// succeeded and the position has advanced beside the slot. A candidate
+    /// rejected before the attempt — a clearance query that polls and then
+    /// turns the entry down — cannot reach that stage, cannot fire the
+    /// signal, and leaves the call Ok, which fails this test instead of
+    /// passing it. Every assertion is unconditional: the cancellation is
+    /// required and must be the cancellation, no stroke of the discarded
+    /// attempt may survive, the position must restore with the attempt, and
+    /// the retried planner must produce a motion starting where the tool
+    /// actually is.
     #[test]
     fn fourth_review_slot_side_cancel_restores_position() {
-        let manifest = || {
-            serde_json::from_str::<crate::stream::StreamManifest>(include_str!(
-                "../../fixtures/operations/adaptive-pocket.json"
-            ))
-            .unwrap()
-        };
-        let total = {
-            let mut m = manifest();
-            let (mut plan, stock) = fourth_review_setup(&mut m).unwrap();
-            let polls = std::cell::Cell::new(0);
-            let planned = plan.slot_side_entry([10., 9.], &stock, &|| {
-                polls.set(polls.get() + 1);
-                false
-            });
-            assert!(
-                planned.is_ok(),
-                "the uncancelled slot-side attempt must plan: {planned:?}"
-            );
-            polls.get()
-        };
-        let mut m = manifest();
+        tests::SLOT_SIDE_STAGE.with(|c| c.set(tests::SLOT_SIDE_BEFORE_ADVANCE));
+        let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+            "../../fixtures/operations/adaptive-pocket.json"
+        ))
+        .unwrap();
         let (mut plan, stock) = fourth_review_setup(&mut m).unwrap();
         let before = plan.position;
-        let polls = std::cell::Cell::new(0);
+        let polls = std::cell::Cell::new(0usize);
+        let fired_stage = std::cell::Cell::new(tests::SLOT_SIDE_BEFORE_ADVANCE);
         let error = plan
             .slot_side_entry([10., 9.], &stock, &|| {
-                let n = polls.get();
-                polls.set(n + 1);
-                n + 1 >= total
+                let stage = tests::SLOT_SIDE_STAGE.with(|c| c.get());
+                polls.set(polls.get() + 1);
+                if stage == tests::SLOT_SIDE_IN_FOLLOW {
+                    fired_stage.set(stage);
+                    return true;
+                }
+                false
             })
-            .expect_err("the slot-side attempt must cancel at its last poll");
+            .expect_err("the slot-side attempt must cancel inside its follow");
+        assert!(
+            polls.get() > 0,
+            "the signal must have been polled at a real cancellation point"
+        );
+        assert_eq!(
+            fired_stage.get(),
+            tests::SLOT_SIDE_IN_FOLLOW,
+            "the cancellation must fire at a poll the follow takes, \
+             after the position advance beside the slot"
+        );
         assert!(
             error.contains("cancel"),
             "the failure must be the cancellation, not another defect: {error}"
-        );
-        assert_eq!(
-            polls.get(),
-            total,
-            "the cancelled attempt must reach the same last poll the completed one did"
         );
         assert_eq!(
             plan.pending.len(),
@@ -7545,6 +7550,15 @@ mod tests {
     // --- production knob): the limit and wider queries come back unresolved
     // --- with chosen reasons and counters, for a chosen number of queries.
 
+    /// Where the fourth_review slot-side cancellation stands in its attempt:
+    /// 0 up to the position advance beside the slot, 1 from that advance on,
+    /// 2 once the follow that the advance feeds has begun. The regression's
+    /// signal fires only at a poll read at 2, so a candidate rejected before
+    /// the attempt can neither trigger the cancellation nor pass the test.
+    pub(super) const SLOT_SIDE_BEFORE_ADVANCE: u8 = 0;
+    pub(super) const SLOT_SIDE_ADVANCED: u8 = 1;
+    pub(super) const SLOT_SIDE_IN_FOLLOW: u8 = 2;
+
     thread_local! {
         /// Test-only branch counters: rollback calls in the wall paths, and
         /// whole-loop wall cuts (`Wall::Whole`, as a pocket's wall pass).
@@ -7554,6 +7568,11 @@ mod tests {
             const { std::cell::Cell::new(0) };
         pub(super) static REVIEW_WALL_RUNS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
+        /// The slot-side attempt's stage marker, set by the `#[cfg(test)]`
+        /// hooks in `slot_side_entry` (at the position advance) and `follow`
+        /// (at its start); read by the fourth_review regression's signal.
+        pub(super) static SLOT_SIDE_STAGE: std::cell::Cell<u8> =
+            const { std::cell::Cell::new(SLOT_SIDE_BEFORE_ADVANCE) };
         static REVIEW_REASONS: std::cell::Cell<Option<(UnresolvedReason, UnresolvedReason)>> =
             const { std::cell::Cell::new(None) };
         static FORCED_QUERIES: std::cell::Cell<usize> =
