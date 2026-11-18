@@ -103,8 +103,12 @@ pub struct SlotReport {
     pub stock_query_work_exhausted: bool,
     /// Lines and arcs of the centreline (1 for a straight slot).
     pub path_pieces: usize,
-    /// Straight links across corners, inside the vertex orbit's disk.
+    /// Links across corners, inside the vertex orbit's disk.
     pub corner_links: usize,
+    /// Of those, the tangent arcs on the vertex orbit's circle (outer
+    /// corners); the rest are straight chords.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub corner_arcs: usize,
     /// Controlled-orbit arcs fed at `air_feed_mm_min` because they are
     /// proven to run inside the disk the previous orbit cleared at the same
     /// depth, and their total length.
@@ -597,6 +601,7 @@ impl SlotPlan {
             stock_query_work_exhausted: false,
             path_pieces: pieces.len(),
             corner_links: 0,
+            corner_arcs: 0,
             air_fed_arcs: 0,
             air_fed_mm: 0.,
         };
@@ -976,20 +981,46 @@ impl SlotPlan {
                         }
                         // A vertex: its orbit is done. Cross to the next
                         // piece's offset inside that orbit's disk.
+                        let vertex = self.center(self.distance, z);
                         let next = self.orbit_start_on(self.piece + 1, 0., z);
                         self.piece += 1;
                         self.distance = 0.;
                         if distance(self.position, next) <= self.op.tolerance_mm {
                             continue;
                         }
-                        let motion = self.emit(
+                        // The vertex orbit ends at the first offset heading
+                        // along the incoming piece. Where the slot turns away
+                        // from the link side (an outer corner), the orbit's
+                        // own circle, in the orbit's sense, reaches the second
+                        // offset heading along the outgoing piece after the
+                        // turn angle: a link tangent at both ends that sweeps
+                        // nothing the orbit did not. Where it turns toward the
+                        // link side, that circle needs 2*pi minus the turn
+                        // (a second orbit), so the link stays the straight
+                        // chord, inside the same disk.
+                        let angle = |p: Vec3| (p[1] - vertex[1]).atan2(p[0] - vertex[0]);
+                        let (a0, a1) = (angle(self.position), angle(next));
+                        let sweep_rad = if self.op.clockwise {
+                            -(a0 - a1).rem_euclid(TAU)
+                        } else {
+                            (a1 - a0).rem_euclid(TAU)
+                        };
+                        let curve = if sweep_rad.abs() <= std::f64::consts::PI {
+                            self.report.corner_arcs += 1;
+                            Curve::Arc {
+                                start: self.position,
+                                end: next,
+                                center: vertex,
+                                plane: Plane::Xy,
+                                sweep_rad,
+                            }
+                        } else {
                             Curve::Line {
                                 start: self.position,
                                 end: next,
-                            },
-                            MoveKind::Link,
-                            false,
-                        )?;
+                            }
+                        };
+                        let motion = self.emit(curve, MoveKind::Link, false)?;
                         self.report.corner_links += 1;
                         self.expected_generation = Some(stock.generation() + 1);
                         return Ok(Some(motion));
@@ -997,20 +1028,28 @@ impl SlotPlan {
                     let remaining = extent - self.distance;
                     let mut advance = self.steps[self.piece].min(remaining);
                     let mut known_clear = false;
-                    // Stock already clear along the rest of a line: one link.
-                    if matches!(piece, Piece::Line { .. })
-                        && remaining > advance
-                        && !self.report.stock_query_work_exhausted
-                    {
+                    // Stock already clear along the rest of the piece (a
+                    // line, or an arc of the centreline): one link.
+                    if remaining > advance && !self.report.stock_query_work_exhausted {
+                        let rest = match piece {
+                            Piece::Line { .. } => Curve::Line {
+                                start: self.center(self.distance, z),
+                                end: self.center(extent, z),
+                            },
+                            Piece::Arc { center, sweep, .. } => Curve::Arc {
+                                start: self.center(self.distance, z),
+                                end: self.center(extent, z),
+                                center: [center[0], center[1], z],
+                                plane: Plane::Xy,
+                                sweep_rad: sweep.signum() * remaining,
+                            },
+                        };
                         let query = Motion {
                             id: self.next_id,
                             operation: self.op.id.clone(),
                             tool: self.op.tool.clone(),
                             kind: MoveKind::Link,
-                            curve: Curve::Line {
-                                start: self.center(self.distance, z),
-                                end: self.center(extent, z),
-                            },
+                            curve: rest,
                             feed_mm_min: Some(self.op.feed_mm_min),
                         };
                         let mut work = usize::MAX;
