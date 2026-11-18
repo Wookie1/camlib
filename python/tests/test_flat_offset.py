@@ -186,6 +186,18 @@ def points(m, n=None):
     return [[a[k] + (b[k] - a[k]) * i / (n - 1) for k in range(3)] for i in range(n)]
 
 
+def arc_points(c, step=0.05):
+    a, ce = c["start"], c["center"]
+    rho = math.hypot(a[0] - ce[0], a[1] - ce[1])
+    a0 = math.atan2(a[1] - ce[1], a[0] - ce[0])
+    sweep = c["sweep_rad"]
+    n = max(2, int(rho * abs(sweep) / step) + 1)
+    return [
+        [ce[0] + rho * math.cos(a0 + sweep * i / (n - 1)), ce[1] + rho * math.sin(a0 + sweep * i / (n - 1)), a[2]]
+        for i in range(n)
+    ]
+
+
 def vertical_plunges(motions):
     out = []
     for m in motions:
@@ -285,9 +297,11 @@ class FlatOffsetTest(unittest.TestCase):
         self.assertLessEqual(report.get("ramped_entries", 0), 1)
 
     def test_first_ring_of_each_level_follows_its_edge(self):
-        # Outside in: the first loop cut at each level is the ring a radius
-        # outside the level's outer edge (boss top: the 8 x 8 boss; base:
-        # the 24 x 16 block), all the way round.
+        # Outside in: the first loop cut at each level runs round the
+        # level's outer edge (boss top: the 8 x 8 boss; base: the 24 x 16
+        # block), all the way round, its centre the radius less one stepover
+        # outside the edge: its disk takes one stepover of the face, like
+        # every later pass, rather than rolling a radius outside it in air.
         _, motions, *_ = cached("stepped")
         for z, rect in ((7.0, (8, 4, 16, 12)), (4.0, (0, 0, 24, 16))):
             cuts = [m for m in level_cuts(motions, z) if m["kind"] == "cut"]
@@ -300,9 +314,9 @@ class FlatOffsetTest(unittest.TestCase):
                 travelled += math.hypot(b[0] - a[0], b[1] - a[1])
                 if travelled > 1 and math.hypot(b[0] - start[0], b[1] - start[1]) < 1e-6:
                     break
-            worst = max(abs(rect_outline_distance(p, rect) - R) for m in ring for p in points(m))
+            worst = max(abs(rect_outline_distance(p, rect) - (R - STEPOVER)) for m in ring for p in points(m))
             self.assertLessEqual(worst, 0.01, f"Z{z}: first loop strays {worst:.4f} mm from the edge ring")
-            perimeter = 2 * (rect[2] - rect[0] + rect[3] - rect[1]) + 2 * math.pi * R
+            perimeter = 2 * (rect[2] - rect[0] + rect[3] - rect[1]) + 2 * math.pi * (R - STEPOVER)
             self.assertGreater(travelled, 0.98 * perimeter, f"Z{z}: first loop {travelled:.3f} of {perimeter:.3f} mm")
 
     def test_coverage_of_every_reachable_flat_point(self):
@@ -406,6 +420,34 @@ class FlatOffsetTest(unittest.TestCase):
                 if right != left:
                     side["climb" if right else "conventional"] += length
             self.assertGreater(side["climb"], 3 * side["conventional"], f"{name}: {side}")
+
+    def test_passes_do_not_run_over_finished_floor(self):
+        # Measured on the live stock before each move: the length of the
+        # level passes (cuts, links and leads at a flat's height) whose disk
+        # (less 0.1 mm) has no stock standing 0.02 mm above the cut — air
+        # beside an open edge, or floor an earlier pass already finished.
+        # A first ring rolling a radius outside every open edge, and inner
+        # rings run all the way round a rim or top that earlier rings had
+        # already covered, made this 47 % (stepped) and 45 % (island).
+        for name in ("stepped", "island"):
+            _, motions, before, grid, _ = cached(name)
+            nx, ny, dx, dy, lo = grid
+            xs = lo[0] + (np.arange(nx) + 0.5) * dx
+            ys = lo[1] + (np.arange(ny) + 0.5) * dy
+            X, Y = np.meshgrid(xs, ys)
+            total = idle = 0.0
+            for m, snap in zip(motions, before):
+                c = m["curve"]
+                z = c["start"][2]
+                if m["kind"] not in ("cut", "link", "lead") or abs(c["end"][2] - z) > 1e-6:
+                    continue
+                H = np.array(snap[1::2]).reshape(ny, nx)
+                ps = points(m) if c.get("kind", "line") == "line" else arc_points(c)
+                length = sum(math.dist(p[:2], q[:2]) for p, q in zip(ps, ps[1:]))
+                live = [bool((H[(X - p[0]) ** 2 + (Y - p[1]) ** 2 < (R - 0.1) ** 2] > z + 0.02).any()) for p in ps]
+                total += length
+                idle += length * (1 - sum(live) / len(live))
+            self.assertLess(idle, 0.1 * total, f"{name}: {idle:.1f} of {total:.1f} mm over no stock")
 
 
 if __name__ == "__main__":

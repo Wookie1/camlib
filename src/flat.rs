@@ -1579,6 +1579,24 @@ impl Piece {
     fn length(&self) -> f64 {
         self.segs.iter().map(crate::profiles::stroke_length).sum()
     }
+    /// The first `length` of the piece (all of it when shorter).
+    fn prefix(&self, length: f64) -> Piece {
+        let mut segs = vec![];
+        let mut left = length;
+        for seg in &self.segs {
+            if left <= 0. {
+                break;
+            }
+            let l = crate::profiles::stroke_length(seg);
+            if l <= left {
+                segs.push(*seg);
+            } else {
+                segs.push(sub_stroke(seg, 0., left / l));
+            }
+            left -= l;
+        }
+        Piece { z: self.z, segs }
+    }
     fn strokes(&self) -> Vec<crate::pocket::Stroke> {
         // The ramp walks the pass stroke by stroke; its arcs are split like
         // the cut moves so no ramp leg sweeps a chord that cuts its corner.
@@ -1838,6 +1856,7 @@ impl FlatPlan {
                 level,
                 op.level_tolerance_mm,
                 r,
+                op.stepover_mm,
                 op.tolerance_mm,
                 cancel,
             )?
@@ -1845,7 +1864,13 @@ impl FlatPlan {
                 continue;
             };
             // Offset loops per connected component, outside in.
-            let groups = level_loops(&region, r, op.stepover_mm, op.tolerance_mm, cancel)?;
+            // A loop cut only in stretches is cut through a gap between two
+            // of them when that takes no longer than a new entry's descent
+            // from the feed height at the plunge feed (and through any gap of
+            // up to two stepovers, as a link at depth would).
+            let bridge = (2. * op.stepover_mm)
+                .max((heights.feed - z).max(0.) * op.feed_mm_min / op.plunge_mm_min);
+            let groups = level_loops(&region, r, op.stepover_mm, op.tolerance_mm, bridge, cancel)?;
             let level_chains = chains.len();
             // Nearest component first.
             let mut order: Vec<usize> = (0..groups.len()).collect();
@@ -1856,13 +1881,25 @@ impl FlatPlan {
                     .then(a.cmp(&b))
             });
             for gi in order {
-                for ring in groups[gi].ordered(tool_xy) {
+                for (_, ring, runs) in groups[gi].ordered(tool_xy) {
                     if cancel.is_cancelled() {
                         return Err("flat-area planning cancelled".into());
                     }
                     loops += 1;
-                    // Each closed loop starts at its vertex nearest the tool.
-                    let ring = rotate_to_nearest(ring, tool_xy);
+                    // An inner loop is cut only where its disk reaches floor
+                    // the loops before it left; a short stretch between two
+                    // such places is cut through rather than left for a link.
+                    let ring = match runs {
+                        // Each closed loop starts at its vertex nearest the tool.
+                        None => rotate_to_nearest(ring, tool_xy),
+                        // Open stretches in loop order from the one starting
+                        // nearest the tool; prove_ring splits them into
+                        // pieces where they do not meet.
+                        Some(runs) => open_runs_from_nearest(runs, tool_xy),
+                    };
+                    if ring.is_empty() {
+                        continue;
+                    }
                     // Prove each chord; halve failures down to h / 16, keep
                     // only the stretches inside the limits.
                     let pieces = prove_ring(
@@ -2014,6 +2051,28 @@ impl FlatPlan {
                 "{which}: the run is shorter than 16 tolerances, too short to ramp on. Rough or rest-rough this area first"
             ));
         }
+        // Moves are read through their endpoints (posted programs, checks):
+        // a helix leg along an arc of the pass drops its depth over the arc,
+        // so over its chord it is steeper by the arc's length over the
+        // chord's. The ramp descends at the angle whose slope over every
+        // move's chord stays within the declared one.
+        let chain = piece.strokes();
+        let stretch = chain
+            .iter()
+            .filter(|s| s.arc.is_some())
+            .map(|s| {
+                let chord = (s.b[0] - s.a[0]).hypot(s.b[1] - s.a[1]);
+                if chord > 0. {
+                    crate::profiles::stroke_length(s) / chord
+                } else {
+                    1.
+                }
+            })
+            .fold(1., f64::max);
+        let entry = &crate::entry::RampEntry {
+            angle_rad: (entry.angle_rad.tan() / stretch).atan(),
+            ..entry.clone()
+        };
         // Reaching here with no stock above the start means the start is over
         // the level's face (the plain plunge above refused it for that). When
         // the stock over the whole pass is that face's already-cut floor (the
@@ -2027,19 +2086,44 @@ impl FlatPlan {
         // no span) — and descends along the pass as for stock. The stock top
         // wins when it is higher (real stock along the pass): the descent to
         // it stops at or above every stock cell under the pass, in air.
-        let target = if at_start <= a[2] + self.op.tolerance_mm {
+        //
+        // The ramp travels only the start of the pass when one leg descends
+        // the whole depth (the leg's length is the depth over the angle's
+        // tangent): it starts above the stock over that stretch, not over the
+        // whole pass, whose far side may run past part standing far above
+        // (cells along a taller wall). Starting from the floor above, the
+        // start height rises to the stock top over the stretch the ramp from
+        // it would travel until that stretch has no stock above it; when the
+        // stretch reaches the whole pass (the ramp reverses on it) the stock
+        // top over the whole pass is the floor.
+        let tan = entry.angle_rad.tan();
+        let mut target = if at_start <= a[2] + self.op.tolerance_mm {
             let span = entry.min_length_mm.unwrap_or(length);
-            (a[2] + span * entry.angle_rad.tan()).max(top)
+            a[2] + span * tan
         } else {
-            top
+            at_start
         };
+        loop {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let span = (target - a[2]) / tan;
+            if span >= length {
+                target = target.max(top);
+                break;
+            }
+            let over = piece_stock_top(&piece.prefix(span), stock, self.radius, cancel)?;
+            if over <= target {
+                break;
+            }
+            target = over;
+        }
         if target > self.heights.feed {
             return Err(format!(
                 "{which}, ramp start Z{target:.3} above the feed height Z{:.3}: raise feed_z_mm/retract_z_mm or rough this area first",
                 self.heights.feed
             ));
         }
-        let chain = piece.strokes();
         let curves = entry
             .zigzag(&chain, target, a[2])
             .map_err(|why| format!("{which}: {why}. Use a steeper declared angle, a longer run, or rough this area first"))?;
@@ -2456,21 +2540,31 @@ pub(crate) fn segment_stock_top(
     Ok(top)
 }
 
-/// The region of tool centres resting on the flat level `z`: the shadow of
-/// the part standing above `z - level_tolerance`, grown by the cutter radius
-/// (every position whose disk touches the part within a tolerance below the
-/// level), minus the shadow of the part standing above the level, grown by
-/// the radius plus the shadows' stated errors (the pattern of
-/// `waterline::flat_level_loops`): every position whose disk would reach the
-/// part above the level. The "above" shadow's tip is picked so its
-/// `protected_from_z_mm` is strictly above `z + level_tolerance`; nothing
-/// standing above the level leaves the resting region alone. What is left is
-/// exactly where a cut at `z + stock_to_leave_mm` rests on the level.
+/// The region of tool centres the passes on the flat level `z` run in: the
+/// shadow of the part standing above `z - level_tolerance`, grown by the
+/// overhang `r - stepover` (none at a stepover of a radius or more), minus
+/// the shadow of the part standing above the level, grown by the radius plus
+/// the shadows' stated errors (the pattern of `waterline::flat_level_loops`):
+/// every position whose disk would reach the part above the level. The
+/// "above" shadow's tip is picked so its `protected_from_z_mm` is strictly
+/// above `z + level_tolerance`; nothing standing above the level leaves the
+/// region alone. Every point of the region rests the disk on the level.
+///
+/// The overhang sets where the outermost pass runs past an open edge of the
+/// face (one where the part drops away): its centre `r - stepover` outside
+/// the edge, so its disk reaches `stepover` onto the face — the same width
+/// every later pass takes — instead of rolling along the edge a radius
+/// outside it and cutting nothing (the face is still covered: it lies inside
+/// the region, and the passes cover the region). This is the usual facing
+/// practice of running the tool part-way past the edge. Next to part standing
+/// above the level the region still ends a radius (plus errors) from it, so
+/// the outermost pass there runs along the wall.
 fn level_region(
     target: &crate::roughing::PreparedRoughingTarget,
     z: f64,
     level_tolerance: f64,
     r: f64,
+    stepover: f64,
     tolerance: f64,
     cancel: &impl CancelSignal,
 ) -> Result<
@@ -2498,7 +2592,7 @@ fn level_region(
         .region
         .prepare(options)
         .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
-        .offset_prepared(-r)
+        .offset_prepared(-(r - stepover).max(0.))
         .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
         .into_parts()
         .1;
@@ -2559,16 +2653,25 @@ fn level_region(
 
 /// The offset loops of one connected component of a level's region: the
 /// outer-boundary loops and the hole loops, each with its inward offset.
+/// One offset loop: its offset depth, its closed strokes, and the stretches
+/// of it that are cut when only part of it finishes floor no other loop
+/// covers (`None`: the whole loop; see `trim_ring`).
+type Ring = (
+    f64,
+    Vec<crate::pocket::Stroke>,
+    Option<Vec<Vec<crate::pocket::Stroke>>>,
+);
+
 struct LoopGroup {
-    outers: Vec<(f64, Vec<crate::pocket::Stroke>)>,
-    holes: Vec<(f64, Vec<crate::pocket::Stroke>)>,
+    outers: Vec<Ring>,
+    holes: Vec<Ring>,
 }
 impl LoopGroup {
     fn distance(&self, p: [f64; 2]) -> f64 {
-        let nearest = |rings: &[(f64, Vec<crate::pocket::Stroke>)]| {
+        let nearest = |rings: &[Ring]| {
             rings
                 .iter()
-                .flat_map(|(_, ring)| ring.iter())
+                .flat_map(|(_, ring, _)| ring.iter())
                 .map(|s| (s.a[0] - p[0]).hypot(s.a[1] - p[1]))
                 .fold(f64::INFINITY, f64::min)
         };
@@ -2576,24 +2679,23 @@ impl LoopGroup {
     }
     /// The rings in cut order: outer loops before hole loops, offset
     /// ascending (outside in), nearest the tool first at the same offset.
-    fn ordered(&self, tool: [f64; 2]) -> Vec<Vec<crate::pocket::Stroke>> {
+    fn ordered(&self, tool: [f64; 2]) -> Vec<Ring> {
         let near = |ring: &[crate::pocket::Stroke]| {
             ring.iter()
                 .map(|s| (s.a[0] - tool[0]).hypot(s.a[1] - tool[1]))
                 .fold(f64::INFINITY, f64::min)
         };
-        let sort =
-            |rings: &[(f64, Vec<crate::pocket::Stroke>)]| -> Vec<Vec<crate::pocket::Stroke>> {
-                let mut order: Vec<usize> = (0..rings.len()).collect();
-                order.sort_by(|&a, &b| {
-                    rings[a]
-                        .0
-                        .total_cmp(&rings[b].0)
-                        .then(near(&rings[a].1).total_cmp(&near(&rings[b].1)))
-                        .then(a.cmp(&b))
-                });
-                order.into_iter().map(|i| rings[i].1.clone()).collect()
-            };
+        let sort = |rings: &[Ring]| -> Vec<Ring> {
+            let mut order: Vec<usize> = (0..rings.len()).collect();
+            order.sort_by(|&a, &b| {
+                rings[a]
+                    .0
+                    .total_cmp(&rings[b].0)
+                    .then(near(&rings[a].1).total_cmp(&near(&rings[b].1)))
+                    .then(a.cmp(&b))
+            });
+            order.into_iter().map(|i| rings[i].clone()).collect()
+        };
         let mut all = sort(&self.outers);
         all.extend(sort(&self.holes));
         all
@@ -2618,6 +2720,7 @@ fn level_loops(
     r: f64,
     stepover: f64,
     tolerance: f64,
+    bridge: f64,
     cancel: &impl CancelSignal,
 ) -> Result<Vec<LoopGroup>, String> {
     use crate::planar::Boolean;
@@ -2641,9 +2744,15 @@ fn level_loops(
         let prepared = single
             .prepare(options)
             .map_err(|e| format!("flat-area loop region: {e}"))?;
-        let mut outers: Vec<(f64, Vec<crate::pocket::Stroke>)> = vec![];
-        let mut holes: Vec<(f64, Vec<crate::pocket::Stroke>)> = vec![];
-        let mut collect = |eroded: &crate::planar::PreparedRegion, d: f64| -> Result<(), String> {
+        // Loops as (depth, strokes, the depth the loops before them reach,
+        // when they are only cut where they reach past it).
+        type Pending = (f64, Vec<crate::pocket::Stroke>, Option<f64>);
+        let mut outers: Vec<Pending> = vec![];
+        let mut holes: Vec<Pending> = vec![];
+        let mut collect = |eroded: &crate::planar::PreparedRegion,
+                           d: f64,
+                           need: Option<f64>|
+         -> Result<(), String> {
             let mut vertices = 0usize;
             // A loop the kernel vouches no geometry for is not cut: shorter
             // than the guard (16 tolerances), or — the offset kernel
@@ -2661,12 +2770,12 @@ fn level_loops(
             for c in &eroded.definition().components {
                 let outer = boundary_strokes(&c.outer, false, tolerance)?;
                 if !outer.is_empty() && !degenerate_loop(&outer, guard, error) {
-                    outers.push((d, outer));
+                    outers.push((d, outer, need));
                 }
                 for hole in &c.holes {
                     let strokes = boundary_strokes(hole, true, tolerance)?;
                     if !strokes.is_empty() && !degenerate_loop(&strokes, guard, error) {
-                        holes.push((d, strokes));
+                        holes.push((d, strokes, need));
                     }
                 }
                 vertices += c.outer.vertices.len()
@@ -2685,7 +2794,26 @@ fn level_loops(
             if cancel.is_cancelled() {
                 return Err("flat-area planning cancelled".into());
             }
-            collect(&eroded, d)?;
+            // The rings so far (at 0, s, ..., d - s) already cover every point
+            // of the region within d - s + r of its boundary: a point at depth
+            // t >= d' lies t - d' from the boundary of the offset at d' (the
+            // erosion's complement is the boundary's complement grown by d').
+            // A ring at d is cut only while points deeper than that remain;
+            // otherwise it would only run over floor the earlier rings have
+            // finished (a narrow rim offset from both sides, a small top).
+            // What is left must be more than the kernel's picture of a line
+            // (`uncovered`).
+            // Where such points remain, the ring is cut only where its disk
+            // reaches them.
+            let need = if d > 0. {
+                if uncovered(&prepared, d - stepover + r, tolerance, guard)?.is_none() {
+                    break;
+                }
+                Some(d - stepover + r)
+            } else {
+                None
+            };
+            collect(&eroded, d, need)?;
             let next = prepared
                 .offset_prepared(d + stepover)
                 .map_err(|e| format!("flat-area loop offset: {e}"))?
@@ -2736,7 +2864,7 @@ fn level_loops(
                             .into_parts()
                             .1;
                         if !mid.definition().components.is_empty() {
-                            collect(&mid, half)?;
+                            collect(&mid, half, None)?;
                         }
                     }
                 }
@@ -2749,12 +2877,7 @@ fn level_loops(
             if cancel.is_cancelled() {
                 return Err("flat-area planning cancelled".into());
             }
-            let deeper = prepared
-                .offset_prepared(core + r - guard)
-                .map_err(|e| format!("flat-area loop offset: {e}"))?
-                .into_parts()
-                .1;
-            if deeper.definition().components.is_empty() {
+            if uncovered(&prepared, core + r, tolerance, guard)?.is_none() {
                 break;
             }
             let step = core + stepover / 2.;
@@ -2763,12 +2886,192 @@ fn level_loops(
                 .map_err(|e| format!("flat-area loop offset: {e}"))?
                 .into_parts()
                 .1;
-            collect(&eroded, step)?;
+            collect(&eroded, step, Some(core + r))?;
             core = step;
         }
-        groups.push(LoopGroup { outers, holes });
+        // Loops cut only where they finish floor nothing else covers: per
+        // depth reached, the points deeper than it, less what each loop's
+        // kept stretches sweep (outer loops first, as they are cut).
+        let (mut done_outers, mut done_holes): (Vec<Ring>, Vec<Ring>) = (vec![], vec![]);
+        let mut depths: Vec<f64> = outers.iter().chain(&holes).filter_map(|p| p.2).collect();
+        depths.sort_by(f64::total_cmp);
+        depths.dedup();
+        let mut needs: Vec<(f64, Option<crate::planar::PreparedRegion>)> = vec![];
+        for depth in depths {
+            needs.push((depth, uncovered(&prepared, depth, tolerance, guard)?));
+        }
+        let outer_count = outers.len();
+        for (index, (d, strokes, reach)) in outers.into_iter().chain(holes).enumerate() {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let runs = match reach {
+                None => None,
+                Some(reach) => {
+                    let slot = needs
+                        .iter_mut()
+                        .find(|(depth, _)| *depth == reach)
+                        .expect("every reach has its region");
+                    match slot.1.take() {
+                        None => Some(vec![]),
+                        Some(need) => {
+                            let runs = trim_ring(&strokes, &need, r, bridge, guard, cancel)?;
+                            let swept = match &runs {
+                                None => vec![strokes.clone()],
+                                Some(runs) => runs.clone(),
+                            };
+                            slot.1 = subtract_swept(need, &swept, r, tolerance, guard)?;
+                            runs
+                        }
+                    }
+                }
+            };
+            if runs.as_ref().is_some_and(|runs| runs.is_empty()) {
+                continue;
+            }
+            if index < outer_count {
+                done_outers.push((d, strokes, runs));
+            } else {
+                done_holes.push((d, strokes, runs));
+            }
+        }
+        groups.push(LoopGroup {
+            outers: done_outers,
+            holes: done_holes,
+        });
     }
     Ok(groups)
+}
+
+/// The points of `prepared` deeper than `depth` (the reach of the rings cut
+/// so far), or `None` when there are none: the offset by `depth` plus the
+/// tolerance, without what is only the kernel's picture of a line
+/// (`without_slivers`). Such a sliver is left where two rings' reach meets
+/// exactly (a rim offset from both sides whose width is a whole number of
+/// passes): the offset returns the meeting line as a strip of no width the
+/// kernel can vouch for, which no ring needs to cover.
+fn uncovered(
+    prepared: &crate::planar::PreparedRegion,
+    depth: f64,
+    tolerance: f64,
+    guard: f64,
+) -> Result<Option<crate::planar::PreparedRegion>, String> {
+    let deeper = prepared
+        .offset_prepared(depth + tolerance)
+        .map_err(|e| format!("flat-area loop offset: {e}"))?
+        .into_parts()
+        .1;
+    without_slivers(deeper, guard)
+}
+
+/// `region` without its slivers — strips thinner than twice its own stated
+/// boundary error plus `guard` (16 tolerances, as for degenerate loops),
+/// which the kernel cannot tell from a line: the morphological opening
+/// (eroded by that width `e`, grown back by it), or `None` when nothing is
+/// left. The opening keeps every point that lies in a disk of radius `e`
+/// inside the region; a point it drops at a corner tip lies within
+/// `e / sin(angle / 2)` of what is kept (twice `e` down to 60 degrees), and
+/// `trim_ring` keeps loops within that margin.
+fn without_slivers(
+    region: crate::planar::PreparedRegion,
+    guard: f64,
+) -> Result<Option<crate::planar::PreparedRegion>, String> {
+    if region.definition().components.is_empty() {
+        return Ok(None);
+    }
+    let e = region.definition().boundary_error_mm + guard;
+    let core = region
+        .offset_prepared(e)
+        .map_err(|e| format!("flat-area loop offset: {e}"))?
+        .into_parts()
+        .1;
+    if core.definition().components.is_empty() {
+        return Ok(None);
+    }
+    let opened = core
+        .offset_prepared(-e)
+        .map_err(|e| format!("flat-area loop offset: {e}"))?
+        .into_parts()
+        .1;
+    Ok((!opened.definition().components.is_empty()).then_some(opened))
+}
+
+/// `need` without what the disk of radius `r` sweeps along the strokes of
+/// `runs` (straight strokes as capsules; arcs by their chords, each capsule's
+/// radius reduced by the chord's sagitta so it stays inside the arc's swept
+/// disk), then without slivers; `None` when nothing is left.
+fn subtract_swept(
+    need: crate::planar::PreparedRegion,
+    runs: &[Vec<crate::pocket::Stroke>],
+    r: f64,
+    tolerance: f64,
+    guard: f64,
+) -> Result<Option<crate::planar::PreparedRegion>, String> {
+    use crate::planar::{Boolean, Boundary, Component, ConstructionOptions, PlanarRegion};
+    let options = ConstructionOptions {
+        tolerance_mm: tolerance,
+    };
+    let mut capsules: Vec<Component> = vec![];
+    let mut capsule = |a: [f64; 2], b: [f64; 2], radius: f64| {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let length = d[0].hypot(d[1]);
+        if length <= guard || radius <= guard {
+            return;
+        }
+        let n = [-d[1] / length * radius, d[0] / length * radius];
+        capsules.push(Component {
+            outer: Boundary {
+                vertices: vec![
+                    [a[0] - n[0], a[1] - n[1], 0.],
+                    [b[0] - n[0], b[1] - n[1], 1.],
+                    [b[0] + n[0], b[1] + n[1], 0.],
+                    [a[0] + n[0], a[1] + n[1], 1.],
+                ],
+            },
+            holes: vec![],
+        });
+    };
+    for seg in runs.iter().flatten() {
+        match seg.arc {
+            None => capsule(seg.a, seg.b, r),
+            Some((c, sweep)) => {
+                let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+                let sagitta = 0.01_f64.min(rho);
+                let half = (1. - sagitta / rho).clamp(-1., 1.).acos().max(1e-6);
+                let n = ((sweep.abs() / (2. * half)).ceil() as usize).clamp(1, 4096);
+                let sag = rho * (1. - (sweep.abs() / (2. * n as f64)).cos());
+                for k in 0..n {
+                    let t0 = k as f64 / n as f64;
+                    let t1 = (k + 1) as f64 / n as f64;
+                    capsule(stroke_point(seg, t0), stroke_point(seg, t1), r - sag);
+                }
+            }
+        }
+    }
+    let mut need = need;
+    // Each capsule on its own: they overlap, and the components of one
+    // region must not.
+    for c in capsules {
+        if need.definition().components.is_empty() {
+            return Ok(None);
+        }
+        let swept = PlanarRegion {
+            version: 1,
+            units: "mm".into(),
+            name: "flat-swept-capsule".into(),
+            boundary_error_mm: 0.,
+            components: vec![c],
+            source: serde_json::Value::Null,
+        }
+        .prepare(options)
+        .map_err(|e| format!("flat-area swept region: {e}"))?;
+        need = need
+            .boolean_prepared(&swept, Boolean::Difference)
+            .map_err(|e| format!("flat-area swept region: {e}"))?
+            .into_parts()
+            .1;
+    }
+    without_slivers(need, guard)
 }
 
 /// Whether a loop carries no geometry the kernel vouches for: its total
@@ -3038,6 +3341,176 @@ fn rotate_piece(piece: &mut Piece, v: [f64; 2]) {
     let mut rotated: Vec<crate::pocket::Stroke> = piece.segs[i..].to_vec();
     rotated.extend_from_slice(&piece.segs[..i]);
     piece.segs = rotated;
+}
+
+/// Sampling step along a loop when trimming it to the floor it must finish.
+const TRIM_STEP_MM: f64 = 0.25;
+
+/// The stretches of the closed `ring` whose disk of radius `r` can reach
+/// `need` (the points the loops before it leave uncovered), in loop order and
+/// each in the loop's direction, or `None` when the whole loop is needed.
+/// The loop is read in pieces of at most `TRIM_STEP_MM`; a piece is kept
+/// when its middle lies within `r` plus half the piece's length of `need`
+/// (the region's signed clearance, a distance, so no point of a dropped
+/// piece comes within `r` of `need`). A dropped stretch no longer than
+/// `bridge` between kept ones is kept as well: the pass is proven along it,
+/// and cutting through is shorter than leaving and coming back. Keeping is
+/// the conservative side: every point of `need` the whole loop would cover,
+/// the kept stretches cover.
+fn trim_ring(
+    ring: &[crate::pocket::Stroke],
+    need: &crate::planar::PreparedRegion,
+    r: f64,
+    bridge: f64,
+    guard: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Option<Vec<Vec<crate::pocket::Stroke>>>, String> {
+    if need.definition().components.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    // The reach kept around `need`: the radius, plus twice the sliver width
+    // `without_slivers` may have opened off a corner tip.
+    let reach = r + 2. * (need.definition().boundary_error_mm + guard);
+    // Pieces as (stroke index, t0, t1, length, kept).
+    let mut pieces: Vec<(usize, f64, f64, f64, bool)> = vec![];
+    for (i, seg) in ring.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let length = crate::profiles::stroke_length(seg);
+        let n = ((length / TRIM_STEP_MM).ceil() as usize).max(1);
+        for k in 0..n {
+            let (t0, t1) = (k as f64 / n as f64, (k + 1) as f64 / n as f64);
+            let mid = stroke_point(seg, (t0 + t1) / 2.);
+            let q = need.query(mid)?;
+            let distance = (-q.signed_clearance_mm.unwrap_or(f64::NEG_INFINITY)).max(0.);
+            pieces.push((
+                i,
+                t0,
+                t1,
+                length / n as f64,
+                distance <= reach + length / n as f64 / 2.,
+            ));
+        }
+    }
+    let count = pieces.len();
+    let Some(first_kept) = pieces.iter().position(|p| p.4) else {
+        return Ok(Some(vec![]));
+    };
+    if pieces.iter().all(|p| p.4) {
+        return Ok(None);
+    }
+    // Bridge short dropped stretches between kept ones, around the loop.
+    let mut k = 0;
+    while k < count {
+        let at = (first_kept + k) % count;
+        if pieces[at].4 {
+            k += 1;
+            continue;
+        }
+        let mut end = k;
+        let mut gap = 0.;
+        while end < count && !pieces[(first_kept + end) % count].4 {
+            gap += pieces[(first_kept + end) % count].3;
+            end += 1;
+        }
+        if gap <= bridge {
+            for j in k..end {
+                pieces[(first_kept + j) % count].4 = true;
+            }
+        }
+        k = end;
+    }
+    if pieces.iter().all(|p| p.4) {
+        return Ok(None);
+    }
+    // Start right after a dropped piece, so no stretch wraps the seam.
+    let start = (0..count)
+        .map(|k| (first_kept + k) % count)
+        .find(|&at| pieces[at].4 && !pieces[(at + count - 1) % count].4)
+        .unwrap_or(first_kept);
+    let mut runs: Vec<Vec<crate::pocket::Stroke>> = vec![];
+    let mut current: Vec<crate::pocket::Stroke> = vec![];
+    let mut open: Option<(usize, f64, f64)> = None;
+    let flush = |open: &mut Option<(usize, f64, f64)>, current: &mut Vec<crate::pocket::Stroke>| {
+        if let Some((i, t0, t1)) = open.take() {
+            current.push(sub_stroke(&ring[i], t0, t1));
+        }
+    };
+    for k in 0..count {
+        let (i, t0, t1, _, kept) = pieces[(start + k) % count];
+        if !kept {
+            flush(&mut open, &mut current);
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        match open {
+            Some((j, a, _)) if j == i => open = Some((j, a, t1)),
+            _ => {
+                flush(&mut open, &mut current);
+                open = Some((i, t0, t1));
+            }
+        }
+    }
+    flush(&mut open, &mut current);
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    Ok(Some(runs))
+}
+
+/// The point of a stroke at parameter `t` (0 at its start, 1 at its end).
+fn stroke_point(seg: &crate::pocket::Stroke, t: f64) -> [f64; 2] {
+    if t <= 0. {
+        return seg.a;
+    }
+    if t >= 1. {
+        return seg.b;
+    }
+    match seg.arc {
+        None => [
+            seg.a[0] + t * (seg.b[0] - seg.a[0]),
+            seg.a[1] + t * (seg.b[1] - seg.a[1]),
+        ],
+        Some((c, sweep)) => {
+            let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+            let angle = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]) + sweep * t;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        }
+    }
+}
+
+/// The part of a stroke between parameters `t0` and `t1`, ending exactly on
+/// the stroke's own endpoints where it reaches them.
+fn sub_stroke(seg: &crate::pocket::Stroke, t0: f64, t1: f64) -> crate::pocket::Stroke {
+    crate::pocket::Stroke {
+        a: stroke_point(seg, t0),
+        b: stroke_point(seg, t1),
+        arc: seg.arc.map(|(c, sweep)| (c, sweep * (t1 - t0))),
+    }
+}
+
+/// Open stretches of one loop, in loop order, starting from the stretch whose
+/// start is nearest `tool`, as one stroke list (stretches that do not meet
+/// are split into separate pieces when proven).
+fn open_runs_from_nearest(
+    runs: Vec<Vec<crate::pocket::Stroke>>,
+    tool: [f64; 2],
+) -> Vec<crate::pocket::Stroke> {
+    let first = runs
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let d = |s: &[crate::pocket::Stroke]| (s[0].a[0] - tool[0]).hypot(s[0].a[1] - tool[1]);
+            d(a).total_cmp(&d(b))
+        })
+        .map_or(0, |(i, _)| i);
+    let n = runs.len();
+    (0..n)
+        .flat_map(|k| runs[(first + k) % n].iter().copied())
+        .collect()
 }
 
 /// Rotate a closed ring of segments (the last ending on the first's start) so
