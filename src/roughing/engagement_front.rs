@@ -2240,6 +2240,7 @@ struct PassMark {
     pending: usize,
     journal: usize,
     report: EngagementFrontReport,
+    position: [f64; 3],
 }
 
 type Pending = (Curve, MoveKind, Option<f64>);
@@ -4313,12 +4314,19 @@ impl EngagementFrontPlan {
         }
     }
 
-    /// Everything a planned pass changes, to undo it.
+    /// Everything a planned pass changes, to undo it: the queued strokes,
+    /// the layer's fitted marks, the staged report, and the position the
+    /// planner keeps. The position is restored with the rest, so a rolled
+    /// back attempt cannot leave the planner at a point the surviving
+    /// queue never reaches (the review of 67a7981: an attempt optimistically
+    /// advances the position, and a later cancellation must not leave the
+    /// resumed motion starting somewhere the tool is not).
     fn checkpoint(&mut self) -> PassMark {
         PassMark {
             pending: self.pending.len(),
             journal: self.layer.as_ref().unwrap().journal.len(),
             report: self.report.clone(),
+            position: self.position,
         }
     }
     fn rollback(&mut self, mark: &PassMark) {
@@ -4327,6 +4335,7 @@ impl EngagementFrontPlan {
         let replans = self.report.engagement_replans;
         self.report = mark.report.clone();
         self.report.engagement_replans = replans;
+        self.position = mark.position;
     }
 
     /// The declared width less what the steering grid cannot resolve: the
@@ -7053,6 +7062,89 @@ mod tests {
                     stock.apply_delta(&delta).unwrap();
                 }
                 _ => break,
+            }
+        }
+    }
+
+    /// A cancellation after the slot-side entry proof succeeded, before the
+    /// front has been followed, must restore the position the planner keeps
+    /// alongside the attempt it rolls back: the resumed motion has to start
+    /// from the last actual tool position, not from the point the rolled
+    /// back attempt had optimistically advanced to (the review of 67a7981).
+    /// Real proofs, a committed precut slot, and a deterministic signal that
+    /// answers 86 successful polls then cancels.
+    #[test]
+    fn fourth_review_slot_side_cancel_restores_position() {
+        for stop in [86] {
+            let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+                "../../fixtures/operations/adaptive-pocket.json"
+            ))
+            .unwrap();
+            let crate::pocket::Operation::AdaptivePocket(mut op) = m.operations.remove(0) else {
+                panic!("fixture");
+            };
+            op.pocket.entry = Some(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
+                }))
+                .unwrap(),
+            );
+            let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+            let mut plan = EngagementFrontPlan::prepare(
+                op.pocket,
+                &m.tools[0],
+                stock.spec(),
+                m.initial_position_mm,
+                0.5,
+                true,
+                &NeverCancelled,
+            )
+            .unwrap();
+            let z = plan.z;
+            let (a, b, q) = ([6., 8.], [10., 8.], [10., 9.]);
+            let slot = Motion {
+                id: 0,
+                operation: "precut-slot".into(),
+                tool: m.tools[0].id.clone(),
+                kind: MoveKind::Cut,
+                curve: Curve::Line {
+                    start: [a[0], a[1], z],
+                    end: [b[0], b[1], z],
+                },
+                feed_mm_min: Some(600.),
+            };
+            let tool = m.tools[0].prepare().unwrap();
+            let delta = stock
+                .preview_sweep(&tool, &slot, 1., m.sweep, &NeverCancelled)
+                .unwrap();
+            stock.apply_delta(&delta).unwrap();
+            plan.build_layer(&stock, &NeverCancelled).unwrap();
+            plan.ramp_slots.push((a, b));
+            let before = plan.position;
+            let polls = std::cell::Cell::new(0);
+            let cancel = || {
+                let n = polls.get();
+                polls.set(n + 1);
+                n >= stop
+            };
+            let result = plan.slot_side_entry(q, &stock, &cancel);
+            if result.is_err() {
+                let after_error = plan.position;
+                let resumed = plan.next_motion_with_stock(&stock, &NeverCancelled);
+                eprintln!("before {before:?}; resumed {resumed:?}");
+                if let Ok(Some(motion)) = resumed {
+                    assert_eq!(
+                        motion.curve.start(),
+                        before,
+                        "resumed motion must start at the last actual position"
+                    );
+                }
+                assert_eq!(
+                    after_error,
+                    before,
+                    "cancel poll {stop}: queue {}, error {result:?}",
+                    plan.pending.len()
+                );
             }
         }
     }
