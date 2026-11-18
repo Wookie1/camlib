@@ -27,7 +27,6 @@ pub(crate) struct SweepReceipt {
     pub motion: Motion,
     pub tool: crate::tool::ToolAssembly,
     pub fraction: f64,
-    pub tolerance_mm: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -594,6 +593,7 @@ impl CommittedColumns {
         self.tolerance_mm = self.tolerance_mm.max(tolerance_mm);
     }
 
+    #[cfg(test)]
     fn collect(
         &self,
         tolerance_mm: f64,
@@ -893,6 +893,9 @@ impl Stock {
     pub(crate) fn last_sweep_receipt(&self) -> Option<&SweepReceipt> {
         self.last_receipt.as_deref()
     }
+    /// Every committed cleared sweep (tests; planners read only what is new
+    /// with `committed_clearance_since`).
+    #[cfg(test)]
     pub(crate) fn committed_clearance(
         &self,
         tolerance_mm: f64,
@@ -1621,7 +1624,6 @@ impl Stock {
                     motion: motion.clone(),
                     tool: tool.definition().clone(),
                     fraction,
-                    tolerance_mm: options.tolerance_mm,
                 })
             }),
         };
@@ -2161,7 +2163,6 @@ impl Stock {
                     motion: motion.clone(),
                     tool: tool.definition().clone(),
                     fraction,
-                    tolerance_mm,
                 })
             }),
         };

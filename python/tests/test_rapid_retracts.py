@@ -107,8 +107,6 @@ class AdaptiveHeightsTest(unittest.TestCase):
             20,
             retract_z_mm=13,
             feed_z_mm=11,
-            # This test is of the orbit planner's links.
-            path_strategy="disk_front",
             feed_mm_min=600,
             plunge_mm_min=150,
             spindle_rpm=12000,
@@ -127,8 +125,13 @@ class AdaptiveHeightsTest(unittest.TestCase):
         moves, statuses = run(camlib.Job("adaptive", "1", (setup,)))
         self.assertEqual(set(statuses), {"clear"}, statuses)
         inner = moves[1:-1]
-        # Only the first and last moves reach clearance; travel is at Z13.
-        self.assertTrue(all(max(m["curve"]["start"][2], m["curve"]["end"][2]) <= 13 + 1e-9 for m in inner[1:]))
+        # Travel within a level is at Z13. The engagement front plans each level on its own and goes to the
+        # clearance height between them (the one trip up, across and down at Z20 below); the removed orbit planner
+        # stayed at Z13 there too (#190).
+        travel = inner[1:]
+        high = [i for i, m in enumerate(travel) if max(m["curve"]["start"][2], m["curve"]["end"][2]) > 13 + 1e-9]
+        self.assertEqual(high, [high[0], high[0] + 1, high[0] + 2], high)
+        self.assertTrue(all(travel[i]["kind"] == "rapid" for i in high))
         # Rapid descents stop at the feed height; below it the tool feeds.
         for m in moves:
             a, b = m["curve"]["start"], m["curve"]["end"]

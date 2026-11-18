@@ -495,9 +495,6 @@ enum Metric {
     WrongSide {
         material_on_right: bool,
     },
-    Front {
-        material_on_right: bool,
-    },
 }
 
 impl EngagementScene {
@@ -549,37 +546,6 @@ impl EngagementScene {
     }
     pub(crate) fn stock_spec(&self) -> &StockSpec {
         &self.stock
-    }
-    /// Conditional geometric premise, just like a ClearedSweep. The planner
-    /// must bind a completed shell recipe to actual full native stock commits.
-    /// Original StockSpec and its physical height cells are never changed.
-    pub(crate) fn append_rectangular_shell(
-        &mut self,
-        bounds: [Point; 2],
-        floor: f64,
-    ) -> Result<(), String> {
-        let old = self.material_bounds(floor);
-        if !floor.is_finite()
-            || bounds.iter().flatten().any(|v| !v.is_finite())
-            || (0..2).any(|k| {
-                bounds[0][k] >= bounds[1][k] || bounds[0][k] < old[0][k] || bounds[1][k] > old[1][k]
-            })
-        {
-            return Err("invalid or non-nested committed rectangular shell".into());
-        }
-        if let Some((_, previous)) = self
-            .rectangular_shells
-            .iter_mut()
-            .find(|(z, _)| *z == floor)
-        {
-            *previous = bounds;
-        } else {
-            if self.rectangular_shells.len() >= 4096 {
-                return Err("rectangular shell floor limit exceeded".into());
-            }
-            self.rectangular_shells.push((floor, bounds));
-        }
-        Ok(())
     }
     pub(crate) fn material_bounds(&self, z: f64) -> [Point; 2] {
         let mut result = [
@@ -709,27 +675,6 @@ impl EngagementScene {
             cancel,
         )
     }
-    /// Joint continuous front admission. One interval tree shares all geometric
-    /// angular unions; success requires BOTH total contact and the entire
-    /// instantaneous forbidden half to be bounded throughout the whole motion.
-    pub(crate) fn check_front(
-        &self,
-        motion: &Motion,
-        radius: f64,
-        max_angle_deg: f64,
-        material_on_right: bool,
-        options: EngagementOptions,
-        cancel: &impl CancelSignal,
-    ) -> Result<EngagementReport, String> {
-        self.check_metric(
-            motion,
-            radius,
-            max_angle_deg,
-            options,
-            Metric::Front { material_on_right },
-            cancel,
-        )
-    }
     /// Heuristic for candidate ranking ONLY. Point queries are not sweep,
     /// stock, productivity or remaining-material certificates.
     pub(crate) fn point_near_cleared_sweep(
@@ -781,90 +726,6 @@ impl EngagementScene {
         }
         Ok(Some(false))
     }
-    /// Candidate poses near the recent cleared front. Geometric ranking ONLY:
-    /// a point on/near a committed axis is not a padded empty disk certificate.
-    /// The caller must still prove source, full disk, engagement and side.
-    pub(crate) fn reentry_positions(
-        &self,
-        goal: Point,
-        floor: f64,
-        inset: f64,
-        material_on_right: bool,
-        work: &mut u64,
-        cancel: &impl CancelSignal,
-    ) -> Result<Vec<(Point, f64)>, String> {
-        if cancel.is_cancelled() {
-            return Err("stock-front history search cancelled".into());
-        }
-        let mut positions = Vec::new();
-        for support in self.supports.iter().rev().take(128) {
-            if cancel.is_cancelled() {
-                return Err("stock-front history search cancelled".into());
-            }
-            if *work == 0 {
-                return Err("stock-front history search work limit; coverage unproven".into());
-            }
-            *work -= 1;
-            if support.floor > floor {
-                continue;
-            }
-            let poses = match support.shape {
-                Shape::Line {
-                    a, unit, length, ..
-                } => {
-                    let t = dot([goal[0] - a[0], goal[1] - a[1]], unit).clamp(0., length);
-                    [t, length / 2.].map(|t| {
-                        (
-                            [a[0] + t * unit[0], a[1] + t * unit[1]],
-                            unit[1].atan2(unit[0]),
-                        )
-                    })
-                }
-                Shape::Arc {
-                    a,
-                    b,
-                    c,
-                    radius,
-                    angle,
-                    sweep,
-                } => {
-                    let theta = (goal[1] - c[1]).atan2(goal[0] - c[0]);
-                    let travel = if sweep > 0. {
-                        angular::wrap_tau(theta - angle)
-                    } else {
-                        angular::wrap_tau(angle - theta)
-                    };
-                    let closest = if travel <= sweep.abs() {
-                        travel * sweep.signum()
-                    } else if distance(goal, a) < distance(goal, b) {
-                        0.
-                    } else {
-                        sweep
-                    };
-                    [closest, sweep / 2.].map(|travel| {
-                        let theta = angle + travel;
-                        (
-                            [c[0] + radius * theta.cos(), c[1] + radius * theta.sin()],
-                            theta + sweep.signum() * PI / 2.,
-                        )
-                    })
-                }
-            };
-            let side = if material_on_right { 1. } else { -1. };
-            for (p, heading) in poses {
-                // Nudge toward the cleared side. Exact path points alone may
-                // only fit the original radius, not a guarded descent disk.
-                positions.push((
-                    [
-                        p[0] - side * inset * heading.sin(),
-                        p[1] + side * inset * heading.cos(),
-                    ],
-                    heading,
-                ));
-            }
-        }
-        Ok(positions)
-    }
     /// Whole closed XY box covered by committed empty columns or outside
     /// original stock. A centre-distance plus half-diagonal bound encloses ALL
     /// points. Reuses the swept-history index; no endpoint/point-sample proof.
@@ -881,39 +742,6 @@ impl EngagementScene {
             return Ok(true);
         };
         self.clear_ball_witness(p, extent, z, work, cancel)
-    }
-    /// A remembered index is only a search hint. Every use rechecks the
-    /// current support geometry, floor and complete query ball; even a hint
-    /// from another scene cannot manufacture a clearance premise.
-    pub(crate) fn clear_box_with_hint(
-        &self,
-        bounds: [Point; 2],
-        z: f64,
-        hint: &mut Option<usize>,
-        work: &mut u64,
-        cancel: &impl CancelSignal,
-    ) -> Result<bool, String> {
-        #[cfg(feature = "profile-planning")]
-        let _profile = crate::planning_profile::span("coverage.scene_box");
-        let Some((p, extent)) = self.box_ball(bounds, z, cancel)? else {
-            return Ok(true);
-        };
-        let numeric = 4096. * f64::EPSILON * (1. + p[0].abs() + p[1].abs() + extent);
-        if let Some(support) = hint.and_then(|i| self.supports.get(i)) {
-            if *work == 0 {
-                return Err("stock-front coverage work limit; coverage unproven".into());
-            }
-            *work -= 1;
-            if ball_in_support(support, p, extent, z, numeric) {
-                return Ok(true);
-            }
-        }
-        if let Some(index) = self.find_ball_witness(p, extent, z, work, cancel)? {
-            *hint = Some(index);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
     fn box_ball(
         &self,
@@ -1242,29 +1070,9 @@ impl EngagementScene {
         metric: Metric,
         cancel: &impl CancelSignal,
     ) -> Result<EngagementReport, String> {
-        if matches!(metric, Metric::Front { .. }) {
-            self.check_metric_mode::<true, true>(
-                motion,
-                radius,
-                max_angle_deg,
-                options,
-                metric,
-                cancel,
-            )
-        } else {
-            // Public angle inspection retains its full-history report; this
-            // optimization answers only the planner's joint admission question.
-            self.check_metric_mode::<false, true>(
-                motion,
-                radius,
-                max_angle_deg,
-                options,
-                metric,
-                cancel,
-            )
-        }
+        self.check_metric_mode::<true>(motion, radius, max_angle_deg, options, metric, cancel)
     }
-    fn check_metric_mode<const EARLY_UNION: bool, const REFUTE: bool>(
+    fn check_metric_mode<const REFUTE: bool>(
         &self,
         motion: &Motion,
         radius: f64,
@@ -1278,7 +1086,6 @@ impl EngagementScene {
             Metric::Total => "engagement.total",
             Metric::Leading => "engagement.leading",
             Metric::WrongSide { .. } => "engagement.side",
-            Metric::Front { .. } => "engagement.front",
         });
         if cancel.is_cancelled() {
             return Err("engagement query cancelled".into());
@@ -1347,7 +1154,7 @@ impl EngagementScene {
                 report.upper_angle_deg = report.upper_angle_deg.max(upper.to_degrees());
                 continue;
             }
-            let Some(upper) = self.angular_bound::<EARLY_UNION, REFUTE>(
+            let Some(upper) = self.angular_bound::<REFUTE>(
                 &span,
                 radius,
                 &mut report,
@@ -1361,11 +1168,7 @@ impl EngagementScene {
                 return Ok(unresolved(report, UnresolvedReason::Work));
             };
             let deg = upper.to_degrees().min(360.);
-            // A joint side failure is encoded as TAU. An authored 360deg
-            // contact limit must never turn that forbidden-half failure into
-            // a successful one-sided front proof.
-            let side_unproved = matches!(metric, Metric::Front { .. }) && upper >= TAU;
-            if deg <= max_angle_deg && !side_unproved {
+            if deg <= max_angle_deg {
                 report.upper_angle_deg = report.upper_angle_deg.max(deg);
                 continue;
             }
@@ -1390,7 +1193,7 @@ impl EngagementScene {
                         b: f,
                         error,
                     };
-                    let Some(upper) = self.angular_bound::<EARLY_UNION, REFUTE>(
+                    let Some(upper) = self.angular_bound::<REFUTE>(
                         &pose,
                         radius,
                         &mut report,
@@ -1403,9 +1206,7 @@ impl EngagementScene {
                     else {
                         return Ok(unresolved(report, UnresolvedReason::Work));
                     };
-                    if upper.to_degrees().min(360.) > max_angle_deg
-                        || (matches!(metric, Metric::Front { .. }) && upper >= TAU)
-                    {
+                    if upper.to_degrees().min(360.) > max_angle_deg {
                         return Ok(unresolved(report, UnresolvedReason::Resolution));
                     }
                 }
@@ -1423,7 +1224,7 @@ impl EngagementScene {
         Ok(report)
     }
     #[allow(clippy::too_many_arguments)]
-    fn angular_bound<const EARLY_UNION: bool, const REFUTE: bool>(
+    fn angular_bound<const REFUTE: bool>(
         &self,
         span: &Span<'_>,
         r: f64,
@@ -1489,17 +1290,13 @@ impl EngagementScene {
         let delta = span.path.length_mm() * (span.b - span.a) / 2. + span.error;
         let mut contact_upper = TAU;
         let mut side_proved = *whole_side_proved;
-        let mut normalized = 0;
-        let mut interval_terms = 0;
-        let mut incremental = EARLY_UNION;
         let x_bounds = span.projection([1., 0.]);
         let y_bounds = span.projection([0., 1.]);
         let bounds = [
             [x_bounds[0] - r - numeric, y_bounds[0] - r - numeric],
             [x_bounds[1] + r + numeric, y_bounds[1] + r + numeric],
         ];
-        if let Metric::WrongSide { material_on_right } | Metric::Front { material_on_right } =
-            metric
+        if let Metric::WrongSide { material_on_right } = metric
             && REFUTE
             && !side_proved
         {
@@ -1528,28 +1325,6 @@ impl EngagementScene {
             }
             if report.support_tests + report.index_visits >= limit {
                 return Ok(None);
-            }
-            // Every interval already encloses clear angles for this WHOLE
-            // motion span. Their union can prove admission before older
-            // supports are visited; more cleared geometry cannot undo it.
-            // Complex fragmented sets use the original one-sort fallback.
-            if incremental && intervals.len() > 128 {
-                incremental = false;
-            }
-            if incremental
-                && merge_new_intervals(&mut intervals, &mut normalized, &mut interval_terms)
-            {
-                let (side, upper) = interval_metric_bound(
-                    &intervals,
-                    forbidden,
-                    side_proved,
-                    metric,
-                    contact_upper,
-                    interval_terms,
-                );
-                if let Some(bound) = sufficient_metric_bound(metric, side, upper, max_angle_deg) {
-                    return Ok(Some(bound));
-                }
             }
             report.index_visits += 1;
             let node = &self.index[node];
@@ -1583,8 +1358,7 @@ impl EngagementScene {
                     if span.a == 0. && span.b == 1. {
                         let right = match metric {
                             Metric::Total | Metric::Leading => None,
-                            Metric::WrongSide { material_on_right }
-                            | Metric::Front { material_on_right } => Some(material_on_right),
+                            Metric::WrongSide { material_on_right } => Some(material_on_right),
                         };
                         if let Some((side, upper)) =
                             whole_line_strip_bound(span, r, &support.shape, h, right, numeric, pad)
@@ -1664,8 +1438,7 @@ impl EngagementScene {
                                     .acos()
                             };
                             contact_upper = contact_upper.min(upper);
-                            if let Metric::WrongSide { material_on_right }
-                            | Metric::Front { material_on_right } = metric
+                            if let Metric::WrongSide { material_on_right } = metric
                                 && !side_proved
                                 && span.a == 0.
                                 && span.b == 1.
@@ -1780,12 +1553,8 @@ impl EngagementScene {
                 }
             }
         }
-        if EARLY_UNION {
-            merge_new_intervals(&mut intervals, &mut normalized, &mut interval_terms);
-        } else {
-            intervals.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
-            interval_terms = intervals.len();
-        }
+        intervals.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
+        let interval_terms = intervals.len();
         Ok(Some(
             interval_metric_bound(
                 &intervals,
@@ -2044,42 +1813,11 @@ fn certainly_farther(shape: &Shape, p: Point, limit: f64) -> bool {
     (centre - radius).abs() > limit + slack
 }
 
-/// Merge only existing known-empty intervals. Keep the original number of
-/// arithmetic terms even after compression so the roundoff reserve never shrinks.
-fn merge_new_intervals(
-    intervals: &mut Vec<[f64; 2]>,
-    normalized: &mut usize,
-    terms: &mut usize,
-) -> bool {
-    #[cfg(feature = "profile-planning")]
-    let _profile = crate::planning_profile::span("engagement.merge");
-    if intervals.len() == *normalized {
-        return false;
-    }
-    *terms += intervals.len() - *normalized;
-    intervals.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
-    let mut written = 0;
-    for read in 0..intervals.len() {
-        let value = intervals[read];
-        if written > 0 && value[0] <= intervals[written - 1][1] {
-            intervals[written - 1][1] = intervals[written - 1][1].max(value[1]);
-        } else {
-            intervals[written] = value;
-            written += 1;
-        }
-    }
-    intervals.truncate(written);
-    *normalized = written;
-    true
-}
-
 /// This world-angle sector depends on the query span, not the growing union.
 /// Compute it once while retaining the same whole-span turn and angular reserve.
 fn forbidden_sector(span: &Span<'_>, pad: f64, metric: Metric) -> Option<[f64; 2]> {
     let material_on_right = match metric {
-        Metric::WrongSide { material_on_right } | Metric::Front { material_on_right } => {
-            material_on_right
-        }
+        Metric::WrongSide { material_on_right } => material_on_right,
         Metric::Total | Metric::Leading => return None,
     };
     let (heading, turn) = span_heading(span);
@@ -2173,9 +1911,6 @@ fn interval_metric_bound(
     if matches!(metric, Metric::WrongSide { .. }) {
         return (side_proved, if side_proved { 0. } else { TAU });
     }
-    if matches!(metric, Metric::Front { .. }) && !side_proved {
-        return (false, TAU);
-    }
     let mut clear = 0.;
     let mut end = 0.;
     for i in intervals {
@@ -2201,11 +1936,6 @@ fn sufficient_metric_bound(
     match metric {
         Metric::WrongSide { .. } if side => Some(0.),
         Metric::Total | Metric::Leading if upper.to_degrees().min(360.) <= max_angle_deg => {
-            Some(upper)
-        }
-        Metric::Front { .. }
-            if side && upper < TAU && upper.to_degrees().min(360.) <= max_angle_deg =>
-        {
             Some(upper)
         }
         _ => None,
@@ -3020,92 +2750,6 @@ mod leading_tests {
 
 #[cfg(test)]
 mod full_column_tests {
-    #[test]
-    fn rectangular_shells_are_floor_tagged_and_preserve_original_stock() {
-        let spec = crate::stock::StockSpec {
-            version: 1,
-            units: "mm".into(),
-            min_mm: [0., 0., 0.],
-            max_mm: [20., 20., 10.],
-            cell_size_mm: 1.,
-            max_cells: 1000,
-        };
-        let mut s = super::EngagementScene::new(spec.clone(), vec![]).unwrap();
-        s.append_rectangular_shell([[0.5, 0.5], [19.5, 19.5]], 5.)
-            .unwrap();
-        assert_eq!(s.material_bounds(4.), [[0., 0.], [20., 20.]]);
-        assert_eq!(s.material_bounds(5.), [[0.5, 0.5], [19.5, 19.5]]);
-        assert_eq!(s.stock, spec);
-        assert!(
-            s.clear_box([[0.1, 9.], [0.4, 11.]], 5., &mut 10000, &|| false)
-                .unwrap()
-        );
-        assert!(
-            !s.clear_box([[0.1, 9.], [0.4, 11.]], 4., &mut 10000, &|| false)
-                .unwrap()
-        );
-        assert!(
-            s.clear_disk([0.25, 10.], 0.1, 5., 1e-5, &mut 10000, &|| false)
-                .unwrap()
-        );
-        assert!(
-            !s.clear_disk([0.25, 10.], 0.1, 4., 1e-5, &mut 10000, &|| false)
-                .unwrap()
-        );
-        assert!(
-            s.clear_disk([0.25, 10.], 0.1, 5., 1e-5, &mut 0, &|| false)
-                .is_err()
-        );
-        assert!(
-            s.clear_box([[0.1, 9.], [0.4, 11.]], 5., &mut 10000, &|| true)
-                .is_err()
-        );
-        assert!(
-            s.append_rectangular_shell([[0.4, 0.5], [19.5, 19.5]], 5.)
-                .is_err()
-        );
-        let mut m = crate::motion::Motion {
-            id: 1,
-            operation: "shell".into(),
-            tool: "t".into(),
-            kind: crate::motion::MoveKind::Cut,
-            curve: crate::motion::Curve::Line {
-                start: [0.25, 9., 5.],
-                end: [0.25, 11., 5.],
-            },
-            feed_mm_min: Some(600.),
-        };
-        assert_eq!(
-            s.check_front(
-                &m,
-                0.1,
-                90.,
-                true,
-                super::EngagementOptions::default(),
-                &|| false
-            )
-            .unwrap()
-            .upper_angle_deg,
-            0.
-        );
-        m.curve = crate::motion::Curve::Line {
-            start: [0.25, 9., 4.],
-            end: [0.25, 11., 4.],
-        };
-        assert_eq!(
-            s.check_front(
-                &m,
-                0.1,
-                90.,
-                true,
-                super::EngagementOptions::default(),
-                &|| false
-            )
-            .unwrap()
-            .status,
-            super::EngagementStatus::Unresolved
-        );
-    }
     use super::*;
     use crate::motion::MoveKind;
     #[test]
@@ -3193,84 +2837,6 @@ mod full_column_tests {
         EngagementScene::new(stock, supports).unwrap()
     }
     #[test]
-    fn coverage_hint_rechecks_full_geometry_depth_foreign_scene_budget_and_cancel() {
-        let history = scene(&[([0., 0.], 0.5, 5.)], 1.);
-        let query = [[-0.1, -0.1], [0.1, 0.1]];
-        let mut hint = None;
-        assert!(
-            history
-                .clear_box_with_hint(query, 5., &mut hint, &mut 100, &|| false)
-                .unwrap()
-        );
-        assert_eq!(hint, Some(0));
-        // Same witness, independently checked on a neighboring complete box.
-        let nearby = [[0.2, 0.2], [0.4, 0.4]];
-        let mut work = 1;
-        assert!(
-            history
-                .clear_box_with_hint(nearby, 5., &mut hint, &mut work, &|| false)
-                .unwrap()
-        );
-        assert_eq!(work, 0);
-        for (bounds, depth) in [
-            (query, 4.999),
-            ([[2., 2.], [2.1, 2.1]], 5.),
-            ([[-2., -2.], [2., 2.]], 5.),
-        ] {
-            assert!(
-                !history
-                    .clear_box_with_hint(bounds, depth, &mut hint, &mut 100, &|| false)
-                    .unwrap()
-            );
-        }
-        // Index zero in a different scene refers to different material removal.
-        let foreign = scene(&[([6., 0.], 0.5, 5.)], 1.);
-        assert!(
-            !foreign
-                .clear_box_with_hint(query, 5., &mut hint, &mut 100, &|| false)
-                .unwrap()
-        );
-        let empty = scene(&[], 1.);
-        assert!(
-            !empty
-                .clear_box_with_hint(query, 5., &mut hint, &mut 100, &|| false)
-                .unwrap()
-        );
-        // A full annular sweep still leaves the entire central disk untouched.
-        let annulus = scene(&[([0., 0.], 3., 5.)], 1.);
-        assert!(
-            !annulus
-                .clear_box_with_hint(query, 5., &mut hint, &mut 100, &|| false)
-                .unwrap()
-        );
-        for cancelled in [false, true] {
-            let mut work = if cancelled { 100 } else { 0 };
-            let before = hint;
-            assert!(
-                history
-                    .clear_box_with_hint(query, 5., &mut hint, &mut work, &|| cancelled)
-                    .is_err()
-            );
-            assert_eq!(hint, before);
-            assert_eq!(work, if cancelled { 100 } else { 0 });
-        }
-        // Analytic filled-disk containment is independent of the lookup path.
-        for i in 0..80 {
-            let p = [i as f64 / 20. - 2., 0.3];
-            let bounds = [[p[0] - 0.04, p[1] - 0.04], [p[0] + 0.04, p[1] + 0.04]];
-            let result = history
-                .clear_box_with_hint(bounds, 5., &mut hint, &mut 100, &|| false)
-                .unwrap();
-            assert_eq!(
-                result,
-                history.clear_box(bounds, 5., &mut 100, &|| false).unwrap()
-            );
-            if result {
-                assert!(p[0].hypot(p[1]) + 0.04 * 2f64.sqrt() < 1.5);
-            }
-        }
-    }
-    #[test]
     fn reentry_point_rejection_cannot_certify_unsampled_interior() {
         let mut disks: Vec<_> = (0..16)
             .map(|i| {
@@ -3301,113 +2867,9 @@ mod full_column_tests {
                 .is_err()
         );
     }
-    #[test]
-    fn incremental_union_combines_distinct_sweeps_over_whole_lines_and_turning_arcs() {
-        let disks: Vec<_> = (0..195)
-            .map(|i| {
-                let a = TAU * (i % 3) as f64 / 3.;
-                ([a.cos(), a.sin()], 0.4, 5.)
-            })
-            .collect();
-        let history = scene(&disks, 1.);
-        for curve in [
-            Curve::Line {
-                start: [-0.01, 0., 5.],
-                end: [0.01, 0., 5.],
-            },
-            Curve::Arc {
-                start: [0., 0., 5.],
-                end: [0.2 * 0.05_f64.cos() - 0.2, 0.2 * 0.05_f64.sin(), 5.],
-                center: [-0.2, 0., 5.],
-                plane: Plane::Xy,
-                sweep_rad: 0.05,
-            },
-        ] {
-            let query = Motion {
-                id: 2,
-                operation: "combined-clearance".into(),
-                tool: "t".into(),
-                kind: MoveKind::Cut,
-                curve,
-                feed_mm_min: Some(600.),
-            };
-            for right in [false, true] {
-                let metric = Metric::Front {
-                    material_on_right: right,
-                };
-                let current = history
-                    .check_metric_mode::<true, true>(
-                        &query,
-                        1.,
-                        1.,
-                        EngagementOptions::default(),
-                        metric,
-                        &|| false,
-                    )
-                    .unwrap();
-                let reference = history
-                    .check_metric_mode::<false, true>(
-                        &query,
-                        1.,
-                        1.,
-                        EngagementOptions::default(),
-                        metric,
-                        &|| false,
-                    )
-                    .unwrap();
-                assert_eq!(current.status, EngagementStatus::Bounded, "{current:?}");
-                assert_eq!(reference.status, EngagementStatus::Bounded);
-                assert!(
-                    current.support_tests * 8 < reference.support_tests,
-                    "{current:?} vs {reference:?}"
-                );
-                assert!(current.upper_angle_deg <= 1.);
-                // No single component disk encloses this whole circumference.
-                for disk in &disks[..3] {
-                    assert_eq!(
-                        scene(&[*disk], 1.)
-                            .check_front(
-                                &query,
-                                1.,
-                                1.,
-                                right,
-                                EngagementOptions::default(),
-                                &|| false
-                            )
-                            .unwrap()
-                            .status,
-                        EngagementStatus::Unresolved
-                    );
-                }
-            }
-            assert!(
-                history
-                    .check_front(&query, 1., 1., true, EngagementOptions::default(), &|| true)
-                    .is_err()
-            );
-            assert_eq!(
-                history
-                    .check_front(
-                        &query,
-                        1.,
-                        1.,
-                        true,
-                        EngagementOptions {
-                            max_work: 0,
-                            ..Default::default()
-                        },
-                        &|| false
-                    )
-                    .unwrap()
-                    .status,
-                EngagementStatus::Unresolved
-            );
-        }
-    }
 
     /// The side refutation changes no result: random line and arc histories,
-    /// line and arc queries, both sides, both side metrics, with and without
-    /// the early union, and small work limits. Reports (status, bound, work
+    /// line and arc queries, both sides, and small work limits. Reports (status, bound, work
     /// counters, depth, reason) equal the full angular proof's.
     #[test]
     fn side_refutation_matches_the_full_angular_proof() {
@@ -3523,181 +2985,52 @@ mod full_column_tests {
                     ..Default::default()
                 };
                 for right in [false, true] {
-                    for metric in [
-                        Metric::Front {
-                            material_on_right: right,
-                        },
-                        Metric::WrongSide {
-                            material_on_right: right,
-                        },
-                    ] {
-                        let pairs = [
-                            (
-                                scene.check_metric_mode::<true, true>(
-                                    &query,
-                                    radius,
-                                    angle,
-                                    options,
-                                    metric,
-                                    &|| false,
-                                ),
-                                scene.check_metric_mode::<true, false>(
-                                    &query,
-                                    radius,
-                                    angle,
-                                    options,
-                                    metric,
-                                    &|| false,
-                                ),
-                            ),
-                            (
-                                scene.check_metric_mode::<false, true>(
-                                    &query,
-                                    radius,
-                                    angle,
-                                    options,
-                                    metric,
-                                    &|| false,
-                                ),
-                                scene.check_metric_mode::<false, false>(
-                                    &query,
-                                    radius,
-                                    angle,
-                                    options,
-                                    metric,
-                                    &|| false,
-                                ),
-                            ),
-                        ];
-                        for (fast, full) in pairs {
-                            let (fast, full) = (
-                                fast.map_err(|e| e.to_string()),
-                                full.map_err(|e| e.to_string()),
+                    let metric = Metric::WrongSide {
+                        material_on_right: right,
+                    };
+                    let (fast, full) = (
+                        scene
+                            .check_metric_mode::<true>(
+                                &query,
+                                radius,
+                                angle,
+                                options,
+                                metric,
+                                &|| false,
+                            )
+                            .map_err(|e| e.to_string()),
+                        scene
+                            .check_metric_mode::<false>(
+                                &query,
+                                radius,
+                                angle,
+                                options,
+                                metric,
+                                &|| false,
+                            )
+                            .map_err(|e| e.to_string()),
+                    );
+                    compared += 1;
+                    match (&fast, &full) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!(
+                                format!("{a:?}"),
+                                format!("{b:?}"),
+                                "{query:?} r={radius} angle={angle}"
                             );
-                            compared += 1;
-                            match (&fast, &full) {
-                                (Ok(a), Ok(b)) => {
-                                    assert_eq!(
-                                        format!("{a:?}"),
-                                        format!("{b:?}"),
-                                        "{query:?} r={radius} angle={angle}"
-                                    );
-                                    if a.support_tests > 0 && a.upper_angle_deg >= 360. {
-                                        refuted += 1;
-                                    }
-                                }
-                                _ => assert_eq!(format!("{fast:?}"), format!("{full:?}")),
+                            if a.support_tests > 0 && a.upper_angle_deg >= 360. {
+                                refuted += 1;
                             }
                         }
+                        _ => assert_eq!(format!("{fast:?}"), format!("{full:?}")),
                     }
                 }
             }
         }
-        assert!(compared > 4000, "{compared}");
+        assert!(compared > 1000, "{compared}");
         assert!(refuted > 100, "few rejections exercised: {refuted}");
     }
 
-    #[test]
-    fn incremental_union_keeps_real_gaps_and_wrong_depths_unresolved() {
-        for floor in [5., 6.] {
-            let disks: Vec<_> = (0..195)
-                .map(|i| {
-                    let a = TAU * (i % 3) as f64 / 3.;
-                    ([1.5 * a.cos(), 1.5 * a.sin()], 0.1, floor)
-                })
-                .collect();
-            let history = scene(&disks, 1.);
-            let query = Motion {
-                id: 2,
-                operation: "uncleared-gaps".into(),
-                tool: "t".into(),
-                kind: MoveKind::Cut,
-                curve: Curve::Line {
-                    start: [-0.01, 0., 5.],
-                    end: [0.01, 0., 5.],
-                },
-                feed_mm_min: Some(600.),
-            };
-            for right in [false, true] {
-                for early in [false, true] {
-                    let metric = Metric::Front {
-                        material_on_right: right,
-                    };
-                    let checked = if early {
-                        history.check_metric_mode::<true, true>(
-                            &query,
-                            1.,
-                            360.,
-                            EngagementOptions::default(),
-                            metric,
-                            &|| false,
-                        )
-                    } else {
-                        history.check_metric_mode::<false, true>(
-                            &query,
-                            1.,
-                            360.,
-                            EngagementOptions::default(),
-                            metric,
-                            &|| false,
-                        )
-                    }
-                    .unwrap();
-                    assert_eq!(checked.status, EngagementStatus::Unresolved, "{checked:?}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn fragmented_union_fallback_preserves_tiny_uncleared_gaps() {
-        let disks: Vec<_> = (0..200)
-            .map(|i| {
-                let a = TAU * i as f64 / 200.;
-                ([a.cos(), a.sin()], 0.001, 5.)
-            })
-            .collect();
-        let history = scene(&disks, 0.01);
-        let query = Motion {
-            id: 2,
-            operation: "fragmented".into(),
-            tool: "t".into(),
-            kind: MoveKind::Cut,
-            curve: Curve::Line {
-                start: [-0.001, 0., 5.],
-                end: [0.001, 0., 5.],
-            },
-            feed_mm_min: Some(600.),
-        };
-        for right in [false, true] {
-            let metric = Metric::Front {
-                material_on_right: right,
-            };
-            let current = history
-                .check_metric_mode::<true, true>(
-                    &query,
-                    1.,
-                    360.,
-                    EngagementOptions::default(),
-                    metric,
-                    &|| false,
-                )
-                .unwrap();
-            let reference = history
-                .check_metric_mode::<false, true>(
-                    &query,
-                    1.,
-                    360.,
-                    EngagementOptions::default(),
-                    metric,
-                    &|| false,
-                )
-                .unwrap();
-            assert_eq!(current.status, EngagementStatus::Unresolved);
-            assert_eq!(reference.status, current.status);
-            assert_eq!(reference.support_tests, current.support_tests);
-        }
-    }
     #[test]
     fn finite_line_witness_proves_contact_and_side_without_scanning_older_history() {
         for shift in [[0., 0.], [10000., -20000.]] {
@@ -3747,10 +3080,7 @@ mod full_column_tests {
                     let side = scene
                         .check_material_side(&query, 1., right, options, &|| false)
                         .unwrap();
-                    let joint = scene
-                        .check_front(&query, 1., 90., right, options, &|| false)
-                        .unwrap();
-                    for bound in [&total, &side, &joint] {
+                    for bound in [&total, &side] {
                         assert_eq!(bound.status, EngagementStatus::Bounded, "{bound:?}");
                         assert_eq!(bound.nodes, 1);
                         assert_eq!(bound.support_tests, 1);
@@ -3758,42 +3088,32 @@ mod full_column_tests {
                     }
                     assert_eq!(side.upper_angle_deg, 0.);
                     let exact = 2. * 0.8f64.acos().to_degrees();
-                    assert!(joint.upper_angle_deg >= exact && joint.upper_angle_deg < 90.);
                     assert!(total.upper_angle_deg >= exact && total.upper_angle_deg < 90.);
                     // A stricter peak limit must still fail despite the side
                     // witness. A previous success cannot carry to the wrong
                     // material side, another floor, or a zero work query.
-                    for (limit, side, curve, work) in [
-                        (60., right, query.curve.clone(), 200000),
-                        (360., !right, query.curve.clone(), 200000),
-                        (90., right, query.curve.clone(), 0),
-                        (
-                            360.,
-                            right,
-                            Curve::Line {
-                                start: [query.curve.start()[0], query.curve.start()[1], 4.],
-                                end: [query.curve.end()[0], query.curve.end()[1], 4.],
-                            },
-                            200000,
-                        ),
+                    let lower = Motion {
+                        curve: Curve::Line {
+                            start: [query.curve.start()[0], query.curve.start()[1], 4.],
+                            end: [query.curve.end()[0], query.curve.end()[1], 4.],
+                        },
+                        ..query.clone()
+                    };
+                    let full = EngagementOptions {
+                        max_work: 200000,
+                        ..Default::default()
+                    };
+                    let none = EngagementOptions {
+                        max_work: 0,
+                        ..Default::default()
+                    };
+                    for refused in [
+                        scene.check(&query, 1., 60., full, &|| false),
+                        scene.check(&query, 1., 90., none, &|| false),
+                        scene.check_material_side(&query, 1., !right, full, &|| false),
+                        scene.check_material_side(&lower, 1., right, full, &|| false),
                     ] {
-                        let refused = scene
-                            .check_front(
-                                &Motion {
-                                    curve,
-                                    ..query.clone()
-                                },
-                                1.,
-                                limit,
-                                side,
-                                EngagementOptions {
-                                    max_work: work,
-                                    ..Default::default()
-                                },
-                                &|| false,
-                            )
-                            .unwrap();
-                        assert_eq!(refused.status, EngagementStatus::Unresolved);
+                        assert_eq!(refused.unwrap().status, EngagementStatus::Unresolved);
                     }
                     // Corroboration only: exact projection inequalities above
                     // are the proof. Check the finite capsule and actual side.
@@ -3806,9 +3126,10 @@ mod full_column_tests {
                             assert!(shape_distance(&scene.supports[64].shape, q) < 0.999);
                         }
                     }
+                    assert!(scene.check(&query, 1., 90., options, &|| true).is_err());
                     assert!(
                         scene
-                            .check_front(&query, 1., 90., right, options, &|| true)
+                            .check_material_side(&query, 1., right, options, &|| true)
                             .is_err()
                     );
                 }
@@ -3817,10 +3138,9 @@ mod full_column_tests {
                 let end_query = motion(3, point(8., -0.2), point(10., -0.2));
                 assert_eq!(
                     scene
-                        .check_front(
+                        .check_material_side(
                             &end_query,
                             1.,
-                            360.,
                             true,
                             EngagementOptions::default(),
                             &|| false,
@@ -3831,62 +3151,14 @@ mod full_column_tests {
                 );
                 let polls = std::cell::Cell::new(0);
                 let cancelled = scene
-                    .check_front(
-                        &end_query,
-                        1.,
-                        90.,
-                        true,
-                        EngagementOptions::default(),
-                        &|| {
-                            polls.set(polls.get() + 1);
-                            polls.get() > 3
-                        },
-                    )
+                    .check(&end_query, 1., 90., EngagementOptions::default(), &|| {
+                        polls.set(polls.get() + 1);
+                        polls.get() > 3
+                    })
                     .unwrap_err();
                 assert!(cancelled.contains("cancelled"));
                 assert!(polls.get() > 3);
             }
-        }
-    }
-
-    #[test]
-    fn sufficient_filled_disk_contact_stops_only_after_both_front_bounds_pass() {
-        let base = scene(&[([0., 0.], 0.5, 5.)], 1.);
-        let history =
-            EngagementScene::new(base.stock.clone(), vec![base.supports[0].clone(); 65]).unwrap();
-        let query = Motion {
-            id: 2,
-            operation: "early-contact".into(),
-            tool: "t".into(),
-            kind: MoveKind::Cut,
-            feed_mm_min: Some(600.),
-            curve: Curve::Arc {
-                start: [0.6, 0., 5.],
-                end: [0.6, 0., 5.],
-                center: [0., 0., 5.],
-                plane: Plane::Xy,
-                sweep_rad: TAU,
-            },
-        };
-        let options = EngagementOptions {
-            max_work: 2,
-            max_nodes: 1,
-            ..Default::default()
-        };
-        let bounded = history
-            .check_front(&query, 1., 100., true, options, &|| false)
-            .unwrap();
-        assert_eq!(bounded.status, EngagementStatus::Bounded);
-        assert_eq!(bounded.support_tests + bounded.index_visits, 2);
-        assert!(bounded.upper_angle_deg > 1. && bounded.upper_angle_deg < 100.);
-        for (angle, right) in [(1., true), (360., false)] {
-            assert_eq!(
-                history
-                    .check_front(&query, 1., angle, right, options, &|| false)
-                    .unwrap()
-                    .status,
-                EngagementStatus::Unresolved
-            );
         }
     }
 
@@ -3951,17 +3223,11 @@ mod full_column_tests {
                         let total = filled.check(&query, 1., 100., options, &|| false).unwrap();
                         assert_eq!(total.status, EngagementStatus::Bounded);
                         assert!(total.upper_angle_deg > 1., "whole cutter is NOT clear");
-                        let joint = filled
-                            .check_front(&query, 1., 100., right, options, &|| false)
-                            .unwrap();
-                        assert_eq!(joint.status, EngagementStatus::Bounded);
-                        assert!(joint.upper_angle_deg > 1. && joint.upper_angle_deg <= 100.);
                         assert_eq!(
                             filled
-                                .check_front(
+                                .check_material_side(
                                     &query,
                                     1.,
-                                    360.,
                                     !right,
                                     EngagementOptions::default(),
                                     &|| false
@@ -3969,14 +3235,13 @@ mod full_column_tests {
                                 .unwrap()
                                 .status,
                             EngagementStatus::Unresolved,
-                            "wrong side must remain unproved even at360deg"
+                            "wrong side must remain unproved"
                         );
                         assert_eq!(
                             filled
-                                .check_front(
+                                .check_material_side(
                                     &query,
                                     1.,
-                                    100.,
                                     right,
                                     EngagementOptions {
                                         max_work: 0,
@@ -3990,7 +3255,7 @@ mod full_column_tests {
                         );
                         assert!(
                             filled
-                                .check_front(&query, 1., 100., right, options, &|| true)
+                                .check_material_side(&query, 1., right, options, &|| true)
                                 .is_err()
                         );
                         // CORROBORATION only. Whole proof is convexity for the
@@ -4075,14 +3340,14 @@ mod full_column_tests {
                 max_nodes: 1,
                 ..Default::default()
             };
-            let incomplete = history
-                .check_front(&query, 1., 1., right, root_only, &|| false)
+            let side = history
+                .check_material_side(&query, 1., right, root_only, &|| false)
                 .unwrap();
+            assert_eq!(side.status, EngagementStatus::Bounded, "{side:?}");
+            let incomplete = history.check(&query, 1., 1., root_only, &|| false).unwrap();
             assert_eq!(incomplete.status, EngagementStatus::Unresolved);
             let complete = history
-                .check_front(&query, 1., 1., right, EngagementOptions::default(), &|| {
-                    false
-                })
+                .check(&query, 1., 1., EngagementOptions::default(), &|| false)
                 .unwrap();
             assert_eq!(complete.status, EngagementStatus::Bounded);
             assert!(complete.maximum_depth > 0 && complete.nodes > 4);
@@ -4098,14 +3363,9 @@ mod full_column_tests {
             }
             assert_eq!(
                 history
-                    .check_front(
-                        &deeper,
-                        1.,
-                        360.,
-                        right,
-                        EngagementOptions::default(),
-                        &|| false,
-                    )
+                    .check_material_side(&deeper, 1., right, EngagementOptions::default(), &|| {
+                        false
+                    },)
                     .unwrap()
                     .status,
                 EngagementStatus::Unresolved,
@@ -4377,74 +3637,6 @@ mod full_column_tests {
                     }
                     let t = dot([q[0] - a[0], q[1] - a[1]], unit).clamp(0., length);
                     assert!(distance(q, [a[0] + t * unit[0], a[1] + t * unit[1]]) <= maximum);
-                }
-            }
-        }
-    }
-    #[test]
-    fn joint_front_proof_requires_whole_contact_and_whole_forbidden_side() {
-        let filled = scene(&[([0., 0.], 0.5, 5.)], 1.);
-        for radius in [0.58, 0.7] {
-            for direction in [1., -1.] {
-                for right in [false, true] {
-                    let p = [radius, 0., 5.];
-                    let query = Motion {
-                        id: 1,
-                        operation: "front".into(),
-                        tool: "t".into(),
-                        kind: MoveKind::Cut,
-                        feed_mm_min: Some(600.),
-                        curve: Curve::Arc {
-                            start: p,
-                            end: p,
-                            center: [0., 0., 5.],
-                            plane: Plane::Xy,
-                            sweep_rad: direction * TAU,
-                        },
-                    };
-                    let options = EngagementOptions::default();
-                    let total = filled.check(&query, 1., 83., options, &|| false).unwrap();
-                    let side = filled
-                        .check_material_side(&query, 1., right, options, &|| false)
-                        .unwrap();
-                    let joint = filled
-                        .check_front(&query, 1., 83., right, options, &|| false)
-                        .unwrap();
-                    assert_eq!(
-                        joint.status == EngagementStatus::Bounded,
-                        total.status == EngagementStatus::Bounded
-                            && side.status == EngagementStatus::Bounded,
-                        "radius={radius},direction={direction},right={right}: {joint:?}"
-                    );
-                    if joint.status == EngagementStatus::Bounded {
-                        assert!(joint.upper_angle_deg <= 83.);
-                    }
-                    let unlimited = filled
-                        .check_front(&query, 1., 360., right, options, &|| false)
-                        .unwrap();
-                    assert_eq!(
-                        unlimited.status == EngagementStatus::Bounded,
-                        side.status == EngagementStatus::Bounded
-                    );
-                    let budget = filled
-                        .check_front(
-                            &query,
-                            1.,
-                            83.,
-                            right,
-                            EngagementOptions {
-                                max_work: 1,
-                                ..options
-                            },
-                            &|| false,
-                        )
-                        .unwrap();
-                    assert_eq!(budget.status, EngagementStatus::Unresolved);
-                    assert!(
-                        filled
-                            .check_front(&query, 1., 83., right, options, &|| true)
-                            .is_err()
-                    );
                 }
             }
         }

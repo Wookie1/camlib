@@ -1,4 +1,6 @@
-//! Full-operation regression for the frozen real CAD case. Independent prism
+//! Full-operation regression for the frozen real CAD case, planned by the
+//! engagement front (the stock_front planner it was saved from was removed
+//! in #190). Independent prism
 //! checks are continuous; point/angular probes are explicitly corroboration.
 use camlib::{
     motion::{Curve, Motion, MoveKind, WorkFrame},
@@ -188,6 +190,10 @@ fn saved_real_cad_case(conventional: bool, rotated: bool) {
     let verifier = geometry
         .prepare(Options {
             spatial_resolution_mm: 1e-5,
+            // The wall pass runs at the walls' exact offset: resolving it at
+            // 10 micron takes more work than the default budget.
+            max_nodes: 1_000_000,
+            max_boundary_tests: 100_000_000,
             ..Default::default()
         })
         .unwrap();
@@ -249,11 +255,15 @@ fn saved_real_cad_case(conventional: bool, rotated: bool) {
                 }
             }
         }
+        // The sides of a cutting pass. Entry moves (at the entry feed) are
+        // a full-width bore or slot, and stay-down links may graze stock on
+        // either side; neither has a material side.
         if count > 4
             && count % 97 == 0
             && motion.curve.start()[2] == 9.
             && motion.curve.end()[2] == 9.
-            && matches!(motion.kind, MoveKind::Cut | MoveKind::Link)
+            && motion.kind == MoveKind::Cut
+            && motion.feed_mm_min == Some(600.)
         {
             let path = motion.curve.prepare(1e-5).unwrap();
             for i in 0..=4 {
@@ -273,19 +283,50 @@ fn saved_real_cad_case(conventional: bool, rotated: bool) {
                     }
                     _ => unreachable!(),
                 };
+                // The move's own sweep up to here is cut too (a tight turn
+                // arc clears the inside of its turn).
+                let prefix = match motion.curve {
+                    Curve::Line { start, .. } => Curve::Line { start, end: p },
+                    Curve::Arc {
+                        start,
+                        center,
+                        plane,
+                        sweep_rad,
+                        ..
+                    } => Curve::Arc {
+                        start,
+                        end: p,
+                        center,
+                        plane,
+                        sweep_rad: f * sweep_rad,
+                    },
+                    _ => unreachable!(),
+                };
                 let mut contact = 0;
                 for j in 0..720 {
                     let a = TAU * (j as f64 + 0.5) / 720.;
                     let q = [p[0] + r * a.cos(), p[1] + r * a.sin()];
-                    if !known_empty(&history, q, 9., r) {
+                    if !known_empty(&history, q, 9., r) && distance(&prefix, q) >= r - 1e-6 {
                         contact += 1;
+                        // The material side of a pass: lines, and arcs that
+                        // turn no tighter than the cutter. On a tighter turn
+                        // arc between passes (0.27 mm radius here, cutter
+                        // 2 mm) the contact can reach a few degrees past the
+                        // cutter's front; the contact bound below still holds.
+                        let sided = match motion.curve {
+                            Curve::Arc { start, center, .. } => {
+                                dist([start[0], start[1]], [center[0], center[1]]) >= r
+                            }
+                            _ => true,
+                        };
                         assert!(
-                            if conventional {
-                                (a - heading).sin() >= -1e-7
-                            } else {
-                                (a - heading).sin() <= 1e-7
-                            },
-                            "sampled material on wrong side at{q:?}"
+                            !sided
+                                || if conventional {
+                                    (a - heading).sin() >= -1e-7
+                                } else {
+                                    (a - heading).sin() <= 1e-7
+                                },
+                            "sampled material on wrong side at{q:?} of motion {count}: {motion:?}"
                         );
                     }
                 }
@@ -306,15 +347,19 @@ fn saved_real_cad_case(conventional: bool, rotated: bool) {
     eprintln!(
         "complete CAD front conventional={conventional},rotated={rotated}, {count} motions: {report}"
     );
-    assert_eq!(report["front"]["coverage_complete"], true);
-    assert_eq!(report["geometric_residual_status"], "estimated");
-    assert!(
-        report["front"]["max_bounded_engagement_deg"]
-            .as_f64()
-            .unwrap()
-            <= 90.
+    assert_eq!(
+        report["completed_layers"].as_u64().unwrap() as usize,
+        report["layers"].as_array().unwrap().len()
     );
-    assert_eq!(report["seed_orbits"], 1);
+    assert_eq!(report["geometric_residual_status"], "estimated");
+    for layer in report["layers"].as_array().unwrap() {
+        assert!(
+            layer["clearing"]["proven_max_engagement_deg"]
+                .as_f64()
+                .unwrap()
+                <= report["max_engagement_deg"].as_f64().unwrap() + 1e-9
+        );
+    }
     assert_eq!(report["helical_entries"], 1);
     assert!(
         reentry_descents > 0,
@@ -348,7 +393,7 @@ fn saved_real_cad_case(conventional: bool, rotated: bool) {
 // Small independent rectilinear corpus exercises real component/depth resets.
 // The full L cases above cover concavity and both material sides.
 #[test]
-fn stock_front_completes_disconnected_components_at_two_depths() {
+fn adaptive_pocket_completes_disconnected_components_at_two_depths() {
     let saved: serde_json::Value = serde_json::from_str(include_str!(
         "../fixtures/regressions/disconnected-pocket.json"
     ))
@@ -393,6 +438,8 @@ fn stock_front_completes_disconnected_components_at_two_depths() {
     let verifier = geometry
         .prepare(Options {
             spatial_resolution_mm: 1e-5,
+            max_nodes: 1_000_000,
+            max_boundary_tests: 100_000_000,
             // Explicit 10micron machining tolerance; fixtures/noncutting parts
             // and all side/bottom boundaries below the top cap remain strict.
             target_floor_tolerance_mm: Some(0.01),
@@ -446,13 +493,10 @@ fn stock_front_completes_disconnected_components_at_two_depths() {
     eprintln!(
         "complete disconnected/depth {} motions: {}",
         history.len(),
-        report["front"]
+        report
     );
-    assert_eq!(report["front"]["completed_components"], 4);
-    assert_eq!(report["front"]["coverage_complete"], true);
     assert_eq!(report["geometric_residual_status"], "estimated");
-    assert_eq!(report["depth_passes"], 2);
-    assert_eq!(report["seed_orbits"], 4);
+    assert_eq!(report["completed_layers"], 2);
     assert_eq!(floors, std::collections::BTreeSet::from([8, 9]));
     assert!(stock.volume().removed_lower_mm3 > 300.);
     // Analytic reachable C for each 10mm square is its radius3 inset.

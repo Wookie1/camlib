@@ -841,11 +841,7 @@
       "clearing": {
         "kind": "adaptive",
         "path_strategy": "engagement_front",
-        "max_radial_engagement_mm": 0.25,
-        "orbit_radius_mm": null,
-        "min_orbit_radius_mm": null,
-        "local_orbit_tolerance_mm": null,
-        "boundary_tolerance_mm": 0.01
+        "max_radial_engagement_mm": 0.25
       },
       "feed_mm_min": 600,
       "plunge_mm_min": 150,

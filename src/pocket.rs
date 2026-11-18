@@ -1167,6 +1167,7 @@ fn stroke_point(s: Stroke, fraction: f64) -> Point {
         ]
     }
 }
+#[cfg(test)]
 fn farthest_point(s: Stroke, p: Point) -> f64 {
     let mut maximum = norm(s.a, p).max(norm(s.b, p));
     if let Some((c, _)) = s.arc {
@@ -1182,6 +1183,7 @@ fn farthest_point(s: Stroke, p: Point) -> f64 {
     }
     maximum
 }
+#[cfg(test)]
 fn maximum_boundary_distance(s: Stroke, edge: Stroke) -> f64 {
     if let Some((center, boundary_sweep)) = edge.arc {
         // Actual boundary points are valid witnesses for every guide point.
@@ -1330,30 +1332,6 @@ impl Crossing {
     }
 }
 
-/// An actually successful whole-curve source check, scoped to the immutable
-/// source geometry/error/allowance of one prepared pocket. Retaining the Arc
-/// allocation prevents address reuse from impersonating a former owner.
-pub(crate) struct GuideTubeApproval {
-    owner: Arc<()>,
-    curve: Curve,
-    radius: f64,
-    tolerance: f64,
-}
-impl GuideTubeApproval {
-    pub(crate) fn matches(
-        &self,
-        source: &PocketPlan,
-        curve: &Curve,
-        radius: f64,
-        tolerance: f64,
-    ) -> bool {
-        Arc::ptr_eq(&self.owner, &source.source_owner)
-            && &self.curve == curve
-            && self.radius == radius
-            && self.tolerance == tolerance
-            && source.operation.tolerance_mm == tolerance
-    }
-}
 /// Committed-clearance scene shared by the plans that stream into one stock
 /// (for example every layer of a roughing operation). It validates itself
 /// against the stock's column history at each use, so sharing is always safe.
@@ -1369,7 +1347,6 @@ pub(crate) type EntrySceneCache = Arc<
 pub struct PocketPlan {
     operation: PocketOperation,
     source: PreparedRegion,
-    source_owner: Arc<()>,
     centers: PreparedRegion,
     radius: f64,
     source_edges: Vec<Stroke>,
@@ -1798,7 +1775,6 @@ impl PocketPlan {
             entry_helix_end: None,
             operation: op,
             source,
-            source_owner: Arc::new(()),
             centers: center,
             radius,
             source_edges,
@@ -2003,12 +1979,8 @@ impl PocketPlan {
         }
         let mut graph = crate::navigation::graph(
             self,
-            strokes.iter().map(|s| (*s, 0., 0.)).collect(),
+            strokes.iter().map(|s| (*s, 0.)).collect(),
             crate::navigation::GraphOptions {
-                bridge_radius: 0.,
-                cutter_radius: self.radius,
-                coverage: 0.,
-                local_sizing: false,
                 starting_work: work,
             },
             cancel,
@@ -2490,257 +2462,6 @@ impl PocketPlan {
     pub(crate) fn guide_strokes(&self) -> &[Stroke] {
         &self.strokes
     }
-    /// Offset for a physical cutter axis, retaining the source, allowance and
-    /// construction reserves. Adaptive guide radii additionally contain an
-    /// orbit radius; that spacing does not constrain a direct contour axis.
-    pub(crate) fn cutter_axis_clearance(&self, cutter_radius: f64) -> f64 {
-        cutter_radius + (self.report.applied_clearance_mm - self.radius)
-    }
-    /// Excluded linear loops of the selected ORIGINAL source component. These
-    /// are a proposal footprint only, never a substitute for whole-tube fit.
-    pub(crate) fn front_obstacles(&self, seed: Point) -> Result<Vec<Point>, String> {
-        for component in &self.source.definition().components {
-            let selected = PlanarRegion {
-                components: vec![component.clone()],
-                ..self.source.definition().clone()
-            }
-            .prepare(ConstructionOptions {
-                tolerance_mm: self.operation.tolerance_mm,
-            })?;
-            let q = selected.query(seed)?;
-            if !q
-                .signed_clearance_mm
-                .is_some_and(|d| d >= -2. * q.uncertainty_mm)
-            {
-                continue;
-            }
-            let count: usize = component.holes.iter().map(|h| h.vertices.len()).sum();
-            if count > 4096
-                || component
-                    .holes
-                    .iter()
-                    .any(|h| h.vertices.iter().any(|p| p[2] != 0.))
-            {
-                return Ok(vec![]);
-            }
-            return Ok(component
-                .holes
-                .iter()
-                .flat_map(|h| h.vertices.iter().map(|p| [p[0], p[1]]))
-                .collect());
-        }
-        Ok(vec![])
-    }
-    /// Same nominal morphological reachable domain as guide_residual, scoped
-    /// to the centre component owning a real admitted entry. No path authority.
-    pub(crate) fn front_component_region(
-        &self,
-        seed: Point,
-        inflation: f64,
-    ) -> Result<(PreparedRegion, PreparedRegion), String> {
-        let options = ConstructionOptions {
-            tolerance_mm: self.operation.tolerance_mm,
-        };
-        let mut selected = None;
-        let mut best = f64::NEG_INFINITY;
-        for component in &self.centers.definition().components {
-            let region = PlanarRegion {
-                components: vec![component.clone()],
-                ..self.centers.definition().clone()
-            }
-            .prepare(options)?;
-            let q = region.query(seed)?;
-            if let Some(signed) = q.signed_clearance_mm
-                && signed >= -2. * q.uncertainty_mm
-                && signed > best
-            {
-                best = signed;
-                selected = Some(region);
-            }
-        }
-        let centres = selected.ok_or("stock-front entry has no matching centre component")?;
-        let domain = centres.offset_prepared(-inflation)?;
-        Ok((centres, domain.into_parts().1))
-    }
-    /// Corridor proposals only: the caller must fit the complete tube against
-    /// the original source and prove the entry disk clear in committed stock.
-    pub(crate) fn front_channel_rails(
-        &self,
-        seed: Point,
-        material: [Point; 2],
-        margin: f64,
-    ) -> Result<Vec<Stroke>, String> {
-        let mut rails: Vec<Stroke> = Vec::new();
-        let tolerance = self.operation.tolerance_mm;
-        for component in &self.source.definition().components {
-            if component.holes.len() < 2 {
-                continue;
-            }
-            let selected = PlanarRegion {
-                components: vec![component.clone()],
-                ..self.source.definition().clone()
-            }
-            .prepare(ConstructionOptions {
-                tolerance_mm: tolerance,
-            })?;
-            let q = selected.query(seed)?;
-            if !q
-                .signed_clearance_mm
-                .is_some_and(|d| d >= -2. * q.uncertainty_mm)
-            {
-                continue;
-            }
-            let edges: Vec<_> = component
-                .holes
-                .iter()
-                .enumerate()
-                .flat_map(|(i, h)| {
-                    Stroke::from_boundary(h)
-                        .into_iter()
-                        .filter(|s| s.arc.is_none())
-                        .map(move |s| (i, s))
-                })
-                .collect();
-            if edges.len() > 256 {
-                return Ok(rails);
-            }
-            let corners = [
-                material[0],
-                [material[0][0], material[1][1]],
-                material[1],
-                [material[1][0], material[0][1]],
-            ];
-            for (i, (hole, a)) in edges.iter().enumerate() {
-                let length = (a.b[0] - a.a[0]).hypot(a.b[1] - a.a[1]);
-                if length <= 32. * tolerance {
-                    continue;
-                }
-                let t = [(a.b[0] - a.a[0]) / length, (a.b[1] - a.a[1]) / length];
-                let n = [t[1], -t[0]];
-                let dot = |p: Point, v: Point| p[0] * v[0] + p[1] * v[1];
-                for (other, b) in &edges[i + 1..] {
-                    if hole == other {
-                        continue;
-                    }
-                    let bd = [b.b[0] - b.a[0], b.b[1] - b.a[1]];
-                    let bl = bd[0].hypot(bd[1]);
-                    if bl <= 32. * tolerance
-                        || (bd[0] * t[1] - bd[1] * t[0]).abs() > 4096. * f64::EPSILON * bl
-                    {
-                        continue;
-                    }
-                    let aa = dot(a.a, t);
-                    let ab = dot(a.b, t);
-                    let ba = dot(b.a, t);
-                    let bb = dot(b.b, t);
-                    if aa.max(ab).min(ba.max(bb)) - aa.min(ab).max(ba.min(bb)) <= 32. * tolerance {
-                        continue;
-                    }
-                    let av = dot(a.a, n);
-                    let bv = dot(b.a, n);
-                    if (av - bv).abs() <= 2. * margin {
-                        continue;
-                    }
-                    let v = (av + bv) / 2.;
-                    let lo = corners
-                        .iter()
-                        .map(|&p| dot(p, t))
-                        .fold(f64::INFINITY, f64::min)
-                        - margin;
-                    let hi = corners
-                        .iter()
-                        .map(|&p| dot(p, t))
-                        .fold(f64::NEG_INFINITY, f64::max)
-                        + margin;
-                    let point = |u: f64| [u * t[0] + v * n[0], u * t[1] + v * n[1]];
-                    let rail = Stroke::line(point(lo), point(hi));
-                    let near =
-                        |a: Point, b: Point| (a[0] - b[0]).hypot(a[1] - b[1]) <= 64. * tolerance;
-                    if !rails.iter().any(|old| {
-                        (near(old.a, rail.a) && near(old.b, rail.b))
-                            || (near(old.a, rail.b) && near(old.b, rail.a))
-                    }) {
-                        rails.push(rail);
-                    }
-                    if rails.len() >= 64 {
-                        return Ok(rails);
-                    }
-                }
-            }
-            break;
-        }
-        Ok(rails)
-    }
-    pub(crate) fn guide_cover_region(&self, inflation: f64) -> Result<PlanarRegion, String> {
-        Ok(self.centers.offset(-inflation)?.region)
-    }
-    /// Clip straight guides against a conservatively eroded covered domain.
-    /// Transform to the line's local XY frame and reuse analytic line/circle
-    /// scan intersections; parity ambiguity retains the whole original guide.
-    pub(crate) fn guides_outside(
-        &self,
-        cover: &PlanarRegion,
-        cancel: &impl CancelSignal,
-    ) -> Result<Vec<Stroke>, String> {
-        let edges: Vec<_> = cover
-            .components
-            .iter()
-            .flat_map(|c| std::iter::once(&c.outer).chain(&c.holes))
-            .flat_map(Stroke::from_boundary)
-            .collect();
-        let mut result = vec![];
-        let guard = 8. * self.operation.tolerance_mm;
-        for &s in &self.strokes {
-            if cancel.is_cancelled() {
-                return Err("adaptive fine-guide clipping cancelled".into());
-            }
-            if s.arc.is_some() {
-                result.push(s);
-                continue;
-            }
-            let length = norm(s.a, s.b);
-            let u = [(s.b[0] - s.a[0]) / length, (s.b[1] - s.a[1]) / length];
-            let local = |p: Point| {
-                [
-                    (p[0] - s.a[0]) * u[0] + (p[1] - s.a[1]) * u[1],
-                    -(p[0] - s.a[0]) * u[1] + (p[1] - s.a[1]) * u[0],
-                ]
-            };
-            let mut xs: Vec<_> = edges
-                .iter()
-                .flat_map(|e| {
-                    Crossing::split(Stroke {
-                        a: local(e.a),
-                        b: local(e.b),
-                        arc: e.arc.map(|(c, sweep)| (local(c), sweep)),
-                    })
-                })
-                .filter_map(|e| e.x_at(0.))
-                .collect();
-            xs.sort_by(f64::total_cmp);
-            if xs.len() % 2 != 0 {
-                result.push(s);
-                continue;
-            }
-            let mut cursor = 0f64;
-            let world = |d: f64| [s.a[0] + d * u[0], s.a[1] + d * u[1]];
-            for pair in xs.as_chunks::<2>().0 {
-                let lo = (pair[0] + guard).clamp(0., length);
-                let hi = (pair[1] - guard).clamp(0., length);
-                if hi <= lo || hi <= cursor {
-                    continue;
-                }
-                if lo > cursor {
-                    result.push(Stroke::line(world(cursor), world(lo)));
-                }
-                cursor = cursor.max(hi);
-            }
-            if cursor < length {
-                result.push(Stroke::line(world(cursor), s.b));
-            }
-        }
-        Ok(result)
-    }
     pub(crate) fn source_component(
         &self,
         p: Point,
@@ -2753,9 +2474,9 @@ impl PocketPlan {
     pub(crate) fn link_work_per_query(&self) -> usize {
         1 + 2 * self.source_edges.len()
     }
-    /// Original-region whole-guide tube radius interval. The lower bound
-    /// admits an entire line/arc; the upper bound limits possible local growth
-    /// and avoids splitting constant-clearance boundary guides needlessly.
+    /// Original-region whole-guide tube radius interval: the independent
+    /// reference `guide_tube_fits` is tested against.
+    #[cfg(test)]
     pub(crate) fn guide_radius_bounds(&self, stroke: Stroke) -> Option<(f64, f64)> {
         #[cfg(feature = "profile-planning")]
         let _profile = crate::planning_profile::span("source.guide_bounds");
@@ -2782,38 +2503,6 @@ impl PocketPlan {
             (lower - reserve - numeric).max(0.),
             (upper - reserve + numeric + 8. * self.operation.tolerance_mm).max(0.),
         ))
-    }
-    /// Boolean version of the original whole-guide lower-radius condition.
-    /// Every boundary must pass; a midpoint alone never admits the tube. Keep
-    /// subtraction order identical to guide_radius_bounds at guarded limits.
-    pub(crate) fn approve_guide_tube(
-        &self,
-        curve: &Curve,
-        radius: f64,
-    ) -> Option<GuideTubeApproval> {
-        let (a, b) = (curve.start(), curve.end());
-        let arc = match curve {
-            Curve::Line { .. } => None,
-            Curve::Arc {
-                center,
-                plane: Plane::Xy,
-                sweep_rad,
-                ..
-            } => Some(([center[0], center[1]], *sweep_rad)),
-            _ => return None,
-        };
-        let stroke = Stroke {
-            a: [a[0], a[1]],
-            b: [b[0], b[1]],
-            arc,
-        };
-        self.guide_tube_fits(stroke, radius)
-            .then(|| GuideTubeApproval {
-                owner: Arc::clone(&self.source_owner),
-                curve: curve.clone(),
-                radius,
-                tolerance: self.operation.tolerance_mm,
-            })
     }
     pub(crate) fn guide_tube_fits(&self, stroke: Stroke, required_radius: f64) -> bool {
         #[cfg(feature = "profile-planning")]
@@ -2845,20 +2534,6 @@ impl PocketPlan {
                 .ok()
                 .and_then(|q| q.signed_clearance_mm)
                 .is_some_and(fits)
-    }
-    pub(crate) fn guide_residual(
-        &self,
-        radius: f64,
-    ) -> Result<crate::planar::PreparedConstruction, String> {
-        #[cfg(feature = "profile-planning")]
-        let _profile = crate::planning_profile::span("guide.residual");
-        let inflated = self.centers.offset_prepared(-radius)?;
-        let desired = self
-            .source
-            .offset_prepared(self.operation.radial_allowance_mm)?;
-        desired
-            .region()
-            .boolean_prepared(inflated.region(), Boolean::Difference)
     }
     /// Deferred diagnostic work. Actual material removal can stream first;
     /// a pending or unknown residual must never be interpreted as all clear.

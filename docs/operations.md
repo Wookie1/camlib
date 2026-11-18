@@ -25,7 +25,7 @@ machine, so they have no defaults: pass them as keyword arguments.
 | `work_offset` | 1 | 1..9 → G54..G59.x |
 | `retract_z_mm` | `clearance_z_mm` | Rapid travel height between passes (Pocket, RestPocket, AdaptivePocket, Roughing, Contour, Chamfer, Facing, TrochoidalSlot, Bore, Parallel, Spiral, Radial, Project, Waterline, Trace) |
 | `feed_z_mm` | `retract_z_mm` | Rapid descent stops here and plunge feed begins; leaving a pass, feed changes to rapid here |
-| `boundary_tolerance_mm` | 0.01 | Allowed construction error of offset boundaries (Contour, Chamfer, Bore, TrochoidalSlot, adaptive clearing) |
+| `boundary_tolerance_mm` | 0.01 | Allowed construction error of offset boundaries (Contour, Chamfer, Bore, TrochoidalSlot) |
 | `reverse` | off | Run the passes the other way: Facing and Parallel start each pass from the opposite end, Waterline cuts its contours the other way, Contour/Chamfer (`None` = from `cutting_sense`) reverse the loop direction |
 | `one_way` | off | Parallel: cut every row in the same direction instead of alternating (see [Parallel finishing](#parallel-finishing-parallel)); Facing has `mode="one_way"` |
 
@@ -155,17 +155,16 @@ without a word:
   `AdaptivePocket` no place in that connected area of tool centres is clear
   of material to enter from and no helix the entry allows fits (a helix the
   policy forbids, `StockEdgeEntry(helix=None)`, is no way in), or the area is
-  tighter than the planner resolves (below); for `disk_front` and
-  `stock_front` no orbit fits. The message names the operation, a tool-centre
-  position in the area, the area's extent, what was tried (the helix or orbit
+  tighter than the planner resolves (below). The message names the operation, a tool-centre
+  position in the area, the area's extent, what was tried (the helix
   radii and what the area leaves) and the options: another entry
   (`RampEntry`, a plunge, a smaller helix), a smaller cutter, an earlier
   operation that opens a start there, or a region without that area.
 - **A region the cutter fits nowhere in refuses the operation**, since it
   can do nothing it was asked to. (This used to be an empty plan with a
   `CamWarning`.)
-- `Pocket`, `RestPocket`, `disk_front` and `stock_front` refuse before any
-  motion. `AdaptivePocket`'s default strategy plans from the stock, so it
+- `Pocket` and `RestPocket` refuse before any
+  motion. `AdaptivePocket` plans from the stock, so it
   refuses when a level starts, before that level's first motion: for the
   first level that is before any motion of the operation.
 - **Not refused:** a pocket with nothing left to cut, and the parts of a
@@ -360,8 +359,6 @@ Decisions (#219), with the reason:
   place, and it would ramp through the air beside the stock and through the
   air the layers above have cut (a layer's pocket starts at the stock top
   while the flutes span it). Use `AdaptiveClearing` for a ramp.
-- **`path_strategy="disk_front"` and `"stock_front"` refuse it**: they start
-  every pass from a fitted seed circle, which a helix opens.
 - **A `Contour` ramp with holding tabs stays refused.** A tab is a lift whose
   far side comes back down into the uncut loop at the tab's own slope (45
   degrees for a triangle, straight down for a rectangle). A tool that needs a
@@ -383,8 +380,8 @@ Refused, before any motion:
 - `RampEntry` on a `Contour` with holding tabs, or with limits that block part
   of a loop: the tool comes back down from a tab or a lift steeper than the
   ramp angle. A `Contour` accepts no other entry type.
-- `RampEntry` on `Roughing` with offset or raster clearing, and with the
-  `disk_front` and `stock_front` strategies (see the decisions above).
+- `RampEntry` on `Roughing` with offset or raster clearing (see the
+  decisions above).
 
 Refused while running (the run stops and no program is written):
 
@@ -404,7 +401,9 @@ Same region and depths as `Pocket`, cleared with a bounded radial engagement:
 no full-width slotting, for hard materials and high-speed toolpaths.
 `retract_z_mm`/`feed_z_mm` work as for `Pocket`.
 
-- **It follows the stock** (`path_strategy="engagement_front"`, the default):
+- **It follows the stock** (`path_strategy="engagement_front"`, the only
+  planner; the orbit planners `disk_front` and `stock_front` were removed in
+  #190 and their names are refused):
   one depth level at a time, each pass runs along the boundary between cut
   and uncut stock inside the region, so nothing is cut twice. The region's
   boundary is a wall.
@@ -498,27 +497,10 @@ no full-width slotting, for hard materials and high-speed toolpaths.
   - `ramp_clearance_mm`: each helix starts this far above the material it
     meets, never above `feed_z_mm`.
   The wall pass is reached like any other pass (a stay-down link, or a
-  descent with these options) and enters on its lead-in arc at `feed_mm_min`. `path_strategy="disk_front"` and `"stock_front"`
-  refuse all four by name.
-- Orbit options, `max_stay_down_mm` and `rest_tolerance_mm` do not apply and
-  are refused. Corners the cutter cannot reach are left and reported as the
-  level's residual area.
-- `path_strategy="disk_front"` is the earlier planner: it covers the region
-  with orbits of `orbit_radius_mm` (default half the tool radius) whatever
-  the stock holds. Its orbits overlap, so it cuts many times longer (33.7 m
-  against 1.1 m on a 50 x 30 x 8 mm pocket with a 10 mm cutter). With it,
-  `clockwise` sets the orbit direction, `max_engagement_deg` (default 90)
-  bounds the total contact, and `min_orbit_radius_mm` with
-  `local_orbit_tolerance_mm` sizes each orbit from the clearance around it.
-  An orbit sweeps a disk of the cutter radius plus the orbit radius. An
-  area of the region the cutter fits in (a component of its tool-centre
-  region) that is nowhere that wide is an area no entry reaches: the pocket
-  is refused before any motion with the sweep's size and the options (#250;
-  it used to be left). The narrower parts of an area an orbit does fit in
-  are left and reported in the plan's residual region, as before. The same
-  holds for `stock_front`.
-- `path_strategy="stock_front"` is a development strategy; it stops with an
-  error where its coverage is unresolved.
+  descent with these options) and enters on its lead-in arc at `feed_mm_min`.
+- `max_stay_down_mm` and `rest_tolerance_mm` do not apply and are refused.
+  Corners the cutter cannot reach are left and reported as the level's
+  residual area.
 
 ## Surface mesh inputs
 
@@ -581,7 +563,7 @@ refused with its location: export the mesh with shared edge vertices
   passes, with that much overlap reserved for the coverage proof,
 - `AdaptiveClearing(max_radial_engagement_mm)`: engagement-limited clearing
   that follows the boundary between cut and uncut stock
-  (`path_strategy="engagement_front"`, the default). Passes start from air
+  (`path_strategy="engagement_front"`, the only planner, #190). Passes start from air
   beside the stock or from stock already cleared (proven clear by the
   committed cuts) and helix only into enclosed material; each pass starts at
   the upstream end of the material it cuts; short moves between passes stay
@@ -643,7 +625,7 @@ refused with its location: export the mesh with shared edge vertices
     `wall_passes_skipped`.
   - Every cutting and link move is also checked exactly against the layer
     region before it is emitted, and the run fails rather than emit one that
-    does not fit. Orbit options and `omit_empty_cuts` do not apply, the entry
+    does not fit. `omit_empty_cuts` does not apply, the entry
     must be `StockEdgeEntry` or `RampEntry`, and the direction is
     `cutting_sense` (`"climb"` by default, `"conventional"`); `clockwise` does
     not apply.
@@ -659,8 +641,8 @@ refused with its location: export the mesh with shared edge vertices
     material and no way in (as defined for
     [`AdaptivePocket`](#adaptive-pocket-adaptivepocket)) is put in the
     layer's report, `layers[].clearing.unentered_areas`: `reason`
-    (`no_helix_fits`, `no_helix_allowed`, `tighter_than_planner_resolves`,
-    or `no_orbit_fits` with `stock_front`), `at_mm`, the extent of its tool
+    (`no_helix_fits`, `no_helix_allowed` or
+    `tighter_than_planner_resolves`), `at_mm`, the extent of its tool
     centres (`min_mm`, `max_mm`), `level_z_mm`, `cutter_radius_mm`,
     `radii_tried_mm`, `needed_mm` and `available_mm`. Its stock is in the
     layer's residual area, which counts all the stock left in the layer's
@@ -683,13 +665,6 @@ refused with its location: export the mesh with shared edge vertices
     an area has none (for example with `StockEdgeEntry(helix=None)` and an
     enclosed area), naming the area, what was tried and the options. They
     leave no area without an entry, so they list none.
-  - `path_strategy="disk_front"` is refused in `Roughing`. It covers a region
-    it takes to be solid with small orbits and never reads the stock;
-    `Roughing`'s region is the stock grown by a margin, so it orbited through
-    the air beside the stock (#167: 75 m of a 137 m path on a 130 x 90 mm
-    stock). It remains `AdaptivePocket`'s strategy, where the region's
-    boundary is a wall. `path_strategy="stock_front"` is a development
-    strategy with the same options as `AdaptivePocket`.
   With `rapid_descent_clearance_mm`
   (opt-in, on `Roughing`), a descent into a column that the committed cuts
   prove clear for the whole tool assembly is rapid down to that far above

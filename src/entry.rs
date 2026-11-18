@@ -78,7 +78,7 @@ pub(crate) enum EntryPolicy {
 /// stock proves (`PocketPlan::rest_ramp_moves`); adaptive clearing's
 /// engagement front into enclosed material, in place of the helix
 /// (`EngagementFrontPlan::ramp_pass`). Roughing's offset and raster layers
-/// and the orbit strategies refuse it (`refuse_ramp`). It does not lift the
+/// refuse it (`refuse_ramp`). It does not lift the
 /// need for a center-cutting cutter (`PocketOperation::validate_authoring`).
 ///
 /// The angle is a fact about the tool and material, so it has no default.
@@ -495,8 +495,6 @@ pub struct UnenteredArea {
     /// `no_helix_allowed`: the same, with an entry that allows no helix.
     /// `tighter_than_planner_resolves`: the cutter fits with less play than
     /// the engagement front's steering grid works in.
-    /// `no_orbit_fits`: disk_front / stock_front, whose orbits sweep more
-    /// than the cutter.
     pub reason: &'static str,
     /// A tool-centre position in the area, and the extent of the tool
     /// centres the cutter fits at around it.
@@ -505,10 +503,10 @@ pub struct UnenteredArea {
     pub max_mm: Point,
     pub level_z_mm: f64,
     pub cutter_radius_mm: f64,
-    /// The helix radii (or orbit radii) tried.
+    /// The helix radii tried.
     pub radii_tried_mm: Vec<f64>,
-    /// What the planner needs there and what the area leaves: a helix (or
-    /// orbit) radius, or for `tighter_than_planner_resolves` the play
+    /// What the planner needs there and what the area leaves: a helix
+    /// radius, or for `tighter_than_planner_resolves` the play
     /// between the cutter and the walls on each side.
     pub needed_mm: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -534,13 +532,6 @@ impl UnenteredArea {
             "tighter_than_planner_resolves" => format!(
                 "engagement_front: {operation} has material at ({:.3}, {:.3}) for the level at Z{z}, where the cutter of radius {r} mm fits the region ({area}) but with less play to its walls than this planner works in (it needs {:.3} mm on each side at this cutter and width), so it has no way into that area. Use a Pocket there (its passes follow the walls' exact offset; entry=RampEntry(angle_deg), a helix or a plunge), a smaller cutter, or {keep_out}",
                 at[0], at[1], self.needed_mm
-            ),
-            "no_orbit_fits" => format!(
-                "{operation}: no orbit fits the area at ({:.3}, {:.3}) ({area}) for the level at Z{z}: this path strategy clears with orbits that sweep a disk of radius {} mm (cutter radius {r} + orbit radius {}), and that area is nowhere that wide, though the cutter fits it. Use path_strategy engagement_front (with entry=RampEntry(angle_deg) where no helix fits), a smaller orbit_radius_mm, a Pocket, a smaller cutter, or {keep_out}",
-                at[0],
-                at[1],
-                r + self.needed_mm,
-                self.needed_mm
             ),
             reason => {
                 let helix = if reason == "no_helix_allowed" {
@@ -1080,15 +1071,11 @@ mod compact_tests {
             };
             forward.push(Guide {
                 stroke: Stroke::line(point(i), point(i + 1)),
-                radius: 0.,
-                coverage: 0.,
                 edge: i,
             });
         }
         forward.push(Guide {
             stroke: Stroke::line([1., 0.], [2., 0.]),
-            radius: 0.,
-            coverage: 0.,
             edge: 5000,
         });
         let mut doubled = forward.clone();

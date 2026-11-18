@@ -552,10 +552,6 @@ class RampEntryIssue219Test(unittest.TestCase):
     def test_adaptive_and_roughing_refusals_name_the_reason(self):
         cases = (
             (adaptive_job(RampEntry(4)), ('no ramp entry into the enclosed material', 'min_length_mm is not set')),
-            (
-                adaptive_job(RampEntry(4, min_length_mm=2), path_strategy='disk_front'),
-                ('RampEntry is not supported here', 'engagement_front ramps into enclosed material'),
-            ),
         )
         for job, parts in cases:
             with Simulation(**job) as sim:

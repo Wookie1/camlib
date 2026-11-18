@@ -1062,353 +1062,6 @@ fn real_cad_roughing_streams_both_entries_and_preserves_whole_columns_and_every_
     }
 }
 
-/// SAME frozen physical input as the historical 90651-motion adaptive job.
-/// Complete operation/quality regression, not a production latency benchmark.
-#[test]
-fn stock_front_bulk_contours_need_full_native_commits_and_remove_actual_stock() {
-    for sense in ["climb", "conventional"] {
-        let saved: serde_json::Value =
-            serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json"))
-                .unwrap();
-        let mut selected =
-            saved["cases"]["adaptive"]["policies"]["omit_proven_empty"]["input"].clone();
-        selected["operations"][0]["clearing"]["path_strategy"] = "stock_front".into();
-        selected["operations"][0]["clearing"]["cutting_sense"] = sense.into();
-        let m: StreamManifest = serde_json::from_value(selected).unwrap();
-        let tool = m.tools[0].prepare().unwrap();
-        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
-        let mut plan = OperationPlan::prepare_with_stock(
-            m.operations[0].clone(),
-            &m.tools[0],
-            &stock,
-            m.initial_position_mm,
-            1,
-            &|| false,
-        )
-        .unwrap();
-        let front = |plan: &OperationPlan| {
-            serde_json::to_value(plan.report()).unwrap()["layers"][0]["clearing"]["front"].clone()
-        };
-        let mut history: Vec<camlib::motion::Motion> = vec![];
-        let mut tested_refusal = false;
-        let tangent = |curve: &Curve, end: bool| {
-            let a = if end { curve.end() } else { curve.start() };
-            let v = match *curve {
-                Curve::Line { start, end } => [end[0] - start[0], end[1] - start[1]],
-                Curve::Arc {
-                    center, sweep_rad, ..
-                } => [
-                    -(a[1] - center[1]) * sweep_rad.signum(),
-                    (a[0] - center[0]) * sweep_rad.signum(),
-                ],
-                _ => panic!("flat contour expected"),
-            };
-            let norm = v[0].hypot(v[1]);
-            [v[0] / norm, v[1] / norm]
-        };
-        for _ in 0..120 {
-            let motion = plan
-                .next_motion_with_stock(&stock, &|| false)
-                .unwrap()
-                .unwrap();
-            assert_eq!(motion.id, history.len() as u64 + 1);
-            assert_eq!(
-                motion.curve.start(),
-                history
-                    .last()
-                    .map_or(m.initial_position_mm, |old| old.curve.end())
-            );
-            certify_part(&motion.curve);
-            if let Some(old) = history.last()
-                && matches!(old.kind, MoveKind::Cut | MoveKind::Lead)
-                && matches!(motion.kind, MoveKind::Cut | MoveKind::Lead)
-                && old.curve.start()[2] == old.curve.end()[2]
-                && motion.curve.start()[2] == motion.curve.end()[2]
-            {
-                let a = tangent(&old.curve, true);
-                let b = tangent(&motion.curve, false);
-                assert!(
-                    a[0] * b[0] + a[1] * b[1] >= 1. - 1e-9,
-                    "bulk G1 discontinuity"
-                );
-            }
-            let r = front(&plan);
-            let last_first_contour =
-                !tested_refusal && r["bulk_contours"] == 0 && r["bulk_committed_moves"] == 10;
-            if last_first_contour {
-                let partial = stock
-                    .preview_sweep(&tool, &motion, 0.5, m.sweep, &|| false)
-                    .unwrap();
-                let mut fractional = stock.clone();
-                fractional.apply_delta(&partial).unwrap();
-                assert!(plan.next_motion_with_stock(&fractional, &|| false).is_err());
-                assert_eq!(front(&plan)["bulk_contours"], 0);
-                assert!(front(&plan)["bulk_material_bounds_mm"].is_null());
-                let full = stock
-                    .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
-                    .unwrap();
-                let mut restored = stock.clone();
-                restored.apply_delta(&full).unwrap();
-                let restored = Stock::from_snapshot(restored.snapshot()).unwrap();
-                assert!(plan.next_motion_with_stock(&restored, &|| false).is_err());
-                assert_eq!(front(&plan)["bulk_contours"], 0);
-            }
-            let delta = stock
-                .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
-                .unwrap();
-            stock.apply_delta(&delta).unwrap();
-            history.push(motion);
-            if last_first_contour {
-                assert!(
-                    plan.next_motion_with_stock(&stock, &|| true)
-                        .unwrap_err()
-                        .contains("cancelled")
-                );
-                assert_eq!(front(&plan)["bulk_contours"], 0);
-                tested_refusal = true;
-            }
-            if front(&plan)["bulk_contours"].as_u64().unwrap() >= 2 {
-                break;
-            }
-        }
-        let report = front(&plan);
-        eprintln!(
-            "bulk {sense}: {} motions, lower removal={}, {report}",
-            history.len(),
-            stock.volume().removed_lower_mm3
-        );
-        assert!(tested_refusal);
-        assert_eq!(report["bulk_contours"], 2);
-        assert_eq!(report["bulk_abandoned"], 0);
-        assert!(stock.volume().removed_lower_mm3 > 50.);
-        assert!(
-            report["max_bounded_engagement_deg"].as_f64().unwrap()
-                <= 2. * 0.75f64.acos().to_degrees()
-        );
-        let b: [[f64; 2]; 2] =
-            serde_json::from_value(report["bulk_material_bounds_mm"].clone()).unwrap();
-        for i in 0..stock.cells().len() {
-            let p = stock.cell_center(i).unwrap();
-            if (0..2).any(|k| p[k] < b[0][k] || p[k] > b[1][k]) {
-                let height = history
-                    .iter()
-                    .filter(|m| m.kind != MoveKind::Rapid)
-                    .map(|m| exact_height(&m.curve, p))
-                    .fold(10f64, f64::min);
-                assert!(
-                    height <= 8. + 1e-6,
-                    "claimed shell contains untouched stock at {p:?}: {height}"
-                );
-            }
-        }
-        assert_eq!(stock.spec(), m.stock.height().unwrap());
-    }
-}
-
-#[test]
-fn stock_front_saved_frustum_completes_all_layers_with_checked_stock_and_quality() {
-    let saved: serde_json::Value =
-        serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json")).unwrap();
-    let original = saved["cases"]["adaptive"]["policies"]["omit_proven_empty"]["input"].clone();
-    let mut selected = original.clone();
-    selected["operations"][0]["clearing"]["path_strategy"] = "stock_front".into();
-    // The selector is the sole changed input: no wider engagement, altered
-    // cutter, simpler CAD, stock spacing, allowances, feeds or new seed policy.
-    let mut restored = selected.clone();
-    restored["operations"][0]["clearing"]
-        .as_object_mut()
-        .unwrap()
-        .remove("path_strategy");
-    assert_eq!(restored, original);
-    let m: StreamManifest = serde_json::from_value(selected).unwrap();
-    m.validate().unwrap();
-    assert_eq!(m.tools[0].cutter.diameter_mm, 2.);
-    let tool = m.tools[0].prepare().unwrap();
-    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
-    let mut plan = OperationPlan::prepare_with_stock(
-        m.operations[0].clone(),
-        &m.tools[0],
-        &stock,
-        m.initial_position_mm,
-        1,
-        &|| false,
-    )
-    .unwrap();
-    let mut history: Vec<camlib::motion::Motion> = Vec::new();
-    let mut current = m.initial_position_mm;
-    let mut nominal = 0.;
-    let started = std::time::Instant::now();
-    let summary = |report: serde_json::Value| {
-        serde_json::json!({
-            "completed_layers":report["completed_layers"], "active_layer":report["active_layer"],
-            "motions":report["motions"], "max_engagement_deg":report["max_engagement_deg"],
-            "layers":report["layers"].as_array().unwrap().iter().map(|layer| serde_json::json!({
-                "z":layer["tip_z_mm"], "front":layer["clearing"]["front"],
-                "motions":layer["clearing"]["motions"]
-            })).collect::<Vec<_>>()
-        })
-    };
-    loop {
-        let motion = match plan.next_motion_with_stock(&stock, &|| false) {
-            Ok(Some(motion)) => motion,
-            Ok(None) => break,
-            Err(error) => {
-                if let Some(path) = std::env::var_os("CAMLIB_FRUSTUM_FAILURE_TRACE") {
-                    let trace = serde_json::json!({
-                        "complete": false,
-                        "error": error,
-                        "manifest": m,
-                        "motions": history,
-                        "stock": stock.snapshot(),
-                        "report": plan.report(),
-                    });
-                    std::fs::write(path, serde_json::to_vec(&trace).unwrap()).unwrap();
-                }
-                panic!(
-                    "frustum incomplete after {} motions at {current:?}: {error}; last={:?}; {}",
-                    history.len(),
-                    history.last(),
-                    summary(serde_json::to_value(plan.report()).unwrap())
-                )
-            }
-        };
-        assert!(
-            history.len() < 100000,
-            "frustum exceeded bounded diagnostic work without completing"
-        );
-        assert_eq!(motion.id, history.len() as u64 + 1);
-        assert_eq!(motion.curve.start(), current);
-        assert_eq!(motion.tool, "t1");
-        assert_eq!(motion.operation, "rough");
-        current = motion.curve.end();
-        if motion.kind == MoveKind::Rapid {
-            assert!(motion.curve.start()[2] >= 12. && current[2] >= 12.);
-        }
-        // Continuous extrema/subdivision proof against the analytic retained
-        // solid, independent of mesh clipping, source offsets and stock sweeps.
-        certify_part(&motion.curve);
-        if motion.kind == MoveKind::Plunge
-            && current[2] < 10.
-            && box_distance(bounds(&motion.curve, 0., 1.), [[0., 0.], [32., 28.]]) < 1.
-        {
-            // Corroborate noncutting inside-stock descents from independently
-            // reconstructed full-motion heights. This is NOT a sweep proof;
-            // the production reentry disk requires whole-region clearance.
-            for radial in [0., 0.5, 1.] {
-                for i in 0..16 {
-                    let angle = TAU * i as f64 / 16.;
-                    let p = [
-                        current[0] + radial * angle.cos(),
-                        current[1] + radial * angle.sin(),
-                    ];
-                    if p[0] < 0. || p[0] > 32. || p[1] < 0. || p[1] > 28. {
-                        continue;
-                    }
-                    let height = history
-                        .iter()
-                        .filter(|old| old.kind != MoveKind::Rapid)
-                        .map(|old| exact_height(&old.curve, p))
-                        .fold(10f64, f64::min);
-                    assert!(
-                        height <= current[2] + 1e-6,
-                        "descent into material at{p:?}: {height} > {}",
-                        current[2]
-                    );
-                }
-            }
-        }
-        nominal += motion
-            .curve
-            .prepare(m.sweep.tolerance_mm)
-            .unwrap()
-            .length_mm()
-            / motion.feed_mm_min.unwrap_or(6000.)
-            * 60.;
-        let delta = stock
-            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
-            .unwrap();
-        stock.apply_delta(&delta).unwrap();
-        history.push(motion);
-        if history.len().is_multiple_of(256) {
-            eprintln!(
-                "frustum {} motions {:?} nominal={nominal}s lower={} {}",
-                history.len(),
-                started.elapsed(),
-                stock.volume().removed_lower_mm3,
-                summary(serde_json::to_value(plan.report()).unwrap())
-            );
-        }
-    }
-    plan.finish_report(&|| false).unwrap();
-    let report = serde_json::to_value(plan.report()).unwrap();
-    eprintln!(
-        "frustum COMPLETE {}motions nominal={nominal}s {}",
-        history.len(),
-        summary(report.clone())
-    );
-    assert_eq!(report["completed_layers"], 4);
-    let angle = 2. * 0.75f64.acos().to_degrees();
-    for layer in report["layers"].as_array().unwrap() {
-        let clearing = &layer["clearing"];
-        assert_eq!(clearing["front"]["coverage_complete"], true);
-        assert!(clearing["front"]["completed_components"].as_u64().unwrap() > 0);
-        // Exterior convex material exclusion and completed enclosed fan.
-        assert_eq!(clearing["front"]["coverage_envelopes"], 2);
-        // This case completes through fixed recipes. Candidate-potential
-        // counters must not imply productive or empty material along them.
-        assert_eq!(clearing["front"]["productive_candidates"], 0);
-        assert_eq!(clearing["front"]["navigation_moves"], 0);
-        assert_eq!(
-            clearing["front"]["unranked_contour_moves"],
-            clearing["front"]["front_moves"]
-        );
-        assert!(
-            clearing["front"]["unranked_contour_moves"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        assert!(clearing["max_bounded_engagement_deg"].as_f64().unwrap() <= angle);
-        assert_eq!(
-            clearing["max_bounded_engagement_deg"],
-            clearing["front"]["max_bounded_engagement_deg"]
-        );
-    }
-    let floor = report["target_z_mm"].as_f64().unwrap();
-    for (i, cell) in stock.cells().iter().enumerate() {
-        let p = stock.cell_center(i).unwrap();
-        let height = history
-            .iter()
-            .filter(|m| m.kind != MoveKind::Rapid)
-            .map(|m| exact_height(&m.curve, p))
-            .fold(10f64, f64::min);
-        assert!(
-            cell.lower_mm <= height + 1e-6 && cell.upper_mm >= height - 1e-6,
-            "{p:?}: {cell:?} misses independent exact height {height}"
-        );
-        if p[0] < 5.
-            || p[0] > 27.
-            || p[1] < 5.
-            || p[1] > 23.
-            || (p[0] > 15.4 && p[0] < 16.6 && p[1] > 13.4 && p[1] < 14.6)
-        {
-            assert!(
-                height <= floor + 1e-6,
-                "uncut reachable floor{p:?}: {height}"
-            );
-        }
-    }
-    assert!(
-        history.len() <= 10000,
-        "complete frustum path quality: {} >10000 motions",
-        history.len()
-    );
-    assert!(
-        nominal <= 3000.,
-        "complete frustum nominal cycle quality: {nominal} >3000s"
-    );
-}
-
 fn engagement_front_frustum() -> StreamManifest {
     let saved: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/regressions/retained-body.json")).unwrap();
@@ -1416,13 +1069,6 @@ fn engagement_front_frustum() -> StreamManifest {
     let op = &mut input["operations"][0];
     op["omit_empty_cuts"] = false.into();
     let clearing = op["clearing"].as_object_mut().unwrap();
-    for key in [
-        "orbit_radius_mm",
-        "min_orbit_radius_mm",
-        "local_orbit_tolerance_mm",
-    ] {
-        clearing.remove(key);
-    }
     clearing.insert("path_strategy".into(), "engagement_front".into());
     serde_json::from_value(input).unwrap()
 }
@@ -1880,30 +1526,20 @@ fn issue_167_open_block_is_cleared_from_the_stock_edge_within_its_engagement() {
     }
     // Allowing a helix changes nothing where none is needed.
     assert_eq!(paths[0], paths[1]);
-    // The old default is refused, with the reason.
-    let mut m = base.clone();
-    let Operation::Roughing(op) = &mut m.operations[0] else {
-        panic!("fixture")
-    };
-    let camlib::roughing::RoughingClearing::Adaptive { path_strategy, .. } = &mut op.clearing
-    else {
-        panic!("clearing")
-    };
-    *path_strategy = camlib::adaptive::AdaptivePathStrategy::DiskFront;
-    let error = OperationPlan::prepare(
-        m.operations[0].clone(),
-        &m.tools[0],
-        m.stock.height().unwrap(),
-        m.initial_position_mm,
-        1,
-        &AtomicBool::new(false),
-    )
-    .err()
-    .unwrap();
-    assert!(
-        error.contains("disk_front") && error.contains("engagement_front"),
-        "{error}"
-    );
+    // The removed orbit planners (#190) are refused when a program is read,
+    // with the name that is not known.
+    for removed in ["disk_front", "stock_front"] {
+        let mut value = serde_json::to_value(&base).unwrap();
+        value["operations"][0]["clearing"]["path_strategy"] = removed.into();
+        let error = serde_json::from_value::<StreamManifest>(value)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains(removed) && error.contains("engagement_front"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -2083,8 +1719,15 @@ fn engagement_front_refuses_orbits_empty_cut_omission_and_helix_only_entry() {
         f(&mut v["operations"][0]);
         serde_json::from_value::<StreamManifest>(v).unwrap()
     };
-    let orbit = edit(&|op| op["clearing"]["orbit_radius_mm"] = 0.5.into());
-    assert!(prepare(&orbit).contains("does not use orbits"));
+    // The orbit options were removed with the orbit planners (#190): a
+    // program that still sets one is refused when it is read.
+    let mut orbit = serde_json::to_value(&base).unwrap();
+    orbit["operations"][0]["clearing"]["orbit_radius_mm"] = 0.5.into();
+    let error = serde_json::from_value::<StreamManifest>(orbit)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("unknown field `orbit_radius_mm`"), "{error}");
     let omit = edit(&|op| op["omit_empty_cuts"] = true.into());
     assert!(prepare(&omit).contains("omit_empty_cuts"));
     let helix = edit(&|op| op["entry"]["kind"] = "helix".into());
@@ -3406,39 +3049,6 @@ fn empty_roughing_still_validates_tool_source_pose_setup_entry_and_all_strategy_
             let mutations: &[fn(&mut RoughingClearing)] = &[
                 |c| {
                     if let RoughingClearing::Adaptive {
-                        orbit_radius_mm, ..
-                    } = c
-                    {
-                        *orbit_radius_mm = Some(f64::NAN)
-                    }
-                },
-                |c| {
-                    if let RoughingClearing::Adaptive {
-                        min_orbit_radius_mm,
-                        ..
-                    } = c
-                    {
-                        *min_orbit_radius_mm = Some(0.)
-                    }
-                },
-                |c| {
-                    if let RoughingClearing::Adaptive {
-                        local_orbit_tolerance_mm,
-                        ..
-                    } = c
-                    {
-                        *local_orbit_tolerance_mm = Some(1e-8)
-                    }
-                },
-                |c| {
-                    // #167: disk_front never reads the stock; Roughing
-                    // refuses it.
-                    if let RoughingClearing::Adaptive { path_strategy, .. } = c {
-                        *path_strategy = camlib::adaptive::AdaptivePathStrategy::DiskFront
-                    }
-                },
-                |c| {
-                    if let RoughingClearing::Adaptive {
                         max_radial_engagement_mm,
                         ..
                     } = c
@@ -3500,141 +3110,6 @@ fn empty_roughing_still_validates_tool_source_pose_setup_entry_and_all_strategy_
             );
         }
     }
-}
-
-#[test]
-fn stock_front_convex_contour_requires_complete_native_receipts() {
-    check_stock_front_contour_receipts("convex_contour", "convex_contours");
-}
-
-#[test]
-fn stock_front_enclosed_contour_requires_complete_native_receipts() {
-    check_stock_front_contour_receipts("enclosed_contour", "enclosed_contours");
-}
-
-fn check_stock_front_contour_receipts(status: &str, counter: &str) {
-    let m: StreamManifest =
-        serde_json::from_str(include_str!("../fixtures/regressions/stock-front.json")).unwrap();
-    let tool = m.tools[0].prepare().unwrap();
-    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
-    let mut plan = OperationPlan::prepare_with_stock(
-        m.operations[0].clone(),
-        &m.tools[0],
-        &stock,
-        m.initial_position_mm,
-        1,
-        &|| false,
-    )
-    .unwrap();
-    let mut checked = false;
-    for _ in 0..10000 {
-        let motion = plan
-            .next_motion_with_stock(&stock, &|| false)
-            .unwrap()
-            .expect("must reach the selected contour transition");
-        let report = serde_json::to_value(plan.report()).unwrap();
-        let convex = report["layers"][0]["clearing"]["front"]["status"] == status;
-        let delta = stock
-            .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
-            .unwrap();
-        if convex && motion.kind == MoveKind::Cut {
-            assert_eq!(report["layers"][0]["clearing"]["front"][counter], 0);
-            assert_eq!(
-                report["layers"][0]["clearing"]["front"]["coverage_envelopes"],
-                usize::from(status == "enclosed_contour")
-            );
-            let mut invalid = Vec::new();
-            let mut partial = stock.clone();
-            partial
-                .apply_delta(
-                    &stock
-                        .preview_sweep(&tool, &motion, 0.5, m.sweep, &|| false)
-                        .unwrap(),
-                )
-                .unwrap();
-            invalid.push(partial);
-            let mut altered = motion.clone();
-            altered.id += 1;
-            let mut wrong_motion = stock.clone();
-            wrong_motion
-                .apply_delta(
-                    &stock
-                        .preview_sweep(&tool, &altered, 1., m.sweep, &|| false)
-                        .unwrap(),
-                )
-                .unwrap();
-            invalid.push(wrong_motion);
-            let wire: camlib::stock::StockDelta =
-                serde_json::from_value(serde_json::to_value(&delta).unwrap()).unwrap();
-            let mut replayed = stock.clone();
-            replayed.apply_delta(&wire).unwrap();
-            invalid.push(replayed);
-            let mut restored = stock.clone();
-            restored.apply_delta(&delta).unwrap();
-            invalid.push(Stock::from_snapshot(restored.snapshot()).unwrap());
-            let mut undone = stock.clone();
-            undone.apply_delta(&delta).unwrap();
-            undone.undo_delta(&delta).unwrap();
-            undone.apply_delta(&delta).unwrap();
-            invalid.push(undone);
-            let mut coarse = m.sweep;
-            coarse.tolerance_mm *= 2.;
-            let mut inaccurate = stock.clone();
-            inaccurate
-                .apply_delta(
-                    &stock
-                        .preview_sweep(&tool, &motion, 1., coarse, &|| false)
-                        .unwrap(),
-                )
-                .unwrap();
-            invalid.push(inaccurate);
-            let mut changed_tool = m.tools[0].clone();
-            changed_tool.cutter.diameter_mm *= 0.9;
-            let mut other_tool = stock.clone();
-            other_tool
-                .apply_delta(
-                    &stock
-                        .preview_sweep(
-                            &changed_tool.prepare().unwrap(),
-                            &motion,
-                            1.,
-                            m.sweep,
-                            &|| false,
-                        )
-                        .unwrap(),
-                )
-                .unwrap();
-            invalid.push(other_tool);
-            for invalid_stock in invalid {
-                assert!(
-                    plan.next_motion_with_stock(&invalid_stock, &|| false)
-                        .is_err()
-                );
-            }
-            stock.apply_delta(&delta).unwrap();
-            assert!(plan.next_motion_with_stock(&stock, &|| true).is_err());
-            let next = plan
-                .next_motion_with_stock(&stock, &|| false)
-                .unwrap()
-                .unwrap();
-            assert_eq!(next.id, motion.id + 1);
-            assert_eq!(next.curve.start(), motion.curve.end());
-            let report = serde_json::to_value(plan.report()).unwrap();
-            assert_eq!(
-                report["layers"][0]["clearing"]["front"][counter], 0,
-                "one cut cannot certify the complete contour"
-            );
-            assert_eq!(
-                report["layers"][0]["clearing"]["front"]["coverage_envelopes"],
-                usize::from(status == "enclosed_contour"),
-                "partial/refused receipts must not publish new coverage"
-            );
-            checked = true;
-            break;
-        }
-        stock.apply_delta(&delta).unwrap();
-    }
-    assert!(checked, "test must exercise an actual selected contour");
 }
 
 #[test]
@@ -3844,7 +3319,7 @@ fn smaller_rest_rougher(offset: bool, clockwise: bool) {
 #[test]
 fn roughing_reports_preserve_progress_across_reads_rejections_and_finalization() {
     let mut m: StreamManifest =
-        serde_json::from_str(include_str!("../fixtures/regressions/stock-front.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/regressions/adaptive-roughing-layers.json")).unwrap();
     // The golden counts below were taken with the exact shadow.
     if let Operation::Roughing(op) = &mut m.operations[0] {
         op.contour_tolerance_mm = Some(0.);
@@ -3874,19 +3349,20 @@ fn roughing_reports_preserve_progress_across_reads_rejections_and_finalization()
             let before = serde_json::to_value(plan.report()).unwrap();
             assert_eq!(before["motions"], count);
             let layers = before["layers"].as_array().unwrap();
-            assert_eq!(
-                layers
-                    .iter()
-                    .map(|l| l["clearing"]["motions"].as_u64().unwrap())
-                    .sum::<u64>(),
-                count
-            );
             let active = before["active_layer"].as_u64().unwrap();
             observed_layers.insert(active);
             assert_eq!(before["completed_layers"], active);
+            // A layer's report is written when the layer completes (the
+            // engagement front reports no partial layer): the completed
+            // layers hold every motion before the active one's.
+            let completed = layers
+                .iter()
+                .take(active as usize)
+                .map(|l| l["clearing"]["motions"].as_u64().unwrap())
+                .sum::<u64>();
+            assert!(completed < count, "{completed} >= {count}");
             for layer in layers.iter().take(active as usize) {
                 assert_eq!(layer["clearing"]["geometric_residual_status"], "estimated");
-                assert_eq!(layer["clearing"]["front"]["coverage_complete"], true);
             }
             assert_eq!(serde_json::to_value(plan.report()).unwrap(), before);
             assert!(plan.next_motion_with_stock(&stock, &|| true).is_err());
@@ -3901,12 +3377,23 @@ fn roughing_reports_preserve_progress_across_reads_rejections_and_finalization()
             .unwrap();
         stock.apply_delta(&delta).unwrap();
     }
-    // Golden count from before entry helices were split one turn per motion.
-    assert_eq!(count - continued_entry_turns(&curves) as u64, 5366);
+    // Golden count, with continued entry-helix turns counted as one motion.
+    // Measured with the engagement front (#190; the removed stock_front
+    // planner made 5366 on this input).
+    assert_eq!(count - continued_entry_turns(&curves) as u64, 5021);
     assert_eq!(observed_layers.len(), 4);
     let drained = serde_json::to_value(plan.report()).unwrap();
     assert_eq!(drained["motions"], count);
     assert_eq!(drained["completed_layers"], 4);
+    assert_eq!(
+        drained["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["clearing"]["motions"].as_u64().unwrap())
+            .sum::<u64>(),
+        count
+    );
     assert_eq!(drained["geometric_residual_status"], "pending");
     assert!(plan.finish_report(&|| true).is_err());
     assert_eq!(serde_json::to_value(plan.report()).unwrap(), drained);
@@ -4727,13 +4214,6 @@ fn bar_input(top_z: f64, ends: bool) -> serde_json::Value {
         "source": null,
     });
     let clearing = op["clearing"].as_object_mut().unwrap();
-    for key in [
-        "orbit_radius_mm",
-        "min_orbit_radius_mm",
-        "local_orbit_tolerance_mm",
-    ] {
-        clearing.remove(key);
-    }
     clearing.insert("path_strategy".into(), "engagement_front".into());
     clearing.insert("max_radial_engagement_mm".into(), 0.6.into());
     input
