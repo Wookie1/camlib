@@ -2909,25 +2909,28 @@ fn level_loops(
                 None => None,
                 Some(reach) => {
                     let slot = needs
-                        .iter_mut()
-                        .find(|(depth, _)| *depth == reach)
+                        .iter()
+                        .position(|(depth, _)| *depth == reach)
                         .expect("every reach has its region");
-                    match slot.1.take() {
+                    match &needs[slot].1 {
                         None => Some(vec![]),
-                        Some(need) => {
-                            let runs = trim_ring(&strokes, &need, r, bridge, guard, cancel)?;
-                            let swept = match &runs {
-                                None => vec![strokes.clone()],
-                                Some(runs) => runs.clone(),
-                            };
-                            slot.1 = subtract_swept(need, &swept, r, tolerance, guard)?;
-                            runs
-                        }
+                        Some(need) => trim_ring(&strokes, need, r, bridge, guard, cancel)?,
                     }
                 }
             };
             if runs.as_ref().is_some_and(|runs| runs.is_empty()) {
                 continue;
+            }
+            // What this loop's kept stretches sweep is finished for every later loop,
+            // whatever depth that loop reaches past.
+            let swept = match &runs {
+                None => vec![strokes.clone()],
+                Some(runs) => runs.clone(),
+            };
+            for (_, need) in needs.iter_mut() {
+                if let Some(region) = need.take() {
+                    *need = subtract_swept(region, &swept, r, tolerance, guard)?;
+                }
             }
             if index < outer_count {
                 done_outers.push((d, strokes, runs));

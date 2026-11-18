@@ -17,6 +17,7 @@ from camlib.tools import HolderSection, ToolAssembly
 R = 2.0  # cutter radius
 STEPOVER = 1.5
 CELL = 0.25
+INITIAL_Z = 14
 
 
 def tool():
@@ -145,7 +146,7 @@ def run(spec, skin=0.1):
         tools=(t,),
         operations=(op,),
         revision="1",
-        initial_position_mm=(0, 0, 14),
+        initial_position_mm=(0, 0, INITIAL_Z),
         verification=camlib.StreamChecks(stock_contact=camlib.StockContactOptions()),
     ) as sim:
         s = sim.state
