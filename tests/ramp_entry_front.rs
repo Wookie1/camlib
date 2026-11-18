@@ -271,6 +271,13 @@ fn check_entries(seen: &Seen, angle_deg: f64) {
         chord(limit)
     );
     assert!(seen.lead_rate > 2. * RADIUS * 0.95, "{}", seen.lead_rate);
+    // #190: the sampled leading contact (the roughing tests' oracle) of every
+    // cutting and link stroke; the ramp's flat slot pass only clears.
+    let worst = crate::adaptive::leading_contact_deg(&seen.motions, RADIUS, [[0., 0.], [26., 26.]]);
+    assert!(
+        worst <= limit + crate::adaptive::LEADING_SLACK_DEG,
+        "{worst} > {limit}"
+    );
     // Entry moves run at the entry feed, cutting moves at the cutting feed.
     for motion in &seen.motions {
         match motion.kind {

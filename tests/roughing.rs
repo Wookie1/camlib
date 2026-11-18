@@ -805,15 +805,15 @@ fn exact_height_for(c: &Curve, p: [f64; 2], cutter_radius: f64, top: f64) -> f64
 /// lies in the stock footprint and no earlier centre (of an earlier move, or
 /// earlier on this one) is within the cutter radius. Sampling can only miss
 /// thin slivers, so it is a refutation check with a stated slack, not a proof.
-struct LeadingOracle {
+pub(crate) struct LeadingOracle {
     r: f64,
     step: f64,
     footprint: [[f64; 2]; 2],
     cells: std::collections::HashMap<(i32, i32), Vec<[f64; 2]>>,
-    worst_deg: f64,
+    pub(crate) worst_deg: f64,
 }
 impl LeadingOracle {
-    fn new(r: f64, footprint: [[f64; 2]; 2]) -> Self {
+    pub(crate) fn new(r: f64, footprint: [[f64; 2]; 2]) -> Self {
         Self {
             r,
             step: r / 20.,
@@ -828,7 +828,7 @@ impl LeadingOracle {
             (p[1] / self.r).floor() as i32,
         )
     }
-    fn cleared(&self, p: [f64; 2]) -> bool {
+    pub(crate) fn cleared(&self, p: [f64; 2]) -> bool {
         // Discs at samples `step` apart cover the swept strip but for
         // slivers step^2 / (8 r) deep.
         let reach = self.r + self.step * self.step / (8. * self.r) + 1e-9;
@@ -861,7 +861,7 @@ impl LeadingOracle {
     }
     /// A flat feed move the cutter makes: clears its sweep; with `check`,
     /// its leading contact is measured first, pose by pose.
-    fn feed(&mut self, c: &Curve, check: bool) {
+    pub(crate) fn feed(&mut self, c: &Curve, check: bool) {
         for (i, (p, heading)) in self.poses(c).into_iter().enumerate() {
             if check && i > 0 {
                 let mut hit = 0;
