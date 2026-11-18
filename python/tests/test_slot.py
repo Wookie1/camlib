@@ -363,3 +363,21 @@ class TrochoidalSlotAirFeedTest(unittest.TestCase):
         self.assertTrue(sim.state.finished)
         self.assertGreater(reports[-1]["air_fed_arcs"], 0)
         self.assertGreater(reports[-1]["air_fed_mm"], 0)
+
+    def test_d_shaped_loops_report_return_chords_without_air_feed(self):
+        reports = []
+        with Simulation(
+            StockSpec((0, 0, 0), (24, 24, 10), 0.25),
+            (tool(),),
+            operations=(slot(),),
+            revision="d-slot",
+            initial_position_mm=(0, 0, 12),
+        ) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, OperationUpdate):
+                    reports.append(update.report)
+        self.assertTrue(sim.state.finished)
+        report = reports[-1]
+        self.assertGreater(report["return_chords"], 0)
+        self.assertGreater(report["return_chord_saved_mm"], 0)
+        self.assertNotIn("air_fed_arcs", report)

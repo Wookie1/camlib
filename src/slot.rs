@@ -112,6 +112,13 @@ pub struct SlotReport {
     pub air_fed_arcs: usize,
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub air_fed_mm: f64,
+    /// D-shaped (peel) loops: controlled orbits whose proven-air stretch is
+    /// cut short by a straight return chord through the previous orbit's
+    /// cleared disk, and the path length those chords saved against the arc.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub return_chords: usize,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub return_chord_saved_mm: f64,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -599,6 +606,8 @@ impl SlotPlan {
             corner_links: 0,
             air_fed_arcs: 0,
             air_fed_mm: 0.,
+            return_chords: 0,
+            return_chord_saved_mm: 0.,
         };
         let heights = crate::heights::Heights::resolve(
             op.clearance_z_mm,
@@ -705,7 +714,6 @@ impl SlotPlan {
     /// rho - g. Solving |d + rho*u(theta)| = rho - g with d = C - C_prev
     /// gives cos(theta - theta_back) = c, theta_back = atan2(-d).
     fn air_interval(&self, center: Vec3) -> Option<(f64, f64)> {
-        self.op.air_feed_mm_min?;
         let prev = self.prev_center?;
         let rho = self.radius;
         let g = self.guard;
@@ -945,19 +953,36 @@ impl SlotPlan {
                     }
                     let piece = self.orbit_pieces.pop_front().unwrap();
                     let last = self.orbit_pieces.is_empty();
-                    let curve = Curve::Arc {
-                        start: self.position,
-                        end: piece.end,
-                        center,
-                        plane: Plane::Xy,
-                        sweep_rad: piece.sweep,
+                    // The proven-air stretch returns on the straight chord
+                    // between its ends (a D-shaped loop): both ends lie in
+                    // the disk |P - C_prev| <= rho - g, which is convex, so
+                    // the whole chord does too, and it cuts nothing.
+                    let curve = if piece.air {
+                        Curve::Line {
+                            start: self.position,
+                            end: piece.end,
+                        }
+                    } else {
+                        Curve::Arc {
+                            start: self.position,
+                            end: piece.end,
+                            center,
+                            plane: Plane::Xy,
+                            sweep_rad: piece.sweep,
+                        }
                     };
                     let mut motion = self.emit(curve, MoveKind::Cut, false)?;
                     if piece.air {
-                        motion.kind = MoveKind::Air;
-                        motion.feed_mm_min = Some(self.op.air_feed_mm_min.unwrap());
-                        self.report.air_fed_arcs += 1;
-                        self.report.air_fed_mm += self.radius * piece.sweep.abs();
+                        let chord = distance(motion.curve.start(), motion.curve.end());
+                        self.report.return_chords += 1;
+                        self.report.return_chord_saved_mm +=
+                            self.radius * piece.sweep.abs() - chord;
+                        if let Some(feed) = self.op.air_feed_mm_min {
+                            motion.kind = MoveKind::Air;
+                            motion.feed_mm_min = Some(feed);
+                            self.report.air_fed_arcs += 1;
+                            self.report.air_fed_mm += chord;
+                        }
                     }
                     if last {
                         self.phase = 4;
