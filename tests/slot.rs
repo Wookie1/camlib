@@ -54,9 +54,9 @@ fn exposed_angle(q: f64, r: f64, cleared: f64) -> f64 {
 
 /// One orbit, grouped from the motion stream alone: (centre, first start,
 /// last end, swept angle, pieces). A controlled orbit is a D-shaped loop:
-/// cut arcs about one centre plus a straight return chord whose ends both
-/// lie on the orbit circle; the chord's swept angle is the signed angle its
-/// ends make at the centre.
+/// cut arcs about one centre plus a return across the proven-air stretch
+/// (a straight line between two fillet arcs about other centres); a return
+/// piece's swept angle is the signed angle its ends make at the centre.
 type Orbit = (Vec3, Vec3, Vec3, f64, usize);
 
 #[derive(PartialEq, Debug)]
@@ -65,8 +65,8 @@ enum Piece {
     First,
     /// A later arc of the open orbit.
     Arc,
-    /// A straight return chord of the open orbit.
-    Chord,
+    /// A piece of the open orbit's return (a fillet arc or the line).
+    Return,
     Other,
 }
 
@@ -74,6 +74,9 @@ enum Piece {
 struct OrbitWalk {
     open: Option<Orbit>,
     closed: Vec<Orbit>,
+    /// Returns seen (consecutive return pieces count once).
+    returns: usize,
+    in_return: bool,
 }
 
 impl OrbitWalk {
@@ -83,59 +86,61 @@ impl OrbitWalk {
         }
     }
     fn step(&mut self, m: &Motion) -> Piece {
-        let cutting = matches!(m.kind, MoveKind::Cut | MoveKind::Air);
-        match m.curve {
-            Curve::Arc {
-                start,
-                end,
-                center,
-                sweep_rad,
-                ..
-            } if cutting => {
-                if let Some(o) = self.open.as_mut()
-                    && close3(o.0, center)
-                    && close3(o.2, start)
-                    && (o.3 + sweep_rad).abs() <= TAU + 1e-9
-                {
-                    o.2 = end;
-                    o.3 += sweep_rad;
-                    o.4 += 1;
-                    return Piece::Arc;
-                }
-                self.close();
-                self.open = Some((center, start, end, sweep_rad, 1));
-                Piece::First
-            }
-            Curve::Line { start, end } if cutting => {
-                if let Some(o) = self.open.as_mut() {
-                    let rho = distance(o.0, o.1);
-                    if close3(o.2, start)
-                        && start[2] == end[2]
-                        && (distance(o.0, start) - rho).abs() < 1e-9
-                        && (distance(o.0, end) - rho).abs() < 1e-9
-                        && o.3.abs() < TAU - 1e-9
-                    {
-                        let angle = |q: Vec3| (q[1] - o.0[1]).atan2(q[0] - o.0[0]);
-                        let mut d = angle(end) - angle(start);
-                        if d > std::f64::consts::PI {
-                            d -= TAU;
-                        } else if d <= -std::f64::consts::PI {
-                            d += TAU;
-                        }
-                        o.2 = end;
-                        o.3 += d;
-                        o.4 += 1;
-                        return Piece::Chord;
-                    }
-                }
-                self.close();
-                Piece::Other
-            }
-            _ => {
-                self.close();
-                Piece::Other
-            }
+        let piece = self.classify(m);
+        if piece == Piece::Return && !self.in_return {
+            self.returns += 1;
         }
+        self.in_return = piece == Piece::Return;
+        piece
+    }
+    fn classify(&mut self, m: &Motion) -> Piece {
+        let cutting = matches!(m.kind, MoveKind::Cut | MoveKind::Air);
+        let (start, end) = (m.curve.start(), m.curve.end());
+        let horizontal = start[2] == end[2];
+        if let Curve::Arc {
+            center, sweep_rad, ..
+        } = m.curve
+            && cutting
+            && let Some(o) = self.open.as_mut()
+            && close3(o.0, center)
+            && close3(o.2, start)
+            && (o.3 + sweep_rad).abs() <= TAU + 1e-9
+        {
+            o.2 = end;
+            o.3 += sweep_rad;
+            o.4 += 1;
+            return Piece::Arc;
+        }
+        if matches!(m.curve, Curve::Arc { .. } | Curve::Line { .. })
+            && cutting
+            && horizontal
+            && let Some(o) = self.open.as_mut()
+            && close3(o.2, start)
+            && o.3.abs() < TAU - 1e-9
+            && (!matches!(m.curve, Curve::Arc { center, .. } if close3(o.0, center)))
+        {
+            let angle = |q: Vec3| (q[1] - o.0[1]).atan2(q[0] - o.0[0]);
+            let mut d = angle(end) - angle(start);
+            if d > std::f64::consts::PI {
+                d -= TAU;
+            } else if d <= -std::f64::consts::PI {
+                d += TAU;
+            }
+            o.2 = end;
+            o.3 += d;
+            o.4 += 1;
+            return Piece::Return;
+        }
+        self.close();
+        if let Curve::Arc {
+            center, sweep_rad, ..
+        } = m.curve
+            && cutting
+        {
+            self.open = Some((center, start, end, sweep_rad, 1));
+            return Piece::First;
+        }
+        Piece::Other
     }
     fn finish(mut self) -> Vec<Orbit> {
         self.close();
@@ -169,7 +174,6 @@ fn slot_engagement_coverage_and_containment_hold_for_rotations_widths_and_angles
         let mut last_position = fixture().initial_position_mm;
         let mut walk = OrbitWalk::default();
         let mut prior_circle: Option<Vec3> = None;
-        let mut chords = 0;
         while let Some(m) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
             assert_eq!(m.curve.start(), last_position);
             last_position = m.curve.end();
@@ -184,17 +188,18 @@ fn slot_engagement_coverage_and_containment_hold_for_rotations_widths_and_angles
                     assert_eq!(sweep_rad.signum(), if cw { -1. } else { 1. });
                     assert_eq!(m.feed_mm_min, Some(op.feed_mm_min));
                 }
-                Curve::Line { start, end } if piece == Piece::Chord => {
-                    // The return chord runs inside the disk the previous
-                    // orbit cleared (convex, so its ends bound it): it
-                    // exposes no edge at all.
-                    let old = prior_circle.expect("a chord needs a previous orbit");
+                _ if piece == Piece::Return => {
+                    // The return runs inside the disk the previous orbit
+                    // cleared (sampled): it exposes no edge at all.
+                    let old = prior_circle.expect("a return needs a previous orbit");
                     let rho = p.report().orbit_radius_mm;
-                    assert!(distance(old, start) <= rho - 16. * op.tolerance_mm + 1e-12);
-                    assert!(distance(old, end) <= rho - 16. * op.tolerance_mm + 1e-12);
+                    let prepared = m.curve.prepare(1e-7).unwrap();
+                    for i in 0..=256 {
+                        let q = prepared.position(i as f64 / 256.).unwrap();
+                        assert!(distance(old, q) <= rho - 16. * op.tolerance_mm + 1e-12);
+                    }
                     assert_eq!(m.kind, MoveKind::Cut);
                     assert_eq!(m.feed_mm_min, Some(op.feed_mm_min));
-                    chords += 1;
                 }
                 Curve::Arc {
                     center,
@@ -273,6 +278,7 @@ fn slot_engagement_coverage_and_containment_hold_for_rotations_widths_and_angles
         }
         assert!(circles > 2);
         // Every orbit, D-shaped or not, sweeps exactly one turn and closes.
+        let chords = walk.returns;
         let orbits = walk.finish();
         assert_eq!(orbits.len(), circles);
         for (_, start, end, sweep, _) in &orbits {
@@ -631,10 +637,10 @@ fn check_curved(op: &TrochoidalSlotOperation) -> SlotPlan {
                 previous = Some(center);
                 orbits += 1;
             }
-            Curve::Line { .. } if piece == Piece::Chord => {
-                // The return chord stays in the previous orbit's cleared
-                // disk, sampled independently of the planner's proof.
-                let old = prior.expect("a chord needs a previous orbit");
+            _ if piece == Piece::Return => {
+                // The return stays in the previous orbit's cleared disk,
+                // sampled independently of the planner's proof.
+                let old = prior.expect("a return needs a previous orbit");
                 for q in &samples {
                     assert!(distance(old, *q) <= rho - 16. * op.tolerance_mm + 1e-12);
                 }
@@ -1051,7 +1057,9 @@ fn slot_air_feed_same_path() {
         let cleared = rho + r;
         let path = base.path_mm.clone();
         let mut previous: Option<Vec3> = None;
+        let mut walk = OrbitWalk::default();
         for m in &air_motions {
+            let piece = walk.step(m);
             let prepared = m.curve.prepare(1e-5).unwrap();
             if m.curve.start()[2] < 10. || m.curve.end()[2] < 10. {
                 for i in 0..=512 {
@@ -1070,7 +1078,9 @@ fn slot_air_feed_same_path() {
             let Curve::Arc { center, .. } = m.curve else {
                 continue;
             };
-            if !matches!(m.kind, MoveKind::Cut | MoveKind::Air) {
+            if !matches!(m.kind, MoveKind::Cut | MoveKind::Air) || piece == Piece::Return {
+                // Return fillets turn about their own centres, inside the
+                // orbit (checked in the disk test).
                 continue;
             }
             let on_path = match &path {
@@ -1210,7 +1220,7 @@ fn slot_return_chords_stay_inside_the_previous_orbit_disk() {
                             open = Some(center);
                         }
                     }
-                    Piece::Arc | Piece::Chord => {}
+                    Piece::Arc | Piece::Return => {}
                     Piece::Other => {
                         if let Some(c) = open.take() {
                             previous = Some((c[2], c));
@@ -1227,11 +1237,11 @@ fn slot_return_chords_stay_inside_the_previous_orbit_disk() {
                 }
                 z_tracked = Some(z1);
                 let is_air = m.kind == MoveKind::Air;
-                assert_eq!(is_air, air_feed.is_some() && piece == Piece::Chord, "{name}: {m:?}");
+                assert_eq!(is_air, air_feed.is_some() && piece == Piece::Return, "{name}: {m:?}");
                 if is_air {
                     assert_eq!(m.feed_mm_min, air_feed);
                 }
-                if piece == Piece::Chord {
+                if piece == Piece::Return {
                     assert!(
                         previous.is_some(),
                         "{name}: chord {} has no remembered previous complete orbit",
@@ -1257,8 +1267,8 @@ fn slot_return_chords_stay_inside_the_previous_orbit_disk() {
                     checked += 1;
                 }
             }
-            assert!(checked > 0, "{name}: no chord was checked");
-            assert_eq!(checked, p.report().return_chords, "{name}");
+            assert!(checked > 0, "{name}: no return was checked");
+            assert_eq!(walk.returns, p.report().return_chords, "{name}");
         }
     }
 }
@@ -1310,4 +1320,58 @@ fn air_intent_requires_committed_clearance_and_never_clears_stock() {
     air.kind = MoveKind::Air;
     air.curve = Curve::Line { start: [8., 12., 8.999999], end: [8.1, 12., 8.999999] };
     assert!(stock.preview_sweep(&tool, &air, 1., sweep, &cancel).is_err());
+}
+
+/// Unit XY direction of travel of a line or arc at its start or end.
+fn travel(curve: &Curve, at_end: bool) -> [f64; 2] {
+    let v = match *curve {
+        Curve::Line { start, end } => [end[0] - start[0], end[1] - start[1]],
+        Curve::Arc {
+            start,
+            end,
+            center,
+            sweep_rad,
+            ..
+        } => {
+            let p = if at_end { end } else { start };
+            let s = sweep_rad.signum();
+            [-s * (p[1] - center[1]), s * (p[0] - center[0])]
+        }
+        _ => panic!("unexpected curve {curve:?}"),
+    };
+    let n = v[0].hypot(v[1]);
+    [v[0] / n, v[1] / n]
+}
+
+/// Every controlled orbit runs without a corner: each piece (cut arc,
+/// return fillet, return line) leaves in the direction the one before it
+/// arrived, checked from the motion stream alone, with and without the air
+/// feed, on the straight, arc, S and corner slots.
+#[test]
+fn d_loop_returns_are_tangent_throughout() {
+    for (name, base) in air_feed_cases() {
+        for air_feed in [None, Some(base.feed_mm_min * 4.)] {
+            let mut op = base.clone();
+            op.air_feed_mm_min = air_feed;
+            let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+            let (motions, _, p, _) = drive(&op, &mut stock);
+            let mut walk = OrbitWalk::default();
+            let mut joins = 0;
+            let mut previous: Option<&Motion> = None;
+            for m in &motions {
+                let piece = walk.step(m);
+                if matches!(piece, Piece::Arc | Piece::Return) {
+                    let before = travel(&previous.unwrap().curve, true);
+                    let after = travel(&m.curve, false);
+                    let gap = (before[0] - after[0]).hypot(before[1] - after[1]);
+                    assert!(gap < 1e-9, "{name}: a {gap} kink before motion {}", m.id);
+                    joins += 1;
+                }
+                previous = Some(m);
+            }
+            // Each return: fillet, line, fillet, then the cut arc after it.
+            assert!(joins >= 4 * p.report().return_chords, "{name}");
+            assert!(walk.returns > 0, "{name}");
+        }
+    }
 }

@@ -326,6 +326,12 @@ fn arc_coverage_half_angle(radius: f64, a: f64, t: f64) -> f64 {
     lo
 }
 
+/// Fillet radius of a rounded return, as a fraction of the orbit radius.
+/// Measured on the trochoidal-slot bench (tangent cycle model) over 0.1 to
+/// 0.95: the smallest was fastest with and without an air feed, since the
+/// return stays shortest while still tangent throughout.
+const RETURN_FILLET: f64 = 0.1;
+
 /// One arc piece of a split controlled orbit: same centre and direction as
 /// the whole orbit, same start and end points joined up; `air` marks the
 /// proven-air piece fed at `air_feed_mm_min`.
@@ -370,6 +376,9 @@ pub struct SlotPlan {
     /// Pending arc pieces of the controlled orbit being emitted (phase 5),
     /// one motion per call like every other phase.
     orbit_pieces: VecDeque<OrbitPiece>,
+    /// Motions of the orbit piece being emitted: one cut arc, or the
+    /// rounded return of a proven-air piece (marked true).
+    pending: VecDeque<(Curve, bool)>,
     report: SlotReport,
 }
 
@@ -636,6 +645,7 @@ impl SlotPlan {
             expected_generation: None,
             prev_center: None,
             orbit_pieces: VecDeque::new(),
+            pending: VecDeque::new(),
             report,
         })
     }
@@ -747,6 +757,67 @@ impl SlotPlan {
     /// today's single full circle, same start and end point, total sweep
     /// exactly one turn. Without a proven-air interval: one full circle
     /// (today's orbit).
+    /// The return across a proven-air piece of the orbit at `center`, from
+    /// the current position P to `piece.end` Q (signed sweep s): a D-shaped
+    /// loop's straight return with rounded ends. A fillet of radius
+    /// rf = RETURN_FILLET * rho, internally tangent to the orbit at P, turns
+    /// by s/2 onto the line parallel to the chord PQ; a second fillet turns
+    /// by s/2 off it, tangent to the orbit at Q. The path is tangent
+    /// throughout and lies between the chord and the arc (the line is
+    /// (rho - rf) cos(s/2) + rf from the centre, farther than the chord's
+    /// rho cos(s/2)), so inside the convex hull of the arc, inside the disk
+    /// |P - C_prev| <= rho - g that contains both: it cuts nothing.
+    fn rounded_return(&self, center: Vec3, piece: OrbitPiece) -> Vec<Curve> {
+        let (p, q, s) = (self.position, piece.end, piece.sweep);
+        let z = p[2];
+        let rho = self.radius;
+        if rho * s.abs() < 64. * self.guard {
+            // Too short to round: the air arc itself (tangent already).
+            return vec![Curve::Arc {
+                start: p,
+                end: q,
+                center,
+                plane: Plane::Xy,
+                sweep_rad: s,
+            }];
+        }
+        let rf = RETURN_FILLET * rho;
+        let at = |theta: f64, radius: f64, from: [f64; 2]| {
+            [
+                from[0] + radius * theta.cos(),
+                from[1] + radius * theta.sin(),
+                z,
+            ]
+        };
+        let c = [center[0], center[1]];
+        let theta_p = (p[1] - c[1]).atan2(p[0] - c[0]);
+        let theta_mid = theta_p + s / 2.;
+        let theta_q = theta_p + s;
+        let f_p = at(theta_p, rho - rf, c);
+        let f_q = at(theta_q, rho - rf, c);
+        let e_p = at(theta_mid, rf, [f_p[0], f_p[1]]);
+        let s_q = at(theta_mid, rf, [f_q[0], f_q[1]]);
+        vec![
+            Curve::Arc {
+                start: p,
+                end: e_p,
+                center: f_p,
+                plane: Plane::Xy,
+                sweep_rad: s / 2.,
+            },
+            Curve::Line {
+                start: e_p,
+                end: s_q,
+            },
+            Curve::Arc {
+                start: s_q,
+                end: q,
+                center: f_q,
+                plane: Plane::Xy,
+                sweep_rad: s / 2.,
+            },
+        ]
+    }
     fn split_orbit(&self, center: Vec3, z: f64) -> VecDeque<OrbitPiece> {
         let sign = if self.op.clockwise { -1. } else { 1. };
         let rho = self.radius;
@@ -947,42 +1018,44 @@ impl SlotPlan {
                 // each returned motion is committed before the next call.
                 5 => {
                     let center = self.center(self.distance, z);
-                    if self.orbit_pieces.is_empty() {
-                        self.orbit_pieces = self.split_orbit(center, z);
-                        self.report.controlled_orbits += 1;
+                    if self.pending.is_empty() {
+                        if self.orbit_pieces.is_empty() {
+                            self.orbit_pieces = self.split_orbit(center, z);
+                            self.report.controlled_orbits += 1;
+                        }
+                        let piece = self.orbit_pieces.pop_front().unwrap();
+                        if piece.air {
+                            let moves = self.rounded_return(center, piece);
+                            let length: f64 = moves
+                                .iter()
+                                .map(|c| c.prepare(self.op.tolerance_mm).map(|p| p.length_mm()))
+                                .sum::<Result<f64, String>>()?;
+                            self.report.return_chords += 1;
+                            self.report.return_chord_saved_mm +=
+                                self.radius * piece.sweep.abs() - length;
+                            self.pending.extend(moves.into_iter().map(|c| (c, true)));
+                        } else {
+                            self.pending.push_back((
+                                Curve::Arc {
+                                    start: self.position,
+                                    end: piece.end,
+                                    center,
+                                    plane: Plane::Xy,
+                                    sweep_rad: piece.sweep,
+                                },
+                                false,
+                            ));
+                        }
                     }
-                    let piece = self.orbit_pieces.pop_front().unwrap();
-                    let last = self.orbit_pieces.is_empty();
-                    // The proven-air stretch returns on the straight chord
-                    // between its ends (a D-shaped loop): both ends lie in
-                    // the disk |P - C_prev| <= rho - g, which is convex, so
-                    // the whole chord does too, and it cuts nothing.
-                    let curve = if piece.air {
-                        Curve::Line {
-                            start: self.position,
-                            end: piece.end,
-                        }
-                    } else {
-                        Curve::Arc {
-                            start: self.position,
-                            end: piece.end,
-                            center,
-                            plane: Plane::Xy,
-                            sweep_rad: piece.sweep,
-                        }
-                    };
+                    let (curve, air) = self.pending.pop_front().unwrap();
+                    let last = self.pending.is_empty() && self.orbit_pieces.is_empty();
                     let mut motion = self.emit(curve, MoveKind::Cut, false)?;
-                    if piece.air {
-                        let chord = distance(motion.curve.start(), motion.curve.end());
-                        self.report.return_chords += 1;
-                        self.report.return_chord_saved_mm +=
-                            self.radius * piece.sweep.abs() - chord;
-                        if let Some(feed) = self.op.air_feed_mm_min {
-                            motion.kind = MoveKind::Air;
-                            motion.feed_mm_min = Some(feed);
-                            self.report.air_fed_arcs += 1;
-                            self.report.air_fed_mm += chord;
-                        }
+                    if air && let Some(feed) = self.op.air_feed_mm_min {
+                        motion.kind = MoveKind::Air;
+                        motion.feed_mm_min = Some(feed);
+                        self.report.air_fed_arcs += 1;
+                        self.report.air_fed_mm +=
+                            motion.curve.prepare(self.op.tolerance_mm)?.length_mm();
                     }
                     if last {
                         self.phase = 4;
