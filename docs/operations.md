@@ -178,8 +178,11 @@ without a word:
 **A top below the remaining stock** (`Pocket` and `AdaptivePocket`, issue
 #129). `top_z_mm` may be below the stock's original top when earlier
 operations removed the material: the depth (and the cutting-length check) is
-then measured from `top_z_mm`. Every stock cell meeting the `region` must be at
-or below it. Stock may stand higher outside the region, for example a low
+then measured from `top_z_mm`, and an `AdaptivePocket` plans its first level
+from it (#344), so no level is deeper than `stepdown_mm`. Every stock cell
+meeting the `region` must be at or below it; the run checks this against the
+committed stock, so a lower top needs the stock (an `AdaptivePocket` planned
+without it is refused). Stock may stand higher outside the region, for example a low
 pocket beside a tall wall, when the tool assembly clears it:
 
 - Before any motion, the neck, shank and every holder section are checked

@@ -120,12 +120,17 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
             .unwrap();
             let report = serde_json::to_value(plan.report()).unwrap();
             if top == 8. {
+                assert_eq!(report["stock_top"]["generation"], current.generation());
                 if adaptive {
-                    // The engagement front plans each level from the
-                    // committed stock; it has no stock-top bound to report.
-                    assert_eq!(report["layers"].as_array().unwrap().len(), 2);
+                    // Levels from the operation top, a stepdown apart.
+                    let tips: Vec<f64> = report["layers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|l| l["tip_z_mm"].as_f64().unwrap())
+                        .collect();
+                    assert_eq!(tips, [6., 5.]);
                 } else {
-                    assert_eq!(report["stock_top"]["generation"], current.generation());
                     assert_eq!(report["depth_passes"], 2);
                 }
             }
@@ -144,10 +149,11 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
         // fewer; the engagement front plans each level from the stock, so
         // its level in the air above the faced top makes no move.
         if adaptive {
-            assert_eq!(
-                results[1].0, results[0].0,
+            assert!(
+                results[1].0 <= results[0].0,
                 "a move in the air depth: {} / {}",
-                results[1].0, results[0].0
+                results[1].0,
+                results[0].0
             );
         } else {
             assert!(
@@ -165,17 +171,25 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
 #[test]
 fn lower_top_rejects_uncut_and_same_generation_foreign_stock_but_accepts_restored_faced_stock() {
     let m = fixture();
-    // Pocket only: AdaptivePocket's engagement front does not check the
-    // stock against top_z_mm (it plans its first level from the stock top).
-    // The removed orbit planner did; see the #190 pull request.
-    let adaptive = false;
-    {
+    for adaptive in [false, true] {
         let original = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let error = OperationPlan::prepare_with_stock(
+            operation(8., adaptive),
+            &m.tools[0],
+            &original,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("raise the operation top"), "{error}");
+        // Without committed stock a lower top cannot be proven.
         assert!(
-            OperationPlan::prepare_with_stock(
+            OperationPlan::prepare(
                 operation(8., adaptive),
                 &m.tools[0],
-                &original,
+                m.stock.height().unwrap(),
                 m.initial_position_mm,
                 1,
                 &|| false

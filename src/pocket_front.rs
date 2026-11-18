@@ -50,6 +50,10 @@ pub struct PocketFrontReport {
     pub max_ramp_angle_deg: Option<f64>,
     pub geometric_residual_status: ResidualStatus,
     pub diagnostics: Vec<String>,
+    /// A `top_z_mm` below the stock's top, proven against the committed
+    /// stock as for `Pocket` (`crate::pocket::StockTop`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stock_top: Option<crate::pocket::StockTopReport>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PocketFrontLayer {
@@ -66,6 +70,9 @@ pub struct PocketFrontPlan {
     next_id: u64,
     generation: Option<u64>,
     spec: StockSpec,
+    /// A lower top's proof: checked before any motion, rescanned on stock
+    /// it did not see committed, and each motion admitted against it.
+    stock_top: Option<crate::pocket::StockTop>,
     report: PocketFrontReport,
 }
 
@@ -105,6 +112,16 @@ impl PocketFrontPlan {
             return Err(format!(
                 "adaptive pocket {}: stepover_mm {stepover} is the radial engagement of each pass; it must be positive and at most the cutter radius {r} mm",
                 pocket.id
+            ));
+        }
+        // A top below the stock's top is only proven against committed
+        // stock (`prepare_with_stock`); here the stock is the whole blank, so
+        // its first level would cut from the blank's top, deeper than a
+        // stepdown (#190 follow-up). Refused, as `Pocket` refuses it.
+        if pocket.top_z_mm < spec.max_mm[2] {
+            return Err(format!(
+                "adaptive pocket {}: top_z_mm {} is below the stock top {}; plan it against the committed stock after the operation that removed the stock above it, or raise the operation top",
+                pocket.id, pocket.top_z_mm, spec.max_mm[2]
             ));
         }
         let floor = pocket.floor_z_mm + pocket.bottom_allowance_mm;
@@ -218,6 +235,7 @@ impl PocketFrontPlan {
             next_id: first_id,
             generation: None,
             spec: spec.clone(),
+            stock_top: None,
             report: PocketFrontReport {
                 strategy: "adaptive_pocket",
                 clearing: "engagement_front",
@@ -233,6 +251,7 @@ impl PocketFrontPlan {
                 ramp_entries: 0,
                 max_ramp_angle_deg: None,
                 geometric_residual_status: ResidualStatus::Pending,
+                stock_top: None,
                 diagnostics: vec![
                     "Each depth level follows the boundary between cut and uncut stock inside the pocket region; every cutting stroke is proven within max_engagement_deg = acos(1 - stepover/r) against the committed cleared sweeps".into(),
                 ],
@@ -247,7 +266,34 @@ impl PocketFrontPlan {
         first_id: u64,
         cancel: &impl CancelSignal,
     ) -> Result<Self, String> {
-        Self::prepare(op, tool, stock.spec(), initial, first_id, cancel)
+        // A top below the stock's top is the caller's statement that
+        // earlier operations removed the stock above it: proven here, as
+        // for `Pocket` (#129), before any motion. The levels are then
+        // planned from that top, each at most a stepdown deep.
+        let pocket = &op.pocket;
+        let scope = crate::pocket::ReachScope {
+            operation: &pocket.id,
+            tool,
+            region: &pocket.region,
+            lowest_tip_z: pocket.floor_z_mm + pocket.bottom_allowance_mm,
+            clearance_z: pocket.clearance_z_mm,
+            boundary_slack_mm: 0.,
+        };
+        let (envelope, bound) = crate::pocket::StockTop::prepare(
+            stock,
+            pocket.top_z_mm,
+            pocket.tolerance_mm,
+            &scope,
+            cancel,
+        )
+        .map_err(|e| format!("adaptive {e}"))?;
+        let mut plan = Self::prepare(op, tool, &envelope, initial, first_id, cancel)?;
+        plan.spec = stock.spec().clone();
+        if let Some(bound) = bound {
+            plan.report.stock_top = Some(bound.report.clone());
+            plan.stock_top = Some(bound);
+        }
+        Ok(plan)
     }
     pub fn report(&self) -> &PocketFrontReport {
         &self.report
@@ -283,6 +329,9 @@ impl PocketFrontPlan {
                 "commit preceding adaptive pocket motion to matching stock before planning".into(),
             );
         }
+        if let Some(bound) = &mut self.stock_top {
+            bound.validate(stock, cancel)?;
+        }
         loop {
             let Some(plan) = self.plans.front_mut() else {
                 return Ok(None);
@@ -313,6 +362,9 @@ impl PocketFrontPlan {
                             .max_ramp_angle_deg
                             .map_or(angle, |a| a.max(angle)),
                     );
+                }
+                if let Some(bound) = &self.stock_top {
+                    bound.admit(&m)?;
                 }
                 self.position = m.curve.end();
                 self.next_id = m.id + 1;
