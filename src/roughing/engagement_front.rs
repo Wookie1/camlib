@@ -7066,87 +7066,131 @@ mod tests {
         }
     }
 
-    /// A cancellation after the slot-side entry proof succeeded, before the
-    /// front has been followed, must restore the position the planner keeps
-    /// alongside the attempt it rolls back: the resumed motion has to start
-    /// from the last actual tool position, not from the point the rolled
-    /// back attempt had optimistically advanced to (the review of 67a7981).
-    /// Real proofs, a committed precut slot, and a deterministic signal that
-    /// answers 86 successful polls then cancels.
+    /// The slot-side entry attempt used by the cancellation regressions
+    /// below: the fixture's first operation, a committed precut slot, the
+    /// layer built on it, and the slot offered for a stock-edge-or-helix
+    /// entry beside it.
+    fn fourth_review_setup(
+        manifest: &mut crate::stream::StreamManifest,
+    ) -> Result<(EngagementFrontPlan, Stock), String> {
+        let crate::pocket::Operation::AdaptivePocket(mut op) = manifest.operations.remove(0) else {
+            panic!("fixture");
+        };
+        op.pocket.entry = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "stock_edge_or_helix",
+                "angle_rad": 0.05235987755982989
+            }))
+            .unwrap(),
+        );
+        let mut stock = Stock::new(manifest.stock.height().unwrap().clone())?;
+        let mut plan = EngagementFrontPlan::prepare(
+            op.pocket,
+            &manifest.tools[0],
+            stock.spec(),
+            manifest.initial_position_mm,
+            0.5,
+            true,
+            &NeverCancelled,
+        )?;
+        let z = plan.z;
+        let (a, b) = ([6., 8.], [10., 8.]);
+        let slot = Motion {
+            id: 0,
+            operation: "precut-slot".into(),
+            tool: manifest.tools[0].id.clone(),
+            kind: MoveKind::Cut,
+            curve: Curve::Line {
+                start: [a[0], a[1], z],
+                end: [b[0], b[1], z],
+            },
+            feed_mm_min: Some(600.),
+        };
+        let tool = manifest.tools[0].prepare()?;
+        let delta = stock.preview_sweep(&tool, &slot, 1., manifest.sweep, &NeverCancelled)?;
+        stock.apply_delta(&delta)?;
+        plan.build_layer(&stock, &NeverCancelled)?;
+        plan.ramp_slots.push((a, b));
+        Ok((plan, stock))
+    }
+
+    /// A cancellation after the slot-side entry: the attempt is rolled back
+    /// to its checkpoint — queue, journal, report and position — so the
+    /// resumed motion starts from the last actual tool position, not from
+    /// the point the discarded attempt had optimistically advanced to (the
+    /// review of 67a7981).
+    ///
+    /// The signal is calibrated against the attempt itself, so cancellation
+    /// cannot land before the position advance: a first, uncancelled run
+    /// counts the polls the whole attempt takes, and a second, identical run
+    /// cancels on that attempt's *last* poll — after the across-slot proof
+    /// has succeeded, after the position has advanced beside the slot, and
+    /// inside the follow the proof fed. Every assertion is unconditional:
+    /// the cancellation is required, the restored position is asserted
+    /// immediately, and the retried planner must produce a motion that
+    /// starts where the tool actually is. (Calibration recipe if the poll
+    /// placement ever drifts: the first run's total is the pin — today the
+    /// advance consumes 86 polls and the follow takes the 87th.)
     #[test]
     fn fourth_review_slot_side_cancel_restores_position() {
-        for stop in [86] {
-            let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
+        let manifest = || {
+            serde_json::from_str::<crate::stream::StreamManifest>(include_str!(
                 "../../fixtures/operations/adaptive-pocket.json"
             ))
-            .unwrap();
-            let crate::pocket::Operation::AdaptivePocket(mut op) = m.operations.remove(0) else {
-                panic!("fixture");
-            };
-            op.pocket.entry = Some(
-                serde_json::from_value(serde_json::json!({
-                    "kind": "stock_edge_or_helix", "angle_rad": 0.05235987755982989
-                }))
-                .unwrap(),
-            );
-            let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
-            let mut plan = EngagementFrontPlan::prepare(
-                op.pocket,
-                &m.tools[0],
-                stock.spec(),
-                m.initial_position_mm,
-                0.5,
-                true,
-                &NeverCancelled,
-            )
-            .unwrap();
-            let z = plan.z;
-            let (a, b, q) = ([6., 8.], [10., 8.], [10., 9.]);
-            let slot = Motion {
-                id: 0,
-                operation: "precut-slot".into(),
-                tool: m.tools[0].id.clone(),
-                kind: MoveKind::Cut,
-                curve: Curve::Line {
-                    start: [a[0], a[1], z],
-                    end: [b[0], b[1], z],
-                },
-                feed_mm_min: Some(600.),
-            };
-            let tool = m.tools[0].prepare().unwrap();
-            let delta = stock
-                .preview_sweep(&tool, &slot, 1., m.sweep, &NeverCancelled)
-                .unwrap();
-            stock.apply_delta(&delta).unwrap();
-            plan.build_layer(&stock, &NeverCancelled).unwrap();
-            plan.ramp_slots.push((a, b));
-            let before = plan.position;
+            .unwrap()
+        };
+        let total = {
+            let mut m = manifest();
+            let (mut plan, stock) = fourth_review_setup(&mut m).unwrap();
             let polls = std::cell::Cell::new(0);
-            let cancel = || {
+            let planned = plan.slot_side_entry([10., 9.], &stock, &|| {
+                polls.set(polls.get() + 1);
+                false
+            });
+            assert!(
+                planned.is_ok(),
+                "the uncancelled slot-side attempt must plan: {planned:?}"
+            );
+            polls.get()
+        };
+        let mut m = manifest();
+        let (mut plan, stock) = fourth_review_setup(&mut m).unwrap();
+        let before = plan.position;
+        let polls = std::cell::Cell::new(0);
+        let error = plan
+            .slot_side_entry([10., 9.], &stock, &|| {
                 let n = polls.get();
                 polls.set(n + 1);
-                n >= stop
-            };
-            let result = plan.slot_side_entry(q, &stock, &cancel);
-            if result.is_err() {
-                let after_error = plan.position;
-                let resumed = plan.next_motion_with_stock(&stock, &NeverCancelled);
-                eprintln!("before {before:?}; resumed {resumed:?}");
-                if let Ok(Some(motion)) = resumed {
-                    assert_eq!(
-                        motion.curve.start(),
-                        before,
-                        "resumed motion must start at the last actual position"
-                    );
-                }
-                assert_eq!(
-                    after_error,
-                    before,
-                    "cancel poll {stop}: queue {}, error {result:?}",
-                    plan.pending.len()
-                );
-            }
-        }
+                n + 1 >= total
+            })
+            .expect_err("the slot-side attempt must cancel at its last poll");
+        assert!(
+            error.contains("cancel"),
+            "the failure must be the cancellation, not another defect: {error}"
+        );
+        assert_eq!(
+            polls.get(),
+            total,
+            "the cancelled attempt must reach the same last poll the completed one did"
+        );
+        assert_eq!(
+            plan.pending.len(),
+            0,
+            "no stroke of the cancelled attempt may survive"
+        );
+        assert_eq!(
+            plan.position, before,
+            "the rollback must restore the position with the attempt"
+        );
+        let resumed = plan
+            .next_motion_with_stock(&stock, &NeverCancelled)
+            .expect("the retry after cancellation must not error");
+        let motion = resumed.expect("the retry must plan a motion to resume with");
+        assert_eq!(
+            motion.curve.start(),
+            before,
+            "resumed motion must start at the last actual tool position"
+        );
     }
 
     #[test]
