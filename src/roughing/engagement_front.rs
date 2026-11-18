@@ -3286,7 +3286,7 @@ impl EngagementFrontPlan {
         // taken inside the follow, which `slot_side_entry` reaches after
         // advancing its position (test-only; no production reading).
         #[cfg(test)]
-        tests::SLOT_SIDE_STAGE.with(|c| c.set(tests::SLOT_SIDE_IN_FOLLOW));
+        tests::slot_side_stage(tests::SLOT_SIDE_ADVANCED, tests::SLOT_SIDE_IN_FOLLOW);
         let r = self.r;
         // Steering width: the declared width less what the grid cannot
         // resolve (see `steering_width`), narrowed by `narrow` when an
@@ -5712,10 +5712,10 @@ impl EngagementFrontPlan {
             self.report.slot_side_entries += 1;
             self.position = [q[0], q[1], z];
             // The fourth_review regression pins its cancellation to the
-            // follow this advance feeds: the stage marker tells the signal
+            // follow this advance feeds: the guarded stage tells the signal
             // where the attempt stands (test-only; no production reading).
             #[cfg(test)]
-            tests::SLOT_SIDE_STAGE.with(|c| c.set(tests::SLOT_SIDE_ADVANCED));
+            tests::slot_side_stage(tests::SLOT_SIDE_BEFORE_ADVANCE, tests::SLOT_SIDE_ADVANCED);
             let heading = (q[1] - p[1]).atan2(q[0] - p[0]);
             if let Some(pts) = self
                 .proven_pass(stock, q, heading, false, from, cancel)
@@ -7137,14 +7137,18 @@ mod tests {
     /// rejected before the attempt — a clearance query that polls and then
     /// turns the entry down — cannot reach that stage, cannot fire the
     /// signal, and leaves the call Ok, which fails this test instead of
-    /// passing it. Every assertion is unconditional: the cancellation is
+    /// passing it. The stage transitions themselves are guarded while this
+    /// test is armed: the follow's marker must begin at the advanced marker,
+    /// which must begin at the start, so the ordering the assertions rely on
+    /// is enforced by the markers, not assumed from the call path. Every
+    /// assertion is unconditional: the cancellation is
     /// required and must be the cancellation, no stroke of the discarded
     /// attempt may survive, the position must restore with the attempt, and
     /// the retried planner must produce a motion starting where the tool
     /// actually is.
     #[test]
     fn fourth_review_slot_side_cancel_restores_position() {
-        tests::SLOT_SIDE_STAGE.with(|c| c.set(tests::SLOT_SIDE_BEFORE_ADVANCE));
+        let _stages = tests::SlotSideStages::arm();
         let mut m: crate::stream::StreamManifest = serde_json::from_str(include_str!(
             "../../fixtures/operations/adaptive-pocket.json"
         ))
@@ -7187,6 +7191,10 @@ mod tests {
             plan.position, before,
             "the rollback must restore the position with the attempt"
         );
+        // The resumed planning is ordinary; disarm the guards before it, so
+        // the retry's own entries are not held to the observed attempt's
+        // stage sequence.
+        drop(_stages);
         let resumed = plan
             .next_motion_with_stock(&stock, &NeverCancelled)
             .expect("the retry after cancellation must not error");
@@ -7568,16 +7576,62 @@ mod tests {
             const { std::cell::Cell::new(0) };
         pub(super) static REVIEW_WALL_RUNS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
-        /// The slot-side attempt's stage marker, set by the `#[cfg(test)]`
-        /// hooks in `slot_side_entry` (at the position advance) and `follow`
-        /// (at its start); read by the fourth_review regression's signal.
+        /// The slot-side attempt's stage marker, set by the guarded
+        /// `#[cfg(test)]` transitions in `slot_side_entry` (at the position
+        /// advance) and `follow` (at its start); read by the fourth_review
+        /// regression's signal.
         pub(super) static SLOT_SIDE_STAGE: std::cell::Cell<u8> =
             const { std::cell::Cell::new(SLOT_SIDE_BEFORE_ADVANCE) };
+        /// Whether the guarded stages are enforced for the fourth_review
+        /// regression: hooks in ordinary tests must not touch them.
+        static SLOT_SIDE_ARMED: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         static REVIEW_REASONS: std::cell::Cell<Option<(UnresolvedReason, UnresolvedReason)>> =
             const { std::cell::Cell::new(None) };
         static FORCED_QUERIES: std::cell::Cell<usize> =
             const { std::cell::Cell::new(usize::MAX) };
         static FORCED_SKIP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// One guarded stage transition of the fourth_review slot-side
+    /// regression (test-only hooks in `slot_side_entry` and `follow`, no
+    /// production reading): while the regression is armed, each stage must
+    /// begin at the one before it — `BEFORE_ADVANCE`, then `ADVANCED`, then
+    /// `IN_FOLLOW` — so the ordering its assertions rely on is enforced by
+    /// these markers themselves and not assumed from the call path. A
+    /// transition taken out of order fails loudly; unarmed hooks do not
+    /// touch the stage.
+    pub(super) fn slot_side_stage(expected: u8, next: u8) {
+        SLOT_SIDE_ARMED.with(|armed| {
+            if !armed.get() {
+                return;
+            }
+            SLOT_SIDE_STAGE.with(|stage| {
+                assert_eq!(
+                    stage.get(),
+                    expected,
+                    "slot-side stage out of order: the {next} transition requires the attempt at {expected}, found {}",
+                    stage.get()
+                );
+                stage.set(next);
+            });
+        });
+    }
+
+    /// Arms the guarded stages for one scope. Dropping disarms, so a failed
+    /// assertion cannot leave unrelated tests on the thread under guards.
+    pub(super) struct SlotSideStages;
+    impl SlotSideStages {
+        pub(super) fn arm() -> SlotSideStages {
+            SLOT_SIDE_STAGE.with(|c| c.set(SLOT_SIDE_BEFORE_ADVANCE));
+            SLOT_SIDE_ARMED.with(|c| c.set(true));
+            SlotSideStages
+        }
+    }
+    impl Drop for SlotSideStages {
+        fn drop(&mut self) {
+            SLOT_SIDE_ARMED.with(|c| c.set(false));
+        }
     }
 
     /// The reasons to force, and one query fewer left to force. Queries
