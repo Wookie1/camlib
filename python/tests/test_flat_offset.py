@@ -450,6 +450,58 @@ class FlatOffsetTest(unittest.TestCase):
                 idle += length * (1 - sum(live) / len(live))
             self.assertLess(idle, 0.1 * total, f"{name}: {idle:.1f} of {total:.1f} mm over no stock")
 
+    def test_entries_plunge_in_air_and_lead_in_and_out_on_tangent_arcs(self):
+        # A run is entered by a vertical plunge in air and a quarter-circle
+        # lead-in of the tool's radius, tangent to the pass where it joins it
+        # (flat beside a face; over a finished face a helix stops above the
+        # floor and descends at the declared 3 degrees over its chord), and
+        # left by a tangent quarter-circle lead-out of the same radius before
+        # the retract. Measured on the motion stream: radius, sweep, slope,
+        # and the direction on both sides of each joint.
+        def tangent(c, end):
+            if c.get("kind", "line") == "line":
+                d = [c["end"][0] - c["start"][0], c["end"][1] - c["start"][1]]
+            else:
+                p = c["end"] if end else c["start"]
+                ce, sign = c["center"], math.copysign(1, c["sweep_rad"])
+                d = [-(p[1] - ce[1]) * sign, (p[0] - ce[0]) * sign]
+            n = math.hypot(*d)
+            return [d[0] / n, d[1] / n]
+
+        for name in ("stepped", "island"):
+            report, motions, *_ = cached(name)
+            self.assertGreater(report.get("arc_lead_ins", 0), 0, name)
+            self.assertGreater(report.get("arc_lead_outs", 0), 0, name)
+            ins = outs = 0
+            for i, m in enumerate(motions[1:-1], 1):
+                c = m["curve"]
+                if c.get("kind") not in ("arc", "helix") or m["kind"] not in ("lead", "plunge"):
+                    continue
+                prev, nxt = motions[i - 1], motions[i + 1]
+                lead_in = prev in vertical_plunges([prev]) and nxt["kind"] == "cut"
+                rise = (
+                    nxt["curve"]["end"][2] > nxt["curve"]["start"][2]
+                    and math.dist(nxt["curve"]["end"][:2], nxt["curve"]["start"][:2]) < 1e-9
+                )
+                lead_out = m["kind"] == "lead" and prev["kind"] in ("cut", "link") and rise
+                if not (lead_in or lead_out):
+                    continue
+                a, ce = c["start"], c["center"]
+                self.assertAlmostEqual(math.hypot(a[0] - ce[0], a[1] - ce[1]), R, delta=1e-6)
+                self.assertAlmostEqual(abs(c["sweep_rad"]), math.pi / 2, delta=1e-9)
+                if lead_in:
+                    ins += 1
+                    t0, t1 = tangent(c, True), tangent(nxt["curve"], False)
+                    drop = c["start"][2] - c["end"][2]
+                    chord = math.dist(c["start"][:2], c["end"][:2])
+                    self.assertLessEqual(drop / chord, math.tan(math.radians(3)) + 1e-9, (name, c))
+                else:
+                    outs += 1
+                    t0, t1 = tangent(prev["curve"], True), tangent(c, False)
+                self.assertGreater(t0[0] * t1[0] + t0[1] * t1[1], 1 - 1e-9, (name, i, c))
+            self.assertEqual(ins, report["arc_lead_ins"], name)
+            self.assertEqual(outs, report["arc_lead_outs"], name)
+
 
 if __name__ == "__main__":
     unittest.main()

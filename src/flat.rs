@@ -163,6 +163,14 @@ pub struct FlatReport {
     /// live stock stood above the run's height at its start.
     #[serde(skip_serializing_if = "is_zero")]
     pub ramped_entries: usize,
+    /// Runs entered by a vertical plunge in air and a tangent arc lead-in
+    /// whose radius is the tool's radius (see `FlatPlan::arc_lead_in`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub arc_lead_ins: usize,
+    /// Runs left by a tangent arc lead-out of the tool's radius before the
+    /// retract (see `FlatPlan::arc_lead_out`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub arc_lead_outs: usize,
     pub clearance_proof: &'static str,
 }
 
@@ -1631,6 +1639,12 @@ enum Entry {
     /// curves (lines and arcs on the pass, helices where a leg descends
     /// along an arc), ending at the pass's start.
     Ramp { top: f64, curves: Vec<Curve> },
+    /// Vertical plunge in air at `lead`'s start, then the tangent arc lead-in
+    /// `lead` to the pass's start: flat at the pass's height (a lead at
+    /// cutting feed) or, when the plunge point is over the level's finished
+    /// face, a helix descending to it at the declared ramp's angle (at the
+    /// ramp's feed).
+    Arc { lead: Curve, helical: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1640,9 +1654,11 @@ enum Phase {
     Descend,
     Enter,
     Lead,
+    ArcIn,
     Ramp,
     Cut,
     PieceEnd,
+    Leave,
     Rise,
     Done,
 }
@@ -1663,6 +1679,7 @@ pub struct FlatPlan {
     limits: Option<crate::limits::PreparedLimits>,
     entry: Option<Entry>,
     ramp: std::collections::VecDeque<Curve>,
+    lead: Option<(Curve, bool)>,
     initial: Vec3,
     position: Vec3,
     next_id: u64,
@@ -1974,6 +1991,8 @@ impl FlatPlan {
             dropped_length_mm: dropped,
             runs_completed: 0,
             ramped_entries: 0,
+            arc_lead_ins: 0,
+            arc_lead_outs: 0,
             clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; contour-parallel offset passes outside in, side entry in air on open edges and every vertical plunge beside the level's face (a radius outside it, the face region a superset of the flat within the shadows' stated errors), links at depth and when chains break",
         };
         Ok(Self {
@@ -1992,6 +2011,7 @@ impl FlatPlan {
             limits: region_limits,
             entry: None,
             ramp: Default::default(),
+            lead: None,
             initial,
             position: initial,
             next_id: first_id,
@@ -2132,6 +2152,156 @@ impl FlatPlan {
         // happens in `next_motion_with_stock`.
         Ok(Some((target, curves)))
     }
+    /// Whether the disk of radius `self.radius` swept along the arc about
+    /// `c` of radius `rho` from angle `start` through `sweep` stays clear of
+    /// the part at height `z`: the arc's chords at the tolerance's sagitta,
+    /// each proven with the capsule of radius r + sagitta, which contains the
+    /// arc's swept disk (as for the arcs of a pass in `prove_ring`).
+    fn arc_clear(&mut self, c: [f64; 2], rho: f64, start: f64, sweep: f64, z: f64) -> bool {
+        let tol = self.op.tolerance_mm;
+        let half = (1. - tol / rho).clamp(-1., 1.).acos().max(1e-9);
+        let count = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(4096);
+        let sagitta = rho * (1. - (sweep.abs() / (2. * count as f64)).cos());
+        let at = |t: f64| {
+            let angle = start + sweep * t;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        };
+        (0..count).all(|i| {
+            let (p, q) = (
+                at(i as f64 / count as f64),
+                at((i + 1) as f64 / count as f64),
+            );
+            self.index
+                .max_height(p, q, self.radius + sagitta, &mut self.seen, &mut self.stamp)
+                <= z + tol
+        })
+    }
+
+    /// The arc lead-in to the pass starting at `v` (height `z`) along the unit
+    /// tangent `t`, as in established CAM practice: a quarter circle of the
+    /// tool's radius, tangent to the pass at `v`, whose centre lies on the
+    /// normal at `v`, entered by a vertical plunge at its start. Of the two
+    /// sides of the pass, a side qualifies when the plunge point's disk
+    /// touches no stock above the pass's height (on an inner pass that is
+    /// the floor the passes before it finished, which lies more than a
+    /// stepover from the pass once the radius exceeds the stepover), the arc
+    /// is proven clear of the part, and the limits allow it. A plunge point a
+    /// radius beside the level's face comes down in air beside the flat and
+    /// the lead is flat at the pass's height; over the face the plunge stops
+    /// above the floor and the lead descends to the pass as a helix at the
+    /// declared ramp's angle over its chord (no ramp declared: no such side).
+    /// Beside the face wins; `None` when no side qualifies.
+    fn arc_lead_in(
+        &mut self,
+        stock: &Stock,
+        v: [f64; 2],
+        t: [f64; 2],
+        z: f64,
+    ) -> Result<Option<Entry>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        let mut found: Option<Entry> = None;
+        for s in [1., -1.] {
+            let n = [-t[1] * s, t[0] * s];
+            let c = [v[0] + rho * n[0], v[1] + rho * n[1]];
+            let p = [c[0] - rho * t[0], c[1] - rho * t[1]];
+            if stock.top_under_disk(p, rho) > z + tol {
+                continue;
+            }
+            let beside = self.beside_face(p)?;
+            let rise = if beside {
+                0.
+            } else {
+                match self.op.entry.as_ref().and_then(|e| e.ramp()) {
+                    Some(ramp) => rho * std::f64::consts::SQRT_2 * ramp.angle_rad.tan(),
+                    None => continue,
+                }
+            };
+            if z + rise > self.heights.feed {
+                continue;
+            }
+            let start = (p[1] - c[1]).atan2(p[0] - c[0]);
+            let sweep = s * std::f64::consts::FRAC_PI_2;
+            if !self.arc_clear(c, rho, start, sweep, z) {
+                continue;
+            }
+            let lead = if beside {
+                Curve::Arc {
+                    start: [p[0], p[1], z],
+                    end: [v[0], v[1], z],
+                    center: [c[0], c[1], z],
+                    plane: crate::motion::Plane::Xy,
+                    sweep_rad: sweep,
+                }
+            } else {
+                Curve::Helix {
+                    start: [p[0], p[1], z + rise],
+                    end: [v[0], v[1], z],
+                    center: [c[0], c[1], z + rise],
+                    plane: crate::motion::Plane::Xy,
+                    sweep_rad: sweep,
+                }
+            };
+            if let Some(l) = &self.limits
+                && !l.allows_curve(&lead, true)?
+            {
+                continue;
+            }
+            let better = matches!(found, None | Some(Entry::Arc { helical: true, .. })) && beside;
+            if found.is_none() || better {
+                found = Some(Entry::Arc {
+                    lead,
+                    helical: !beside,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// The arc lead-out from the pass ending at `v` (height `z`) along the
+    /// unit tangent `t`: a quarter circle of the tool's radius, tangent to the
+    /// pass at `v`, flat at the pass's height, on a side where the disk at its
+    /// end (where the retract lifts) touches no stock above the pass, proven
+    /// clear of the part and allowed by the limits; `None` when neither side
+    /// qualifies (the retract then lifts at `v`).
+    fn arc_lead_out(
+        &mut self,
+        stock: &Stock,
+        v: [f64; 2],
+        t: [f64; 2],
+        z: f64,
+    ) -> Result<Option<Curve>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        for s in [1., -1.] {
+            let n = [-t[1] * s, t[0] * s];
+            let c = [v[0] + rho * n[0], v[1] + rho * n[1]];
+            let e = [c[0] + rho * t[0], c[1] + rho * t[1]];
+            if stock.top_under_disk(e, rho) > z + tol {
+                continue;
+            }
+            let start = (v[1] - c[1]).atan2(v[0] - c[0]);
+            let sweep = s * std::f64::consts::FRAC_PI_2;
+            if !self.arc_clear(c, rho, start, sweep, z) {
+                continue;
+            }
+            let lead = Curve::Arc {
+                start: [v[0], v[1], z],
+                end: [e[0], e[1], z],
+                center: [c[0], c[1], z],
+                plane: crate::motion::Plane::Xy,
+                sweep_rad: sweep,
+            };
+            if let Some(l) = &self.limits
+                && !l.allows_curve(&lead, true)?
+            {
+                continue;
+            }
+            return Ok(Some(lead));
+        }
+        Ok(None)
+    }
+
     /// Whether the disk at `p` comes down beside this chain's level's face: a
     /// radius (less the tolerance) outside the face region, so a vertical
     /// plunge at `p` never rests the disk on the flat the pass finishes. An
@@ -2224,7 +2394,17 @@ impl FlatPlan {
                 let piece = &mut self.chains[self.chain].pieces[self.piece];
                 rotate_piece(piece, v);
             }
+            let t = self.chains[self.chain].pieces[self.piece].segs[0].tangent(false);
+            if let Some(entry) = self.arc_lead_in(stock, v, t, z)? {
+                self.report.arc_lead_ins += 1;
+                return Ok(entry);
+            }
             return Ok(Entry::Side { p });
+        }
+        let t = self.chains[self.chain].pieces[self.piece].segs[0].tangent(false);
+        if let Some(entry) = self.arc_lead_in(stock, first, t, z)? {
+            self.report.arc_lead_ins += 1;
+            return Ok(entry);
         }
         let piece = &self.chains[self.chain].pieces[self.piece];
         match self.plunge_or_ramp(piece, stock, cancel)? {
@@ -2325,6 +2505,10 @@ impl FlatPlan {
                             let a = self.chains[self.chain].pieces[self.piece].start();
                             [a[0], a[1]]
                         }
+                        Entry::Arc { lead, .. } => {
+                            let f = lead.start();
+                            [f[0], f[1]]
+                        }
                     };
                     self.entry = Some(entry);
                     (
@@ -2347,6 +2531,12 @@ impl FlatPlan {
                             ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Lead, None)
                         }
                         Entry::Plunge => ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Cut, None),
+                        Entry::Arc { lead, helical } => {
+                            // Straight down in air to the lead's start.
+                            let f = lead.start();
+                            self.lead = Some((lead, helical));
+                            ([p[0], p[1], f[2]], MoveKind::Plunge, Phase::ArcIn, None)
+                        }
                         Entry::Ramp { top, curves } => {
                             self.ramp = curves.into();
                             // Down through air to the stock's top over the
@@ -2367,6 +2557,23 @@ impl FlatPlan {
                 Phase::Lead => {
                     let a = self.chains[self.chain].pieces[self.piece].start();
                     ([a[0], a[1], a[2]], MoveKind::Lead, Phase::Cut, None)
+                }
+                Phase::ArcIn => {
+                    let (lead, helical) = self.lead.take().expect("arc lead-in");
+                    let kind = if helical {
+                        // A helical lead descends as a ramp: at the ramp's feed.
+                        ramp_feed = Some(
+                            self.op
+                                .entry
+                                .as_ref()
+                                .and_then(|e| e.feed_mm_min())
+                                .unwrap_or(self.op.plunge_mm_min),
+                        );
+                        MoveKind::Plunge
+                    } else {
+                        MoveKind::Lead
+                    };
+                    (lead.end(), kind, Phase::Cut, Some(lead))
                 }
                 Phase::Ramp => {
                     let curve = self.ramp.pop_front().expect("ramp move");
@@ -2414,14 +2621,29 @@ impl FlatPlan {
                         self.seg = 0;
                         (next, MoveKind::Link, Phase::Cut, None)
                     } else {
-                        (
-                            [p[0], p[1], self.heights.feed.max(p[2])],
-                            MoveKind::Retract,
-                            Phase::Rise,
-                            None,
-                        )
+                        let piece = &self.chains[self.chain].pieces[self.piece];
+                        let (v, z) = ([p[0], p[1]], piece.z);
+                        let t = piece.segs[piece.segs.len() - 1].tangent(true);
+                        match self.arc_lead_out(stock, v, t, z)? {
+                            Some(lead) => {
+                                self.report.arc_lead_outs += 1;
+                                (lead.end(), MoveKind::Lead, Phase::Leave, Some(lead))
+                            }
+                            None => (
+                                [p[0], p[1], self.heights.feed.max(p[2])],
+                                MoveKind::Retract,
+                                Phase::Rise,
+                                None,
+                            ),
+                        }
                     }
                 }
+                Phase::Leave => (
+                    [p[0], p[1], self.heights.feed.max(p[2])],
+                    MoveKind::Retract,
+                    Phase::Rise,
+                    None,
+                ),
                 Phase::Rise => {
                     self.chain += 1;
                     self.piece = 0;

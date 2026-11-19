@@ -1658,33 +1658,46 @@ arc, and a straight stub under 0.005 mm is absorbed into its straight
 neighbour. Consecutive pieces join into one chain by a straight link at the cut
 height and cutting feed when the link is at most two stepovers long, passes the
 same proof and lies inside the machine limits; otherwise the chain ends
-(retract, new entry). A chain is entered beside the level's face where the flat
-is open (side entry in air): the tool rapids over a point a quarter to two
-radii outside the chain's first loop, away from the region, where no stock
-stands within the disk above the cut, plunges vertically through air to the cut
-height and leads in at cutting feed. Where no such point exists it plunges
-vertically at the chain's start when no live stock stands above its height
-there (within `tolerance_mm`). Where stock does (roughing left it, or the stock
-was not cut there yet), the chain is entered by a ramp, and only if the
-operation declares `entry=RampEntry(angle_deg, ...)`: the tool plunges through
-air to the top of the live stock over the stretch of the chain's first loop the
-ramp travels (the highest cell bound anywhere along that stretch; the whole
-loop when the ramp has to reverse on it), then zigzags down along that loop at
-no more than the declared angle (over each move's chord, so a leg along an arc
-descends a little shallower) and at the entry's `feed_mm_min` (default the
-plunge feed); a zigzag that has to reverse needs the entry's `min_length_mm`.
-Every ramp point lies above the proven loop, so it clears the part like the
-loop does; the report counts ramped chains as `ramped_entries`. Nothing is
-plunged into stock on any path: a chain with stock above it and no declared
-entry, a ramp that does not fit (too short a loop, an angle too shallow for the
-loop, or stock above the feed height) is refused, naming the chain, its length
-and the stock above it. The `flat` benchmark runs on a blank roughed to 0.1 mm
-over the flats and declares a 3 degree entry. The report gives the levels,
-`loops` (closed offset loops planned), `rows` (loops cut, counting the open
-pieces a split loop leaves), `runs` (chains), `links_at_depth`, cut length,
-`runs_completed`, `ramped_entries`, and any length that could not be proven
-clear (`dropped_length_mm`). `axis` is still accepted so old jobs load, but no
-longer orders anything.
+(retract, new entry). Where a side of the chain's first pass has no live stock
+above the cut (beside an open edge, or floor earlier passes have finished), the
+chain is entered by a vertical plunge through air and a quarter-circle lead-in
+of the tool's radius, tangent to the pass at its start: flat at the cut height
+and cutting feed when the plunge point lies a radius beside the face, otherwise
+a helix that stops above the finished floor (radius × √2 × the tangent of the
+declared ramp angle) and descends to the pass at no more than the ramp's angle
+over its chord, at the ramp's feed (with no ramp declared that side does not
+qualify). The arc is proven clear of the part by its chords at radius r +
+sagitta and must lie inside the machine limits. A chain ends with a flat
+tangent quarter-circle lead-out of the tool's radius where the disk at its end
+touches no stock above the cut; otherwise it retracts at the pass's end. The
+report counts them as `arc_lead_ins` and `arc_lead_outs`. Otherwise a chain is
+entered beside the level's face where the flat is open (side entry in air): the
+tool rapids over a point a quarter to two radii outside the chain's first loop,
+away from the region, where no stock stands within the disk above the cut,
+plunges vertically through air to the cut height and leads in at cutting feed.
+Where no such point exists it plunges vertically at the chain's start when no
+live stock stands above its height there (within `tolerance_mm`). Where stock
+does (roughing left it, or the stock was not cut there yet), the chain is
+entered by a ramp, and only if the operation declares
+`entry=RampEntry(angle_deg, ...)`: the tool plunges through air to the top of
+the live stock over the stretch of the chain's first loop the ramp travels (the
+highest cell bound anywhere along that stretch; the whole loop when the ramp
+has to reverse on it), then zigzags down along that loop at no more than the
+declared angle (over each move's chord, so a leg along an arc descends a little
+shallower) and at the entry's `feed_mm_min` (default the plunge feed); a zigzag
+that has to reverse needs the entry's `min_length_mm`. Every ramp point lies
+above the proven loop, so it clears the part like the loop does; the report
+counts ramped chains as `ramped_entries`. Nothing is plunged into stock on any
+path: a chain with stock above it and no declared entry, a ramp that does not
+fit (too short a loop, an angle too shallow for the loop, or stock above the
+feed height) is refused, naming the chain, its length and the stock above it.
+The `flat` benchmark runs on a blank roughed to 0.1 mm over the flats and
+declares a 3 degree entry. The report gives the levels, `loops` (closed offset
+loops planned), `rows` (loops cut, counting the open pieces a split loop
+leaves), `runs` (chains), `links_at_depth`, cut length, `runs_completed`,
+`ramped_entries`, `arc_lead_ins`, `arc_lead_outs`, and any length that could
+not be proven clear (`dropped_length_mm`). `axis` is still accepted so old jobs
+load, but no longer orders anything.
 
 ## Spiral, radial and project finishing: `Spiral`, `Radial`, `Project`
 

@@ -757,10 +757,16 @@ class Flat:
     only where it finishes floor the rings before it have not reached. Offset
     loops are cut as arcs, each proven by chords at radius r + sagitta like
     the straight cuts. Every cut is kept only where the part under the tool's
-    swept disk is proven not above it. A chain of passes is entered beside
-    the level's face in air where the flat is open (a vertical plunge through
-    air, then a lead-in at cutting feed), else by a vertical plunge where no
-    stock stands above it. A chain with stock above it is refused unless
+    swept disk is proven not above it. A chain of passes is entered by a
+    vertical plunge through air and a quarter-circle lead-in of the tool's
+    radius, tangent to the pass, wherever a side of the pass has no stock
+    above it (beside an open edge, or floor earlier passes finished): flat
+    at cutting feed when the plunge point is a radius beside the face, else a
+    helix that stops above the finished floor and descends at the declared
+    ramp's angle. A chain ends with a tangent quarter-circle lead-out of the
+    same radius where its end point is clear. Otherwise a chain is entered
+    beside the face in air (a straight lead-in), else by a vertical plunge
+    where no stock stands above it. A chain with stock above it is refused unless
     ``entry=RampEntry(angle_deg, ...)`` is declared: the tool then plunges to
     the stock's top over the stretch of the chain's first loop the ramp
     travels and ramps down along it
