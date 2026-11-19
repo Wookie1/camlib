@@ -1654,32 +1654,42 @@ disk is not above the cut (computed exactly per facet). Per connected
 component, nearest first, the passes are cut at growing offset depth (the
 outermost ring first); at the same depth outer boundary loops before hole
 loops, then nearest first, and each loop starts at its vertex nearest the tool.
-Kernel artefacts are not cut as moves of their own: a run of strokes on one
-circle (straight chords, or chords mixed with micro-arcs) is refitted as one
-arc, and a straight stub under 0.005 mm is absorbed into its straight
-neighbour. Consecutive pieces join into one chain by a straight link at the cut
-height and cutting feed when the link is at most two stepovers long, passes the
-same proof and lies inside the machine limits; otherwise the chain ends
-(retract, new entry). Where a side of the chain's first pass has no live stock
-above the cut (beside an open edge, or floor earlier passes have finished), the
-chain is entered by a vertical plunge through air and a quarter-circle lead-in
-of the tool's radius, tangent to the pass at its start: flat at the cut height
-and cutting feed when the plunge point lies a radius beside the face, otherwise
-a helix that stops above the finished floor (radius × √2 × the tangent of the
-declared ramp angle) and descends to the pass at no more than the ramp's angle
-over its chord, at the ramp's feed (with no ramp declared that side does not
-qualify). The arc is proven clear of the part by its chords at radius r +
-sagitta and must lie inside the machine limits. A chain ends with a flat
-tangent quarter-circle lead-out of the tool's radius where the disk at its end
-touches no stock above the cut; otherwise it retracts at the pass's end. The
-report counts them as `arc_lead_ins` and `arc_lead_outs`. Every vertical plunge
-that lands in air (side entries, arc lead-ins, plunges at a chain's start)
-stops a tool radius higher and a radius back along the move that follows, and
-turns to horizontal on a quarter circle of the tool's radius in the vertical
-plane of that move (one XZ or YZ arc when the move runs along X or Y, otherwise
-its chords within 5 microns), at cutting feed; the span is proven clear of the
-part and of live stock at the landing height and inside the limits, otherwise
-the plunge comes straight down. The report counts these as `rounded_plunges`.
+Where the offsets split a level into separate areas (the strips either side of
+a boss), each area is finished, outside in, before the tool crosses to the
+next: a loop or a kept stretch of one waits only for the shallower ones whose
+swept disk overlaps its own, and of those whose turn has come the nearest is
+cut next. This order is used when it needs fewer entries than the plain depth
+order, or as many with less travel. Kernel artefacts are not cut as moves of
+their own: a run of strokes on one circle (straight chords, or chords mixed
+with micro-arcs) is refitted as one arc, and a straight stub under 0.005 mm is
+absorbed into its straight neighbour. Consecutive pieces join into one chain by
+a straight link at the cut height and cutting feed when the link is at most two
+stepovers long, passes the same proof and lies inside the machine limits;
+otherwise the chain ends (retract, new entry). Where a side of the chain's
+first pass has no live stock above the cut (beside an open edge, or floor
+earlier passes have finished), the chain is entered by a vertical plunge
+through air and a quarter-circle lead-in of the tool's radius, tangent to the
+pass at its start: flat at the cut height and cutting feed when the plunge
+point lies a radius beside the face, otherwise a helix that stops above the
+finished floor (radius × √2 × the tangent of the declared ramp angle) and
+descends to the pass at no more than the ramp's angle over its chord, at the
+ramp's feed (with no ramp declared that side does not qualify). The arc is
+proven clear of the part by its chords at radius r + sagitta and must lie
+inside the machine limits. A chain ends with a flat tangent quarter-circle
+lead-out of the tool's radius where the disk at its end touches no stock above
+the cut; otherwise it retracts at the pass's end. The report counts them as
+`arc_lead_ins` and `arc_lead_outs`. Every vertical plunge that lands in air
+(side entries, arc lead-ins, plunges at a chain's start) stops a tool radius
+higher and a radius back along the move that follows, and turns to horizontal
+on a quarter circle of the tool's radius in the vertical plane of that move
+(one XZ or YZ arc when the move runs along X or Y, otherwise its chords within
+5 microns), at cutting feed; the span is proven clear of the part and of live
+stock at the landing height and inside the limits, otherwise the plunge comes
+straight down. The report counts these as `rounded_plunges`. Because a rounded
+plunge reaches the floor moving sideways, a plunge may also land over the
+level's face where no stock stands above the pass: there the arc lead-in is
+flat, and a pass start with no stock above it is plunged and turned instead of
+ramped. A helical lead-in, or a ramp, is used only where the turn does not fit.
 Otherwise a chain is entered beside the level's face where the flat is open
 (side entry in air): the tool rapids over a point a quarter to two radii
 outside the chain's first loop, away from the region, where no stock stands

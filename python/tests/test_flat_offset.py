@@ -46,6 +46,22 @@ ISLAND = dict(
     bosses=[(7, 8, 3, 13, 12, 5), (16, 8, 3, 20, 12, 9)],
     extent=(0, 0, 30, 20),
 )
+# A wide block with a boss in the middle whose offsets split the block's
+# level into separate areas either side of the boss.
+WIDE = dict(
+    boxes=[(0, 0, 0, 60, 40, 4)],
+    pockets=[],
+    bosses=[(20, 10, 4, 40, 30, 7)],
+    extent=(0, 0, 60, 40),
+)
+# STEPPED at 1.89 times the size: a lead-in that starts over floor the first
+# lap finished.
+STEPPED_LARGE = dict(
+    boxes=[(0, 0, 0, 45.4, 30.2, 4)],
+    pockets=[],
+    bosses=[(15.1, 7.6, 4, 30.2, 22.7, 7)],
+    extent=(0, 0, 45.4, 30.2),
+)
 
 
 def solid(spec, skin=0.0):
@@ -588,6 +604,61 @@ class FlatOffsetTest(unittest.TestCase):
                 R + radial - 1e-4 - field.step,
                 f"{name}: tool within {worst[0] - R:.4f} mm of a wall at {worst[1]}",
             )
+
+    def test_each_area_is_finished_before_crossing_to_the_next(self):
+        # The base level of WIDE splits into areas left and right of the
+        # boss. Each is finished before the tool moves on: between cutting
+        # moves on the base level, the tool crosses from one side of the boss
+        # to the other through the air (a retract and rapid) at most once.
+        _, motions, *_ = run(WIDE)
+        x0, x1 = WIDE["bosses"][0][0], WIDE["bosses"][0][3]
+        z = WIDE["boxes"][0][5]
+        crossings, side, lifted = 0, None, False
+        for m in motions:
+            c = m["curve"]
+            if m["kind"] in ("rapid", "retract"):
+                lifted = True
+                continue
+            if m["kind"] != "cut" or abs(c["start"][2] - z) > 1e-6:
+                continue
+            x = c["start"][0]
+            here = "left" if x < x0 else "right" if x > x1 else None
+            if here is None:
+                continue
+            if lifted and side is not None and here != side:
+                crossings += 1
+            side, lifted = here, False
+        self.assertLessEqual(crossings, 1)
+
+    def test_entries_over_finished_floor_plunge_rather_than_spiral(self):
+        # A pass whose arc lead-in starts over floor already finished (no
+        # stock above the pass under the tool) is entered by a plunge that
+        # turns to horizontal, not by a helix down onto the floor.
+        parts = (("stepped", STEPPED), ("large", STEPPED_LARGE), ("wide", WIDE), ("island", ISLAND))
+        for name, spec in parts:
+            _, motions, before, grid, _ = run(spec)
+            for i in range(1, len(motions)):
+                c, prev = motions[i]["curve"], motions[i - 1]["curve"]
+                vertical = (
+                    motions[i - 1]["kind"] == "plunge"
+                    and prev.get("kind", "line") == "line"
+                    and math.hypot(prev["end"][0] - prev["start"][0], prev["end"][1] - prev["start"][1]) < 1e-9
+                )
+                lead_in = (
+                    vertical
+                    and c.get("kind") == "helix"
+                    and i + 1 < len(motions)
+                    and motions[i + 1]["kind"] != "plunge"
+                )
+                if not lead_in:
+                    continue
+                # A helix between a vertical plunge and the pass is a helical
+                # lead-in (a ramp continues with more plunging moves); it is
+                # only allowed where stock under the plunge point stands above
+                # the pass (no plunge in air there).
+                p, z = c["start"], c["end"][2]
+                top = stock_top_near(grid, before[i], p, R)
+                self.assertGreater(top, z + 0.05, (name, motions[i]["id"], p))
 
 
 if __name__ == "__main__":

@@ -1920,11 +1920,11 @@ impl FlatPlan {
                     .then(a.cmp(&b))
             });
             for gi in order {
-                for (_, ring, runs) in groups[gi].ordered(tool_xy) {
+                loops += groups[gi].outers.len() + groups[gi].holes.len();
+                for (_, ring, runs) in groups[gi].ordered(tool_xy, 2. * r, 2. * op.stepover_mm) {
                     if cancel.is_cancelled() {
                         return Err("flat-area planning cancelled".into());
                     }
-                    loops += 1;
                     // An inner loop is cut only where its disk reaches floor
                     // the loops before it left; a short stretch between two
                     // such places is cut through rather than left for a link.
@@ -2222,6 +2222,7 @@ impl FlatPlan {
         v: [f64; 2],
         t: [f64; 2],
         z: f64,
+        cancel: &impl CancelSignal,
     ) -> Result<Option<Entry>, String> {
         let tol = self.op.tolerance_mm;
         let rho = self.radius;
@@ -2233,7 +2234,14 @@ impl FlatPlan {
             if stock.top_under_disk(p, rho) > z + tol {
                 continue;
             }
-            let beside = self.beside_face(p)?;
+            // Over the face, a plunge whose last radius turns to horizontal
+            // (`plunge_turn`, along the arc's tangent at `p`, which is -n)
+            // reaches the floor moving sideways and never dwells on it: the
+            // lead is flat there too.
+            let beside = self.beside_face(p)? || {
+                let d = [-n[0], -n[1]];
+                self.plunge_turn(stock, p, d, z, cancel)?.is_some()
+            };
             let rise = if beside {
                 0.
             } else {
@@ -2516,16 +2524,27 @@ impl FlatPlan {
                 rotate_piece(piece, v);
             }
             let t = self.chains[self.chain].pieces[self.piece].segs[0].tangent(false);
-            if let Some(entry) = self.arc_lead_in(stock, v, t, z)? {
+            if let Some(entry) = self.arc_lead_in(stock, v, t, z, cancel)? {
                 self.report.arc_lead_ins += 1;
                 return Ok(entry);
             }
             return Ok(Entry::Side { p });
         }
         let t = self.chains[self.chain].pieces[self.piece].segs[0].tangent(false);
-        if let Some(entry) = self.arc_lead_in(stock, first, t, z)? {
+        if let Some(entry) = self.arc_lead_in(stock, first, t, z, cancel)? {
             self.report.arc_lead_ins += 1;
             return Ok(entry);
+        }
+        // A pass start over the face with no stock above it is plunged when
+        // the plunge turns to horizontal there (`plunge_turn`): the disk never
+        // dwells on the floor it finishes.
+        let a = self.chains[self.chain].pieces[self.piece].start();
+        if stock.top_under_disk([a[0], a[1]], self.radius) <= z + tol
+            && self
+                .plunge_turn(stock, [a[0], a[1]], t, z, cancel)?
+                .is_some()
+        {
+            return Ok(Entry::Plunge);
         }
         let piece = &self.chains[self.chain].pieces[self.piece];
         match self.plunge_or_ramp(piece, stock, cancel)? {
@@ -3103,8 +3122,11 @@ impl LoopGroup {
         nearest(&self.outers).min(nearest(&self.holes))
     }
     /// The rings in cut order: outer loops before hole loops, offset
-    /// ascending (outside in), nearest the tool first at the same offset.
-    fn ordered(&self, tool: [f64; 2]) -> Vec<Ring> {
+    /// ascending (outside in), nearest the tool first at the same offset;
+    /// then, within the outer and within the hole loops, area by area
+    /// (`by_area`) where that takes fewer entries, so each area is finished,
+    /// outside in, before the tool crosses to the next.
+    fn ordered(&self, tool: [f64; 2], gap: f64, link: f64) -> Vec<Ring> {
         let near = |ring: &[crate::pocket::Stroke]| {
             ring.iter()
                 .map(|s| (s.a[0] - tool[0]).hypot(s.a[1] - tool[1]))
@@ -3121,9 +3143,177 @@ impl LoopGroup {
             });
             order.into_iter().map(|i| rings[i].clone()).collect()
         };
-        let mut all = sort(&self.outers);
-        all.extend(sort(&self.holes));
+        let mut all = by_area(sort(&self.outers), tool, gap, link);
+        let at = all
+            .last()
+            .and_then(|(_, ring, runs)| match runs {
+                Some(runs) => runs.last().and_then(|r| r.last()).map(|s| s.b),
+                None => ring.first().map(|s| s.a),
+            })
+            .unwrap_or(tool);
+        all.extend(by_area(sort(&self.holes), at, gap, link));
         all
+    }
+}
+
+/// `rings` (in cut order: offset ascending) reordered area by area when
+/// that takes fewer entries. Each full ring and each kept stretch of a
+/// trimmed ring is one item; an item waits for every shallower item within
+/// `gap` of it (the cutter's diameter: every shallower item whose swept
+/// disk overlaps its own), so every area is still cut outside in and no
+/// item runs over floor a deeper one finished first; of the items whose
+/// turn has come, the one nearest the tool is cut next. Where the offsets
+/// split a level into separate areas (the strips either side of a boss),
+/// the tool then finishes one area before crossing to the next instead of
+/// visiting every area once per offset. The new order is taken only when
+/// it needs fewer entries (moves to the next item longer than `link`, the
+/// longest link at depth), or as many over less travel; otherwise the
+/// rings keep their order. Cut order does not change what is cut: each item
+/// was kept for the floor it alone reaches, and its proof and entry are
+/// decided against the part and the live stock as before.
+fn by_area(rings: Vec<Ring>, tool: [f64; 2], gap: f64, link: f64) -> Vec<Ring> {
+    let mut items: Vec<Ring> = vec![];
+    for (d, ring, runs) in &rings {
+        match runs {
+            None => items.push((*d, ring.clone(), None)),
+            Some(runs) => {
+                for run in runs.iter().filter(|r| !r.is_empty()) {
+                    items.push((*d, ring.clone(), Some(vec![run.clone()])));
+                }
+            }
+        }
+    }
+    let lines: Vec<Vec<crate::pocket::Stroke>> = items
+        .iter()
+        .map(|item| match &item.2 {
+            None => item.1.clone(),
+            Some(runs) => runs.concat(),
+        })
+        .collect();
+    let points: Vec<Vec<[f64; 2]>> = lines
+        .iter()
+        .map(|run| {
+            run.iter()
+                .flat_map(|s| (0..4).map(move |k| stroke_point(s, k as f64 / 4.)))
+                .chain(run.last().map(|s| s.b))
+                .collect()
+        })
+        .collect();
+    let distance = |p: [f64; 2], s: &crate::pocket::Stroke| {
+        if s.arc.is_none() {
+            dist2_to_segment(p, s.a, s.b).sqrt()
+        } else {
+            (0..=16)
+                .map(|k| {
+                    let x = stroke_point(s, k as f64 / 16.);
+                    (x[0] - p[0]).hypot(x[1] - p[1])
+                })
+                .fold(f64::INFINITY, f64::min)
+        }
+    };
+    let near = |i: usize, j: usize| {
+        points[i]
+            .iter()
+            .any(|p| lines[j].iter().any(|s| distance(*p, s) <= gap))
+            || points[j]
+                .iter()
+                .any(|p| lines[i].iter().any(|s| distance(*p, s) <= gap))
+    };
+    let n = items.len();
+    let mut waits: Vec<Vec<usize>> = vec![vec![]; n];
+    for j in 0..n {
+        for i in 0..n {
+            if items[i].0 < items[j].0 && near(i, j) {
+                waits[j].push(i);
+            }
+        }
+    }
+    let hypot = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).hypot(p[1] - q[1]);
+    // Where an item is entered and left from `at`: a closed ring at its
+    // vertex nearest the tool (`rotate_to_nearest`), a stretch from its first
+    // stroke to its last.
+    let ends = |strokes: &[crate::pocket::Stroke], closed: bool, at: [f64; 2]| {
+        if closed {
+            let v = strokes
+                .iter()
+                .map(|s| s.a)
+                .min_by(|p, q| hypot(*p, at).total_cmp(&hypot(*q, at)))
+                .unwrap_or(at);
+            (v, v)
+        } else {
+            (
+                strokes.first().map_or(at, |s| s.a),
+                strokes.last().map_or(at, |s| s.b),
+            )
+        }
+    };
+    // (entries, travel) of a walk over (strokes, closed) pieces.
+    let cost = |walk: &[(Vec<crate::pocket::Stroke>, bool)]| {
+        let (mut entries, mut travel, mut at) = (0usize, 0f64, tool);
+        for (strokes, closed) in walk {
+            let (start, end) = ends(strokes, *closed, at);
+            let jump = hypot(at, start);
+            if jump > link {
+                entries += 1;
+            }
+            travel += jump;
+            at = end;
+        }
+        (entries, travel)
+    };
+    let mut done = vec![false; n];
+    let mut order: Vec<usize> = vec![];
+    let mut at = tool;
+    while order.len() < n {
+        let next = (0..n)
+            .filter(|&j| !done[j] && waits[j].iter().all(|&i| done[i]))
+            .min_by(|&a, &b| {
+                let d = |k: usize| {
+                    points[k]
+                        .iter()
+                        .map(|p| hypot(*p, at))
+                        .fold(f64::INFINITY, f64::min)
+                };
+                d(a).total_cmp(&d(b)).then(a.cmp(&b))
+            })
+            .expect("the shallowest item left waits for nothing");
+        done[next] = true;
+        order.push(next);
+        at = ends(&lines[next], items[next].2.is_none(), at).1;
+    }
+    let by_area: Vec<(Vec<crate::pocket::Stroke>, bool)> = order
+        .iter()
+        .map(|&i| (lines[i].clone(), items[i].2.is_none()))
+        .collect();
+    // The rings as they are: a trimmed ring's stretches in loop order from
+    // the one starting nearest the tool (`open_runs_from_nearest`).
+    let mut as_is: Vec<(Vec<crate::pocket::Stroke>, bool)> = vec![];
+    let mut at = tool;
+    for (_, ring, runs) in &rings {
+        match runs {
+            None => {
+                at = ends(ring, true, at).1;
+                as_is.push((ring.clone(), true));
+            }
+            Some(runs) => {
+                let runs: Vec<&Vec<crate::pocket::Stroke>> =
+                    runs.iter().filter(|r| !r.is_empty()).collect();
+                let first = (0..runs.len())
+                    .min_by(|&a, &b| hypot(runs[a][0].a, at).total_cmp(&hypot(runs[b][0].a, at)))
+                    .unwrap_or(0);
+                for k in 0..runs.len() {
+                    let run = runs[(first + k) % runs.len()];
+                    at = run.last().map_or(at, |s| s.b);
+                    as_is.push((run.clone(), false));
+                }
+            }
+        }
+    }
+    let (new, old) = (cost(&by_area), cost(&as_is));
+    if new.0 < old.0 || (new.0 == old.0 && new.1 < old.1) {
+        order.into_iter().map(|i| items[i].clone()).collect()
+    } else {
+        rings
     }
 }
 
