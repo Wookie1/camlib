@@ -1235,8 +1235,16 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
 - The step follows the outside of each bend, where the gap between two orbits'
   disks is widest, so the swept width stays within `boundary_tolerance_mm` of
   the slot width.
-- Every vertex gets an orbit. At a corner, a straight link inside that orbit's
-  disk joins the two offsets (`corner_links` in the report).
+- Every vertex gets an orbit. At a corner, a link inside that orbit's disk
+  joins the two offsets (`corner_links` in the report). Where the slot turns
+  away from the link side (an outer corner) the link is an arc of the vertex
+  orbit's own circle, in the orbit's sense, tangent to the orbit before it and
+  to the link after it (`corner_arcs`). Where it turns toward the link side, a
+  tangent link inside that disk would have to circle 360° minus the turn, so
+  the link is the straight chord.
+- Where the stock along the rest of a piece (a line or an arc) is already
+  clear, one link covers it (`stock_clear_advances`); the next orbit is then a
+  full circle.
 - Links run on the left of the centreline for `clockwise=True`, on the right
   otherwise. An arc bending toward that side needs a radius above the orbit
   radius (width/2 − tool radius), otherwise the slot is refused, naming the

@@ -716,12 +716,233 @@ fn s_slot_bounds_engagement_through_the_inflection() {
 
 #[test]
 fn corner_slot_links_inside_the_vertex_orbit() {
-    let p = check_curved(&curved(
-        vec![[8., 6., 0.], [26., 6., 0.], [26., 20., 0.]],
-        true,
+    // A left turn: clockwise orbits link on the left, the inside of the turn
+    // (a chord); counter-clockwise ones on the right, the outside (an arc).
+    for cw in [true, false] {
+        let p = check_curved(&curved(
+            vec![[8., 6., 0.], [26., 6., 0.], [26., 20., 0.]],
+            cw,
+            90.,
+        ));
+        assert_eq!(p.report().corner_links, 1);
+        assert_eq!(p.report().corner_arcs, if cw { 0 } else { 1 });
+    }
+}
+
+/// Unit XY direction of a curve at its start (`at_end` false) or end.
+fn heading(curve: &Curve, at_end: bool) -> [f64; 2] {
+    let (a, b) = match *curve {
+        Curve::Line { start, end } => ([start[0], start[1]], [end[0], end[1]]),
+        Curve::Arc {
+            start,
+            end,
+            center,
+            sweep_rad,
+            ..
+        } => {
+            let p = if at_end { end } else { start };
+            let (rx, ry) = (p[0] - center[0], p[1] - center[1]);
+            let s = sweep_rad.signum();
+            ([0., 0.], [-s * ry, s * rx])
+        }
+        _ => panic!("unexpected curve {curve:?}"),
+    };
+    let n = (b[0] - a[0]).hypot(b[1] - a[1]);
+    [(b[0] - a[0]) / n, (b[1] - a[1]) / n]
+}
+
+/// At an outer corner the link is an arc of the vertex orbit's own circle in
+/// the orbit's sense, tangent to the orbit it leaves and to the link that
+/// follows, checked from the motion stream alone, in both turn directions.
+#[test]
+fn outer_corner_links_are_tangent_arcs_on_the_vertex_orbit() {
+    let cancel = AtomicBool::new(false);
+    // (path, clockwise, vertex, turn): each has its links on the outside.
+    for (path, cw, vertex, turn) in [
+        (
+            vec![[8., 6., 0.], [26., 6., 0.], [26., 20., 0.]],
+            false,
+            [26., 6.],
+            std::f64::consts::FRAC_PI_2,
+        ),
+        (
+            vec![[8., 20., 0.], [26., 20., 0.], [26., 6., 0.]],
+            true,
+            [26., 20.],
+            -std::f64::consts::FRAC_PI_2,
+        ),
+        // A 135 degree turn.
+        (
+            vec![[8., 6., 0.], [26., 6., 0.], [16., 16., 0.]],
+            false,
+            [26., 6.],
+            3. * std::f64::consts::FRAC_PI_4,
+        ),
+    ] {
+        let op = curved(path, cw, 90.);
+        let mut p = plan(op.clone());
+        let rho = p.report().orbit_radius_mm;
+        let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let mut motions = Vec::new();
+        while let Some(m) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
+            commit(&mut stock, &m);
+            motions.push(m);
+        }
+        let mut arcs = 0;
+        for (i, m) in motions.iter().enumerate() {
+            let Curve::Arc {
+                start,
+                end,
+                center,
+                sweep_rad,
+                ..
+            } = m.curve
+            else {
+                continue;
+            };
+            if m.kind != MoveKind::Link || !close3(center, [vertex[0], vertex[1], center[2]]) {
+                continue;
+            }
+            assert!((distance(center, start) - rho).abs() < 1e-9);
+            assert!((distance(center, end) - rho).abs() < 1e-9);
+            assert!((sweep_rad - turn).abs() < 1e-9, "sweep {sweep_rad}");
+            // Tangent to the vertex orbit before it and the link after it.
+            let before = heading(&motions[i - 1].curve, true);
+            let after = heading(&motions[i + 1].curve, false);
+            let (h0, h1) = (heading(&m.curve, false), heading(&m.curve, true));
+            assert!((h0[0] - before[0]).hypot(h0[1] - before[1]) < 1e-9);
+            assert!((h1[0] - after[0]).hypot(h1[1] - after[1]) < 1e-9);
+            arcs += 1;
+        }
+        // One per depth pass.
+        assert_eq!(arcs, p.report().depth_passes);
+        assert_eq!(p.report().corner_arcs, arcs);
+    }
+}
+
+#[test]
+fn oblique_outer_corner_has_reproducible_sweep() {
+    let op = curved(
+        vec![[8., 6., 0.], [26., 6., 0.], [18., 13., 0.]],
+        false,
         90.,
-    ));
-    assert_eq!(p.report().corner_links, 1);
+    );
+    let mut plan = plan(op);
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let cancel = AtomicBool::new(false);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if motion.kind == MoveKind::Link
+            && let Curve::Arc {
+                center, sweep_rad, ..
+            } = motion.curve
+            && center[..2] == [26., 6.]
+        {
+            // Signed angle between the two rounded offset radii at this vertex.
+            assert_eq!(sweep_rad, 2.4227626539681677);
+            return;
+        }
+        commit(&mut stock, &motion);
+    }
+    panic!("missing outer corner arc");
+}
+
+/// The stock-clear fast path also runs on an arc piece: one link along the
+/// rest of the arc when the stock is already clear there.
+#[test]
+fn arc_slot_stock_clear_corridor_links_the_rest_of_the_arc() {
+    for cw in [true, false] {
+        let op = curved(vec![[8., 6., -1.], [32., 6., 0.]], cw, 90.);
+        let mut snapshot = Stock::new(fixture().stock.height().unwrap().clone())
+            .unwrap()
+            .snapshot();
+        snapshot.cells.fill(HeightBounds {
+            lower_mm: 8.,
+            upper_mm: 8.,
+        });
+        let mut stock = Stock::from_snapshot(snapshot).unwrap();
+        let mut p = plan(op.clone());
+        let mut motions = 0;
+        while let Some(m) = p
+            .next_motion_with_stock(&stock, &AtomicBool::new(false))
+            .unwrap()
+        {
+            commit(&mut stock, &m);
+            motions += 1;
+        }
+        assert_eq!(p.report().stock_clear_advances, p.report().depth_passes);
+        assert_eq!(p.report().controlled_orbits, p.report().depth_passes);
+        assert!(motions < 20, "{motions} motions");
+        // Stock left on the arc: no stock-clear advance, the full slot is cut.
+        let fresh = check_curved(&op);
+        assert_eq!(fresh.report().stock_clear_advances, 0);
+    }
+}
+
+/// One occupied cell near the far end of a cleared arc defeats the
+/// stock-clear query from every station, and each station rescans nearly the
+/// same arc. The operation's query work is one shared budget: once it is
+/// spent the plan stops querying and keeps its bounded orbits, still cutting
+/// the cell.
+#[test]
+fn arc_stock_clear_queries_share_one_work_budget() {
+    // `STOCK_QUERY_WORK` in src/slot.rs.
+    const BUDGET: usize = 1_000_000;
+    let cancel = AtomicBool::new(false);
+    let m = fixture();
+    let mut spec = m.stock.height().unwrap().clone();
+    spec.cell_size_mm = 0.0625;
+    let op = curved(vec![[8., 6., -1.], [32., 6., 0.]], true, 90.);
+    let mut p = SlotPlan::prepare(
+        op.clone(),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut snapshot = Stock::new(spec).unwrap().snapshot();
+    snapshot.cells.fill(HeightBounds {
+        lower_mm: 8.,
+        upper_mm: 8.,
+    });
+    let stock = Stock::from_snapshot(snapshot).unwrap();
+    // The cell on the centreline just before the far end point (32, 6).
+    let target = [31.97, 6.03];
+    let cell = (0..stock.cells().len())
+        .min_by(|&a, &b| {
+            let d = |i: usize| {
+                let c = stock.cell_center(i).unwrap();
+                (c[0] - target[0]).hypot(c[1] - target[1])
+            };
+            d(a).total_cmp(&d(b))
+        })
+        .unwrap();
+    let mut snapshot = stock.snapshot();
+    snapshot.cells[cell] = HeightBounds {
+        lower_mm: 10.,
+        upper_mm: 10.,
+    };
+    let mut stock = Stock::from_snapshot(snapshot).unwrap();
+    let mut uncertainty = 0f64;
+    while let Some(motion) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
+        uncertainty = uncertainty.max(commit_measured(&mut stock, &motion).1);
+    }
+    let report = p.report();
+    assert!(
+        report.stock_query_work <= BUDGET,
+        "query work {} exceeds the shared budget",
+        report.stock_query_work
+    );
+    assert!(report.stock_query_work_exhausted);
+    assert!(report.controlled_orbits > 100, "{}", report.controlled_orbits);
+    // The occupied cell is still cut to the floor (within the stock's own
+    // height uncertainty, as the slot's interior checks allow).
+    let h = stock.cells()[cell];
+    assert!(
+        h.upper_mm <= op.floor_z_mm + uncertainty + 1e-9,
+        "{h:?}, uncertainty {uncertainty}"
+    );
 }
 
 #[test]
