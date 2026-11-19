@@ -701,6 +701,12 @@ class FlatOffsetTest(unittest.TestCase):
                     self.assertLessEqual((a[2] - b[2]) / span, slope, (name, motions[j]["id"]))
                     last = c
                     j += 1
+                # A ramp started beside the pass leads into it on a flat arc.
+                if motions[j]["kind"] == "lead":
+                    c = motions[j]["curve"]
+                    self.assertAlmostEqual(c["start"][2], last["end"][2], delta=1e-9)
+                    self.assertAlmostEqual(c["end"][2], last["end"][2], delta=1e-9)
+                    j += 1
                 self.assertEqual(motions[j]["kind"], "cut", name)
                 self.assertAlmostEqual(last["end"][2], motions[j]["curve"]["start"][2], delta=1e-9)
             self.assertEqual(ramps, report.get("arc_ramps", 0), name)

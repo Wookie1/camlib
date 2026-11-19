@@ -1658,11 +1658,15 @@ enum Entry {
     /// helices where a leg descends along an arc), or an arc ramp's descent
     /// along the pass's line (`FlatPlan::arc_ramp`), whose first `air`
     /// moves run through air above the stock (at the cutting feed, like a
-    /// lead) and the rest at the ramp's feed.
+    /// lead) and the rest at the ramp's feed; or an arc ramp onto the start of
+    /// a flat arc lead-in, `then`.
     Ramp {
         top: f64,
         curves: Vec<Curve>,
         air: usize,
+        /// A flat arc lead-in from the descent's end to the pass's start
+        /// (`FlatPlan::ramped_arc_lead_in`).
+        then: Option<Curve>,
     },
     /// Vertical plunge in air at `lead`'s start, then the tangent arc lead-in
     /// `lead` to the pass's start: flat at the pass's height (a lead at
@@ -2310,6 +2314,74 @@ impl FlatPlan {
         Ok(found)
     }
 
+    /// The arc lead-in to the pass starting at `v` (height `z`, unit tangent
+    /// `t`) entered through shallow stock: the flat quarter circle of
+    /// `arc_lead_in`, on a side where stock stands above the pass at its
+    /// start, reached by an arc ramp (`arc_ramp`) that descends along the
+    /// arc's tangent there (or, where the part is in the way, along the
+    /// pass's direction) and ends level at its start. The descent stays a
+    /// radius and more away from the pass, so it reads the stock beside the
+    /// pass rather than at the pass (next to a wall the stock grid carries
+    /// the wall's height in the cells beside it); the arc itself runs level
+    /// at the pass's height, as the passes do. `None` when neither side
+    /// qualifies.
+    fn ramped_arc_lead_in(
+        &mut self,
+        stock: &Stock,
+        v: [f64; 2],
+        t: [f64; 2],
+        z: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Entry>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        let n = t[0].hypot(t[1]);
+        if n <= 0. {
+            return Ok(None);
+        }
+        let t = [t[0] / n, t[1] / n];
+        for s in [1., -1.] {
+            let n = [-t[1] * s, t[0] * s];
+            let c = [v[0] + rho * n[0], v[1] + rho * n[1]];
+            let p = [c[0] - rho * t[0], c[1] - rho * t[1]];
+            if stock.top_under_disk(p, rho) <= z + tol {
+                continue;
+            }
+            let start = (p[1] - c[1]).atan2(p[0] - c[0]);
+            let sweep = s * std::f64::consts::FRAC_PI_2;
+            if !self.arc_clear(c, rho, start, sweep, z) {
+                continue;
+            }
+            let lead = Curve::Arc {
+                start: [p[0], p[1], z],
+                end: [v[0], v[1], z],
+                center: [c[0], c[1], z],
+                plane: crate::motion::Plane::Xy,
+                sweep_rad: sweep,
+            };
+            if let Some(l) = &self.limits
+                && !l.allows_curve(&lead, true)?
+            {
+                continue;
+            }
+            // Along the arc's tangent at its start first (one smooth path);
+            // where the part is in the way, along the pass's direction either
+            // way (the descent then meets the arc at a corner, at depth, as
+            // passes meet at their corners).
+            for d in [[-n[0], -n[1]], t, [-t[0], -t[1]]] {
+                if let Some((top, curves, air)) = self.arc_ramp(stock, p, d, z, cancel)? {
+                    return Ok(Some(Entry::Ramp {
+                        top,
+                        curves,
+                        air,
+                        then: Some(lead),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// The arc lead-out from the pass ending at `v` (height `z`) along the
     /// unit tangent `t`: a quarter circle of the tool's radius, tangent to the
     /// pass at `v`, flat at the pass's height, on a side where the disk at its
@@ -2728,7 +2800,72 @@ impl FlatPlan {
         if let Some((top, curves, air)) = self.arc_ramp(stock, [a[0], a[1]], t, z, cancel)? {
             self.report.ramped_entries += 1;
             self.report.arc_ramps += 1;
-            return Ok(Entry::Ramp { top, curves, air });
+            return Ok(Entry::Ramp {
+                top,
+                curves,
+                air,
+                then: None,
+            });
+        }
+        if let Some(entry) = self.ramped_arc_lead_in(stock, first, t, z, cancel)? {
+            self.report.ramped_entries += 1;
+            self.report.arc_ramps += 1;
+            self.report.arc_lead_ins += 1;
+            return Ok(entry);
+        }
+        // A closed first pass may also be entered at the middle of one of its
+        // straight strokes, where the arc lead-in fits there and not at its
+        // corner: each half of the split stroke is part of the proven
+        // stroke. Alone in its chain the pass starts and ends there; with a
+        // pass linked after it (proven from its original end), it runs from
+        // there to its original start and then once round in full, so it
+        // still ends where the link was proven (the stretch before its
+        // original start is cut twice). The strokes nearest the tool first,
+        // then the shortest such lead-up.
+        if closed {
+            let segs = self.chains[self.chain].pieces[self.piece].segs.clone();
+            let linked = self.piece + 1 < self.chains[self.chain].pieces.len();
+            let mut order: Vec<usize> = (0..segs.len())
+                .filter(|&i| {
+                    segs[i].arc.is_none()
+                        && crate::profiles::stroke_length(&segs[i]) >= 4. * self.radius
+                })
+                .collect();
+            let middle = |i: usize| stroke_point(&segs[i], 0.5);
+            let here = [self.position[0], self.position[1]];
+            if linked {
+                order.reverse();
+            } else {
+                order.sort_by(|&a, &b| {
+                    let (ma, mb) = (middle(a), middle(b));
+                    (ma[0] - here[0])
+                        .hypot(ma[1] - here[1])
+                        .total_cmp(&(mb[0] - here[0]).hypot(mb[1] - here[1]))
+                        .then(a.cmp(&b))
+                });
+            }
+            for i in order {
+                if cancel.is_cancelled() {
+                    return Err("flat-area planning cancelled".into());
+                }
+                let m = middle(i);
+                let t = segs[i].tangent(false);
+                if let Some(entry) = self.ramped_arc_lead_in(stock, m, t, z, cancel)? {
+                    let mut split = vec![sub_stroke(&segs[i], 0.5, 1.)];
+                    split.extend_from_slice(&segs[i + 1..]);
+                    if linked {
+                        split.extend_from_slice(&segs);
+                    } else {
+                        split.extend_from_slice(&segs[..i]);
+                        split.push(sub_stroke(&segs[i], 0., 0.5));
+                    }
+                    self.chains[self.chain].pieces[self.piece].segs = split;
+                    self.report.ramped_entries += 1;
+                    self.report.arc_ramps += 1;
+                    self.report.arc_lead_ins += 1;
+                    return Ok(entry);
+                }
+            }
         }
         let piece = &self.chains[self.chain].pieces[self.piece];
         match self.plunge_or_ramp(piece, stock, cancel)? {
@@ -2739,6 +2876,7 @@ impl FlatPlan {
                     top,
                     curves,
                     air: 0,
+                    then: None,
                 })
             }
         }
@@ -2923,9 +3061,15 @@ impl FlatPlan {
                             self.lead = Some((lead, helical));
                             ([p[0], p[1], f[2]], MoveKind::Plunge, Phase::ArcIn, None)
                         }
-                        Entry::Ramp { top, curves, air } => {
+                        Entry::Ramp {
+                            top,
+                            curves,
+                            air,
+                            then,
+                        } => {
                             self.ramp = curves.into();
                             self.ramp_air = air;
+                            self.lead = then.map(|lead| (lead, false));
                             // Down through air to the stock's top over the
                             // pass, where the ramp's first curve begins.
                             (
@@ -2999,10 +3143,12 @@ impl FlatPlan {
                     (
                         end,
                         MoveKind::Plunge,
-                        if self.ramp.is_empty() {
-                            Phase::Cut
-                        } else {
+                        if !self.ramp.is_empty() {
                             Phase::Ramp
+                        } else if self.lead.is_some() {
+                            Phase::ArcIn
+                        } else {
+                            Phase::Cut
                         },
                         Some(curve),
                     )
