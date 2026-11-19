@@ -1696,27 +1696,36 @@ outside the chain's first loop, away from the region, where no stock stands
 within the disk above the cut, plunges vertically through air to the cut height
 and leads in at cutting feed. Where no such point exists it plunges vertically
 at the chain's start when no live stock stands above its height there (within
-`tolerance_mm`). Where stock does (roughing left it, or the stock was not cut
-there yet), the chain is entered by a ramp, and only if the operation declares
-`entry=RampEntry(angle_deg, ...)`: the tool plunges through air to the top of
-the live stock over the stretch of the chain's first loop the ramp travels (the
-highest cell bound anywhere along that stretch; the whole loop when the ramp
-has to reverse on it), then zigzags down along that loop at no more than the
-declared angle (over each move's chord, so a leg along an arc descends a little
-shallower) and at the entry's `feed_mm_min` (default the plunge feed); a zigzag
-that has to reverse needs the entry's `min_length_mm`. Every ramp point lies
-above the proven loop, so it clears the part like the loop does; the report
-counts ramped chains as `ramped_entries`. Nothing is plunged into stock on any
-path: a chain with stock above it and no declared entry, a ramp that does not
-fit (too short a loop, an angle too shallow for the loop, or stock above the
-feed height) is refused, naming the chain, its length and the stock above it.
-The `flat` benchmark runs on a blank roughed to 0.1 mm over the flats and
-declares a 3 degree entry. The report gives the levels, `loops` (closed offset
-loops planned), `rows` (loops cut, counting the open pieces a split loop
-leaves), `runs` (chains), `links_at_depth`, cut length, `runs_completed`,
-`ramped_entries`, `arc_lead_ins`, `arc_lead_outs`, `rounded_plunges`, and any
-length that could not be proven clear (`dropped_length_mm`). `axis` is still
-accepted so old jobs load, but no longer orders anything.
+`tolerance_mm`). A pass start under no more stock than an arc ramp can take is
+entered by one smooth descent along the pass's line, as with a plunge and an
+arc lead-in: the tool plunges through air, an arc of its radius turns it to the
+declared ramp angle above the stock, a straight leg at that angle goes through
+the stock, and an arc of its radius turns it level onto the pass. The stock is
+never met steeper than the declared angle, and the whole descent starts at most
+four tool radii behind the pass start (about half a millimetre of stock at 3
+degrees). Deeper stock is ramped along the pass as follows. Where stock does
+(roughing left it, or the stock was not cut there yet), the chain is entered by
+a ramp, and only if the operation declares `entry=RampEntry(angle_deg, ...)`:
+the tool plunges through air to the top of the live stock over the stretch of
+the chain's first loop the ramp travels (the highest cell bound anywhere along
+that stretch; the whole loop when the ramp has to reverse on it), then zigzags
+down along that loop at no more than the declared angle (over each move's
+chord, so a leg along an arc descends a little shallower) and at the entry's
+`feed_mm_min` (default the plunge feed); a zigzag that has to reverse needs the
+entry's `min_length_mm`. Every ramp point lies above the proven loop, so it
+clears the part like the loop does; the report counts ramped chains as
+`ramped_entries`. Nothing is plunged into stock on any path: a chain with stock
+above it and no declared entry, a ramp that does not fit (too short a loop, an
+angle too shallow for the loop, or stock above the feed height) is refused,
+naming the chain, its length and the stock above it. The `flat` benchmark runs
+on a blank roughed to 0.1 mm over the flats and declares a 3 degree entry. The
+report gives the levels, `loops` (closed offset loops planned), `rows` (loops
+cut, counting the open pieces a split loop leaves), `runs` (chains),
+`links_at_depth`, cut length, `runs_completed`, `ramped_entries`, `arc_ramps`
+(arc-ramp entries, also counted in `ramped_entries`), `arc_lead_ins`,
+`arc_lead_outs`, `rounded_plunges`, and any length that could not be proven
+clear (`dropped_length_mm`). `axis` is still accepted so old jobs load, but no
+longer orders anything.
 
 ## Spiral, radial and project finishing: `Spiral`, `Radial`, `Project`
 

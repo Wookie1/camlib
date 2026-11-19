@@ -22,6 +22,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+/// How far behind the pass start (in cutter radii) an arc ramp may begin
+/// (`FlatPlan::arc_ramp`), as far as a waterline side entry is searched.
+const ARC_RAMP_REACH_RADII: f64 = 4.;
+
 fn x_axis() -> TraverseAxis {
     TraverseAxis::X
 }
@@ -181,6 +185,10 @@ pub struct FlatReport {
     /// the tool's radius in the vertical plane (see `FlatPlan::plunge_turn`).
     #[serde(skip_serializing_if = "is_zero")]
     pub rounded_plunges: usize,
+    /// Entries through stock on one smooth descent along the pass's line
+    /// (see `FlatPlan::arc_ramp`): counted in `ramped_entries` too.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub arc_ramps: usize,
     pub clearance_proof: &'static str,
 }
 
@@ -1645,10 +1653,17 @@ enum Entry {
     Side { p: [f64; 2] },
     /// Vertical plunge at the pass's start.
     Plunge,
-    /// Ramp down the first pass from the stock's top over it: the zigzag's
-    /// curves (lines and arcs on the pass, helices where a leg descends
-    /// along an arc), ending at the pass's start.
-    Ramp { top: f64, curves: Vec<Curve> },
+    /// Ramp down from `top` (reached through air) to the pass's start: the
+    /// zigzag's curves down the first pass (lines and arcs on the pass,
+    /// helices where a leg descends along an arc), or an arc ramp's descent
+    /// along the pass's line (`FlatPlan::arc_ramp`), whose first `air`
+    /// moves run through air above the stock (at the cutting feed, like a
+    /// lead) and the rest at the ramp's feed.
+    Ramp {
+        top: f64,
+        curves: Vec<Curve>,
+        air: usize,
+    },
     /// Vertical plunge in air at `lead`'s start, then the tangent arc lead-in
     /// `lead` to the pass's start: flat at the pass's height (a lead at
     /// cutting feed) or, when the plunge point is over the level's finished
@@ -1690,6 +1705,8 @@ pub struct FlatPlan {
     limits: Option<crate::limits::PreparedLimits>,
     entry: Option<Entry>,
     ramp: std::collections::VecDeque<Curve>,
+    /// How many of `ramp`'s first moves run through air (`Entry::Ramp`).
+    ramp_air: usize,
     lead: Option<(Curve, bool)>,
     turn: std::collections::VecDeque<Curve>,
     after_turn: Phase,
@@ -2016,6 +2033,7 @@ impl FlatPlan {
             arc_lead_ins: 0,
             arc_lead_outs: 0,
             rounded_plunges: 0,
+            arc_ramps: 0,
             clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; contour-parallel offset passes outside in, side entry in air on open edges and every vertical plunge beside the level's face (a radius outside it, the face region a superset of the flat within the shadows' stated errors), links at depth and when chains break",
         };
         Ok(Self {
@@ -2034,6 +2052,7 @@ impl FlatPlan {
             limits: region_limits,
             entry: None,
             ramp: Default::default(),
+            ramp_air: 0,
             lead: None,
             turn: Default::default(),
             after_turn: Phase::Cut,
@@ -2431,6 +2450,166 @@ impl FlatPlan {
         ))
     }
 
+    /// A ramp into stock as one smooth descent onto the pass start `p`
+    /// (height `z`) along the pass's direction `d`, in the vertical plane
+    /// through `d`, as in established CAM practice for a plunge with an arc
+    /// lead-in: a vertical plunge through air, a quarter-circle-like arc of
+    /// the tool's radius turning it to the declared ramp angle above the
+    /// stock, a straight leg at that angle through the stock, and an arc of
+    /// the tool's radius turning it to horizontal, tangent to the pass at `p`.
+    /// The stock is met only on the leg and the last arc, never steeper than
+    /// the declared angle. Taken where a ramp is declared, live stock stands
+    /// above `z` under the span (at most the stock top over the whole span;
+    /// the upper arc ends above it), the disk over the span is clear of the
+    /// part at `z` (every point of the path is at or above `z`), the span lies
+    /// inside the limits and the plunge's bottom is below the feed height;
+    /// `None` otherwise (the zigzag ramp along the pass, `plunge_or_ramp`).
+    /// At most `ARC_RAMP_REACH_RADII` radii long (about half a millimetre of
+    /// stock at 3 degrees); deeper stock is ramped along the pass. Returns
+    /// the plunge's bottom, the descent's moves, and how many of them (the
+    /// upper arc) run through air.
+    fn arc_ramp(
+        &mut self,
+        stock: &Stock,
+        p: [f64; 2],
+        d: [f64; 2],
+        z: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<(f64, Vec<Curve>, usize)>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        let Some(ramp) = self.op.entry.as_ref().and_then(|e| e.ramp()) else {
+            return Ok(None);
+        };
+        let n = d[0].hypot(d[1]);
+        if n <= 0. {
+            return Ok(None);
+        }
+        let d = [d[0] / n, d[1] / n];
+        let along_x = d[1].abs() <= 1e-12;
+        let along_y = d[0].abs() <= 1e-12;
+        let d = if along_x {
+            [d[0].signum(), 0.]
+        } else if along_y {
+            [0., d[1].signum()]
+        } else {
+            d
+        };
+        let (sin, cos, tan) = (
+            ramp.angle_rad.sin(),
+            ramp.angle_rad.cos(),
+            ramp.angle_rad.tan(),
+        );
+        // Heights above z, distances along d (0 at p, negative behind it).
+        let bottom = rho * (1. - cos);
+        let mut stock_top = stock.top_under_disk(p, rho) - z;
+        if stock_top <= tol {
+            return Ok(None);
+        }
+        let mut shape = None;
+        for _ in 0..4 {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            // The upper arc ends a tolerance above the stock.
+            let h_a = (stock_top + tol).max(bottom);
+            let u_b = -rho * sin;
+            let u_a = u_b - (h_a - bottom) / tan;
+            let u_t = u_a - rho * (1. - sin);
+            let h_t = h_a + rho * cos;
+            let t = [p[0] + u_t * d[0], p[1] + u_t * d[1]];
+            let top = segment_stock_top(stock, t, p, rho, cancel)? - z;
+            if top <= stock_top + 1e-9 {
+                shape = Some((h_a, u_b, u_a, u_t, h_t, t));
+                break;
+            }
+            stock_top = top;
+        }
+        let Some((h_a, u_b, u_a, u_t, h_t, t)) = shape else {
+            return Ok(None);
+        };
+        // No farther out than four radii, as far as a waterline side entry
+        // is searched: deeper stock is ramped along the pass instead.
+        if -u_t > ARC_RAMP_REACH_RADII * rho
+            || z + h_t > self.heights.feed
+            || self
+                .index
+                .max_height(t, p, rho, &mut self.seen, &mut self.stamp)
+                > z + tol
+            || !allows_segment(self.limits.as_ref(), t, p, z, tol)?
+        {
+            return Ok(None);
+        }
+        let at = |u: f64, h: f64| [p[0] + u * d[0], p[1] + u * d[1], z + h];
+        let arc = |start: [f64; 3], end: [f64; 3], center: [f64; 3]| -> Vec<Curve> {
+            if along_x || along_y {
+                let plane = if along_x {
+                    crate::motion::Plane::Xz
+                } else {
+                    crate::motion::Plane::Yz
+                };
+                let [u, v, _] = plane.axes();
+                let angle = |q: [f64; 3]| (q[v] - center[v]).atan2(q[u] - center[u]);
+                let mut sweep = angle(end) - angle(start);
+                if sweep > std::f64::consts::PI {
+                    sweep -= 2. * std::f64::consts::PI;
+                } else if sweep < -std::f64::consts::PI {
+                    sweep += 2. * std::f64::consts::PI;
+                }
+                return vec![Curve::Arc {
+                    start,
+                    end,
+                    center,
+                    plane,
+                    sweep_rad: sweep,
+                }];
+            }
+            // Chords at ARC_MOVE_SAGITTA, inside the circle, in (u, h).
+            let to_uh = |q: [f64; 3]| ((q[0] - p[0]) * d[0] + (q[1] - p[1]) * d[1], q[2] - z);
+            let (cu, ch) = to_uh(center);
+            let (su, sh) = to_uh(start);
+            let (eu, eh) = to_uh(end);
+            let a0 = (sh - ch).atan2(su - cu);
+            let mut sweep = (eh - ch).atan2(eu - cu) - a0;
+            if sweep > std::f64::consts::PI {
+                sweep -= 2. * std::f64::consts::PI;
+            } else if sweep < -std::f64::consts::PI {
+                sweep += 2. * std::f64::consts::PI;
+            }
+            let half = (1. - ARC_MOVE_SAGITTA / rho)
+                .clamp(-1., 1.)
+                .acos()
+                .max(1e-9);
+            let count = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(4096);
+            let point = |k: usize| {
+                if k == 0 {
+                    return start;
+                }
+                if k == count {
+                    return end;
+                }
+                let a = a0 + sweep * k as f64 / count as f64;
+                at(cu + rho * a.cos(), ch + rho * a.sin())
+            };
+            (0..count)
+                .map(|k| Curve::Line {
+                    start: point(k),
+                    end: point(k + 1),
+                })
+                .collect()
+        };
+        let mut curves = arc(at(u_t, h_t), at(u_a, h_a), at(u_t + rho, h_t));
+        let air = curves.len();
+        if u_a < u_b - 1e-9 {
+            curves.push(Curve::Line {
+                start: at(u_a, h_a),
+                end: at(u_b, bottom),
+            });
+        }
+        curves.extend(arc(at(u_b, bottom), at(0., 0.), at(0., rho)));
+        Ok(Some((z + h_t, curves, air)))
+    }
+
     /// Whether the disk at `p` comes down beside this chain's level's face: a
     /// radius (less the tolerance) outside the face region, so a vertical
     /// plunge at `p` never rests the disk on the flat the pass finishes. An
@@ -2546,12 +2725,21 @@ impl FlatPlan {
         {
             return Ok(Entry::Plunge);
         }
+        if let Some((top, curves, air)) = self.arc_ramp(stock, [a[0], a[1]], t, z, cancel)? {
+            self.report.ramped_entries += 1;
+            self.report.arc_ramps += 1;
+            return Ok(Entry::Ramp { top, curves, air });
+        }
         let piece = &self.chains[self.chain].pieces[self.piece];
         match self.plunge_or_ramp(piece, stock, cancel)? {
             None => Ok(Entry::Plunge),
             Some((top, curves)) => {
                 self.report.ramped_entries += 1;
-                Ok(Entry::Ramp { top, curves })
+                Ok(Entry::Ramp {
+                    top,
+                    curves,
+                    air: 0,
+                })
             }
         }
     }
@@ -2735,8 +2923,9 @@ impl FlatPlan {
                             self.lead = Some((lead, helical));
                             ([p[0], p[1], f[2]], MoveKind::Plunge, Phase::ArcIn, None)
                         }
-                        Entry::Ramp { top, curves } => {
+                        Entry::Ramp { top, curves, air } => {
                             self.ramp = curves.into();
+                            self.ramp_air = air;
                             // Down through air to the stock's top over the
                             // pass, where the ramp's first curve begins.
                             (
@@ -2790,6 +2979,12 @@ impl FlatPlan {
                         MoveKind::Lead
                     };
                     (lead.end(), kind, Phase::Cut, Some(lead))
+                }
+                Phase::Ramp if self.ramp_air > 0 => {
+                    // Through air above the stock: like a lead.
+                    self.ramp_air -= 1;
+                    let curve = self.ramp.pop_front().expect("ramp move");
+                    (curve.end(), MoveKind::Lead, Phase::Ramp, Some(curve))
                 }
                 Phase::Ramp => {
                     let curve = self.ramp.pop_front().expect("ramp move");

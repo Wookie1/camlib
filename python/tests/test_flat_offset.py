@@ -550,7 +550,8 @@ class FlatOffsetTest(unittest.TestCase):
                 ):
                     path.append(motions[j])
                     j += 1
-                if not path:
+                if not path or motions[j]["kind"] == "plunge":
+                    # No turn, or an arc ramp's upper arc (its own test).
                     continue
                 turns += 1
                 top, end = path[0]["curve"]["start"], path[-1]["curve"]["end"]
@@ -659,6 +660,51 @@ class FlatOffsetTest(unittest.TestCase):
                 p, z = c["start"], c["end"][2]
                 top = stock_top_near(grid, before[i], p, R)
                 self.assertGreater(top, z + 0.05, (name, motions[i]["id"], p))
+
+    def test_arc_ramps_meet_the_stock_at_the_declared_angle(self):
+        # A pass start under stock is entered by one smooth descent: a
+        # vertical plunge, an arc of the tool's radius through air above the
+        # stock under the tool (measured on the live stock), then moves that
+        # descend no steeper than the declared 3 degree ramp onto the pass,
+        # arriving level. Each is counted in arc_ramps.
+        slope = math.tan(math.radians(3)) + 1e-9
+        for name in ("island", "wide"):
+            if name == "island":
+                report, motions, before, grid, _ = cached(name)
+            else:
+                report, motions, before, grid, _ = run(WIDE, radial_stock_to_leave_mm=0.1)
+            ramps = 0
+            for i, m in enumerate(motions):
+                if m not in vertical_plunges([m]):
+                    continue
+                j = i + 1
+                air = []
+                while (
+                    motions[j]["kind"] == "lead"
+                    and motions[j]["curve"]["end"][2] < motions[j]["curve"]["start"][2] - 1e-9
+                ):
+                    air.append(j)
+                    j += 1
+                if not air or motions[j]["kind"] != "plunge":
+                    continue
+                ramps += 1
+                for k in air:
+                    q = motions[k]["curve"]["end"]
+                    top = stock_top_near(grid, before[k], q, R)
+                    self.assertGreaterEqual(q[2], top - 1e-9, (name, motions[k]["id"]))
+                last = None
+                while motions[j]["kind"] == "plunge":
+                    c = motions[j]["curve"]
+                    a, b = c["start"], c["end"]
+                    span = math.hypot(b[0] - a[0], b[1] - a[1])
+                    self.assertGreater(span, 0, (name, motions[j]["id"]))
+                    self.assertLessEqual((a[2] - b[2]) / span, slope, (name, motions[j]["id"]))
+                    last = c
+                    j += 1
+                self.assertEqual(motions[j]["kind"], "cut", name)
+                self.assertAlmostEqual(last["end"][2], motions[j]["curve"]["start"][2], delta=1e-9)
+            self.assertEqual(ramps, report.get("arc_ramps", 0), name)
+            self.assertGreater(ramps, 0, name)
 
 
 if __name__ == "__main__":
