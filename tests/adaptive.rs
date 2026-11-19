@@ -1853,6 +1853,87 @@ fn front_run(edit: impl FnOnce(&mut AdaptivePocketOperation)) -> Result<FrontRun
     run.before.push(stock.cells().to_vec());
     Ok(run)
 }
+#[test]
+fn corner_limit_keeps_l_pocket_coverage_and_refuses_unproven_strokes() {
+    let plain = front_run(|op| op.pocket.stepdown_mm = 2.).unwrap();
+    let bounded = front_run(|op| {
+        op.pocket.stepdown_mm = 2.;
+        op.max_corner_engagement_deg = Some(150.);
+    })
+    .unwrap();
+    assert_eq!(plain.before.last(), bounded.before.last());
+    for m in bounded.motions.iter().filter(|m| m.kind == MoveKind::Cut) {
+        assert_entire_l_sweep(&m.curve, 2.);
+    }
+    let Err(error) = front_run(|op| {
+        op.pocket.stepdown_mm = 2.;
+        op.max_corner_engagement_deg = Some(65.);
+    }) else {
+        panic!("an unproven corner must be refused");
+    };
+    assert!(error.contains("not proven within max_corner_engagement_deg 65"), "{error}");
+}
+
+#[test]
+fn corner_cap_steering_width_is_reproducible() {
+    let m = fixture();
+    let mut op = operation();
+    op.path_strategy = AdaptivePathStrategy::EngagementFront;
+    op.pocket.stepdown_mm = 2.;
+    op.max_corner_engagement_deg = Some(45.14);
+    let plan = camlib::pocket_front::PocketFrontPlan::prepare(
+        op, &m.tools[0], m.stock.height().unwrap(), m.initial_position_mm, 1, &|| false,
+    ).unwrap();
+    // Radius 2 mm times (1 - cos(45.14 degrees)), with binary64 intermediates.
+    assert_eq!(plan.report().max_radial_engagement_mm, 0.5892462315868332);
+}
+
+#[test]
+fn corner_cap_refusal_never_completes_on_retry() {
+    use camlib::operation::{OperationPlan, OperationReport};
+    use camlib::pocket::ResidualStatus;
+
+    let cancel = AtomicBool::new(false);
+    for angle in [100., 65.] {
+        let m = fixture();
+        let mut op = operation();
+        op.path_strategy = AdaptivePathStrategy::EngagementFront;
+        op.pocket.stepdown_mm = 2.;
+        op.max_corner_engagement_deg = Some(angle);
+        let tool = m.tools[0].prepare().unwrap();
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = OperationPlan::prepare_with_stock(
+            Operation::AdaptivePocket(op),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &cancel,
+        )
+        .unwrap();
+        let refusal = loop {
+            match plan.next_motion_with_stock(&stock, &cancel) {
+                Ok(Some(motion)) => {
+                    let delta = stock.preview_sweep(&tool, &motion, 1., m.sweep, &cancel).unwrap();
+                    stock.apply_delta(&delta).unwrap();
+                }
+                Ok(None) => panic!("{angle} degrees must be refused before completion"),
+                Err(error) => break error,
+            }
+        };
+        assert!(refusal.contains("not proven within max_corner_engagement_deg"), "{refusal}");
+        let generation = stock.generation();
+        for _ in 0..4 {
+            assert_eq!(plan.next_motion_with_stock(&stock, &cancel).unwrap_err(), refusal);
+            assert_eq!(plan.finish_report(&cancel).unwrap_err(), refusal);
+            let OperationReport::AdaptiveFront(report) = plan.report() else { panic!("adaptive report") };
+            assert_eq!(report.completed_layers, 0);
+            assert_eq!(report.geometric_residual_status, ResidualStatus::Pending);
+        }
+        assert_eq!(stock.generation(), generation);
+    }
+}
+
 /// Straight links end to end on one line are one move: a link with a link
 /// feed is emitted in stretches, one per feed.
 fn joined(motions: &[Motion]) -> Vec<(MoveKind, Curve)> {

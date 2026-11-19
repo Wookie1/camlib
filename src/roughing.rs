@@ -1395,6 +1395,7 @@ impl RoughingPlan {
                 ..
             } => {
                 AdaptivePocketOperation {
+                    max_corner_engagement_deg: None,
                     pocket: template,
                     path_strategy,
                     cutting_sense,
@@ -1612,6 +1613,7 @@ impl RoughingPlan {
                             ..
                         } => LayerPlan::Adaptive(Box::new(AdaptivePlan::prepare(
                             AdaptivePocketOperation {
+                                max_corner_engagement_deg: None,
                                 pocket,
                                 path_strategy,
                                 cutting_sense,
