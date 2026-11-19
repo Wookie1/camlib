@@ -805,15 +805,16 @@ fn exact_height_for(c: &Curve, p: [f64; 2], cutter_radius: f64, top: f64) -> f64
 /// lies in the stock footprint and no earlier centre (of an earlier move, or
 /// earlier on this one) is within the cutter radius. Sampling can only miss
 /// thin slivers, so it is a refutation check with a stated slack, not a proof.
-struct LeadingOracle {
+pub(crate) struct LeadingOracle {
     r: f64,
     step: f64,
     footprint: [[f64; 2]; 2],
-    cells: std::collections::HashMap<(i32, i32), Vec<[f64; 2]>>,
-    worst_deg: f64,
+    /// Sampled centres, each with the distance its disc is taken to clear.
+    cells: std::collections::HashMap<(i32, i32), Vec<([f64; 2], f64)>>,
+    pub(crate) worst_deg: f64,
 }
 impl LeadingOracle {
-    fn new(r: f64, footprint: [[f64; 2]; 2]) -> Self {
+    pub(crate) fn new(r: f64, footprint: [[f64; 2]; 2]) -> Self {
         Self {
             r,
             step: r / 20.,
@@ -828,26 +829,25 @@ impl LeadingOracle {
             (p[1] / self.r).floor() as i32,
         )
     }
-    fn cleared(&self, p: [f64; 2]) -> bool {
-        // Discs at samples `step` apart cover the swept strip but for
-        // slivers step^2 / (8 r) deep.
-        let reach = self.r + self.step * self.step / (8. * self.r) + 1e-9;
+    pub(crate) fn cleared(&self, p: [f64; 2]) -> bool {
         let k = self.key(p);
         (k.0 - 1..=k.0 + 1).any(|x| {
             (k.1 - 1..=k.1 + 1).any(|y| {
-                self.cells
-                    .get(&(x, y))
-                    .is_some_and(|v| v.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) <= reach))
+                self.cells.get(&(x, y)).is_some_and(|v| {
+                    v.iter()
+                        .any(|(q, reach)| (q[0] - p[0]).hypot(q[1] - p[1]) <= *reach)
+                })
             })
         })
     }
-    fn poses(&self, c: &Curve) -> Vec<([f64; 2], f64)> {
+    /// Poses at most `step` apart along the move, and their actual spacing.
+    fn poses(&self, c: &Curve) -> (Vec<([f64; 2], f64)>, f64) {
         let len = match circle(c) {
             Some((o, s)) => (c.start()[0] - o[0]).hypot(c.start()[1] - o[1]) * s.abs(),
             None => (c.end()[0] - c.start()[0]).hypot(c.end()[1] - c.start()[1]),
         };
         let n = (len / self.step).ceil().max(1.) as usize;
-        (0..=n)
+        let poses = (0..=n)
             .map(|i| {
                 let t = i as f64 / n as f64;
                 let p = position(c, t);
@@ -857,12 +857,19 @@ impl LeadingOracle {
                 };
                 ([p[0], p[1]], heading)
             })
-            .collect()
+            .collect();
+        (poses, len / n as f64)
     }
     /// A flat feed move the cutter makes: clears its sweep; with `check`,
     /// its leading contact is measured first, pose by pose.
-    fn feed(&mut self, c: &Curve, check: bool) {
-        for (i, (p, heading)) in self.poses(c).into_iter().enumerate() {
+    pub(crate) fn feed(&mut self, c: &Curve, check: bool) {
+        let (poses, spacing) = self.poses(c);
+        // Discs at samples `spacing` apart cover the swept strip but for
+        // slivers spacing^2 / (8 r) deep. The allowance follows the actual
+        // spacing, not the largest one: a fixed `step` allowance would let a
+        // move shorter than it clear its own leading edge from its start.
+        let reach = self.r + spacing * spacing / (8. * self.r) + 1e-9;
+        for (i, (p, heading)) in poses.into_iter().enumerate() {
             if check && i > 0 {
                 let mut hit = 0;
                 for d in -89..=89 {
@@ -877,7 +884,7 @@ impl LeadingOracle {
                 self.worst_deg = self.worst_deg.max(hit as f64);
             }
             let k = self.key(p);
-            self.cells.entry(k).or_default().push(p);
+            self.cells.entry(k).or_default().push((p, reach));
         }
     }
 }
@@ -1877,6 +1884,48 @@ fn scheduled_run(m: &StreamManifest) -> ScheduledRun {
         nominal,
     }
 }
+#[test]
+fn raster_exterior_links_change_only_the_feed_and_keep_committed_stock() {
+    let base = fixture(false);
+    let old = scheduled_run(&base);
+    let mut auto = base.clone();
+    let Operation::Roughing(op) = &mut auto.operations[0] else {
+        panic!("rough")
+    };
+    op.link_feed_mm_min = Some(1800.);
+    let new = scheduled_run(&auto);
+    assert_eq!(new.motions.len(), old.motions.len());
+    assert_eq!(new.stock.cells(), old.stock.cells());
+    let mut changed = 0;
+    let spec = base.stock.height().unwrap();
+    for (a, b) in old.motions.iter().zip(&new.motions) {
+        let mut restored = b.clone();
+        restored.feed_mm_min = a.feed_mm_min;
+        assert_eq!(
+            serde_json::to_value(a).unwrap(),
+            serde_json::to_value(restored).unwrap()
+        );
+        if a.feed_mm_min == b.feed_mm_min {
+            continue;
+        }
+        assert_eq!(b.kind, MoveKind::Link);
+        assert_eq!(b.feed_mm_min, Some(1800.));
+        let range = bounds(&b.curve, 0., 1.);
+        assert_eq!(b.curve.start()[2], b.curve.end()[2]);
+        assert!((0..2).any(|axis| range[1][axis] + 4. < spec.min_mm[axis]
+            || range[0][axis] - 4. > spec.max_mm[axis]));
+        changed += 1;
+    }
+    assert!(changed > 0 && new.nominal < old.nominal);
+    let reported: u64 = new.report["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|layer| layer["clearing"]["exterior_links"].as_u64().unwrap())
+        .sum();
+    assert_eq!(reported, changed);
+}
+
 fn set_routing(m: &mut StreamManifest) {
     let Operation::Roughing(op) = &mut m.operations[0] else {
         panic!("rough")
