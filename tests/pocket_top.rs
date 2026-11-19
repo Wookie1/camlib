@@ -129,10 +129,7 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
                         .iter()
                         .map(|l| l["tip_z_mm"].as_f64().unwrap())
                         .collect();
-                    // The faced stock model stands up to 16 x tolerance
-                    // above Z8 (see `faced`); levels start from it (#344).
-                    assert!(tips.len() == 2 && tips[1] == 5., "{tips:?}");
-                    assert!((6. ..=6. + 16. * 1e-5).contains(&tips[0]), "{tips:?}");
+                    assert_eq!(tips, [6., 5.]);
                 } else {
                     assert_eq!(report["depth_passes"], 2);
                 }

@@ -726,8 +726,7 @@ impl StockTop {
         }
         let ceiling = top + 16. * tolerance;
         let mut outside = Outside::new(scope, tolerance)?;
-        let (maximum, examined, reachable) =
-            Self::scan(stock, top, ceiling, &mut outside, cancel)?;
+        let (maximum, examined, reachable) = Self::scan(stock, top, ceiling, &mut outside, cancel)?;
         spec.max_mm[2] = top;
         stock.request_sweep_receipts();
         let tall = outside.highest;
@@ -789,7 +788,8 @@ impl StockTop {
                     .hypot((b[1] - p[1]).max(p[1] - b[3]).max(0.))
                     - half;
                 if far <= o.cutter_radius + o.guard + o.slack {
-                    reachable = Some(reachable.map_or(cell.upper_mm, |h: f64| h.max(cell.upper_mm)));
+                    reachable =
+                        Some(reachable.map_or(cell.upper_mm, |h: f64| h.max(cell.upper_mm)));
                 }
                 continue;
             }
@@ -1428,10 +1428,16 @@ impl PocketPlan {
         let (mut envelope, bound) =
             StockTop::prepare(stock, op.top_z_mm, op.tolerance_mm, &scope, cancel)?;
         // Stock the top accepts within the model's band still stands above
-        // it where the cutter reaches: the depth passes start from that
-        // stock, so the first is no deeper than a stepdown below it (#344).
+        // it where the cutter reaches: when it is higher than the operation's
+        // own tolerance, the depth passes start from that stock, so the first
+        // is no deeper than a stepdown below it (#344). Within the tolerance
+        // (a faced top's sweep error) the passes stay where they were.
         let mut op = op;
-        if let Some(h) = bound.as_ref().and_then(|b| b.report.reachable_upper_z_mm) {
+        if let Some(h) = bound
+            .as_ref()
+            .and_then(|b| b.report.reachable_upper_z_mm)
+            .filter(|h| *h > op.top_z_mm + op.tolerance_mm + 1e-9)
+        {
             op.top_z_mm = h;
             envelope.max_mm[2] = h;
         }

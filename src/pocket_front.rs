@@ -288,12 +288,16 @@ impl PocketFrontPlan {
         )
         .map_err(|e| format!("adaptive {e}"))?;
         // Stock the top accepts within the model's band still stands above
-        // it where the cutter reaches: the levels start from that stock, so
-        // the first is no deeper than a stepdown below it (#344).
+        // it where the cutter reaches: when it is higher than the operation's
+        // own tolerance, the levels start from that stock, so the first is no
+        // deeper than a stepdown below it (#344). Within the tolerance (a
+        // faced top's sweep error) the levels stay where they were.
+        let within = pocket.top_z_mm + pocket.tolerance_mm + 1e-9;
         let (mut op, mut envelope) = (op, envelope);
         if let Some(h) = bound
             .as_ref()
             .and_then(|b| b.report.reachable_upper_z_mm)
+            .filter(|h| *h > within)
         {
             op.pocket.top_z_mm = h;
             envelope.max_mm[2] = h;
