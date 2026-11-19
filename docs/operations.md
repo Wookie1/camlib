@@ -1279,6 +1279,35 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
   distance in `air_fed_mm` includes both arcs and straight returns. Without it, the returns are cut moves at
   `feed_mm_min`.
 
+### Finishing the walls
+
+`TrochoidalSlot` leaves its walls as the orbits cut them: scalloped, and cut
+by both sides of the cutter in turn. For a finished wall, cut the slot
+narrower by an allowance on each side, then cut both walls with a
+[`Contour`](#contour-contour) around the slot's outline, as a hole in the
+retained part, with a ramp entry. The Contour climb-mills by default, and
+the cutter takes only the allowance, since the slot has already cleared
+everything inside it.
+
+```python
+allowance = 0.2
+rough = TrochoidalSlot("slot", tool, (8, 12), (14, 12), 6 - 2 * allowance,
+                       10, 8, 1, 12, ...)
+# The slot's full outline: a capsule of radius 3 around the centreline.
+outline = Boundary(((8, 9, 0), (14, 9, 1), (14, 15, 0), (8, 15, 1)))
+part = PlanarRegion("part", (Component(stock_outline, (outline,)),))
+walls = Contour("walls", tool, part, 8, 2, 12, boundaries="holes",
+                entry=RampEntry(3), ...)
+```
+
+- Use the same tool and floor. Without `entry`, the Contour plunges at the
+  start of its loop beside the wall, at full depth; with `RampEntry`, it
+  descends around the loop, inside the space the slot cleared, and the
+  cutter takes only the allowance on the way down.
+- Keep the allowance small next to the tool radius, so the Contour's
+  engagement stays light. Leads (`lead_in_mm`, `lead_out_mm`) usually do not
+  fit inside a slot this narrow, and are refused as gouges.
+
 ## V-carve: `VCarve`
 
 Required: `region` (letters or a logo as a `PlanarRegion`), `top_z_mm`,

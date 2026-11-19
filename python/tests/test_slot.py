@@ -385,3 +385,106 @@ class TrochoidalSlotAirFeedTest(unittest.TestCase):
         self.assertGreater(report["return_chords"], 0)
         self.assertGreater(report["return_chord_saved_mm"], 0)
         self.assertNotIn("air_fed_arcs", report)
+
+
+class SlotWallFinishTest(unittest.TestCase):
+    """#34 part 4: the slot's walls are finished by a separate Contour, as the
+    docs recommend: the slot is cut narrower by an allowance, then a Contour
+    around the slot's outline, entered on a ramp, cuts that allowance."""
+
+    WIDTH, ALLOWANCE, CELL = 6.0, 0.2, 0.05
+
+    def run_recipe(self, finish):
+        from dataclasses import replace
+
+        import numpy as np
+        from camlib.operations import Contour, RampEntry
+
+        rough = replace(slot(), width_mm=self.WIDTH - 2 * self.ALLOWANCE)
+        (x0, y0), (x1, y1) = rough.start_mm, rough.end_mm
+        h = self.WIDTH / 2
+        outline = Boundary(((x0, y0 - h, 0), (x1, y1 - h, 1), (x1, y1 + h, 0), (x0, y0 + h, 1)))
+        square = Boundary.polygon(((0, 0), (24, 0), (24, 24), (0, 24)))
+        part = PlanarRegion("part", (Component(square, (outline,)),))
+        walls = Contour(
+            "walls",
+            tool(),
+            part,
+            rough.floor_z_mm,
+            2,
+            12,
+            boundaries="holes",
+            entry=RampEntry(3),
+            feed_mm_min=600,
+            plunge_mm_min=150,
+            spindle_rpm=12000,
+            tool_number=1,
+            length_register=1,
+            coolant="flood",
+        )
+        operations = (rough, walls) if finish else (rough,)
+        motions, reports, current = {}, {}, None
+        with Simulation(
+            StockSpec((0, 0, 0), (24, 24, 10), self.CELL),
+            (tool(),),
+            operations=operations,
+            revision="walls",
+            initial_position_mm=(0, 0, 12),
+        ) as sim:
+            for update in sim.run_operations():
+                if isinstance(update, OperationUpdate):
+                    current = update.operation
+                    if update.stage == "end":
+                        reports[current] = update.report
+                else:
+                    motions.setdefault(current, []).append(update.motion)
+            self.assertTrue(sim.state.finished)
+            nx, ny = sim.state.nx, sim.state.ny
+            cells = np.asarray(sim.state.heights).reshape(ny, nx, 2)
+        # Distance of each cell centre from the slot's centreline.
+        xs, ys = np.meshgrid((np.arange(nx) + 0.5) * self.CELL, (np.arange(ny) + 0.5) * self.CELL)
+        ax, ay = x1 - x0, y1 - y0
+        t = np.clip(((xs - x0) * ax + (ys - y0) * ay) / (ax * ax + ay * ay), 0, 1)
+        d = np.hypot(xs - (x0 + t * ax), ys - (y0 + t * ay))
+        return d, cells[..., 0], cells[..., 1], motions, reports, rough, walls
+
+    def test_contour_after_a_narrower_slot_finishes_both_walls_without_plunging(self):
+        d, low, high, motions, reports, rough, walls = self.run_recipe(True)
+        h = self.WIDTH / 2
+        # A cell wholly inside the slot, short of the wall by the Contour's
+        # boundary tolerance, holds no material above the floor; a cell
+        # wholly outside it was not cut at all.
+        half = self.CELL * math.sqrt(2) / 2
+        inside = d <= h - half - walls.boundary_tolerance_mm
+        outside = d >= h + half
+        self.assertGreater(inside.sum(), 20000)
+        self.assertLessEqual(high[inside].max(), rough.floor_z_mm + 1e-4)
+        self.assertGreaterEqual(low[inside].min(), rough.floor_z_mm - 1e-4)
+        self.assertGreaterEqual(low[outside].min(), 10 - 1e-6)
+        self.assertEqual(reports["walls"]["loops_completed"], 1)
+        # The Contour never moves straight down: every descent is a ramp no
+        # steeper than its 3 degrees.
+        descents = 0
+        for motion in motions["walls"]:
+            curve = motion["curve"]
+            drop = curve["start"][2] - curve["end"][2]
+            if drop <= 1e-9 or motion["kind"] == "rapid":
+                continue
+            a, b = curve["start"], curve["end"]
+            if curve["kind"] == "line":
+                run = math.hypot(b[0] - a[0], b[1] - a[1])
+            else:
+                c = curve["center"]
+                run = math.hypot(a[0] - c[0], a[1] - c[1]) * abs(curve["sweep_rad"])
+            if b[2] < 10:
+                descents += 1
+                self.assertLessEqual(drop, run * math.tan(math.radians(3)) * (1 + 1e-9), motion)
+        self.assertGreater(descents, 0)
+
+    def test_the_narrower_slot_alone_leaves_the_wall_allowance(self):
+        d, _, high, _, _, rough, _ = self.run_recipe(False)
+        h = self.WIDTH / 2
+        half = self.CELL * math.sqrt(2) / 2
+        band = (d > h - self.ALLOWANCE + half) & (d < h - half)
+        self.assertGreater(band.sum(), 1000)
+        self.assertTrue((high[band] > rough.floor_z_mm + 1).all())
