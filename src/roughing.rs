@@ -662,6 +662,21 @@ pub enum RoughingClearing {
         max_radial_engagement_mm: f64,
     },
 }
+/// Reads a saved clearing, without the fields the removed orbit planners
+/// wrote into adaptive clearing that chose engagement_front (#190).
+fn clearing_from_saved<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RoughingClearing, D::Error> {
+    use serde::de::Error;
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(fields) = value.as_object_mut()
+        && fields.get("kind").and_then(|k| k.as_str()) == Some("adaptive")
+    {
+        crate::adaptive::drop_removed_orbit_fields(fields, "adaptive clearing", &[])
+            .map_err(D::Error::custom)?;
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
+}
 fn default_coverage_margin() -> f64 {
     0.01
 }
@@ -709,7 +724,9 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     /// material top.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ramp_clearance_mm: Option<f64>,
-    /// engagement_front only. Stay-down links at depth feed at this rate
+    /// Raster: use this feed only for horizontal links whose complete assembly
+    /// sweep is outside the initial rectangular stock footprint.
+    /// engagement_front: stay-down links at depth feed at this rate
     /// (mm/min) wherever the committed stock's whole-cell bounds prove the
     /// cutter's footprint clear of stock; stretches that may touch stock keep
     /// `feed_mm_min`. None: every link feeds at `feed_mm_min`.
@@ -725,6 +742,7 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     pub id: String,
     pub tool: String,
     pub target: G,
+    #[serde(deserialize_with = "clearing_from_saved")]
     pub clearing: RoughingClearing,
     pub top_z_mm: f64,
     pub floor_z_mm: f64,
@@ -1247,11 +1265,24 @@ impl RoughingPlan {
             feed_z_mm: op.feed_z_mm,
         };
         template.validate_authoring(tool, prepared_tool.cutter().definition(), initial, r)?;
+        let raster = matches!(op.clearing, RoughingClearing::Raster { .. });
+        let exterior_link = if let Some(feed) = op.link_feed_mm_min.filter(|_| raster) {
+            if !feed.is_finite() || !(op.feed_mm_min..=1e6).contains(&feed) {
+                return Err("raster roughing link_feed_mm_min must be finite and at least feed_mm_min, up to 1000000 mm/min".into());
+            }
+            let radius = crate::verification::parts(&prepared_tool)?
+                .iter()
+                .map(|p| p.radius.max_over(p.min, p.max))
+                .fold(r, f64::max);
+            Some((feed, radius))
+        } else {
+            None
+        };
         let front = FrontMotionOptions {
             rapid_descent_clearance_mm: op.rapid_descent_clearance_mm,
             travel_clearance_mm: op.travel_clearance_mm,
             ramp_clearance_mm: op.ramp_clearance_mm,
-            link_feed_mm_min: op.link_feed_mm_min,
+            link_feed_mm_min: op.link_feed_mm_min.filter(|_| !raster),
             link_chip_thinning: op.link_chip_thinning,
         };
         front.validate(
@@ -1458,6 +1489,10 @@ impl RoughingPlan {
                             .with_wall_runs(true),
                         )),
                     };
+                    if let (Some((feed, radius)), LayerPlan::Pocket(p)) = (exterior_link, &mut plan)
+                    {
+                        p.enable_exterior_links(feed, radius);
+                    }
                     if op.omit_empty_cuts {
                         match &mut plan {
                             LayerPlan::Pocket(p) => p.enable_empty_cuts(),

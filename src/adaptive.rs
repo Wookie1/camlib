@@ -60,12 +60,66 @@ impl AdaptivePocketOperation {
         }
     }
 }
+/// Fields the removed orbit planners (#190) wrote. Saved programs that chose
+/// `engagement_front` still carry them: the earlier serializers wrote
+/// `boundary_tolerance_mm` (and, for an adaptive pocket, `clockwise`) for every
+/// strategy and the orbit sizes as null, and the engagement front never read
+/// them. Such a program is read without them. A program without a
+/// `path_strategy` was planned by the old default, disk_front, and is refused:
+/// reading it as engagement_front would silently plan a different path.
+pub(crate) fn drop_removed_orbit_fields(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    owner: &str,
+    extra: &[&str],
+) -> Result<(), String> {
+    const ORBITS: [&str; 3] = [
+        "orbit_radius_mm",
+        "min_orbit_radius_mm",
+        "local_orbit_tolerance_mm",
+    ];
+    let present: Vec<&str> = ORBITS
+        .iter()
+        .chain(["boundary_tolerance_mm"].iter())
+        .chain(extra)
+        .copied()
+        .filter(|name| fields.contains_key(*name))
+        .collect();
+    let Some(first) = present.first() else {
+        return Ok(());
+    };
+    match fields.get("path_strategy") {
+        Some(serde_json::Value::String(s)) if s == "engagement_front" => {}
+        Some(_) => return Ok(()), // the strategy itself is refused by name
+        None => {
+            return Err(format!(
+                "{owner}: `{first}` without a path_strategy is a program saved for disk_front, the earlier default planner, which was removed (#190); set path_strategy \"engagement_front\" and remove the orbit fields to plan it with the engagement front"
+            ));
+        }
+    }
+    for name in present {
+        let value = fields.remove(name).expect("present");
+        let ok = if ORBITS.contains(&name) {
+            value.is_null()
+        } else if name == "boundary_tolerance_mm" {
+            value.as_f64().is_some_and(f64::is_finite)
+        } else {
+            value.is_boolean()
+        };
+        if !ok {
+            return Err(format!(
+                "{owner}: {name} {value} belongs to the removed orbit planners (#190) and engagement_front does not use it; remove it"
+            ));
+        }
+    }
+    Ok(())
+}
 impl TryFrom<serde_json::Value> for AdaptivePocketOperation {
     type Error = String;
     fn try_from(value: serde_json::Value) -> Result<Self, String> {
         let serde_json::Value::Object(mut fields) = value else {
             return Err("adaptive operation must be an object".into());
         };
+        drop_removed_orbit_fields(&mut fields, "adaptive pocket", &["clockwise"])?;
         let path_strategy = serde_json::from_value(
             fields
                 .remove("path_strategy")
