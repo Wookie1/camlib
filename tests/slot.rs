@@ -696,6 +696,73 @@ fn arc_slot_stock_clear_corridor_links_the_rest_of_the_arc() {
     }
 }
 
+/// One occupied cell near the far end of a cleared arc defeats the
+/// stock-clear query from every station, and each station rescans nearly the
+/// same arc. The operation's query work is one shared budget: once it is
+/// spent the plan stops querying and keeps its bounded orbits, still cutting
+/// the cell.
+#[test]
+fn arc_stock_clear_queries_share_one_work_budget() {
+    // `STOCK_QUERY_WORK` in src/slot.rs.
+    const BUDGET: usize = 1_000_000;
+    let cancel = AtomicBool::new(false);
+    let m = fixture();
+    let mut spec = m.stock.height().unwrap().clone();
+    spec.cell_size_mm = 0.0625;
+    let op = curved(vec![[8., 6., -1.], [32., 6., 0.]], true, 90.);
+    let mut p = SlotPlan::prepare(
+        op.clone(),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut snapshot = Stock::new(spec).unwrap().snapshot();
+    snapshot.cells.fill(HeightBounds {
+        lower_mm: 8.,
+        upper_mm: 8.,
+    });
+    let stock = Stock::from_snapshot(snapshot).unwrap();
+    // The cell on the centreline just before the far end point (32, 6).
+    let target = [31.97, 6.03];
+    let cell = (0..stock.cells().len())
+        .min_by(|&a, &b| {
+            let d = |i: usize| {
+                let c = stock.cell_center(i).unwrap();
+                (c[0] - target[0]).hypot(c[1] - target[1])
+            };
+            d(a).total_cmp(&d(b))
+        })
+        .unwrap();
+    let mut snapshot = stock.snapshot();
+    snapshot.cells[cell] = HeightBounds {
+        lower_mm: 10.,
+        upper_mm: 10.,
+    };
+    let mut stock = Stock::from_snapshot(snapshot).unwrap();
+    let mut uncertainty = 0f64;
+    while let Some(motion) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
+        uncertainty = uncertainty.max(commit_measured(&mut stock, &motion).1);
+    }
+    let report = p.report();
+    assert!(
+        report.stock_query_work <= BUDGET,
+        "query work {} exceeds the shared budget",
+        report.stock_query_work
+    );
+    assert!(report.stock_query_work_exhausted);
+    assert!(report.controlled_orbits > 100, "{}", report.controlled_orbits);
+    // The occupied cell is still cut to the floor (within the stock's own
+    // height uncertainty, as the slot's interior checks allow).
+    let h = stock.cells()[cell];
+    assert!(
+        h.upper_mm <= op.floor_z_mm + uncertainty + 1e-9,
+        "{h:?}, uncertainty {uncertainty}"
+    );
+}
+
 #[test]
 fn bends_tighter_than_the_orbit_are_refused_with_the_radius() {
     // Radius 0.9 bending toward the clockwise orbits' side; the orbit

@@ -34,6 +34,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::f64::consts::TAU;
 
+/// Stock-query work one slot operation may spend on its stock-clear fast
+/// path, shared by every station. A query that finds material near the far
+/// end of a piece rescans almost the same area from the next station, so a
+/// per-query allowance is unbounded in total; once the shared budget is
+/// spent the plan keeps its bounded orbits and queries no more.
+const STOCK_QUERY_WORK: usize = 1_000_000;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrochoidalSlotOperation {
@@ -358,6 +365,8 @@ pub struct SlotPlan {
     phase: u8,
     next_id: u64,
     expected_generation: Option<u64>,
+    /// What is left of `STOCK_QUERY_WORK` for the stock-clear fast path.
+    query_work_left: usize,
     /// Centre of the most recent completed orbit at this depth (seed or
     /// controlled): the predecessor the next controlled orbit's proven-air
     /// proof needs. None at a new depth pass and after a stock-clear
@@ -630,6 +639,7 @@ impl SlotPlan {
             phase: 0,
             next_id: first_motion_id,
             expected_generation: None,
+            query_work_left: STOCK_QUERY_WORK,
             prev_center: None,
             orbit_pieces: VecDeque::new(),
             report,
@@ -1052,7 +1062,7 @@ impl SlotPlan {
                             curve: rest,
                             feed_mm_min: Some(self.op.feed_mm_min),
                         };
-                        let mut work = usize::MAX;
+                        let mut work = self.query_work_left;
                         let before = work;
                         known_clear = !stock.may_remove_material(
                             &query,
@@ -1062,6 +1072,7 @@ impl SlotPlan {
                             &mut work,
                             cancel,
                         )?;
+                        self.query_work_left = work;
                         self.report.stock_query_work += before - work;
                         self.report.stock_query_work_exhausted |= work == 0;
                         if known_clear {
