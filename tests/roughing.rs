@@ -805,12 +805,14 @@ fn exact_height_for(c: &Curve, p: [f64; 2], cutter_radius: f64, top: f64) -> f64
 /// lies in the stock footprint and no earlier centre (of an earlier move, or
 /// earlier on this one) is within the cutter radius. Sampling can only miss
 /// thin slivers, so it is a refutation check with a stated slack, not a proof.
+/// A sampled cutter centre and the distance its disc is taken to clear.
+type Disc = ([f64; 2], f64);
 pub(crate) struct LeadingOracle {
     r: f64,
     step: f64,
     footprint: [[f64; 2]; 2],
     /// Sampled centres, each with the distance its disc is taken to clear.
-    cells: std::collections::HashMap<(i32, i32), Vec<([f64; 2], f64)>>,
+    cells: std::collections::HashMap<(i32, i32), Vec<Disc>>,
     pub(crate) worst_deg: f64,
 }
 impl LeadingOracle {
