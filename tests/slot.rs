@@ -1004,6 +1004,36 @@ fn slot_without_air_feed_return_chords_cut_at_feed() {
     assert!(p.report().return_chords > 0);
 }
 
+#[test]
+fn air_returns_too_short_to_round_report_no_chord() {
+    // A narrow slot and a fine tolerance: every proven-air stretch is shorter
+    // than 64 guards, so each return is the air arc itself. No chord is cut
+    // and none may be counted or credited with a saving.
+    let cancel = AtomicBool::new(false);
+    let mut op = operation();
+    op.width_mm = 4.4;
+    op.tolerance_mm = 0.001;
+    op.boundary_tolerance_mm = 0.05;
+    op.max_engagement_deg = 90.;
+    op.air_feed_mm_min = Some(op.feed_mm_min * 4.);
+    let mut p = plan(op);
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let (mut air_arcs, mut air_lines) = (0, 0);
+    while let Some(m) = p.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if m.kind == MoveKind::Air {
+            match m.curve {
+                Curve::Arc { .. } => air_arcs += 1,
+                _ => air_lines += 1,
+            }
+        }
+        commit(&mut stock, &m);
+    }
+    assert!(air_arcs > 0, "the case must produce air returns");
+    assert_eq!(air_lines, 0);
+    assert_eq!(p.report().return_chords, 0);
+    assert_eq!(p.report().return_chord_saved_mm, 0.);
+}
+
 /// One record per orbit (see `OrbitWalk`).
 fn orbit_groups(motions: &[Motion]) -> Vec<Orbit> {
     let mut walk = OrbitWalk::default();

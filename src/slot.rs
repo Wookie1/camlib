@@ -1026,13 +1026,17 @@ impl SlotPlan {
                         let piece = self.orbit_pieces.pop_front().unwrap();
                         if piece.air {
                             let moves = self.rounded_return(center, piece);
-                            let length: f64 = moves
-                                .iter()
-                                .map(|c| c.prepare(self.op.tolerance_mm).map(|p| p.length_mm()))
-                                .sum::<Result<f64, String>>()?;
-                            self.report.return_chords += 1;
-                            self.report.return_chord_saved_mm +=
-                                self.radius * piece.sweep.abs() - length;
+                            // A return too short to round is the air arc
+                            // itself: no chord, nothing saved.
+                            if moves.iter().any(|c| matches!(c, Curve::Line { .. })) {
+                                let length: f64 = moves
+                                    .iter()
+                                    .map(|c| c.prepare(self.op.tolerance_mm).map(|p| p.length_mm()))
+                                    .sum::<Result<f64, String>>()?;
+                                self.report.return_chords += 1;
+                                self.report.return_chord_saved_mm +=
+                                    self.radius * piece.sweep.abs() - length;
+                            }
                             self.pending.extend(moves.into_iter().map(|c| (c, true)));
                         } else {
                             self.pending.push_back((
