@@ -134,10 +134,10 @@ def flat_op(spec, entry=camlib.RampEntry(angle_deg=3, min_length_mm=1), **change
     return t, op
 
 
-def run(spec, skin=0.1):
+def run(spec, skin=0.1, **changes):
     """Run Flat on the roughed blank; return (report, motions, stock
     snapshots before each motion as (nx, ny, dx, dy, heights), final state)."""
-    t, op = flat_op(spec)
+    t, op = flat_op(spec, **changes)
     stock = camlib.StockSpec.from_mesh(export_stock_mesh(solid(spec, skin)), CELL)
     motions, before = [], []
     report = None
@@ -380,14 +380,14 @@ class FlatOffsetTest(unittest.TestCase):
     def test_no_moves_of_kernel_artefacts(self):
         # A kernel's flattened circle (chords mixed with micro-arcs) and its
         # snapped corner stubs are not cut as moves of their own: no cut,
-        # link or lead shorter than 5 microns (the arcs' own move sagitta).
+        # link or lead shorter than 5 microns (the arcs' own move sagitta),
+        # measured in 3D (a rounded plunge's chords descend mostly in Z).
         for name in ("stepped", "island"):
             _, motions, *_ = cached(name)
             tiny = [
                 m["id"]
                 for m in motions
-                if m["kind"] in ("cut", "link", "lead")
-                and math.hypot(*(m["curve"]["end"][k] - m["curve"]["start"][k] for k in (0, 1))) < 0.005
+                if m["kind"] in ("cut", "link", "lead") and math.dist(m["curve"]["end"], m["curve"]["start"]) < 0.005
             ]
             self.assertEqual(tiny, [], f"{name}: moves under 5 microns: {tiny[:10]}")
 
@@ -475,10 +475,22 @@ class FlatOffsetTest(unittest.TestCase):
             ins = outs = 0
             for i, m in enumerate(motions[1:-1], 1):
                 c = m["curve"]
-                if c.get("kind") not in ("arc", "helix") or m["kind"] not in ("lead", "plunge"):
+                if (
+                    c.get("kind") not in ("arc", "helix")
+                    or c.get("plane") != "xy"
+                    or m["kind"] not in ("lead", "plunge")
+                ):
                     continue
                 prev, nxt = motions[i - 1], motions[i + 1]
-                lead_in = prev in vertical_plunges([prev]) and nxt["kind"] == "cut"
+                # A ramp's helix legs also end on a pass: a lead-in is told
+                # apart by its shape (quarter circle of the tool's radius);
+                # the counts below must then match the report's.
+                a, ce = c["start"], c["center"]
+                quarter = (
+                    abs(math.hypot(a[0] - ce[0], a[1] - ce[1]) - R) < 1e-6
+                    and abs(abs(c["sweep_rad"]) - math.pi / 2) < 1e-9
+                )
+                lead_in = nxt["kind"] == "cut" and (m["kind"] == "lead" or quarter)
                 rise = (
                     nxt["curve"]["end"][2] > nxt["curve"]["start"][2]
                     and math.dist(nxt["curve"]["end"][:2], nxt["curve"]["start"][:2]) < 1e-9
@@ -486,7 +498,6 @@ class FlatOffsetTest(unittest.TestCase):
                 lead_out = m["kind"] == "lead" and prev["kind"] in ("cut", "link") and rise
                 if not (lead_in or lead_out):
                     continue
-                a, ce = c["start"], c["center"]
                 self.assertAlmostEqual(math.hypot(a[0] - ce[0], a[1] - ce[1]), R, delta=1e-6)
                 self.assertAlmostEqual(abs(c["sweep_rad"]), math.pi / 2, delta=1e-9)
                 if lead_in:
@@ -501,6 +512,82 @@ class FlatOffsetTest(unittest.TestCase):
                 self.assertGreater(t0[0] * t1[0] + t0[1] * t1[1], 1 - 1e-9, (name, i, c))
             self.assertEqual(ins, report["arc_lead_ins"], name)
             self.assertEqual(outs, report["arc_lead_outs"], name)
+
+    def test_plunges_turn_to_horizontal_on_a_quarter_circle(self):
+        # A vertical plunge stops a tool radius above where it used to land
+        # and turns to horizontal on a quarter circle of the tool's radius in
+        # the vertical plane of the move that follows: the turn ends a radius
+        # lower and a radius on, every point of it on that circle (its chords
+        # within 5 microns), leaving horizontally in the direction the
+        # next move starts in.
+        for name in ("stepped", "island"):
+            report, motions, *_ = cached(name)
+            self.assertGreater(report.get("rounded_plunges", 0), 0, name)
+            turns = 0
+            for i, m in enumerate(motions):
+                if m not in vertical_plunges([m]):
+                    continue
+                j, path = i + 1, []
+                while (
+                    motions[j]["kind"] == "lead"
+                    and motions[j]["curve"]["end"][2] < motions[j]["curve"]["start"][2] - 1e-9
+                ):
+                    path.append(motions[j])
+                    j += 1
+                if not path:
+                    continue
+                turns += 1
+                top, end = path[0]["curve"]["start"], path[-1]["curve"]["end"]
+                self.assertEqual(top, m["curve"]["end"], name)
+                self.assertAlmostEqual(top[2] - end[2], R, delta=1e-9)
+                self.assertAlmostEqual(math.dist(top[:2], end[:2]), R, delta=1e-9)
+                centre = [end[0], end[1], top[2]]
+                for t in path:
+                    c = t["curve"]
+                    for q in (c["start"], c["end"]):
+                        self.assertAlmostEqual(math.dist(q, centre), R, delta=1e-9)
+                    if c["kind"] == "line":
+                        mid = [(a + b) / 2 for a, b in zip(c["start"], c["end"])]
+                        self.assertLessEqual(R - math.dist(mid, centre), 0.005 + 1e-9)
+                d = [end[0] - top[0], end[1] - top[1]]
+                nxt = motions[j]["curve"]
+                if nxt.get("kind", "line") == "line":
+                    e = [nxt["end"][0] - nxt["start"][0], nxt["end"][1] - nxt["start"][1]]
+                else:
+                    a, ce, sign = nxt["start"], nxt["center"], math.copysign(1, nxt["sweep_rad"])
+                    e = [-(a[1] - ce[1]) * sign, (a[0] - ce[0]) * sign]
+                cos = (d[0] * e[0] + d[1] * e[1]) / (math.hypot(*d) * math.hypot(*e))
+                self.assertGreater(cos, 1 - 1e-9, (name, motions[j]))
+            self.assertEqual(turns, report["rounded_plunges"], name)
+
+    def test_radial_stock_is_left_on_every_wall(self):
+        # With radial_stock_to_leave_mm the passes cut only the flats: on every
+        # feed move the tool's axis stays a radius plus that stock (less the
+        # sampling step and 1e-4) from every part point above its tip,
+        # measured against the analytic part (the short island's walls, the
+        # tall boss beside it, the pocket and boss walls).
+        radial = 0.1
+        for name, spec in (("stepped", STEPPED), ("island", ISLAND)):
+            _, motions, *_ = run(spec, radial_stock_to_leave_mm=radial)
+            field = Field(spec)
+            worst = (math.inf, None)
+            for m in motions:
+                if m["kind"] == "rapid":
+                    continue
+                ps = (
+                    arc_points(m["curve"])
+                    if m["curve"].get("kind") == "arc" and m["curve"].get("plane") == "xy"
+                    else points(m, 9)
+                )
+                for p in ps:
+                    c = field.clearance(p, p[2])
+                    if c < worst[0]:
+                        worst = (c, (m["id"], m["kind"], [round(v, 4) for v in p]))
+            self.assertGreaterEqual(
+                worst[0],
+                R + radial - 1e-4 - field.step,
+                f"{name}: tool within {worst[0] - R:.4f} mm of a wall at {worst[1]}",
+            )
 
 
 if __name__ == "__main__":

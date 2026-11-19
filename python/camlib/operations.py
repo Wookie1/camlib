@@ -797,6 +797,9 @@ class Flat:
     # How a run under stock is entered: RampEntry(angle_deg, ...). None: no
     # stock stands above the runs, and one that does is refused.
     entry: object | None = None
+    # Radial stock left on the walls: the passes stay this much farther than
+    # the cutter's radius from everything standing above a flat.
+    radial_stock_to_leave_mm: float = 0
 
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}

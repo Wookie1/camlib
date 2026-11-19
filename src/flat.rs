@@ -85,6 +85,11 @@ pub struct FlatOperation<G = SurfaceMesh> {
     /// Axial stock left on the flats.
     #[serde(default)]
     pub stock_to_leave_mm: f64,
+    /// Radial stock left on the walls: the passes keep this much farther
+    /// from every surface standing above the flat than the cutter's radius,
+    /// so they cut only the horizontal faces.
+    #[serde(default)]
+    pub radial_stock_to_leave_mm: f64,
     /// Faces within this height of each other form one flat level.
     #[serde(default = "level_tolerance")]
     pub level_tolerance_mm: f64,
@@ -126,6 +131,7 @@ impl<G> FlatOperation<G> {
             clearance_z_mm: self.clearance_z_mm,
             axis: self.axis,
             stock_to_leave_mm: self.stock_to_leave_mm,
+            radial_stock_to_leave_mm: self.radial_stock_to_leave_mm,
             level_tolerance_mm: self.level_tolerance_mm,
             feed_mm_min: self.feed_mm_min,
             plunge_mm_min: self.plunge_mm_min,
@@ -171,6 +177,10 @@ pub struct FlatReport {
     /// retract (see `FlatPlan::arc_lead_out`).
     #[serde(skip_serializing_if = "is_zero")]
     pub arc_lead_outs: usize,
+    /// Vertical plunges that turn to horizontal through a quarter circle of
+    /// the tool's radius in the vertical plane (see `FlatPlan::plunge_turn`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rounded_plunges: usize,
     pub clearance_proof: &'static str,
 }
 
@@ -1653,6 +1663,7 @@ enum Phase {
     Approach,
     Descend,
     Enter,
+    Turn,
     Lead,
     ArcIn,
     Ramp,
@@ -1680,6 +1691,8 @@ pub struct FlatPlan {
     entry: Option<Entry>,
     ramp: std::collections::VecDeque<Curve>,
     lead: Option<(Curve, bool)>,
+    turn: std::collections::VecDeque<Curve>,
+    after_turn: Phase,
     initial: Vec3,
     position: Vec3,
     next_id: u64,
@@ -1707,6 +1720,7 @@ impl FlatPlan {
             op.stepover_mm,
             op.clearance_z_mm,
             op.stock_to_leave_mm,
+            op.radial_stock_to_leave_mm,
             op.level_tolerance_mm,
             op.feed_mm_min,
             op.plunge_mm_min,
@@ -1752,6 +1766,13 @@ impl FlatPlan {
                     format!(
                         "stock_to_leave_mm {} must not be negative",
                         op.stock_to_leave_mm
+                    ),
+                ),
+                (
+                    op.radial_stock_to_leave_mm >= 0.,
+                    format!(
+                        "radial_stock_to_leave_mm {} must not be negative",
+                        op.radial_stock_to_leave_mm
                     ),
                 ),
                 (
@@ -1873,6 +1894,7 @@ impl FlatPlan {
                 level,
                 op.level_tolerance_mm,
                 r,
+                op.radial_stock_to_leave_mm,
                 op.stepover_mm,
                 op.tolerance_mm,
                 cancel,
@@ -1993,6 +2015,7 @@ impl FlatPlan {
             ramped_entries: 0,
             arc_lead_ins: 0,
             arc_lead_outs: 0,
+            rounded_plunges: 0,
             clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; contour-parallel offset passes outside in, side entry in air on open edges and every vertical plunge beside the level's face (a radius outside it, the face region a superset of the flat within the shadows' stated errors), links at depth and when chains break",
         };
         Ok(Self {
@@ -2012,6 +2035,8 @@ impl FlatPlan {
             entry: None,
             ramp: Default::default(),
             lead: None,
+            turn: Default::default(),
+            after_turn: Phase::Cut,
             initial,
             position: initial,
             next_id: first_id,
@@ -2302,6 +2327,102 @@ impl FlatPlan {
         Ok(None)
     }
 
+    /// The turn at the bottom of a vertical plunge onto `p` at height `z0`,
+    /// where the move that follows leaves along the unit direction `d`: the
+    /// plunge stops a tool radius higher, a radius back along `d`, and a
+    /// quarter circle of the tool's radius in the vertical plane through `d`
+    /// turns it to horizontal at `p`, tangent to the plunge above and to the
+    /// move after (one arc in the XZ or YZ plane when `d` runs along X or Y,
+    /// otherwise its chords at `ARC_MOVE_SAGITTA`, inside the circle).
+    /// Taken where the disk over the whole turn's span at `z0` is clear of
+    /// live stock above `z0` and of the part, the span lies inside the
+    /// limits, and the plunge's new bottom is below the feed height; `None`
+    /// otherwise (the plunge then comes straight down onto `p`).
+    fn plunge_turn(
+        &mut self,
+        stock: &Stock,
+        p: [f64; 2],
+        d: [f64; 2],
+        z0: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Vec<Curve>>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        if z0 + rho > self.heights.feed {
+            return Ok(None);
+        }
+        let along_x = d[1].abs() <= 1e-12;
+        let along_y = d[0].abs() <= 1e-12;
+        let s = if along_x {
+            [p[0] - rho * d[0].signum(), p[1]]
+        } else if along_y {
+            [p[0], p[1] - rho * d[1].signum()]
+        } else {
+            [p[0] - rho * d[0], p[1] - rho * d[1]]
+        };
+        if segment_stock_top(stock, s, p, rho, cancel)? > z0 + tol
+            || self
+                .index
+                .max_height(s, p, rho, &mut self.seen, &mut self.stamp)
+                > z0 + tol
+            || !allows_segment(self.limits.as_ref(), s, p, z0, tol)?
+        {
+            return Ok(None);
+        }
+        let start = [s[0], s[1], z0 + rho];
+        let end = [p[0], p[1], z0];
+        let center = [p[0], p[1], z0 + rho];
+        if along_x || along_y {
+            let plane = if along_x {
+                crate::motion::Plane::Xz
+            } else {
+                crate::motion::Plane::Yz
+            };
+            let [u, v, _] = plane.axes();
+            let angle = |q: [f64; 3]| (q[v] - center[v]).atan2(q[u] - center[u]);
+            let mut sweep = angle(end) - angle(start);
+            if sweep > std::f64::consts::PI {
+                sweep -= 2. * std::f64::consts::PI;
+            } else if sweep < -std::f64::consts::PI {
+                sweep += 2. * std::f64::consts::PI;
+            }
+            return Ok(Some(vec![Curve::Arc {
+                start,
+                end,
+                center,
+                plane,
+                sweep_rad: sweep,
+            }]));
+        }
+        let half = (1. - ARC_MOVE_SAGITTA / rho)
+            .clamp(-1., 1.)
+            .acos()
+            .max(1e-9);
+        let count = ((std::f64::consts::FRAC_PI_2 / (2. * half)).ceil().max(1.) as usize).min(4096);
+        let at = |k: usize| {
+            if k == 0 {
+                return start;
+            }
+            if k == count {
+                return end;
+            }
+            let theta = std::f64::consts::FRAC_PI_2 * k as f64 / count as f64;
+            [
+                p[0] - rho * theta.cos() * d[0],
+                p[1] - rho * theta.cos() * d[1],
+                z0 + rho - rho * theta.sin(),
+            ]
+        };
+        Ok(Some(
+            (0..count)
+                .map(|k| Curve::Line {
+                    start: at(k),
+                    end: at(k + 1),
+                })
+                .collect(),
+        ))
+    }
+
     /// Whether the disk at `p` comes down beside this chain's level's face: a
     /// radius (less the tolerance) outside the face region, so a vertical
     /// plunge at `p` never rests the disk on the flat the pass finishes. An
@@ -2495,6 +2616,57 @@ impl FlatPlan {
                     // rapid goes over the plunge point (a side entry), the
                     // ramp's start, or the pass's start.
                     let entry = self.decide_entry(stock, cancel)?;
+                    // Where the plunge lands, the direction the move after it
+                    // leaves in, and the phase after the plunge.
+                    let landing = {
+                        let piece = &self.chains[self.chain].pieces[self.piece];
+                        let a = piece.start();
+                        match &entry {
+                            Entry::Side { p: q } => {
+                                let (dx, dy) = (a[0] - q[0], a[1] - q[1]);
+                                let n = dx.hypot(dy);
+                                (n > 0.).then(|| (*q, [dx / n, dy / n], a[2], Phase::Lead))
+                            }
+                            Entry::Arc { lead, .. } => {
+                                let (Curve::Arc {
+                                    start,
+                                    center,
+                                    sweep_rad,
+                                    ..
+                                }
+                                | Curve::Helix {
+                                    start,
+                                    center,
+                                    sweep_rad,
+                                    ..
+                                }) = lead
+                                else {
+                                    unreachable!("an arc lead is an arc or a helix")
+                                };
+                                let sign = sweep_rad.signum();
+                                let (rx, ry) = (start[0] - center[0], start[1] - center[1]);
+                                let n = rx.hypot(ry);
+                                Some((
+                                    [start[0], start[1]],
+                                    [-ry * sign / n, rx * sign / n],
+                                    start[2],
+                                    Phase::ArcIn,
+                                ))
+                            }
+                            Entry::Plunge => {
+                                Some(([a[0], a[1]], piece.segs[0].tangent(false), a[2], Phase::Cut))
+                            }
+                            Entry::Ramp { .. } => None,
+                        }
+                    };
+                    self.turn.clear();
+                    if let Some((q, d, z0, after)) = landing
+                        && let Some(turn) = self.plunge_turn(stock, q, d, z0, cancel)?
+                    {
+                        self.report.rounded_plunges += 1;
+                        self.turn = turn.into();
+                        self.after_turn = after;
+                    }
                     let over = match &entry {
                         Entry::Side { p: over } => *over,
                         Entry::Ramp { curves, .. } => {
@@ -2509,6 +2681,13 @@ impl FlatPlan {
                             let f = lead.start();
                             [f[0], f[1]]
                         }
+                    };
+                    let over = match self.turn.front() {
+                        Some(first) => {
+                            let f = first.start();
+                            [f[0], f[1]]
+                        }
+                        None => over,
                     };
                     self.entry = Some(entry);
                     (
@@ -2526,7 +2705,7 @@ impl FlatPlan {
                 ),
                 Phase::Enter => {
                     let a = self.chains[self.chain].pieces[self.piece].start();
-                    match self.entry.take().expect("entry plan") {
+                    let planned = match self.entry.take().expect("entry plan") {
                         Entry::Side { .. } => {
                             ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Lead, None)
                         }
@@ -2552,7 +2731,25 @@ impl FlatPlan {
                                 None,
                             )
                         }
+                    };
+                    // A rounded plunge stops at the turn's top; the turn
+                    // lands where the plain plunge would have.
+                    match self.turn.front() {
+                        Some(first) => {
+                            let f = first.start();
+                            ([p[0], p[1], f[2]], MoveKind::Plunge, Phase::Turn, None)
+                        }
+                        None => planned,
                     }
+                }
+                Phase::Turn => {
+                    let curve = self.turn.pop_front().expect("turn move");
+                    let next = if self.turn.is_empty() {
+                        self.after_turn
+                    } else {
+                        Phase::Turn
+                    };
+                    (curve.end(), MoveKind::Lead, next, Some(curve))
                 }
                 Phase::Lead => {
                     let a = self.chains[self.chain].pieces[self.piece].start();
@@ -2766,8 +2963,9 @@ pub(crate) fn segment_stock_top(
 /// shadow of the part standing above `z - level_tolerance`, grown by the
 /// overhang `r - stepover` (none at a stepover of a radius or more), minus
 /// the shadow of the part standing above the level, grown by the radius plus
-/// the shadows' stated errors (the pattern of `waterline::flat_level_loops`):
-/// every position whose disk would reach the part above the level. The
+/// `radial` (the radial stock left on the walls) plus the shadows' stated
+/// errors (the pattern of `waterline::flat_level_loops`): every position
+/// whose disk would come within `radial` of the part above the level. The
 /// "above" shadow's tip is picked so its `protected_from_z_mm` is strictly
 /// above `z + level_tolerance`; nothing standing above the level leaves the
 /// region alone. Every point of the region rests the disk on the level.
@@ -2779,13 +2977,16 @@ pub(crate) fn segment_stock_top(
 /// outside it and cutting nothing (the face is still covered: it lies inside
 /// the region, and the passes cover the region). This is the usual facing
 /// practice of running the tool part-way past the edge. Next to part standing
-/// above the level the region still ends a radius (plus errors) from it, so
-/// the outermost pass there runs along the wall.
+/// above the level the region still ends a radius plus `radial` (plus
+/// errors) from it, so the outermost pass there runs along the wall, the
+/// wall's radial stock left standing.
+#[allow(clippy::too_many_arguments)]
 fn level_region(
     target: &crate::roughing::PreparedRoughingTarget,
     z: f64,
     level_tolerance: f64,
     r: f64,
+    radial: f64,
     stepover: f64,
     tolerance: f64,
     cancel: &impl CancelSignal,
@@ -2829,7 +3030,9 @@ fn level_region(
             .map_err(|e| format!("flat-area face at Z{z}: {e}"))?;
         (resting, face)
     } else {
-        let reach = r + (above.report.boundary_error_mm - source_error).max(0.);
+        // A radius plus the radial stock left on the walls off everything
+        // standing above the level.
+        let reach = r + radial + (above.report.boundary_error_mm - source_error).max(0.);
         let blocked = above
             .region
             .prepare(options)
