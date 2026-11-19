@@ -403,7 +403,13 @@ no full-width slotting, for hard materials and high-speed toolpaths.
 
 - **It follows the stock** (`path_strategy="engagement_front"`, the only
   planner; the orbit planners `disk_front` and `stock_front` were removed in
-  #190 and their names are refused):
+  #190 and their names are refused. A program saved earlier that chose
+  `engagement_front` still reads: the orbit fields the earlier serializers
+  wrote with it (`orbit_radius_mm` and its siblings as null,
+  `boundary_tolerance_mm`, and an adaptive pocket's `clockwise`) are dropped,
+  since the engagement front never used them. One saved without a
+  `path_strategy` was planned by the old default, `disk_front`, and is refused
+  with that reason):
   one depth level at a time, each pass runs along the boundary between cut
   and uncut stock inside the region, so nothing is cut twice. The region's
   boundary is a wall.

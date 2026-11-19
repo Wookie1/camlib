@@ -1727,7 +1727,10 @@ fn engagement_front_refuses_orbits_empty_cut_omission_and_helix_only_entry() {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("unknown field `orbit_radius_mm`"), "{error}");
+    assert!(
+        error.contains("orbit_radius_mm") && error.contains("removed orbit planners"),
+        "{error}"
+    );
     let omit = edit(&|op| op["omit_empty_cuts"] = true.into());
     assert!(prepare(&omit).contains("omit_empty_cuts"));
     let helix = edit(&|op| op["entry"]["kind"] = "helix".into());
@@ -4856,4 +4859,68 @@ fn bounded_front_on_large_blank_keeps_independent_pocket_engagement_and_stock_ch
     let report = serde_json::to_value(plan.report()).unwrap();
     assert_eq!(report["completed_layers"], 1);
     assert!(report["layers"][0]["clearing"]["certified_strokes"].as_u64().unwrap() > 0);
+}
+
+/// Programs saved before the orbit planners were removed (#190) that chose
+/// engagement_front still read: the earlier serializers wrote the orbit
+/// fields (null) and `boundary_tolerance_mm` for every strategy, and the
+/// engagement front never used them. A program saved for the old default,
+/// disk_front (no path_strategy), is refused rather than replanned.
+#[test]
+fn saved_engagement_front_programs_read_without_the_removed_orbit_fields() {
+    let saved: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/regressions/saved-engagement-front-roughing.json"
+    ))
+    .unwrap();
+    let current: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/operations/roughing-open-block.json"))
+            .unwrap();
+    let read = |v: &serde_json::Value| {
+        serde_json::to_value(serde_json::from_value::<StreamManifest>(v.clone()).unwrap()).unwrap()
+    };
+    assert_eq!(read(&saved), read(&current));
+    // The old default strategy: no path_strategy, with the orbit fields.
+    let mut disk = saved.clone();
+    disk["operations"][0]["clearing"]
+        .as_object_mut()
+        .unwrap()
+        .remove("path_strategy");
+    let error = serde_json::from_value::<StreamManifest>(disk)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("disk_front") && error.contains("path_strategy"), "{error}");
+
+    // An adaptive pocket as the earlier serializer wrote it for
+    // engagement_front: orbit sizes null, boundary_tolerance_mm and clockwise.
+    let pocket: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/operations/adaptive-pocket.json")).unwrap();
+    let mut old = pocket.clone();
+    let op = old["operations"][0].as_object_mut().unwrap();
+    op.insert("path_strategy".into(), "engagement_front".into());
+    for name in ["orbit_radius_mm", "min_orbit_radius_mm", "local_orbit_tolerance_mm"] {
+        op.insert(name.into(), serde_json::Value::Null);
+    }
+    op.insert("boundary_tolerance_mm".into(), 0.01.into());
+    op.insert("clockwise".into(), true.into());
+    assert_eq!(read(&old), read(&pocket));
+    // A set orbit size was refused by engagement_front before, and still is.
+    let mut sized = old.clone();
+    sized["operations"][0]["orbit_radius_mm"] = 1.into();
+    let error = serde_json::from_value::<StreamManifest>(sized)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("orbit_radius_mm") && error.contains("#190"), "{error}");
+    // Saved for disk_front (the old default): refused.
+    let mut disk = old;
+    disk["operations"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("path_strategy");
+    let error = serde_json::from_value::<StreamManifest>(disk)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("disk_front"), "{error}");
 }

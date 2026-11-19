@@ -662,6 +662,21 @@ pub enum RoughingClearing {
         max_radial_engagement_mm: f64,
     },
 }
+/// Reads a saved clearing, without the fields the removed orbit planners
+/// wrote into adaptive clearing that chose engagement_front (#190).
+fn clearing_from_saved<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RoughingClearing, D::Error> {
+    use serde::de::Error;
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(fields) = value.as_object_mut()
+        && fields.get("kind").and_then(|k| k.as_str()) == Some("adaptive")
+    {
+        crate::adaptive::drop_removed_orbit_fields(fields, "adaptive clearing", &[])
+            .map_err(D::Error::custom)?;
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
+}
 fn default_coverage_margin() -> f64 {
     0.01
 }
@@ -725,6 +740,7 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     pub id: String,
     pub tool: String,
     pub target: G,
+    #[serde(deserialize_with = "clearing_from_saved")]
     pub clearing: RoughingClearing,
     pub top_z_mm: f64,
     pub floor_z_mm: f64,
