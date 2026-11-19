@@ -180,9 +180,13 @@ without a word:
 operations removed the material: the depth (and the cutting-length check) is
 then measured from `top_z_mm`, and an `AdaptivePocket` plans its first level
 from it (#344), so no level is deeper than `stepdown_mm`. Every stock cell
-meeting the `region` must be at or below it; the run checks this against the
-committed stock, so a lower top needs the stock (an `AdaptivePocket` planned
-without it is refused). Stock may stand higher outside the region, for example a low
+meeting the `region` must be at or below it, within the stock model's band
+of 16 x `tolerance_mm`; the run checks this against the committed stock, so a
+lower top needs the stock (an `AdaptivePocket` planned without it is refused).
+Where stock inside that band stands above `top_z_mm` within the cutter's reach,
+the depths are measured from the highest of it instead, so the first is still no
+deeper than `stepdown_mm` below the stock it meets
+(`stock_top.reachable_upper_z_mm` in the report, #344). Stock may stand higher outside the region, for example a low
 pocket beside a tall wall, when the tool assembly clears it:
 
 - Before any motion, the neck, shank and every holder section are checked

@@ -578,6 +578,11 @@ pub struct StockTopReport {
     /// Stock cells above the top that the assembly proof examined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assembly_checked_cells: Option<usize>,
+    /// Highest stock above the authored top, within the stock model's band
+    /// (16 x tolerance_mm), where the cutter can reach it. The depth levels
+    /// are placed from it, so no level cuts deeper than a stepdown (#344).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachable_upper_z_mm: Option<f64>,
 }
 
 /// What a lower top needs to know about the operation, to judge stock left
@@ -719,7 +724,8 @@ impl StockTop {
         }
         let ceiling = top + 16. * tolerance;
         let mut outside = Outside::new(scope, tolerance)?;
-        let (maximum, examined) = Self::scan(stock, top, ceiling, &mut outside, cancel)?;
+        let (maximum, examined, reachable) =
+            Self::scan(stock, top, ceiling, &mut outside, cancel)?;
         spec.max_mm[2] = top;
         stock.request_sweep_receipts();
         let tall = outside.highest;
@@ -736,18 +742,21 @@ impl StockTop {
                     generation: stock.generation(),
                     outside_upper_z_mm: tall,
                     assembly_checked_cells: tall.map(|_| examined),
+                    reachable_upper_z_mm: reachable,
                 },
             }),
         ))
     }
-    /// The highest stock, and how many cells above the top were examined.
+    /// The highest stock, how many cells above the ceiling were examined,
+    /// and the highest stock above the top (up to the ceiling) that the
+    /// cutter can reach.
     fn scan(
         stock: &Stock,
         top: f64,
         ceiling: f64,
         outside: &mut Outside,
         cancel: &impl CancelSignal,
-    ) -> Result<(f64, usize), String> {
+    ) -> Result<(f64, usize, Option<f64>), String> {
         let mut maximum = f64::NEG_INFINITY;
         let [dx, dy] = stock.cell_widths_mm();
         let half = dx.hypot(dy) / 2.;
@@ -760,12 +769,26 @@ impl StockTop {
         // Per section, the highest obstruction within its radius.
         let mut blocked = vec![None::<f64>; o.sections.len()];
         let mut examined = 0;
+        let mut reachable = None;
         for (i, cell) in stock.cells().iter().enumerate() {
             if i.is_multiple_of(1024) && cancel.is_cancelled() {
                 return Err("pocket stock-top inspection cancelled".into());
             }
             maximum = maximum.max(cell.upper_mm);
+            if cell.upper_mm <= top {
+                continue;
+            }
             if cell.upper_mm <= ceiling {
+                // Within the band the top is accepted, but the cutter meets
+                // this stock where it can reach it: the levels start from it.
+                let p = stock.cell_center(i).ok_or("stock cell outside the grid")?;
+                let b = o.region_bounds;
+                let far = ((b[0] - p[0]).max(p[0] - b[2]).max(0.))
+                    .hypot((b[1] - p[1]).max(p[1] - b[3]).max(0.))
+                    - half;
+                if far <= o.cutter_radius + o.guard + o.slack {
+                    reachable = Some(reachable.map_or(cell.upper_mm, |h: f64| h.max(cell.upper_mm)));
+                }
                 continue;
             }
             let refuse = || {
@@ -843,7 +866,7 @@ impl StockTop {
             ));
         }
         outside.highest = tall;
-        Ok((maximum, examined))
+        Ok((maximum, examined, reachable))
     }
     pub(crate) fn validate(
         &mut self,
@@ -857,7 +880,7 @@ impl StockTop {
                 .last_sweep_receipt()
                 .is_some_and(|r| r.base_identity == self.identity)
             {
-                let (_, _) = Self::scan(
+                let _ = Self::scan(
                     stock,
                     self.report.authored_top_z_mm,
                     self.ceiling,
@@ -1399,8 +1422,16 @@ impl PocketPlan {
             clearance_z: op.clearance_z_mm,
             boundary_slack_mm: 0.,
         };
-        let (envelope, bound) =
+        let (mut envelope, bound) =
             StockTop::prepare(stock, op.top_z_mm, op.tolerance_mm, &scope, cancel)?;
+        // Stock the top accepts within the model's band still stands above
+        // it where the cutter reaches: the depth passes start from that
+        // stock, so the first is no deeper than a stepdown below it (#344).
+        let mut op = op;
+        if let Some(h) = bound.as_ref().and_then(|b| b.report.reachable_upper_z_mm) {
+            op.top_z_mm = h;
+            envelope.max_mm[2] = h;
+        }
         let mut plan = Self::prepare(op, assembly, &envelope, initial, first_motion_id, cancel)?;
         if let Some(bound) = bound {
             plan.activate_layer(initial, first_motion_id, stock.spec())?;

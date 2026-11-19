@@ -129,7 +129,10 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
                         .iter()
                         .map(|l| l["tip_z_mm"].as_f64().unwrap())
                         .collect();
-                    assert_eq!(tips, [6., 5.]);
+                    // The faced stock model stands up to 16 x tolerance
+                    // above Z8 (see `faced`); levels start from it (#344).
+                    assert!(tips.len() == 2 && tips[1] == 5., "{tips:?}");
+                    assert!((6. ..=6. + 16. * 1e-5).contains(&tips[0]), "{tips:?}");
                 } else {
                     assert_eq!(report["depth_passes"], 2);
                 }
@@ -271,4 +274,46 @@ fn cancelled_faced_stock_inspection_does_not_change_stock() {
     );
     assert_eq!(stock.generation(), before.generation);
     assert_eq!(stock.cells(), before.cells);
+}
+
+/// A top within the stock-model band below uncut stock is accepted as the
+/// stock top, but the first level must still be at most a stepdown below the
+/// stock it meets (#344 review): measured on the stock each motion removes.
+#[test]
+fn top_inside_the_tolerance_band_never_cuts_deeper_than_a_stepdown() {
+    let m = fixture();
+    for adaptive in [false, true] {
+        let mut op = operation(9.9, adaptive);
+        let pocket = match &mut op {
+            Operation::Pocket(p) => p,
+            Operation::AdaptivePocket(a) => &mut a.pocket,
+            _ => unreachable!(),
+        };
+        pocket.tolerance_mm = 0.01;
+        pocket.stepdown_mm = 1.;
+        pocket.floor_z_mm = 7.;
+        let stepdown = pocket.stepdown_mm;
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut plan = OperationPlan::prepare_with_stock(
+            op,
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .unwrap();
+        let mut deepest: f64 = 0.;
+        while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
+            let before: Vec<f64> = stock.cells().iter().map(|c| c.upper_mm).collect();
+            commit(&mut stock, &motion, &m);
+            for (b, a) in before.iter().zip(stock.cells()) {
+                deepest = deepest.max(b - a.upper_mm);
+            }
+        }
+        assert!(
+            deepest <= stepdown + 1e-6,
+            "adaptive {adaptive}: one motion removed {deepest} mm of stock depth, more than the stepdown {stepdown}"
+        );
+    }
 }
