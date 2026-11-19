@@ -809,7 +809,8 @@ pub(crate) struct LeadingOracle {
     r: f64,
     step: f64,
     footprint: [[f64; 2]; 2],
-    cells: std::collections::HashMap<(i32, i32), Vec<[f64; 2]>>,
+    /// Sampled centres, each with the distance its disc is taken to clear.
+    cells: std::collections::HashMap<(i32, i32), Vec<([f64; 2], f64)>>,
     pub(crate) worst_deg: f64,
 }
 impl LeadingOracle {
@@ -829,25 +830,24 @@ impl LeadingOracle {
         )
     }
     pub(crate) fn cleared(&self, p: [f64; 2]) -> bool {
-        // Discs at samples `step` apart cover the swept strip but for
-        // slivers step^2 / (8 r) deep.
-        let reach = self.r + self.step * self.step / (8. * self.r) + 1e-9;
         let k = self.key(p);
         (k.0 - 1..=k.0 + 1).any(|x| {
             (k.1 - 1..=k.1 + 1).any(|y| {
-                self.cells
-                    .get(&(x, y))
-                    .is_some_and(|v| v.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) <= reach))
+                self.cells.get(&(x, y)).is_some_and(|v| {
+                    v.iter()
+                        .any(|(q, reach)| (q[0] - p[0]).hypot(q[1] - p[1]) <= *reach)
+                })
             })
         })
     }
-    fn poses(&self, c: &Curve) -> Vec<([f64; 2], f64)> {
+    /// Poses at most `step` apart along the move, and their actual spacing.
+    fn poses(&self, c: &Curve) -> (Vec<([f64; 2], f64)>, f64) {
         let len = match circle(c) {
             Some((o, s)) => (c.start()[0] - o[0]).hypot(c.start()[1] - o[1]) * s.abs(),
             None => (c.end()[0] - c.start()[0]).hypot(c.end()[1] - c.start()[1]),
         };
         let n = (len / self.step).ceil().max(1.) as usize;
-        (0..=n)
+        let poses = (0..=n)
             .map(|i| {
                 let t = i as f64 / n as f64;
                 let p = position(c, t);
@@ -857,12 +857,19 @@ impl LeadingOracle {
                 };
                 ([p[0], p[1]], heading)
             })
-            .collect()
+            .collect();
+        (poses, len / n as f64)
     }
     /// A flat feed move the cutter makes: clears its sweep; with `check`,
     /// its leading contact is measured first, pose by pose.
     pub(crate) fn feed(&mut self, c: &Curve, check: bool) {
-        for (i, (p, heading)) in self.poses(c).into_iter().enumerate() {
+        let (poses, spacing) = self.poses(c);
+        // Discs at samples `spacing` apart cover the swept strip but for
+        // slivers spacing^2 / (8 r) deep. The allowance follows the actual
+        // spacing, not the largest one: a fixed `step` allowance would let a
+        // move shorter than it clear its own leading edge from its start.
+        let reach = self.r + spacing * spacing / (8. * self.r) + 1e-9;
+        for (i, (p, heading)) in poses.into_iter().enumerate() {
             if check && i > 0 {
                 let mut hit = 0;
                 for d in -89..=89 {
@@ -877,7 +884,7 @@ impl LeadingOracle {
                 self.worst_deg = self.worst_deg.max(hit as f64);
             }
             let k = self.key(p);
-            self.cells.entry(k).or_default().push(p);
+            self.cells.entry(k).or_default().push((p, reach));
         }
     }
 }

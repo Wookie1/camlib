@@ -76,6 +76,52 @@ fn leading_contact_check_reads_a_slot_and_a_side_step() {
     }
 }
 
+/// #190 review: the reading does not depend on how a cut is split into
+/// moves. The same straight cut through fresh stock, fed as one move or as
+/// many moves shorter than the sampling step, reads the full leading
+/// half-circle; so does a side step split the same way read its width.
+#[test]
+fn leading_contact_check_does_not_depend_on_move_length() {
+    let r = 2.;
+    let footprint = [[0., 0.], [26., 26.]];
+    let split = |leading: &mut LeadingOracle, y: f64, from: f64, to: f64, n: usize| {
+        for i in 0..n {
+            let a = from + (to - from) * i as f64 / n as f64;
+            let b = from + (to - from) * (i + 1) as f64 / n as f64;
+            leading.feed(
+                &Curve::Line {
+                    start: [a, y, 9.],
+                    end: [b, y, 9.],
+                },
+                true,
+            );
+        }
+    };
+    for n in [1, 200] {
+        let mut leading = LeadingOracle::new(r, footprint);
+        split(&mut leading, 5., 10., 10.1, n);
+        assert!(leading.worst_deg >= 175., "{n} moves: slot read {}", leading.worst_deg);
+    }
+    let w = 1.;
+    let exact = (1f64 - w / r).acos().to_degrees();
+    for n in [1, 200] {
+        let mut leading = LeadingOracle::new(r, footprint);
+        leading.feed(
+            &Curve::Line {
+                start: [-3., 5., 9.],
+                end: [29., 5., 9.],
+            },
+            false,
+        );
+        split(&mut leading, 5. + w, 10., 10.1, n);
+        assert!(
+            leading.worst_deg <= exact + LEADING_SLACK_DEG && leading.worst_deg >= exact - 2.,
+            "{n} moves: side step read {} against {exact}",
+            leading.worst_deg
+        );
+    }
+}
+
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
