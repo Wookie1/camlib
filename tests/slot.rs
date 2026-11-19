@@ -905,6 +905,35 @@ fn fed_length(motions: &[Motion], feed: f64) -> f64 {
 }
 
 #[test]
+fn oblique_slot_return_has_reproducible_fillet_geometry() {
+    let m = fixture();
+    let mut op = operation();
+    op.start_mm = Some([0., 0.]);
+    op.end_mm = Some([17., 27.]);
+    op.floor_z_mm = 9.;
+    let mut spec = m.stock.height().unwrap().clone();
+    spec.min_mm[..2].copy_from_slice(&[-10., -10.]);
+    let cancel = AtomicBool::new(false);
+    let mut plan =
+        SlotPlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    let mut stock = Stock::new(spec).unwrap();
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if motion.id == 138 {
+            let Curve::Arc { center, end, .. } = motion.curve else {
+                panic!("expected return fillet")
+            };
+            // Reference fillet from the preceding orbit, evaluating atan2 and sin
+            // at 90 decimal digits and rounding each result to binary64.
+            assert_eq!(center[1], 3.938138415666419);
+            assert_eq!(end[1], 3.8535286713828856);
+            return;
+        }
+        commit(&mut stock, &motion);
+    }
+    panic!("missing return fillet");
+}
+
+#[test]
 fn slot_air_feed_arcs_remove_no_stock() {
     for (name, base) in air_feed_cases() {
         let mut with_air = base.clone();
@@ -912,7 +941,12 @@ fn slot_air_feed_arcs_remove_no_stock() {
         let air_feed = with_air.air_feed_mm_min.unwrap();
         let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
         let (motions, removed, p, _) = drive(&with_air, &mut stock);
-        assert!(p.report().air_fed_arcs > 0, "{name}: no air-fed arcs");
+        let air_arcs = motions
+            .iter()
+            .filter(|m| m.kind == MoveKind::Air && matches!(m.curve, Curve::Arc { .. }))
+            .count();
+        assert!(air_arcs > 0, "{name}: no air-fed arcs");
+        assert_eq!(p.report().air_fed_arcs, air_arcs);
         assert!(p.report().air_fed_mm > 0., "{name}: no air-fed length");
         for (m, removed) in motions.iter().zip(&removed) {
             if m.feed_mm_min == Some(air_feed) {

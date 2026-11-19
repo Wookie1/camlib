@@ -1235,8 +1235,8 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
   prove their whole cutter sweep inside committed clearance; unresolved
   clearance or rounding into fresh stock refuses the run. Increase output
   precision or disable the optional air feed to resolve a posting refusal.
-  The report counts the air moves (three per return) and their length
-  (`air_fed_arcs`, `air_fed_mm`). Without it, the returns are cut moves at
+  The report counts air-fed arcs in `air_fed_arcs`. The total air-fed
+  distance in `air_fed_mm` includes both arcs and straight returns. Without it, the returns are cut moves at
   `feed_mm_min`.
 
 ## V-carve: `VCarve`
