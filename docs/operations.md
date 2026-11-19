@@ -1214,8 +1214,11 @@ Required: `start_mm` and `end_mm` (straight), or `path_mm` (along a
 centreline; pass `None` for both points), and `width_mm`, `top_z_mm`,
 `floor_z_mm`, `stepdown_mm`, `clearance_z_mm`. Slots whose width is more than
 the tool diameter and at most twice it, cut with looping low-engagement passes:
-full orbits at stations along the centreline, joined by links on the
-centreline's offset. `entry_feed_mm_min` (150) is the entry feed.
+orbits at stations along the centreline, joined by links on the centreline's
+offset. The first orbit at each depth is a full circle; each later orbit is
+D-shaped (a peel loop): its front cuts on the circle, and the back, which
+lies inside the disk the previous orbit cleared, returns on a short cut across
+the circle with rounded ends. `entry_feed_mm_min` (150) is the entry feed.
 
 ```python
 # An S-shaped slot: two half turns of radius 7, tangent where they meet.
@@ -1238,18 +1241,29 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
   otherwise. An arc bending toward that side needs a radius above the orbit
   radius (width/2 − tool radius), otherwise the slot is refused, naming the
   radius. Reverse `clockwise`, or use a narrower slot or a larger tool.
-- `air_feed_mm_min` feeds the part of each controlled orbit that is proven to
-  cut nothing: when a full orbit at the previous station at the same depth
+- The return: when the orbit at the previous station at the same depth
   cleared a disk of radius orbit radius + tool radius, a cutter centre far
-  enough inside that disk (by the guard) keeps the whole cutter inside it, so
-  that arc runs in air. It must be finite and at least `feed_mm_min`; the arc
-  is shrunk by the planning tolerance. These moves retain `air` intent through
+  enough inside that disk (by the guard) keeps the whole cutter inside it. The
+  back arc's two ends are such centres; the arc it replaces is shrunk by the
+  planning tolerance. The return is three moves: an arc of radius 0.1 × orbit
+  radius tangent to the orbit at the first end, a straight line parallel to
+  the chord, and a matching arc tangent to the orbit at the second end, so the
+  path is tangent throughout and the machine need not stop at either end. All
+  three lie between the chord and the arc they replace, inside the disk of
+  allowed centres, so the return cuts nothing. A back arc too short for the
+  fillets (under 64 guards long) stays an arc. The orbit's cut front, its engagement bound and the swept width
+  are those of the full circle. No return follows a seed orbit or a
+  stock-clear advance (no adjacent previous orbit). The report counts the
+  returns and the path they saved against the arc (`return_chords`,
+  `return_chord_saved_mm`).
+- `air_feed_mm_min` feeds the returns. It must be finite and at least
+  `feed_mm_min`. These moves retain `air` intent through
   posting and independent decoding. Both native and posted stock replay must
   prove their whole cutter sweep inside committed clearance; unresolved
   clearance or rounding into fresh stock refuses the run. Increase output
   precision or disable the optional air feed to resolve a posting refusal.
-  The report counts the arcs and their length (`air_fed_arcs`,
-  `air_fed_mm`). Without it, every orbit stays one full circle at
+  The report counts air-fed arcs in `air_fed_arcs`. The total air-fed
+  distance in `air_fed_mm` includes both arcs and straight returns. Without it, the returns are cut moves at
   `feed_mm_min`.
 
 ## V-carve: `VCarve`
