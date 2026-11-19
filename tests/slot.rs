@@ -664,6 +664,32 @@ fn outer_corner_links_are_tangent_arcs_on_the_vertex_orbit() {
     }
 }
 
+#[test]
+fn oblique_outer_corner_has_reproducible_sweep() {
+    let op = curved(
+        vec![[8., 6., 0.], [26., 6., 0.], [18., 13., 0.]],
+        false,
+        90.,
+    );
+    let mut plan = plan(op);
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let cancel = AtomicBool::new(false);
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if motion.kind == MoveKind::Link
+            && let Curve::Arc {
+                center, sweep_rad, ..
+            } = motion.curve
+            && center[..2] == [26., 6.]
+        {
+            // Signed angle between the two rounded offset radii at this vertex.
+            assert_eq!(sweep_rad, 2.4227626539681677);
+            return;
+        }
+        commit(&mut stock, &motion);
+    }
+    panic!("missing outer corner arc");
+}
+
 /// The stock-clear fast path also runs on an arc piece: one link along the
 /// rest of the arc when the stock is already clear there.
 #[test]

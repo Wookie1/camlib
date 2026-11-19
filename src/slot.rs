@@ -153,7 +153,7 @@ enum Piece {
 }
 
 fn distance(a: Vec3, b: Vec3) -> f64 {
-    (a[0] - b[0]).hypot(a[1] - b[1])
+    metallic::hypot(a[0] - b[0], a[1] - b[1])
 }
 
 impl Piece {
@@ -189,7 +189,8 @@ impl Piece {
                     b
                 } else {
                     let t = start + sweep.signum() * along;
-                    [center[0] + radius * t.cos(), center[1] + radius * t.sin()]
+                    let (sin, cos) = metallic::sincos(t);
+                    [center[0] + radius * cos, center[1] + radius * sin]
                 }
             }
         }
@@ -200,7 +201,8 @@ impl Piece {
             Piece::Line { dir, .. } => dir,
             Piece::Arc { start, sweep, .. } => {
                 let t = start + sweep.signum() * along;
-                [-sweep.signum() * t.sin(), sweep.signum() * t.cos()]
+                let (sin, cos) = metallic::sincos(t);
+                [-sweep.signum() * sin, sweep.signum() * cos]
             }
         }
     }
@@ -256,7 +258,7 @@ fn pieces(op: &TrochoidalSlotOperation, guard: f64) -> Result<Vec<Piece>, String
     let mut out = Vec::with_capacity(vertices.len() - 1);
     for (i, w) in vertices.windows(2).enumerate() {
         let (a, b, bulge) = ([w[0][0], w[0][1]], [w[1][0], w[1][1]], w[0][2]);
-        let chord = (b[0] - a[0]).hypot(b[1] - a[1]);
+        let chord = metallic::hypot(b[0] - a[0], b[1] - a[1]);
         if chord <= guard {
             return Err(format!(
                 "path piece {i}: its end points coincide (start_mm and end_mm must be different points)"
@@ -272,8 +274,8 @@ fn pieces(op: &TrochoidalSlotOperation, guard: f64) -> Result<Vec<Piece>, String
             });
             continue;
         }
-        let sweep = 4. * bulge.atan();
-        let radius = chord / (2. * (sweep / 2.).sin().abs());
+        let sweep = 4. * metallic::atan(bulge);
+        let radius = chord / (2. * metallic::sin(sweep / 2.).abs());
         if radius > 1e6 {
             return Err(format!(
                 "path piece {i}: bulge {bulge} is too small for an arc; use a line (bulge 0)"
@@ -281,7 +283,7 @@ fn pieces(op: &TrochoidalSlotOperation, guard: f64) -> Result<Vec<Piece>, String
         }
         // The centre is on the chord's bisector, left of it for a
         // counter-clockwise arc.
-        let h = chord / 2. / (sweep / 2.).tan();
+        let h = chord / 2. / metallic::tan(sweep / 2.);
         let center = [
             (a[0] + b[0]) / 2. - dir[1] * h,
             (a[1] + b[1]) / 2. + dir[0] * h,
@@ -291,7 +293,7 @@ fn pieces(op: &TrochoidalSlotOperation, guard: f64) -> Result<Vec<Piece>, String
             b,
             center,
             radius,
-            start: (a[1] - center[1]).atan2(a[0] - center[0]),
+            start: metallic::atan2(a[1] - center[1], a[0] - center[0]),
             sweep,
         });
     }
@@ -312,11 +314,11 @@ pub fn centerline_curves(op: &TrochoidalSlotOperation, z: f64) -> Result<Vec<Cur
 /// R (1 - cos alpha) <= t. The left side grows with alpha (bisection).
 fn arc_coverage_half_angle(radius: f64, a: f64, t: f64) -> f64 {
     let gap = |alpha: f64| {
-        let s = radius * alpha.sin();
-        a - (a * a - s * s).max(0.).sqrt() + 2. * radius * (alpha / 2.).sin().powi(2)
+        let s = radius * metallic::sin(alpha);
+        a - (a * a - s * s).max(0.).sqrt() + 2. * radius * metallic::sin(alpha / 2.).powi(2)
     };
     let mut lo = 0f64;
-    let mut hi = std::f64::consts::FRAC_PI_2.min((a / radius).min(1.).asin());
+    let mut hi = std::f64::consts::FRAC_PI_2.min(metallic::asin((a / radius).min(1.)));
     if gap(hi) <= t {
         return hi;
     }
@@ -539,8 +541,8 @@ impl SlotPlan {
         let radius = op.width_mm / 2. - r - guard;
         let a = radius + r;
         let half_phi = op.max_engagement_deg.to_radians() / 2.;
-        let engagement_pitch =
-            (a * a - (r * half_phi.sin()).powi(2)).sqrt() - r * half_phi.cos() - radius - guard;
+        let (sin, cos) = metallic::sincos(half_phi);
+        let engagement_pitch = (a * a - (r * sin).powi(2)).sqrt() - r * cos - radius - guard;
         let t = op.boundary_tolerance_mm - guard;
         let coverage_pitch = 2. * (2. * a * t - t * t).sqrt();
         let pitch = engagement_pitch.min(coverage_pitch) * (1. - 1e-9);
@@ -577,7 +579,7 @@ impl SlotPlan {
                     // Engagement: the chord to the next station (a half turn
                     // at most) is at most the straight pitch. Coverage: the
                     // outer-wall cusp between the two disks.
-                    let chord = (engagement_pitch * (1. - 1e-9) / (2. * big)).min(1.).asin();
+                    let chord = metallic::asin((engagement_pitch * (1. - 1e-9) / (2. * big)).min(1.));
                     let cover = arc_coverage_half_angle(big, a, t);
                     let step = 2. * chord.min(cover) * (1. - 1e-9);
                     if !step.is_finite() || step * big <= guard {
@@ -725,7 +727,7 @@ impl SlotPlan {
         let rho = self.radius;
         let g = self.guard;
         let d = [center[0] - prev[0], center[1] - prev[1]];
-        let q = d[0].hypot(d[1]);
+        let q = metallic::hypot(d[0], d[1]);
         if q <= g {
             return None;
         }
@@ -733,13 +735,14 @@ impl SlotPlan {
         if c >= 1. {
             return None;
         }
-        let beta = c.acos() - self.op.tolerance_mm / rho;
+        let beta = metallic::acos(c) - self.op.tolerance_mm / rho;
         if beta <= 0. {
             return None;
         }
         let sign = if self.op.clockwise { -1. } else { 1. };
-        let theta_start = (self.position[1] - center[1]).atan2(self.position[0] - center[0]);
-        let theta_back = (-d[1]).atan2(-d[0]);
+        let theta_start =
+            metallic::atan2(self.position[1] - center[1], self.position[0] - center[0]);
+        let theta_back = metallic::atan2(-d[1], -d[0]);
         // Map the interval [theta_back - beta, theta_back + beta] into the
         // orbit's own parameter t = sign*(theta - theta_start): t runs
         // against theta for clockwise orbits, so the interval starts at the
@@ -829,7 +832,8 @@ impl SlotPlan {
             spans.len() != 1 || !spans[0].2,
             "a whole orbit is never proven air"
         );
-        let theta_start = (self.position[1] - center[1]).atan2(self.position[0] - center[0]);
+        let theta_start =
+            metallic::atan2(self.position[1] - center[1], self.position[0] - center[0]);
         let mut pieces = VecDeque::with_capacity(spans.len());
         let count = spans.len();
         for (k, &(t0, t1, air)) in spans.iter().enumerate() {
@@ -839,11 +843,8 @@ impl SlotPlan {
                 self.position
             } else {
                 let theta = theta_start + sign * t1;
-                [
-                    center[0] + rho * theta.cos(),
-                    center[1] + rho * theta.sin(),
-                    z,
-                ]
+                let (sin, cos) = metallic::sincos(theta);
+                [center[0] + rho * cos, center[1] + rho * sin, z]
             };
             pieces.push_back(OrbitPiece {
                 end,
@@ -1008,7 +1009,7 @@ impl SlotPlan {
                         // link side, that circle needs 2*pi minus the turn
                         // (a second orbit), so the link stays the straight
                         // chord, inside the same disk.
-                        let angle = |p: Vec3| (p[1] - vertex[1]).atan2(p[0] - vertex[0]);
+                        let angle = |p: Vec3| metallic::atan2(p[1] - vertex[1], p[0] - vertex[0]);
                         let (a0, a1) = (angle(self.position), angle(next));
                         let sweep_rad = if self.op.clockwise {
                             -(a0 - a1).rem_euclid(TAU)
