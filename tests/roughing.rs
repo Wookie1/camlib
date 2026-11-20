@@ -5038,10 +5038,8 @@ fn bounded_front_on_large_blank_keeps_independent_pocket_engagement_and_stock_ch
 /// disk_front (no path_strategy), is refused rather than replanned.
 #[test]
 fn saved_engagement_front_programs_read_without_the_removed_orbit_fields() {
-    let saved: serde_json::Value = serde_json::from_str(include_str!(
-        "../fixtures/regressions/saved-engagement-front-roughing.json"
-    ))
-    .unwrap();
+    let saved_wire = include_str!("../fixtures/regressions/saved-engagement-front-roughing.json");
+    let saved: serde_json::Value = serde_json::from_str(saved_wire).unwrap();
     let current: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/operations/roughing-open-block.json"))
             .unwrap();
@@ -5049,6 +5047,13 @@ fn saved_engagement_front_programs_read_without_the_removed_orbit_fields() {
         serde_json::to_value(serde_json::from_value::<StreamManifest>(v.clone()).unwrap()).unwrap()
     };
     assert_eq!(read(&saved), read(&current));
+    // Read the raw wire here: a Value would already have discarded the duplicate.
+    let key = "\"max_radial_engagement_mm\":";
+    let duplicate = saved_wire.replacen(key, &format!("{key} 0.01, {key}"), 1);
+    let error = serde_json::from_str::<StreamManifest>(&duplicate)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("duplicate field `max_radial_engagement_mm`"), "{error}");
     // The old default strategy: no path_strategy, with the orbit fields.
     let mut disk = saved.clone();
     disk["operations"][0]["clearing"]

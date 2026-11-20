@@ -667,15 +667,29 @@ pub enum RoughingClearing {
 fn clearing_from_saved<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<RoughingClearing, D::Error> {
-    use serde::de::Error;
-    let mut value = serde_json::Value::deserialize(deserializer)?;
-    if let Some(fields) = value.as_object_mut()
-        && fields.get("kind").and_then(|k| k.as_str()) == Some("adaptive")
-    {
-        crate::adaptive::drop_removed_orbit_fields(fields, "adaptive clearing", &[])
-            .map_err(D::Error::custom)?;
+    use serde::de::{Error, MapAccess, Visitor};
+    struct ClearingVisitor;
+    impl<'de> Visitor<'de> for ClearingVisitor {
+        type Value = RoughingClearing;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a roughing clearing object")
+        }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut fields = serde_json::Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if fields.contains_key(&key) {
+                    return Err(M::Error::custom(format!("duplicate field `{key}`")));
+                }
+                fields.insert(key, map.next_value()?);
+            }
+            if fields.get("kind").and_then(|k| k.as_str()) == Some("adaptive") {
+                crate::adaptive::drop_removed_orbit_fields(&mut fields, "adaptive clearing", &[])
+                    .map_err(M::Error::custom)?;
+            }
+            serde_json::from_value(serde_json::Value::Object(fields)).map_err(M::Error::custom)
+        }
     }
-    serde_json::from_value(value).map_err(D::Error::custom)
+    deserializer.deserialize_map(ClearingVisitor)
 }
 fn default_coverage_margin() -> f64 {
     0.01
