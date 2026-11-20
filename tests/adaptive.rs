@@ -148,6 +148,75 @@ fn leading_contact_check_reads_a_cut_after_a_lead_whatever_the_lead_split() {
     }
 }
 
+fn notch_clearance(p: [f64; 2]) -> f64 {
+    (11. - p[0]).max(0.).hypot((11. - p[1]).max(0.))
+}
+fn l_clearance(p: [f64; 2]) -> f64 {
+    (p[0] - 3.)
+        .min(p[1] - 3.)
+        .min(23. - p[0])
+        .min(23. - p[1])
+        .min(notch_clearance(p))
+}
+fn assert_entire_l_sweep(c: &Curve, r: f64) {
+    let a = c.start();
+    let b = c.end();
+    let mut points = vec![[a[0], a[1]], [b[0], b[1]]];
+    match *c {
+        Curve::Line { .. } => {
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l = d[0] * d[0] + d[1] * d[1];
+            let mut ts = vec![];
+            if l > 0. {
+                ts.push(((11. - a[0]) * d[0] + (11. - a[1]) * d[1]) / l);
+            }
+            for k in 0..2 {
+                if d[k] != 0. {
+                    ts.push((11. - a[k]) / d[k]);
+                }
+            }
+            points.extend(
+                ts.into_iter()
+                    .filter(|t| (0. ..=1.).contains(t))
+                    .map(|t| [a[0] + t * d[0], a[1] + t * d[1]]),
+            );
+        }
+        Curve::Arc {
+            center, sweep_rad, ..
+        } => {
+            let rho = dist([a[0], a[1]], [center[0], center[1]]);
+            let start = (a[1] - center[1]).atan2(a[0] - center[0]);
+            let mut angles = vec![
+                0.,
+                PI / 2.,
+                PI,
+                3. * PI / 2.,
+                (11. - center[1]).atan2(11. - center[0]),
+            ];
+            let x = (11. - center[0]) / rho;
+            if x.abs() <= 1. {
+                angles.extend([x.acos(), -x.acos()]);
+            }
+            let y = (11. - center[1]) / rho;
+            if y.abs() <= 1. {
+                angles.extend([y.asin(), PI - y.asin()]);
+            }
+            points.extend(
+                angles
+                    .into_iter()
+                    .filter(|x| angle_on(*x, start, sweep_rad))
+                    .map(|x| [center[0] + rho * x.cos(), center[1] + rho * x.sin()]),
+            );
+        }
+        _ => panic!("unexpected helix"),
+    }
+    for p in points {
+        assert!(
+            l_clearance(p) >= r - 1e-7,
+            "whole L sweep exits at{p:?}: {c:?}"
+        );
+    }
+}
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
