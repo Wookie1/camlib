@@ -89,6 +89,20 @@ mills. Indexable rows use the profile's floor-cutting width, and each stepdown
 must respect the assembly's maximum depth of cut. See
 [indexable geometry and limits](indexable-geometry.md).
 
+`axis="auto"` compares the complete existing X and Y routes (including entry,
+retracts, overtravel and returns). Declare a positive `auto_rapid_mm_min` for
+scoring rapids. The report gives the selected `axis` and `auto_axis_seconds`
+in X, Y order. An unavailable axis has a null score and a reason in
+`auto_axis_refusals`. If only one route can be planned, that route is used.
+If neither can be planned, the operation reports the refusal. These are
+nominal distance/rate estimates, with no acceleration
+or controller effects, and a tie within 1 ns selects X. Python still defaults
+to X. Automatic mode requires whole rectangular stock, refuses active
+in-plane limits, and refuses when either route reaches the 100,000-motion
+scoring budget. An explicit axis remains available for larger routes. Only
+the selected route streams, through the same independent geometry and posting
+checks. Scoring cannot establish fixture or machine clearance.
+
 The Rust planner refuses exhausted motion IDs before emitting another move or
 changing its position; IDs never wrap to zero during facing.
 
@@ -419,6 +433,19 @@ no full-width slotting, for hard materials and high-speed toolpaths.
   [3D roughing](#3d-roughing-roughing-restroughing) for the proof and the
   report fields, which each level carries). A `max_engagement_deg` below that
   angle narrows the width further.
+- **Corner engagement (#25):** for a pocket where a hard angle is required,
+  use `AdaptivePocket(..., max_corner_engagement_deg=150)`. The limit
+  (1–170 degrees) applies to horizontal cutting and stay-down links, including
+  confined clearing and wall cuts handled at entry feed. A limit below the
+  angle set by the stepover narrows the steering width. Both queries use the
+  committed cleared sweeps. If a stroke cannot be proven within the declared
+  limit, the planner refuses the operation. After a corner-cap refusal, the
+  planner cannot emit more moves or complete its report, even if called again.
+  The report records the requested limit and
+  each layer's ordinary and confined upper bounds. Helices and descent ramps
+  still use their qualified entry policies. Leave the option unset for the
+  default behavior. `Pocket`, `RestPocket`, and the orbit strategies retain
+  their own paths.
 - **Entry:** each level enters by a helix into uncut material, with `entry`'s
   helix (`HelicalEntry`) or `HelicalEntry`'s defaults when none is given, and
   straight down only through stock the committed cuts prove is gone. With
@@ -1168,8 +1195,11 @@ Required: `start_mm` and `end_mm` (straight), or `path_mm` (along a
 centreline; pass `None` for both points), and `width_mm`, `top_z_mm`,
 `floor_z_mm`, `stepdown_mm`, `clearance_z_mm`. Slots whose width is more than
 the tool diameter and at most twice it, cut with looping low-engagement passes:
-full orbits at stations along the centreline, joined by links on the
-centreline's offset. `entry_feed_mm_min` (150) is the entry feed.
+orbits at stations along the centreline, joined by links on the centreline's
+offset. The first orbit at each depth is a full circle; each later orbit is
+D-shaped (a peel loop): its front cuts on the circle, and the back, which
+lies inside the disk the previous orbit cleared, returns on a short cut across
+the circle with rounded ends. `entry_feed_mm_min` (150) is the entry feed.
 
 ```python
 # An S-shaped slot: two half turns of radius 7, tangent where they meet.
@@ -1186,24 +1216,43 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
 - The step follows the outside of each bend, where the gap between two orbits'
   disks is widest, so the swept width stays within `boundary_tolerance_mm` of
   the slot width.
-- Every vertex gets an orbit. At a corner, a straight link inside that orbit's
-  disk joins the two offsets (`corner_links` in the report).
+- Every vertex gets an orbit. At a corner, a link inside that orbit's disk
+  joins the two offsets (`corner_links` in the report). Where the slot turns
+  away from the link side (an outer corner) the link is an arc of the vertex
+  orbit's own circle, in the orbit's sense, tangent to the orbit before it and
+  to the link after it (`corner_arcs`). Where it turns toward the link side, a
+  tangent link inside that disk would have to circle 360° minus the turn, so
+  the link is the straight chord.
+- Where the stock along the rest of a piece (a line or an arc) is already
+  clear, one link covers it (`stock_clear_advances`); the next orbit is then a
+  full circle.
 - Links run on the left of the centreline for `clockwise=True`, on the right
   otherwise. An arc bending toward that side needs a radius above the orbit
   radius (width/2 − tool radius), otherwise the slot is refused, naming the
   radius. Reverse `clockwise`, or use a narrower slot or a larger tool.
-- `air_feed_mm_min` feeds the part of each controlled orbit that is proven to
-  cut nothing: when a full orbit at the previous station at the same depth
+- The return: when the orbit at the previous station at the same depth
   cleared a disk of radius orbit radius + tool radius, a cutter centre far
-  enough inside that disk (by the guard) keeps the whole cutter inside it, so
-  that arc runs in air. It must be finite and at least `feed_mm_min`; the arc
-  is shrunk by the planning tolerance. These moves retain `air` intent through
+  enough inside that disk (by the guard) keeps the whole cutter inside it. The
+  back arc's two ends are such centres; the arc it replaces is shrunk by the
+  planning tolerance. The return is three moves: an arc of radius 0.1 × orbit
+  radius tangent to the orbit at the first end, a straight line parallel to
+  the chord, and a matching arc tangent to the orbit at the second end, so the
+  path is tangent throughout and the machine need not stop at either end. All
+  three lie between the chord and the arc they replace, inside the disk of
+  allowed centres, so the return cuts nothing. A back arc too short for the
+  fillets (under 64 guards long) stays an arc. The orbit's cut front, its engagement bound and the swept width
+  are those of the full circle. No return follows a seed orbit or a
+  stock-clear advance (no adjacent previous orbit). The report counts the
+  returns and the path they saved against the arc (`return_chords`,
+  `return_chord_saved_mm`).
+- `air_feed_mm_min` feeds the returns. It must be finite and at least
+  `feed_mm_min`. These moves retain `air` intent through
   posting and independent decoding. Both native and posted stock replay must
   prove their whole cutter sweep inside committed clearance; unresolved
   clearance or rounding into fresh stock refuses the run. Increase output
   precision or disable the optional air feed to resolve a posting refusal.
-  The report counts the arcs and their length (`air_fed_arcs`,
-  `air_fed_mm`). Without it, every orbit stays one full circle at
+  The report counts air-fed arcs in `air_fed_arcs`. The total air-fed
+  distance in `air_fed_mm` includes both arcs and straight returns. Without it, the returns are cut moves at
   `feed_mm_min`.
 
 ## V-carve: `VCarve`
@@ -1581,7 +1630,9 @@ continuous clearance), along other XY patterns:
 - `Spiral(..., stepover_mm, clearance_z_mm, center_mm)`: one Archimedean
   spiral, ring pitch `stepover_mm`, inward by default (`outward=True`,
   `clockwise=True` to change). `inner_radius_mm` (0) and `outer_radius_mm`
-  (default: reach the whole stock) bound it. Suits round, domed areas.
+  (default: reach the whole stock) bound it. The planner uses portable math
+  for the radius, angle increments and XY vertices before clipping the spiral
+  to the stock. Suits round, domed areas.
 - `Radial(..., clearance_z_mm, center_mm, angular_step_deg)`: straight spokes
   from the center; the step is rounded down so spokes divide 360 evenly,
   starting at `start_angle_deg` (0).

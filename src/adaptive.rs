@@ -31,6 +31,9 @@ pub struct AdaptivePocketOperation {
     /// An upper limit on the contact angle: below the stepover's own angle,
     /// acos(1 - stepover / r), it narrows the radial width.
     pub max_engagement_deg: f64,
+    /// Hard upper bound on horizontal clearing and links, including confined
+    /// retries at entry feed. Explicit helix and ramp entries are separate.
+    pub max_corner_engagement_deg: Option<f64>,
     /// See `RoughingOperation::rapid_descent_clearance_mm`.
     /// The proof is per depth level: a descent into a level below one
     /// already cut is rapid down to this far above what the committed sweeps
@@ -144,6 +147,7 @@ impl TryFrom<serde_json::Value> for AdaptivePocketOperation {
         };
         let rapid_descent_clearance_mm = optional("rapid_descent_clearance_mm")?;
         let ramp_clearance_mm = optional("ramp_clearance_mm")?;
+        let max_corner_engagement_deg = optional("max_corner_engagement_deg")?;
         let link_feed_mm_min = optional("link_feed_mm_min")?;
         let link_chip_thinning = serde_json::from_value(
             fields
@@ -158,6 +162,7 @@ impl TryFrom<serde_json::Value> for AdaptivePocketOperation {
             path_strategy,
             cutting_sense,
             max_engagement_deg,
+            max_corner_engagement_deg,
             rapid_descent_clearance_mm,
             ramp_clearance_mm,
             link_feed_mm_min,
@@ -183,6 +188,7 @@ impl From<AdaptivePocketOperation> for serde_json::Value {
             ("rapid_descent_clearance_mm", op.rapid_descent_clearance_mm),
             ("ramp_clearance_mm", op.ramp_clearance_mm),
             ("link_feed_mm_min", op.link_feed_mm_min),
+            ("max_corner_engagement_deg", op.max_corner_engagement_deg),
         ] {
             if let Some(v) = value {
                 fields.insert(name.into(), v.into());

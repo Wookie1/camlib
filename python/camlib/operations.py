@@ -1376,7 +1376,7 @@ class Contour:
 class Facing:
     """Level the whole stock rectangle; enter outside its cutting-axis edges.
 
-    axis is x/y, mode is zigzag/one_way. None edge overlap uses 10% of diameter.
+    axis is x/y or auto (requires auto_rapid_mm_min), mode is zigzag/one_way. None edge overlap uses 10% of diameter.
     The initial stock top is the depth reference. Cutter overtravel is intentional.
     """
 
@@ -1406,10 +1406,12 @@ class Facing:
     retract_z_mm: float | None = None
     feed_z_mm: float | None = None
 
+    auto_rapid_mm_min: float | None = field(default=None, kw_only=True)
+
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
         result.update(kind="facing", tool=getattr(self.tool, "id", self.tool))
-        for key in ('retract_z_mm', 'feed_z_mm'):
+        for key in ('retract_z_mm', 'feed_z_mm', 'auto_rapid_mm_min'):
             if result[key] is None:
                 result.pop(key)
         return result
@@ -1772,6 +1774,12 @@ class AdaptivePocket(Pocket):
     (about 0.19 mm a side with a 4 mm cutter; use a Pocket there), and a
     region the cutter fits nowhere in. Each level's report counts all the
     stock left in the region as its residual area.
+    Set max_corner_engagement_deg (1–170) to bound horizontal clearing and
+    links even in a confined corner where the planner would otherwise retry
+    at entry feed. The cap may also narrow the stepover. A stroke that cannot
+    be proven within it refuses the operation. Helical and ramp entries still
+    use their own entry rules.
+
     max_stay_down_mm and rest_tolerance_mm do not apply; the
     direction is cutting_sense ('climb' by default, or 'conventional').
 
@@ -1805,6 +1813,7 @@ class AdaptivePocket(Pocket):
     ramp_clearance_mm: float | None = None
     link_feed_mm_min: float | None = None
     link_chip_thinning: bool = False
+    max_corner_engagement_deg: float | None = field(default=None, kw_only=True)
 
     def to_dict(self):
         pocket = {field: getattr(self, field) for field in Pocket.__dataclass_fields__}
@@ -1830,7 +1839,7 @@ class AdaptivePocket(Pocket):
         if self.cutting_sense is not None:
             result["cutting_sense"] = self.cutting_sense
         # Written only when set: a job without them is the job it was.
-        for key in ("rapid_descent_clearance_mm", "ramp_clearance_mm", "link_feed_mm_min"):
+        for key in ("rapid_descent_clearance_mm", "ramp_clearance_mm", "link_feed_mm_min", "max_corner_engagement_deg"):
             if getattr(self, key) is not None:
                 result[key] = getattr(self, key)
         if type(self.link_chip_thinning) is not bool:
