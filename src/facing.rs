@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub enum TraverseAxis {
     X,
     Y,
+    Auto,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +35,9 @@ pub struct FacingOperation {
     pub feed_mm_min: f64,
     pub plunge_mm_min: f64,
     pub axis: TraverseAxis,
+    /// Nominal rapid rate for comparing complete X and Y routes in `Auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_rapid_mm_min: Option<f64>,
     pub mode: FacingMode,
     pub reverse: bool,
     pub entry_air_gap_mm: f64,
@@ -55,7 +59,7 @@ pub struct FacingOperation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<crate::limits::Limits>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FacingReport {
     pub strategy: &'static str,
     pub geometric_residual_status: ResidualStatus,
@@ -70,6 +74,12 @@ pub struct FacingReport {
     pub edge_overlap_mm: f64,
     pub entry_air_gap_mm: f64,
     pub axis: TraverseAxis,
+    /// Estimated seconds for X and Y, respectively, in opt-in mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_axis_seconds: Option<[Option<f64>; 2]>,
+    /// Refusal reason for each unavailable axis, in X, Y order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_axis_refusals: Option<[Option<String>; 2]>,
     pub mode: FacingMode,
     pub cut_rows_emitted: usize,
     pub side_links_emitted: usize,
@@ -91,6 +101,7 @@ enum Phase {
     Descend,
     Done,
 }
+#[derive(Clone)]
 pub struct FacingPlan {
     op: FacingOperation,
     heights: crate::heights::Heights,
@@ -110,6 +121,8 @@ pub struct FacingPlan {
     expected_generation: Option<u64>,
     report: FacingReport,
 }
+const PLANNING_CANCELLED: &str = "facing planning cancelled";
+
 impl FacingPlan {
     pub fn prepare(
         op: FacingOperation,
@@ -120,7 +133,51 @@ impl FacingPlan {
         cancel: &impl CancelSignal,
     ) -> Result<Self, String> {
         if cancel.is_cancelled() {
-            return Err("facing planning cancelled".into());
+            return Err(PLANNING_CANCELLED.into());
+        }
+        if op.axis == TraverseAxis::Auto {
+            if op.limits.as_ref().is_some_and(|limits| !limits.is_empty()) {
+                return Err("automatic facing axis requires whole rectangular stock without in-plane limits; choose an explicit axis".into());
+            }
+            let rapid = op
+                .auto_rapid_mm_min
+                .filter(|v| v.is_finite() && *v > 0.)
+                .ok_or("automatic facing axis requires a positive finite auto_rapid_mm_min")?;
+            let candidate = |axis| {
+                let mut concrete = op.clone();
+                concrete.axis = axis;
+                concrete.auto_rapid_mm_min = None;
+                let plan = Self::prepare(concrete, assembly, spec, initial, first_id, cancel)?;
+                let seconds = plan.clone().route_seconds(rapid, cancel)?;
+                Ok::<_, String>((plan, seconds))
+            };
+            let x = candidate(TraverseAxis::X);
+            if cancel.is_cancelled() || matches!(&x, Err(reason) if reason == PLANNING_CANCELLED) {
+                return Err(PLANNING_CANCELLED.into());
+            }
+            let y = candidate(TraverseAxis::Y);
+            if cancel.is_cancelled() || matches!(&y, Err(reason) if reason == PLANNING_CANCELLED) {
+                return Err(PLANNING_CANCELLED.into());
+            }
+            let (mut selected, seconds, refusals) = match (x, y) {
+                (Ok((x, tx)), Ok((y, ty))) => (
+                    if ty + 1e-9 < tx { y } else { x },
+                    [Some(tx), Some(ty)],
+                    None,
+                ),
+                (Ok((x, tx)), Err(reason)) => (x, [Some(tx), None], Some([None, Some(reason)])),
+                (Err(reason), Ok((y, ty))) => (y, [None, Some(ty)], Some([Some(reason), None])),
+                (Err(x), Err(y)) if x == y => return Err(x),
+                (Err(x), Err(y)) => {
+                    return Err(format!("automatic facing axis refused: X: {x}; Y: {y}"));
+                }
+            };
+            selected.report.auto_axis_seconds = Some(seconds);
+            selected.report.auto_axis_refusals = refusals;
+            return Ok(selected);
+        }
+        if op.auto_rapid_mm_min.is_some() {
+            return Err("auto_rapid_mm_min requires axis = auto".into());
         }
         spec.grid()?;
         let prepared = assembly.prepare()?;
@@ -316,6 +373,8 @@ impl FacingPlan {
             edge_overlap_mm: overlap,
             entry_air_gap_mm: op.entry_air_gap_mm,
             axis: op.axis,
+            auto_axis_seconds: None,
+            auto_axis_refusals: None,
             mode: op.mode,
             cut_rows_emitted: 0,
             side_links_emitted: 0,
@@ -449,9 +508,31 @@ impl FacingPlan {
         {
             return Err("commit preceding facing motion to matching stock before planning".into());
         }
+        let motion = self.next_motion(cancel)?;
+        if motion.is_some() {
+            self.expected_generation = Some(stock.generation() + 1);
+        }
+        Ok(motion)
+    }
+
+    fn route_seconds(mut self, rapid: f64, cancel: &impl CancelSignal) -> Result<f64, String> {
+        let mut seconds = 0_f64;
+        while let Some(motion) = self.next_motion(cancel)? {
+            let (a, b) = (motion.curve.start(), motion.curve.end());
+            let length = metallic::hypot(metallic::hypot(b[0] - a[0], b[1] - a[1]), b[2] - a[2]);
+            seconds += 60. * length / motion.feed_mm_min.unwrap_or(rapid);
+        }
+        if seconds.is_finite() {
+            Ok(seconds)
+        } else {
+            Err("automatic facing axis timing is not finite; check the rates".into())
+        }
+    }
+
+    fn next_motion(&mut self, cancel: &impl CancelSignal) -> Result<Option<Motion>, String> {
         loop {
             if cancel.is_cancelled() {
-                return Err("facing planning cancelled".into());
+                return Err(PLANNING_CANCELLED.into());
             }
             let z = (self.spec.max_mm[2] - (self.pass + 1) as f64 * self.op.stepdown_mm)
                 .max(self.op.floor_z_mm);
@@ -537,7 +618,6 @@ impl FacingPlan {
                 }
             };
             if result.is_some() {
-                self.expected_generation = Some(stock.generation() + 1);
                 return Ok(result);
             }
         }
@@ -547,6 +627,129 @@ impl FacingPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_axis_requires_rapid_rate_and_breaks_symmetric_ties_to_x() {
+        let mut manifest: crate::stream::StreamManifest =
+            serde_json::from_str(include_str!("../fixtures/operations/facing.json")).unwrap();
+        let crate::pocket::Operation::Facing(mut op) = manifest.operations.remove(0) else {
+            panic!("facing fixture")
+        };
+        let tool = &manifest.tools[0];
+        let mut spec = manifest.stock.height().unwrap().clone();
+        spec.max_mm[1] = spec.max_mm[0];
+        op.axis = TraverseAxis::Auto;
+        let prepare = |op| FacingPlan::prepare(op, tool, &spec, [0., 0., 12.], 1, &|| false);
+        assert!(
+            prepare(op.clone())
+                .err()
+                .unwrap()
+                .contains("auto_rapid_mm_min")
+        );
+        op.auto_rapid_mm_min = Some(f64::NAN);
+        assert!(prepare(op.clone()).is_err());
+        op.auto_rapid_mm_min = Some(6000.);
+        let plan = prepare(op).unwrap();
+        assert_eq!(plan.report().axis, TraverseAxis::X);
+        let [Some(x), Some(y)] = plan.report().auto_axis_seconds.unwrap() else {
+            panic!("two available axes")
+        };
+        assert!((x - y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn auto_axis_selects_x_at_the_one_nanosecond_boundary() {
+        let mut manifest: crate::stream::StreamManifest =
+            serde_json::from_str(include_str!("../fixtures/operations/facing.json")).unwrap();
+        let crate::pocket::Operation::Facing(mut op) = manifest.operations.remove(0) else {
+            panic!("facing fixture")
+        };
+        let mut spec = manifest.stock.height().unwrap().clone();
+        spec.max_mm[0] = 24.;
+        op.axis = TraverseAxis::Auto;
+        op.auto_rapid_mm_min = Some(6000.);
+        op.floor_z_mm = 9.;
+        // On this square the initial diagonal rapid decides the near tie.
+        let initial = [0.058823529411764705, 0.05882345679234425, 12.];
+        let plan =
+            FacingPlan::prepare(op, &manifest.tools[0], &spec, initial, 1, &|| false).unwrap();
+        assert_eq!(plan.report().axis, TraverseAxis::X);
+    }
+
+    #[test]
+    fn auto_facing_streams_the_explicit_route_when_an_axis_is_dense_or_out_of_range() {
+        let m: crate::stream::StreamManifest =
+            serde_json::from_str(include_str!("../fixtures/operations/facing.json")).unwrap();
+        let crate::pocket::Operation::Facing(base) = &m.operations[0] else {
+            panic!("facing fixture")
+        };
+        let tool = &m.tools[0];
+        for (min, max, pitch, preferred) in [
+            ([0., 0.], [1000., 10.], 0.01, TraverseAxis::X),
+            (
+                [999960., 0.],
+                [999999., 24.],
+                base.stepover_mm,
+                TraverseAxis::Y,
+            ),
+        ] {
+            let mut spec = m.stock.height().unwrap().clone();
+            spec.min_mm[..2].copy_from_slice(&min);
+            spec.max_mm[..2].copy_from_slice(&max);
+            let prepare =
+                |op| FacingPlan::prepare(op, tool, &spec, m.initial_position_mm, 1, &|| false);
+            let mut op = base.clone();
+            op.stepover_mm = pitch;
+            op.axis = TraverseAxis::Auto;
+            op.auto_rapid_mm_min = Some(6000.);
+            let mut auto = prepare(op.clone()).unwrap();
+            assert_eq!(auto.report().axis, preferred);
+            let scores = auto.report().auto_axis_seconds.unwrap();
+            if preferred == TraverseAxis::X {
+                assert_eq!(auto.report().rows_per_pass, 362);
+                assert!(scores[0].unwrap() < scores[1].unwrap());
+                assert!(auto.report().auto_axis_refusals.is_none());
+            } else {
+                assert_eq!(auto.report().rows_per_pass, 7);
+                assert!(scores[0].is_none());
+                let [Some(x), None] = auto.report().auto_axis_refusals.as_ref().unwrap() else {
+                    panic!("only X should be refused");
+                };
+                assert!(x.contains("coordinate overtravel"), "{x}");
+            }
+            op.axis = preferred;
+            op.auto_rapid_mm_min = None;
+            let mut explicit = prepare(op).unwrap();
+            loop {
+                let a = auto.next_motion(&|| false).unwrap();
+                let b = explicit.next_motion(&|| false).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&a).unwrap(),
+                    serde_json::to_value(b).unwrap()
+                );
+                if a.is_none() {
+                    break;
+                }
+            }
+        }
+
+        // Cancellation during the longer candidate is propagated even though X qualified.
+        let mut spec = m.stock.height().unwrap().clone();
+        spec.max_mm[..2].copy_from_slice(&[1000., 10.]);
+        let mut op = base.clone();
+        op.stepover_mm = 0.01;
+        op.axis = TraverseAxis::Auto;
+        op.auto_rapid_mm_min = Some(6000.);
+        let polls = std::cell::Cell::new(0);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 10_000
+        };
+        let error = FacingPlan::prepare(op, tool, &spec, m.initial_position_mm, 1, &cancel)
+            .err()
+            .unwrap();
+        assert_eq!(error, PLANNING_CANCELLED);
+    }
 
     #[test]
     fn exhausted_motion_ids_refuse_without_advancing_position() {
