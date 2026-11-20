@@ -511,7 +511,11 @@ fn slot_passes_link_at_retract_height_and_end_at_clearance() {
                 at_retract += usize::from(a[2] == retract && b[2] == retract);
             }
             MoveKind::Retract => assert_eq!(b[2], feed),
-            MoveKind::Plunge => assert_eq!(a[2], feed),
+            // Straight plunges start at the feed height; the helix turns
+            // below them continue from where the plunge ended.
+            MoveKind::Plunge if matches!(motion.curve, Curve::Line { .. }) => {
+                assert_eq!(a[2], feed)
+            }
             _ => {}
         }
     }
@@ -1659,4 +1663,177 @@ fn d_loop_returns_are_tangent_throughout() {
             assert!(walk.returns > 0, "{name}");
         }
     }
+}
+fn helix_entry(angle_deg: f64) -> camlib::pocket::PocketEntry {
+    serde_json::from_value(serde_json::json!({
+        "kind": "helix",
+        "angle_rad": angle_deg.to_radians(),
+    }))
+    .unwrap()
+}
+
+/// Every straight plunge removes no stock (it runs through air), and each
+/// depth pass below the stock then descends on whole-turn helices around
+/// the first orbit's centre, no steeper than the declared angle, ending at
+/// the orbit start at the pass depth.
+#[test]
+fn slot_plunges_only_through_air_and_helixes_down_at_the_declared_angle() {
+    for (name, mut op) in air_feed_cases() {
+        let angle = 2.5f64;
+        op.entry = Some(helix_entry(angle));
+        let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let (motions, removed, p, _) = drive(&op, &mut stock);
+        let rho = p.report().orbit_radius_mm;
+        let advance = TAU * rho * angle.to_radians().tan();
+        let mut helices = 0;
+        let mut plunge_ends = Vec::new();
+        for (m, &volume) in motions.iter().zip(&removed) {
+            match m.curve {
+                Curve::Line { start, end } if m.kind == MoveKind::Plunge => {
+                    assert!(volume <= 1e-9, "{name}: plunge to Z{} removed {volume}", end[2]);
+                    assert_eq!(m.feed_mm_min, Some(op.entry_feed_mm_min));
+                    assert_eq!((start[0], start[1]), (end[0], end[1]));
+                    plunge_ends.push(end[2]);
+                }
+                Curve::Helix {
+                    start,
+                    end,
+                    center,
+                    sweep_rad,
+                    ..
+                } => {
+                    assert_eq!(m.kind, MoveKind::Plunge, "{name}");
+                    assert_eq!(m.feed_mm_min, Some(op.entry_feed_mm_min));
+                    assert_eq!(sweep_rad, if op.clockwise { -TAU } else { TAU });
+                    assert!((distance(start, center) - rho).abs() < 1e-9, "{name}");
+                    assert_eq!((start[0], start[1]), (end[0], end[1]));
+                    let drop = start[2] - end[2];
+                    assert!(drop > 0. && drop <= advance + 1e-12, "{name}: {drop} > {advance}");
+                    helices += 1;
+                }
+                _ => assert_ne!(m.kind, MoveKind::Plunge, "{name}"),
+            }
+        }
+        let passes = p.report().depth_passes;
+        assert_eq!(p.report().helical_entries, passes, "{name}");
+        assert_eq!(p.report().helix_turns, helices, "{name}");
+        // The first pass plunges to the stock top; each later one to the
+        // depth the previous pass cut at this centre.
+        for (k, z) in plunge_ends.iter().enumerate() {
+            let expected = op.top_z_mm - k as f64 * op.stepdown_mm;
+            assert!((z - expected).abs() < 1e-9, "{name}: pass {k} plunged to {z}");
+        }
+        assert_eq!(plunge_ends.len(), passes, "{name}");
+        // Each helix chain ends where the seed orbit starts, at depth.
+        for w in motions.windows(2) {
+            if matches!(w[0].curve, Curve::Helix { .. })
+                && !matches!(w[1].curve, Curve::Helix { .. })
+            {
+                let Curve::Arc { sweep_rad, .. } = w[1].curve else {
+                    panic!("{name}: a helix is followed by the seed orbit");
+                };
+                assert_eq!(sweep_rad.abs(), TAU);
+            }
+        }
+        assert!(p.report().seed_entry_policy.contains("helix"));
+    }
+}
+
+/// No entry declared: the first pass below the stock top is refused
+/// before any motion cuts, naming the pass and the remedy.
+#[test]
+fn slot_without_an_entry_refuses_to_plunge_into_stock() {
+    let mut op = operation();
+    op.entry = None;
+    let mut p = plan(op);
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let error = loop {
+        match p.next_motion_with_stock(&stock, &AtomicBool::new(false)) {
+            Ok(Some(m)) => {
+                assert_ne!(m.kind, MoveKind::Plunge);
+                commit(&mut stock, &m);
+            }
+            Ok(None) => panic!("a plunge into stock was planned"),
+            Err(e) => break e,
+        }
+    };
+    assert!(error.contains("depth pass 1 would plunge"), "{error}");
+    assert!(error.contains("HelicalEntry"), "{error}");
+}
+
+/// Over stock a previous cut already cleared (here a wider slot on the
+/// same centreline, so the narrower one's disk stays clear of the grid's
+/// rim cells), no entry is needed: every pass plunges straight, through
+/// air.
+#[test]
+fn slot_over_cleared_stock_plunges_without_an_entry() {
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let mut wide = operation();
+    wide.width_mm = 7.9;
+    drive(&wide, &mut stock);
+    let mut op = operation();
+    op.entry = None;
+    let (motions, removed, p, _) = drive(&op, &mut stock);
+    assert_eq!(p.report().helical_entries, 0);
+    assert!(!motions.iter().any(|m| matches!(m.curve, Curve::Helix { .. })));
+    for (m, v) in motions.iter().zip(&removed) {
+        if m.kind == MoveKind::Plunge {
+            assert!(*v <= 1e-9);
+        }
+    }
+    assert!(p.report().seed_entry_policy.contains("else_refused"));
+}
+
+#[test]
+fn slot_entry_must_be_a_helix_on_the_orbit_circle_in_the_slot_sense() {
+    let m = fixture();
+    let refuse = |entry: serde_json::Value, needle: &str| {
+        let mut op = operation();
+        op.entry = Some(serde_json::from_value(entry).unwrap());
+        let error = SlotPlan::prepare(
+            op,
+            &m.tools[0],
+            m.stock.height().unwrap(),
+            m.initial_position_mm,
+            1,
+            &AtomicBool::new(false),
+        )
+        .err()
+        .expect("refused");
+        assert!(error.contains(needle), "{error}");
+    };
+    refuse(
+        serde_json::json!({"kind": "ramp", "angle_rad": 0.05}),
+        "HelicalEntry only",
+    );
+    refuse(
+        serde_json::json!({"kind": "stock_edge_or_helix"}),
+        "HelicalEntry only",
+    );
+    refuse(
+        serde_json::json!({"kind": "helix", "radius_mm": 0.5}),
+        "no radius_mm",
+    );
+    refuse(
+        serde_json::json!({"kind": "helix", "clockwise": false}),
+        "no clockwise other",
+    );
+    refuse(
+        serde_json::json!({"kind": "helix", "angle_rad": 0.0}),
+        "valid angle",
+    );
+    // The slot's own sense is accepted, and the helix's own feed is used.
+    let mut op = operation();
+    op.entry = Some(
+        serde_json::from_value(
+            serde_json::json!({"kind": "helix", "clockwise": true, "feed_mm_min": 90.0}),
+        )
+        .unwrap(),
+    );
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let (motions, ..) = drive(&op, &mut stock);
+    assert!(motions
+        .iter()
+        .filter(|m| matches!(m.curve, Curve::Helix { .. }))
+        .all(|m| m.feed_mm_min == Some(90.)));
 }

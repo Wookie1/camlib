@@ -2595,8 +2595,13 @@ class TrochoidalSlot:
     an arc bending toward the orbit side needs a radius above the orbit radius
     (width/2 - tool radius), otherwise the slot is refused.
 
-    The plunge and first orbit at each depth use entry_feed_mm_min and are
-    explicitly outside the engagement limit. Width must be in (D, 2D].
+    Each depth pass plunges at entry_feed_mm_min only through air, down to the
+    highest stock the first orbit's disk can touch, then descends the rest on
+    ``entry=HelicalEntry(angle_deg)`` around the orbit circle (no radius_mm;
+    feed_mm_min defaults to entry_feed_mm_min). With no entry declared, a
+    plunge into stock is refused, naming the pass. The entry and the first
+    orbit at each depth are explicitly outside the engagement limit. Width
+    must be in (D, 2D].
     boundary_tolerance_mm bounds side underclearance, not stock-grid resolution.
     """
 
@@ -2631,6 +2636,7 @@ class TrochoidalSlot:
     # the disk the previous orbit cleared at the same depth. None: whole
     # orbits at feed_mm_min (today's output, unchanged).
     air_feed_mm_min: float | None = field(default=None, kw_only=True)
+    entry: object | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.path_mm is not None:
@@ -2647,9 +2653,12 @@ class TrochoidalSlot:
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
         result.update(kind="trochoidal_slot", tool=getattr(self.tool, "id", self.tool))
-        for key in ('retract_z_mm', 'feed_z_mm', 'start_mm', 'end_mm', 'path_mm', 'air_feed_mm_min'):
+        for key in ('retract_z_mm', 'feed_z_mm', 'start_mm', 'end_mm', 'path_mm', 'air_feed_mm_min', 'entry'):
             if result[key] is None:
                 result.pop(key)
+        if "entry" in result:
+            entry = result["entry"]
+            result["entry"] = entry.to_dict() if hasattr(entry, "to_dict") else dict(entry)
         if "path_mm" in result:
             result["path_mm"] = [list(vertex) for vertex in result["path_mm"]]
         return result

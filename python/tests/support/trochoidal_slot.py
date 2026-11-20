@@ -1,6 +1,6 @@
 """Synthetic CAM regression input."""
 
-from camlib.operations import TrochoidalSlot
+from camlib.operations import HelicalEntry, TrochoidalSlot
 from camlib.simulation import StockSpec
 from camlib.tools import EndMill, HolderSection, ToolAssembly
 
@@ -27,6 +27,7 @@ def slot_job():
         tool_number=1,
         length_register=1,
         coolant="flood",
+        entry=HelicalEntry(3),
     )
     return dict(
         stock=StockSpec((0, 0, 0), (40, 24, 10), 0.25),

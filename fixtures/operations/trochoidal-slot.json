@@ -92,6 +92,10 @@
       "tool_number": 1,
       "length_register": 1,
       "coolant": "flood",
+      "entry": {
+        "kind": "helix",
+        "angle_rad": 0.05235987755982988
+      },
       "kind": "trochoidal_slot"
     }
   ]

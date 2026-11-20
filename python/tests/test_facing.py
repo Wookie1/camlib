@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 from camlib import Engine
-from camlib.operations import TrochoidalSlot
+from camlib.operations import HelicalEntry, TrochoidalSlot
 from camlib.playback import Cursor, Player, RecordedRun
 from camlib.simulation import OperationUpdate, Simulation, SimulationError
 from test_simulation import tool
@@ -164,6 +164,7 @@ class FacingTest(unittest.TestCase):
             entry_feed_mm_min=150,
             spindle_rpm=12000,
             coolant="flood",
+            entry=HelicalEntry(3),
         )
         config.update(tools=(*config["tools"], tool()), operations=(face, slot), revision="face-then-slot")
         controls = []
