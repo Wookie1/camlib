@@ -805,14 +805,95 @@ fn exact_height_for(c: &Curve, p: [f64; 2], cutter_radius: f64, top: f64) -> f64
 /// lies in the stock footprint and no earlier centre (of an earlier move, or
 /// earlier on this one) is within the cutter radius. Sampling can only miss
 /// thin slivers, so it is a refutation check with a stated slack, not a proof.
-/// A sampled cutter centre and the distance its disc is taken to clear.
-type Disc = ([f64; 2], f64);
+/// A piece of a cutter-centre path the oracle has swept: a straight segment,
+/// or an arc about `centre` from angle `from` through `sweep` radians. The
+/// cutter cleared exactly the points within its radius of it.
+#[derive(Clone, Copy)]
+enum Swept {
+    Line([f64; 2], [f64; 2]),
+    Arc {
+        centre: [f64; 2],
+        radius: f64,
+        from: f64,
+        sweep: f64,
+    },
+}
+impl Swept {
+    /// A point every point of the piece is within `bound` of.
+    fn centre_bound(&self) -> ([f64; 2], f64) {
+        match *self {
+            Swept::Line(a, b) => (
+                [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.],
+                (a[0] - b[0]).hypot(a[1] - b[1]) / 2.,
+            ),
+            Swept::Arc {
+                centre,
+                radius,
+                from,
+                sweep,
+            } => {
+                let mid = from + sweep / 2.;
+                (
+                    [
+                        centre[0] + radius * mid.cos(),
+                        centre[1] + radius * mid.sin(),
+                    ],
+                    radius * sweep.abs() / 2.,
+                )
+            }
+        }
+    }
+    fn distance(&self, q: [f64; 2]) -> f64 {
+        let d = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        match *self {
+            Swept::Line(a, b) => {
+                let v = [b[0] - a[0], b[1] - a[1]];
+                let l = v[0] * v[0] + v[1] * v[1];
+                let t = if l > 0. {
+                    (((q[0] - a[0]) * v[0] + (q[1] - a[1]) * v[1]) / l).clamp(0., 1.)
+                } else {
+                    0.
+                };
+                d([a[0] + t * v[0], a[1] + t * v[1]], q)
+            }
+            Swept::Arc {
+                centre,
+                radius,
+                from,
+                sweep,
+            } => {
+                let at = |angle: f64| {
+                    [
+                        centre[0] + radius * angle.cos(),
+                        centre[1] + radius * angle.sin(),
+                    ]
+                };
+                // Within the arc's angular span the nearest point is radial;
+                // outside it, one of the ends.
+                let angle = (q[1] - centre[1]).atan2(q[0] - centre[0]);
+                let along = if sweep >= 0. {
+                    (angle - from).rem_euclid(std::f64::consts::TAU)
+                } else {
+                    (from - angle).rem_euclid(std::f64::consts::TAU)
+                };
+                if along <= sweep.abs() {
+                    (d(centre, q) - radius).abs()
+                } else {
+                    d(at(from), q).min(d(at(from + sweep), q))
+                }
+            }
+        }
+    }
+}
 pub(crate) struct LeadingOracle {
     r: f64,
     step: f64,
     footprint: [[f64; 2]; 2],
-    /// Sampled centres, each with the distance its disc is taken to clear.
-    cells: std::collections::HashMap<(i32, i32), Vec<Disc>>,
+    /// The swept path pieces, listed under every grid cell their samples
+    /// pass through.
+    /// Each piece, with a centre and radius that bound it (a cheap reject).
+    swept: Vec<(Swept, [f64; 2], f64)>,
+    cells: std::collections::HashMap<(i32, i32), Vec<usize>>,
     pub(crate) worst_deg: f64,
 }
 impl LeadingOracle {
@@ -820,36 +901,44 @@ impl LeadingOracle {
         Self {
             r,
             step: r / 20.,
+            cell: r * 1.05,
             footprint,
+            swept: vec![],
             cells: Default::default(),
             worst_deg: 0.,
         }
     }
     fn key(&self, p: [f64; 2]) -> (i32, i32) {
         (
-            (p[0] / self.r).floor() as i32,
-            (p[1] / self.r).floor() as i32,
+            (p[0] / self.cell).floor() as i32,
+            (p[1] / self.cell).floor() as i32,
         )
     }
+    /// Within the cutter radius of a swept path: exact distance to the path,
+    /// so the result does not depend on how the path was split into moves or
+    /// sampled.
     pub(crate) fn cleared(&self, p: [f64; 2]) -> bool {
         let k = self.key(p);
         (k.0 - 1..=k.0 + 1).any(|x| {
             (k.1 - 1..=k.1 + 1).any(|y| {
                 self.cells.get(&(x, y)).is_some_and(|v| {
-                    v.iter()
-                        .any(|(q, reach)| (q[0] - p[0]).hypot(q[1] - p[1]) <= *reach)
+                    v.iter().any(|&i| {
+                        let (piece, c, bound) = &self.swept[i];
+                        (c[0] - p[0]).hypot(c[1] - p[1]) <= self.r + bound + 1e-9
+                            && piece.distance(p) <= self.r + 1e-9
+                    })
                 })
             })
         })
     }
-    /// Poses at most `step` apart along the move, and their actual spacing.
-    fn poses(&self, c: &Curve) -> (Vec<([f64; 2], f64)>, f64) {
+    /// Poses at most `step` apart along the move, at parameters `t`.
+    fn poses(&self, c: &Curve) -> Vec<([f64; 2], f64, f64)> {
         let len = match circle(c) {
             Some((o, s)) => (c.start()[0] - o[0]).hypot(c.start()[1] - o[1]) * s.abs(),
             None => (c.end()[0] - c.start()[0]).hypot(c.end()[1] - c.start()[1]),
         };
         let n = (len / self.step).ceil().max(1.) as usize;
-        let poses = (0..=n)
+        (0..=n)
             .map(|i| {
                 let t = i as f64 / n as f64;
                 let p = position(c, t);
@@ -857,22 +946,50 @@ impl LeadingOracle {
                     Some((o, s)) => (p[1] - o[1]).atan2(p[0] - o[0]) + s.signum() * PI / 2.,
                     None => (c.end()[1] - c.start()[1]).atan2(c.end()[0] - c.start()[0]),
                 };
-                ([p[0], p[1]], heading)
+                ([p[0], p[1]], heading, t)
             })
-            .collect();
-        (poses, len / n as f64)
+            .collect()
+    }
+    /// The piece of `c` between parameters `t0` and `t1`.
+    fn piece(c: &Curve, t0: f64, t1: f64) -> Swept {
+        let a = position(c, t0);
+        let b = position(c, t1);
+        match circle(c) {
+            Some((o, s)) => {
+                let start = c.start();
+                Swept::Arc {
+                    centre: [o[0], o[1]],
+                    radius: (start[0] - o[0]).hypot(start[1] - o[1]),
+                    from: (start[1] - o[1]).atan2(start[0] - o[0]) + s * t0,
+                    sweep: s * (t1 - t0),
+                }
+            }
+            None => Swept::Line([a[0], a[1]], [b[0], b[1]]),
+        }
+    }
+    fn add(&mut self, piece: Swept, at: &[[f64; 2]]) {
+        let i = self.swept.len();
+        let (c, bound) = piece.centre_bound();
+        self.swept.push((piece, c, bound));
+        let mut keys: Vec<_> = at.iter().map(|p| self.key(*p)).collect();
+        keys.dedup();
+        for k in keys {
+            let v = self.cells.entry(k).or_default();
+            if v.last() != Some(&i) {
+                v.push(i);
+            }
+        }
     }
     /// A flat feed move the cutter makes: clears its sweep; with `check`,
-    /// its leading contact is measured first, pose by pose.
+    /// its leading contact is measured first, pose by pose, against what
+    /// was swept before that pose.
     pub(crate) fn feed(&mut self, c: &Curve, check: bool) {
-        let (poses, spacing) = self.poses(c);
-        // Discs at samples `spacing` apart cover the swept strip but for
-        // slivers spacing^2 / (8 r) deep. The allowance follows the actual
-        // spacing, not the largest one: a fixed `step` allowance would let a
-        // move shorter than it clear its own leading edge from its start.
-        let reach = self.r + spacing * spacing / (8. * self.r) + 1e-9;
-        for (i, (p, heading)) in poses.into_iter().enumerate() {
-            if check && i > 0 {
+        let poses = self.poses(c);
+        let start = poses[0].0;
+        self.add(Swept::Line(start, start), &[start]);
+        for i in 1..poses.len() {
+            let (p, heading, t) = poses[i];
+            if check {
                 let mut hit = 0;
                 for d in -89..=89 {
                     let a = heading + (d as f64).to_radians();
@@ -885,8 +1002,8 @@ impl LeadingOracle {
                 }
                 self.worst_deg = self.worst_deg.max(hit as f64);
             }
-            let k = self.key(p);
-            self.cells.entry(k).or_default().push((p, reach));
+            let (previous, _, t0) = poses[i - 1];
+            self.add(Self::piece(c, t0, t), &[previous, p]);
         }
     }
 }
