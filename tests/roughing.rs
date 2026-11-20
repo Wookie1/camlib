@@ -888,10 +888,12 @@ impl Swept {
 pub(crate) struct LeadingOracle {
     r: f64,
     step: f64,
+    /// Grid cell width: a point within r of a piece is within r + step / 2
+    /// of one of its samples, so the 3 x 3 cells around it suffice.
+    cell: f64,
     footprint: [[f64; 2]; 2],
-    /// The swept path pieces, listed under every grid cell their samples
-    /// pass through.
-    /// Each piece, with a centre and radius that bound it (a cheap reject).
+    /// The swept path pieces, each with a centre and radius that bound it (a
+    /// cheap reject), listed under every grid cell their samples pass through.
     swept: Vec<(Swept, [f64; 2], f64)>,
     cells: std::collections::HashMap<(i32, i32), Vec<usize>>,
     pub(crate) worst_deg: f64,
