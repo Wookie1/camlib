@@ -390,3 +390,80 @@ fn a_floor_above_the_authored_top_is_refused_on_stock_in_the_band() {
         );
     }
 }
+
+#[test]
+fn lower_top_requires_the_planned_sweep_before_advancing_to_the_next_layer() {
+    let m = fixture();
+    for adaptive in [false, true] {
+        let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let blank = stock.snapshot();
+        let mut plan = OperationPlan::prepare_with_stock(
+            band_operation(9.9, adaptive, |_| ()),
+            &m.tools[0],
+            &stock,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .unwrap();
+        // Stop during the entry into the second level, with moves still queued.
+        for _ in 0..1000 {
+            let motion = plan.next_motion_with_stock(&stock, &|| false).unwrap().unwrap();
+            let z = motion.curve.end()[2];
+            if z < 8.9 && motion.kind.cuts() {
+                let mut restored = blank.clone();
+                restored.generation = stock.generation() + 1;
+                let foreign = Stock::from_snapshot(restored).unwrap();
+                let err = plan.next_motion_with_stock(&foreign, &|| false).unwrap_err();
+                assert!(err.contains("commit the complete preceding motion"), "{err}");
+
+                let mut partial = stock.clone();
+                let delta = partial.preview_sweep(
+                    &m.tools[0].prepare().unwrap(), &motion, 0.5, SweepOptions::default(), &|| false,
+                ).unwrap();
+                partial.apply_delta(&delta).unwrap();
+                let err = plan.next_motion_with_stock(&partial, &|| false).unwrap_err();
+                assert!(err.contains("commit the complete preceding motion"), "{err}");
+
+                commit(&mut stock, &motion, &m);
+                assert!(plan.next_motion_with_stock(&stock, &|| false).unwrap().is_some());
+                break;
+            }
+            commit(&mut stock, &motion, &m);
+            assert!(motion.id < 1000, "did not reach the second level");
+        }
+    }
+}
+
+#[test]
+fn stock_in_the_gap_between_pockets_does_not_raise_the_planning_top() {
+    let m = fixture();
+    let mut low = Stock::new(m.stock.height().unwrap().clone()).unwrap().snapshot();
+    for cell in &mut low.cells {
+        cell.lower_mm = 9.9;
+        cell.upper_mm = 9.9;
+    }
+    let mut raised = low.clone();
+    raised.cells[48 * 160 + 80].upper_mm = 10.;
+    let low = Stock::from_snapshot(low).unwrap();
+    let raised = Stock::from_snapshot(raised).unwrap();
+    let op = band_operation(9.9, true, |p| {
+        p.region.components[0].outer.vertices =
+            vec![[1., 1., 0.], [12., 1., 0.], [12., 22., 0.], [1., 22., 0.]];
+        let mut second = p.region.components[0].clone();
+        for vertex in &mut second.outer.vertices {
+            vertex[0] += 26.;
+        }
+        p.region.components.push(second);
+    });
+    let prepare = |stock| {
+        OperationPlan::prepare_with_stock(
+            op.clone(), &m.tools[0], stock, m.initial_position_mm, 1, &|| false,
+        )
+        .unwrap()
+    };
+    let report = serde_json::to_value(prepare(&raised).report()).unwrap();
+    assert_eq!(report["stock_top"]["maximum_upper_z_mm"], 10.);
+    assert!(report["stock_top"].get("reachable_upper_z_mm").is_none());
+    assert!(prepare(&low).next_motion_with_stock(&raised, &|| false).unwrap().is_some());
+}

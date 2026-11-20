@@ -357,6 +357,10 @@ impl PocketFrontPlan {
                     self.report.layers[layer].tip_z_mm
                 )
             })? {
+                if let Some(bound) = &mut self.stock_top {
+                    bound.admit(&m)?;
+                    bound.expect_commit(&m);
+                }
                 self.report.stock_edge_entries += plan.report().stock_edge_entries - before.0;
                 self.report.helical_entries += plan.report().helical_entries - before.1;
                 self.report.ramp_entries += plan.report().ramp_entries - before.2;
@@ -367,9 +371,6 @@ impl PocketFrontPlan {
                             .max_ramp_angle_deg
                             .map_or(angle, |a| a.max(angle)),
                     );
-                }
-                if let Some(bound) = &self.stock_top {
-                    bound.admit(&m)?;
                 }
                 self.position = m.curve.end();
                 self.next_id = m.id + 1;

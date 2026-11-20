@@ -189,10 +189,13 @@ the depths are measured from the highest of it instead
 strict maximum below the stock model. The model cannot tell a faced top's
 sweep error from material, so a top faced to exactly `top_z_mm` can gain a last,
 nearly empty depth when the depth is a whole number of stepdowns. The floor is
-checked against the authored top first. If the stock changes after planning and
+checked against the authored top first. If the stock changes before the first motion and
 stands higher than the top the depths were planned from, where the cutter
-reaches, the run refuses before the next motion; plan the operation again
-against that stock. Stock may stand higher outside the region, for example a low
+reaches, the run refuses. After the first motion, the next move requires the
+complete preceding sweep to have been committed with the matching tool and
+stock. A replacement stock may have refilled earlier levels even if its top
+and generation still match; plan the operation again against that stock.
+Stock may stand higher outside the region, for example a low
 pocket beside a tall wall, when the tool assembly clears it:
 
 - Before any motion, the neck, shank and every holder section are checked
