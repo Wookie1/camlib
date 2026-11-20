@@ -122,6 +122,32 @@ fn leading_contact_check_does_not_depend_on_move_length() {
     }
 }
 
+/// #190 review: an unchecked lead does not clear stock ahead of its end. A
+/// short checked cut that continues a lead reads the full slot whether the
+/// lead is one move or 2,000.
+#[test]
+fn leading_contact_check_reads_a_cut_after_a_lead_whatever_the_lead_split() {
+    let r = 2.;
+    let footprint = [[0., 0.], [26., 26.]];
+    let line = |from: f64, to: f64| Curve::Line {
+        start: [from, 5., 9.],
+        end: [to, 5., 9.],
+    };
+    for n in [1, 2000] {
+        let mut leading = LeadingOracle::new(r, footprint);
+        for i in 0..n {
+            let a = 9. + i as f64 / n as f64;
+            leading.feed(&line(a, a + 1. / n as f64), false);
+        }
+        leading.feed(&line(10., 10.0005), true);
+        assert!(
+            leading.worst_deg >= 175.,
+            "lead in {n} moves: the cut read {}",
+            leading.worst_deg
+        );
+    }
+}
+
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
