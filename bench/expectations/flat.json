@@ -2,33 +2,33 @@
   "name": "flat",
   "operations": {
     "flats": {
-      "air_cut_mm": 426.794,
-      "cut_mm": 964.771,
-      "cycle_seconds_exact_stop": 190.983,
-      "cycle_seconds_tangent": 190.983,
-      "link_mm": 0.0,
-      "moves": 222,
-      "plunges": 105,
-      "rapid_mm": 458.843,
-      "removed_mm3": 36.021,
-      "retracts": 39
+      "air_cut_mm": 39.466,
+      "cut_mm": 329.128,
+      "cycle_seconds_exact_stop": 40.432,
+      "cycle_seconds_tangent": 38.895,
+      "link_mm": 7.789,
+      "moves": 197,
+      "plunges": 3,
+      "rapid_mm": 55.442,
+      "removed_mm3": 37.571,
+      "retracts": 3
     }
   },
   "toolpath": {
-    "cycle_seconds_exact_stop": 190.983,
-    "cycle_seconds_tangent": 190.983,
+    "cycle_seconds_exact_stop": 40.432,
+    "cycle_seconds_tangent": 38.895,
     "material": {
       "leftover_mm3": [
-        0.95,
-        104.629
+        0.0,
+        103.079
       ],
       "overcut_mm3": [
         0.0,
-        24.404
+        48.004
       ]
     },
-    "moves": 222,
+    "moves": 197,
     "post_error": null,
-    "posted_blocks": 245
+    "posted_blocks": 224
   }
 }
