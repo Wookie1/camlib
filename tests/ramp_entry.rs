@@ -560,7 +560,7 @@ fn pocket_ramp_on_uneven_stock_descends_straight_only_through_air() {
 #[test]
 fn pocket_ramp_below_a_lower_authored_top_starts_at_that_top() {
     // A wider pocket has taken the top 2 mm; the slot starts at Z8 inside
-    // it. The first ramp starts at Z8, in air above the earlier floor.
+    // it. The first ramp starts at Z8 (the stock model's floor), in air above it.
     let (stock, heights) = precut([[2., 8.], [30., 16.]], 8.);
     let mut m = pocket_manifest(SLOT, Some(PocketEntry::Ramp(zigzag(4., 2.))));
     let Operation::Pocket(p) = &mut m.operations[0] else {
@@ -577,7 +577,9 @@ fn pocket_ramp_below_a_lower_authored_top_starts_at_that_top() {
         .filter(|m| m.curve.end()[2] < m.curve.start()[2] && horizontal(&m.curve) > 0.)
         .map(|m| m.curve.start()[2])
         .fold(f64::NEG_INFINITY, f64::max);
-    assert_eq!(sloped_top, 8.);
+    // At the earlier floor as the stock model holds it: up to its sweep
+    // tolerance above Z8, where the depths are planned from (#344).
+    assert!((8. ..=8. + 1e-4).contains(&sloped_top), "{sloped_top}");
     check_slot(&seen, &stock, true, 4., None);
 }
 

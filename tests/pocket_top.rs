@@ -129,7 +129,11 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
                         .iter()
                         .map(|l| l["tip_z_mm"].as_f64().unwrap())
                         .collect();
-                    assert_eq!(tips, [6., 5.]);
+                    // From the faced stock model, which stands up to
+                    // 16 x tolerance above Z8 (see `faced`): stepdown_mm is
+                    // a strict maximum below it (#344).
+                    assert!(tips.len() == 2 && tips[1] == 5., "{tips:?}");
+                    assert!((6. ..=6. + 16. * 1e-5).contains(&tips[0]), "{tips:?}");
                 } else {
                     assert_eq!(report["depth_passes"], 2);
                 }
@@ -311,6 +315,78 @@ fn top_inside_the_tolerance_band_never_cuts_deeper_than_a_stepdown() {
         assert!(
             deepest <= stepdown + 1e-6,
             "adaptive {adaptive}: one motion removed {deepest} mm of stock depth, more than the stepdown {stepdown}"
+        );
+    }
+}
+
+fn band_operation(top: f64, adaptive: bool, edit: impl Fn(&mut PocketOperation)) -> Operation {
+    let mut op = operation(top, adaptive);
+    let pocket = match &mut op {
+        Operation::Pocket(p) => p,
+        Operation::AdaptivePocket(a) => &mut a.pocket,
+        _ => unreachable!(),
+    };
+    pocket.tolerance_mm = 0.01;
+    pocket.stepdown_mm = 1.;
+    pocket.floor_z_mm = 7.;
+    edit(pocket);
+    op
+}
+
+/// #344 review: the depths are planned from the stock seen at preparation.
+/// Stock supplied later that stands higher within the band, where the cutter
+/// reaches, would make the next cut deeper than a stepdown: refused on the
+/// rescan, before any motion.
+#[test]
+fn a_rescan_refuses_stock_above_the_top_the_depths_were_planned_from() {
+    let m = fixture();
+    for adaptive in [false, true] {
+        let blank = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let mut lower = blank.snapshot();
+        for cell in &mut lower.cells {
+            cell.lower_mm = 9.9;
+            cell.upper_mm = 9.9;
+        }
+        let lower = Stock::from_snapshot(lower).unwrap();
+        let mut plan = OperationPlan::prepare_with_stock(
+            band_operation(9.9, adaptive, |_| ()),
+            &m.tools[0],
+            &lower,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .unwrap();
+        let error = plan
+            .next_motion_with_stock(&blank, &|| false)
+            .unwrap_err();
+        assert!(
+            error.contains("stock changed after planning") && error.contains("Z10"),
+            "adaptive {adaptive}: {error}"
+        );
+    }
+}
+
+/// #344 review: a floor above the authored top is refused even where the
+/// depths would be planned from higher stock.
+#[test]
+fn a_floor_above_the_authored_top_is_refused_on_stock_in_the_band() {
+    let m = fixture();
+    for adaptive in [false, true] {
+        let blank = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+        let error = OperationPlan::prepare_with_stock(
+            band_operation(9.9, adaptive, |p| p.floor_z_mm = 9.92),
+            &m.tools[0],
+            &blank,
+            m.initial_position_mm,
+            1,
+            &|| false,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("must be below top_z_mm 9.9"),
+            "adaptive {adaptive}: {error}"
         );
     }
 }

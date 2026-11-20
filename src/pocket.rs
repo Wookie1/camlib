@@ -705,6 +705,8 @@ impl Outside {
 /// judged by the tool assembly (`Outside`).
 pub(crate) struct StockTop {
     ceiling: f64,
+    /// The top the depths are planned from (`planning_top`).
+    planned: f64,
     identity: u64,
     outside: Outside,
     pub(crate) report: StockTopReport,
@@ -724,16 +726,26 @@ impl StockTop {
         if !tolerance.is_finite() || !(1e-7..=0.01).contains(&tolerance) {
             return Err("pocket tolerance_mm must be finite in [1e-7, 0.01]".into());
         }
+        // Checked here, against the authored top, because the depths may be
+        // planned from a higher one (below) that would hide it (#344).
+        if scope.lowest_tip_z >= top {
+            return Err(format!(
+                "operation {}: floor_z_mm plus bottom allowance (Z{}) must be below top_z_mm {top}",
+                scope.operation, scope.lowest_tip_z
+            ));
+        }
         let ceiling = top + 16. * tolerance;
         let mut outside = Outside::new(scope, tolerance)?;
         let (maximum, examined, reachable) = Self::scan(stock, top, ceiling, &mut outside, cancel)?;
-        spec.max_mm[2] = top;
+        let planned = Self::planning_top(top, reachable);
+        spec.max_mm[2] = planned;
         stock.request_sweep_receipts();
         let tall = outside.highest;
         Ok((
             spec,
             Some(Self {
                 ceiling,
+                planned,
                 identity: stock.identity(),
                 outside,
                 report: StockTopReport {
@@ -747,6 +759,18 @@ impl StockTop {
                 },
             }),
         ))
+    }
+    /// The top the depths are planned from. Stock the top accepts within
+    /// the model's band may still stand above it where the cutter reaches:
+    /// the depths then start from the highest of it, so no depth of cut is
+    /// deeper than `stepdown_mm` below the stock model (#344). `stepdown_mm`
+    /// is a strict maximum: the model cannot tell a faced top's sweep error
+    /// from material, so that error is treated as material too.
+    fn planning_top(top: f64, reachable: Option<f64>) -> f64 {
+        reachable.filter(|h| *h > top).unwrap_or(top)
+    }
+    pub(crate) fn planned_top(&self) -> f64 {
+        self.planned
     }
     /// The highest stock, how many cells above the ceiling were examined,
     /// and the highest stock above the top (up to the ceiling) that the
@@ -882,13 +906,23 @@ impl StockTop {
                 .last_sweep_receipt()
                 .is_some_and(|r| r.base_identity == self.identity)
             {
-                let _ = Self::scan(
+                let (_, _, reachable) = Self::scan(
                     stock,
                     self.report.authored_top_z_mm,
                     self.ceiling,
                     &mut self.outside,
                     cancel,
                 )?;
+                // The depths were planned from `planned`: stock that now
+                // stands higher where the cutter reaches would make the
+                // next cut deeper than a stepdown (#344 review).
+                let needed = Self::planning_top(self.report.authored_top_z_mm, reachable);
+                if needed > self.planned {
+                    return Err(format!(
+                        "operation {}: the stock changed after planning: stock up to Z{needed} where the cutter reaches stands above Z{}, the top the depths were planned from; plan the operation again against this stock",
+                        self.outside.operation, self.planned
+                    ));
+                }
             }
             self.identity = stock.identity();
         }
@@ -1425,21 +1459,12 @@ impl PocketPlan {
             clearance_z: op.clearance_z_mm,
             boundary_slack_mm: 0.,
         };
-        let (mut envelope, bound) =
+        let (envelope, bound) =
             StockTop::prepare(stock, op.top_z_mm, op.tolerance_mm, &scope, cancel)?;
-        // Stock the top accepts within the model's band still stands above
-        // it where the cutter reaches: when it is higher than the operation's
-        // own tolerance, the depth passes start from that stock, so the first
-        // is no deeper than a stepdown below it (#344). Within the tolerance
-        // (a faced top's sweep error) the passes stay where they were.
+        // The depths start from the top `StockTop` planned (#344).
         let mut op = op;
-        if let Some(h) = bound
-            .as_ref()
-            .and_then(|b| b.report.reachable_upper_z_mm)
-            .filter(|h| *h > op.top_z_mm + op.tolerance_mm + 1e-9)
-        {
-            op.top_z_mm = h;
-            envelope.max_mm[2] = h;
+        if let Some(b) = &bound {
+            op.top_z_mm = b.planned_top();
         }
         let mut plan = Self::prepare(op, assembly, &envelope, initial, first_motion_id, cancel)?;
         if let Some(bound) = bound {
