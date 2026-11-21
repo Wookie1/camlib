@@ -2054,7 +2054,7 @@ impl WaterlinePlan {
             pieces.extend(loops.into_iter().map(|(ring, strokes)| Piece {
                 z,
                 ring,
-                closed: crate::profiles::loop_closes(&strokes),
+                closed: loop_is_closed(&strokes),
                 strokes,
             }));
             self.slot += 1;

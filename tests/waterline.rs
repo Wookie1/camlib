@@ -923,7 +923,7 @@ fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
     .unwrap();
     let tool = m.tools[0].prepare().unwrap();
     let r = 2.;
-    let (mut plunges, mut beside) = (0, 0);
+    let mut plunges = 0;
     while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
         // Vertical plunges only: a ramp along a contour (a travelling
         // plunge, #46) cuts the wall like the loop's own moves.
@@ -952,9 +952,6 @@ fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
                 }
             }
             plunges += 1;
-            if p[2] < 6.3 {
-                beside += 1;
-            }
         }
         let d = stock
             .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
@@ -964,7 +961,6 @@ fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
     // The island enters on a ramp from the band top (a lead from beside the
     // band into it would cut it from the side, #46 WL3) and its lower levels
     // follow by ramps: the one vertical plunge stops on the band top.
-    println!("plunges {plunges} beside {beside}");
     assert!(plunges > 0);
     assert_eq!(plan.report().moved_entries, 0);
     assert!(plan.report().helical_entries >= 1);
@@ -1007,7 +1003,6 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     // has no stock under the ball, but the lead from it onto the wall would
     // run through the raw stock, so no side entry is taken (#46: a side
     // entry only where its lead is pure air); the island enters on a ramp.
-    println!("raw plate: moved {} helical {}", plan.report().moved_entries, plan.report().helical_entries);
     assert_eq!(plan.report().moved_entries, 0);
     assert!(plan.report().helical_entries >= 1);
     // Roughed: a point beside the wall is clear, but the roughed band runs
@@ -1175,7 +1170,6 @@ fn blocked_loop_starts_move_to_a_clear_entry() {
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let given_start = [16.201954570312502, 4.9751401953125];
-    println!("given Z6 loop start {given_start:?}");
     let tolerance = plate(&m).tolerance_mm;
     let spec = m.stock.height().unwrap().clone();
     let probe = Stock::new(spec.clone()).unwrap();
@@ -1217,11 +1211,6 @@ fn blocked_loop_starts_move_to_a_clear_entry() {
     // The whole plan streams: every motion starts where the previous one
     // ended, with an increasing id (what the simulation and the UI check).
     assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
-    println!(
-        "replay {replay:?} moved {} helical {}",
-        plan.report().moved_entries,
-        plan.report().helical_entries
-    );
     // No vertical descent meets stock deeper than the tolerance. A side
     // entry is taken only where its lead onto the wall is pure air (#46
     // WL3): every lead from a clear point here crosses the lump or its
@@ -1303,11 +1292,6 @@ fn fully_blocked_loops_enter_on_a_helix() {
     // The whole plan streams: every motion starts where the previous one
     // ended, with an increasing id (what the simulation and the UI check).
     assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
-    println!(
-        "replay {replay:?} moved {} helical {}",
-        plan.report().moved_entries,
-        plan.report().helical_entries
-    );
     // The entry plunge stops at the stock top Z7, in air; the helix lap
     // meets the wall it cuts, never deeper than the level gap it descends.
     assert!(replay.vertical_plunges > 0);
@@ -1369,11 +1353,6 @@ fn open_runs_enter_on_a_helix_that_returns_to_their_start() {
     // The whole plan streams: every motion starts where the previous one
     // ended, with an increasing id (what the simulation and the UI check).
     assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
-    println!(
-        "replay {replay:?} moved {} helical {}",
-        plan.report().moved_entries,
-        plan.report().helical_entries
-    );
     assert!(plan.report().helical_entries > 0);
     assert!(replay.helix_moves > 0);
     assert!(
@@ -1408,7 +1387,6 @@ fn unblocked_loops_keep_their_start() {
     // The whole plan streams: every motion starts where the previous one
     // ended, with an increasing id (what the simulation and the UI check).
     assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
-    println!("replay {replay:?}");
     assert_eq!(plan.report().moved_entries, 0);
     assert_eq!(plan.report().helical_entries, 0);
     assert_eq!(replay.motions, 335);
@@ -1916,15 +1894,6 @@ fn levels_link_with_a_ramp_that_the_next_level_recuts() {
                 .unwrap();
         let (moves, error) = trace(&m, &mut plan, &mut stock);
         assert!(error.is_none(), "{error:?}");
-        let summary: Vec<String> = moves
-            .iter()
-            .map(|(m, cut)| {
-                let (a, b) = (m.curve.start(), m.curve.end());
-                format!("{:?} {:.3}->{:.3} cut {:.3}", m.kind, a[2], b[2], cut)
-            })
-            .filter(|t| !t.starts_with("Cut"))
-            .collect();
-        println!("{entry:?}: {summary:?}");
         assert_eq!(plan.report().ramp_links, 2, "{entry:?}");
         let motions: Vec<&camlib::motion::Motion> = moves.iter().map(|(m, _)| m).collect();
         let mut links = 0;
@@ -2079,15 +2048,9 @@ fn blocked_reorder_falls_back_to_level_order() {
         &cancel,
     )
     .unwrap();
-    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    let (_, error) = trace(&m, &mut plan, &mut stock);
     assert!(error.is_none(), "{error:?}");
     let report = plan.report();
-    println!(
-        "stacks {} level-ordered {} moves {}",
-        report.stacks,
-        report.stacks_level_ordered,
-        moves.len()
-    );
     assert!(report.reach_proof.is_some(), "the reach check runs");
     assert_eq!(report.stacks, 2);
     assert!(report.stacks_level_ordered >= 1);
@@ -2125,12 +2088,6 @@ fn entries_ramp_instead_of_a_side_lead_into_stock() {
         })
         .map(|w| w[1].1)
         .fold(0., f64::max);
-    println!(
-        "worst lead cut {worst}, helical {} moved {} links {}",
-        plan.report().helical_entries,
-        plan.report().moved_entries,
-        plan.report().ramp_links
-    );
     assert!(worst <= tolerance + 1e-6, "a side lead cut {worst} mm of stock");
     assert!(plan.report().helical_entries >= 1);
     for (motion, cut) in &moves {
@@ -2159,12 +2116,6 @@ fn declared_ramps_stream_on_a_curved_part() {
     let mut plan =
         WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
     let (moves, error) = trace(&m, &mut plan, &mut stock);
-    println!(
-        "moves {} links {} helical {}",
-        moves.len(),
-        plan.report().ramp_links,
-        plan.report().helical_entries
-    );
     assert!(error.is_none(), "{error:?}");
     assert!(plan.report().helical_entries + plan.report().ramp_links > 0);
     // Every line survives a post at three decimals: a sliver that rounds to
@@ -2279,15 +2230,6 @@ fn links_meet_no_more_than_the_lap_below_cuts() {
     let error = stream_error(&m, &motions);
     assert!(error.is_none(), "{error:?}");
     let report = plan.report();
-    println!(
-        "links {} refused stock {} link-clear {} ramp-clear {} helical {} stacks {}",
-        report.ramp_links,
-        report.links_refused_stock,
-        report.links_refused_link_clearance,
-        report.links_refused_ramp_clearance,
-        report.helical_entries,
-        report.stacks
-    );
     // Measured: 12 of the 13 level changes linked (one refused by the stock
     // it would meet); with links bounded by the level gap alone, most of the
     // in-between levels here would retract instead.
@@ -2315,5 +2257,5 @@ fn links_meet_no_more_than_the_lap_below_cuts() {
         );
         links += 1;
     }
-    println!("checked links {links}");
+    assert!(links > 0, "no link was checked");
 }
