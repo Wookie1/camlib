@@ -1075,7 +1075,15 @@ impl SlotPlan {
                         .top_under_disk([c[0], c[1]], self.radius + self.cutter_radius)
                         .min(previous);
                     let air = top.max(z);
-                    let helix_top = if air - z <= self.op.tolerance_mm {
+                    // A straight plunge only where no stock is known above the
+                    // pass depth (no cell's lower bound above it: any known
+                    // thickness, however thin, takes the helix or is refused)
+                    // and what may be there is within the planning tolerance
+                    // (a cut to this depth leaves its cells' upper bounds a
+                    // sweep's rounding above it).
+                    let known =
+                        stock.known_top_under_disk([c[0], c[1]], self.radius + self.cutter_radius);
+                    let helix_top = if known <= z && air - z <= self.op.tolerance_mm {
                         z
                     } else if let Some(h) = helix(&self.op) {
                         let turns = h.turns(self.radius, air - z).map_err(|e| {

@@ -1142,8 +1142,17 @@ fn oblique_slot_return_has_reproducible_fillet_geometry() {
     let mut plan =
         SlotPlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
     let mut stock = Stock::new(spec).unwrap();
+    // The fillet is the 135th motion after the first pass's seed orbit (the
+    // first full-turn cut arc), whatever entry comes before that orbit.
+    let mut fillet = None;
     while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
-        if motion.id == 138 {
+        if fillet.is_none()
+            && motion.kind == MoveKind::Cut
+            && matches!(motion.curve, Curve::Arc { sweep_rad, .. } if sweep_rad.abs() == TAU)
+        {
+            fillet = Some(motion.id + 135);
+        }
+        if Some(motion.id) == fillet {
             let Curve::Arc { center, end, .. } = motion.curve else {
                 panic!("expected return fillet")
             };
@@ -1836,4 +1845,43 @@ fn slot_entry_must_be_a_helix_on_the_orbit_circle_in_the_slot_sense() {
         .iter()
         .filter(|m| matches!(m.curve, Curve::Helix { .. }))
         .all(|m| m.feed_mm_min == Some(90.)));
+}
+
+/// Stock thinner than `tolerance_mm` above the pass is still stock: without
+/// an entry the pass is refused, and with one it helixes down from the stock
+/// top. Untouched stock at Z10, one pass at Z9.995, tolerance 0.01 mm.
+#[test]
+fn slot_stock_thinner_than_the_tolerance_is_not_air() {
+    let mut op = operation();
+    op.floor_z_mm = 9.995;
+    op.tolerance_mm = 0.01;
+    op.boundary_tolerance_mm = 0.4;
+    op.max_engagement_deg = 150.;
+    op.entry = None;
+    let mut p = plan(op.clone());
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let error = loop {
+        match p.next_motion_with_stock(&stock, &AtomicBool::new(false)) {
+            Ok(Some(m)) => {
+                assert_ne!(m.kind, MoveKind::Plunge, "{m:?}");
+                commit(&mut stock, &m);
+            }
+            Ok(None) => panic!("a 0.005 mm plunge into stock was planned"),
+            Err(e) => break e,
+        }
+    };
+    assert!(error.contains("depth pass 1 would plunge"), "{error}");
+    op.entry = Some(helix_entry(3.));
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let (motions, _, p, _) = drive(&op, &mut stock);
+    let plunge = motions.iter().find(|m| m.kind == MoveKind::Plunge).unwrap();
+    assert_eq!(plunge.curve.end()[2], op.top_z_mm);
+    let helices: Vec<_> = motions
+        .iter()
+        .filter(|m| matches!(m.curve, Curve::Helix { .. }))
+        .collect();
+    assert!(!helices.is_empty());
+    assert_eq!(helices[0].curve.start()[2], op.top_z_mm);
+    assert_eq!(helices.last().unwrap().curve.end()[2], op.floor_z_mm);
+    assert_eq!(p.report().max_air_plunge_mm, 0.);
 }
