@@ -40,8 +40,10 @@ use std::f64::consts::TAU;
 /// per-query allowance is unbounded in total; once the shared budget is
 /// spent the plan keeps its bounded orbits and queries no more.
 const STOCK_QUERY_WORK: usize = 1_000_000;
-/// History-clearance work for one depth pass's straight-plunge proof; out of
-/// work the plunge is not proven and the pass takes its helix or is refused.
+/// History-clearance work one slot operation may spend proving its passes'
+/// straight plunges clear, shared by every pass (each pass's proof revisits
+/// the history of the passes before it); out of work a plunge is not proven
+/// and the pass takes its helix or is refused.
 const PLUNGE_PROOF_WORK: u64 = 1_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,6 +121,10 @@ pub struct SlotReport {
     pub stock_clear_advances: usize,
     pub stock_query_work: usize,
     pub stock_query_work_exhausted: bool,
+    /// History-proof work spent on straight-plunge proofs, all passes
+    /// together (at most `PLUNGE_PROOF_WORK`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub plunge_proof_work: usize,
     /// Lines and arcs of the centreline (1 for a straight slot).
     pub path_pieces: usize,
     /// Links across corners, inside the vertex orbit's disk.
@@ -406,6 +412,8 @@ pub struct SlotPlan {
     expected_generation: Option<u64>,
     /// What is left of `STOCK_QUERY_WORK` for the stock-clear fast path.
     query_work_left: usize,
+    /// What is left of `PLUNGE_PROOF_WORK`, shared by every pass's plunge proof.
+    plunge_work_left: u64,
     /// Centre of the most recent completed orbit at this depth (seed or
     /// controlled): the predecessor the next controlled orbit's proven-air
     /// proof needs. None at a new depth pass and after a stock-clear
@@ -684,6 +692,7 @@ impl SlotPlan {
             stock_clear_advances: 0,
             stock_query_work: 0,
             stock_query_work_exhausted: false,
+            plunge_proof_work: 0,
             path_pieces: pieces.len(),
             corner_links: 0,
             corner_arcs: 0,
@@ -721,6 +730,7 @@ impl SlotPlan {
             next_id: first_motion_id,
             expected_generation: None,
             query_work_left: STOCK_QUERY_WORK,
+            plunge_work_left: PLUNGE_PROOF_WORK,
             prev_center: None,
             orbit_pieces: VecDeque::new(),
             pending: VecDeque::new(),
@@ -1081,39 +1091,38 @@ impl SlotPlan {
                     // A straight plunge to the pass depth only where it is
                     // proven to cut nothing: no cell's upper bound under the
                     // disk stands above the pass (a conservative bound), or
-                    // the committed cutter sweeps prove the seed orbit at the
-                    // pass depth removes nothing new (the flat air-move
-                    // proof, footprint by footprint, where a floor cut to
-                    // exactly this depth may be touched). The orbit runs
-                    // through the plunge's end, so its sweep holds the
-                    // plunging cutter's footprint. A cut to this depth leaves
-                    // its cells' upper bounds a sweep's rounding above it,
-                    // and a cut elsewhere in the same cell proves nothing
-                    // here. Any other stock above the pass, however thin,
-                    // takes the helix or is refused.
-                    let start = self.orbit_start(0., z);
-                    let seed = Motion {
+                    // the committed cutter sweeps prove the cutter's disk at
+                    // the plunge's end clear from the pass depth up (the flat
+                    // air-move proof, footprint by footprint from the
+                    // recorded sweeps, where a floor cut to exactly this
+                    // depth may be touched). A cut to this depth leaves its
+                    // cells' upper bounds a sweep's rounding above it, and a
+                    // cut elsewhere in the same cell proves nothing here. Any
+                    // other stock above the pass, however thin, takes the
+                    // helix or is refused. The proofs of all passes share one
+                    // work budget: out of it, a pass is not proven.
+                    let end = self.orbit_start(0., z);
+                    let at_end = Motion {
                         id: self.next_id,
                         operation: self.op.id.clone(),
                         tool: self.op.tool.clone(),
                         kind: MoveKind::Air,
-                        curve: Curve::Arc {
-                            start,
-                            end: start,
-                            center: c,
-                            plane: Plane::Xy,
-                            sweep_rad: if self.op.clockwise { -TAU } else { TAU },
-                        },
+                        curve: Curve::Line { start: end, end },
                         feed_mm_min: Some(self.op.entry_feed_mm_min),
                     };
-                    let mut work = PLUNGE_PROOF_WORK;
-                    let helix_top = if air <= z
-                        || stock.flat_history_clearance(
-                            &seed,
-                            self.cutter_radius,
-                            &mut work,
-                            cancel,
-                        )? {
+                    let proven = air <= z || {
+                        let before = self.plunge_work_left;
+                        let proven = self.plunge_work_left > 0
+                            && stock.flat_history_clearance(
+                                &at_end,
+                                self.cutter_radius,
+                                &mut self.plunge_work_left,
+                                cancel,
+                            )?;
+                        self.report.plunge_proof_work += (before - self.plunge_work_left) as usize;
+                        proven
+                    };
+                    let helix_top = if proven {
                         z
                     } else if let Some(h) = helix(&self.op) {
                         let turns = h.turns(self.radius, air - z).map_err(|e| {

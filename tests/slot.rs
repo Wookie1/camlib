@@ -1776,21 +1776,52 @@ fn slot_without_an_entry_refuses_to_plunge_into_stock() {
 /// air.
 #[test]
 fn slot_over_cleared_stock_plunges_without_an_entry() {
-    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
-    let mut wide = operation();
-    wide.width_mm = 7.9;
-    drive(&wide, &mut stock);
-    let mut op = operation();
-    op.entry = None;
-    let (motions, removed, p, _) = drive(&op, &mut stock);
-    assert_eq!(p.report().helical_entries, 0);
-    assert!(!motions.iter().any(|m| matches!(m.curve, Curve::Helix { .. })));
-    for (m, v) in motions.iter().zip(&removed) {
-        if m.kind == MoveKind::Plunge {
-            assert!(*v <= 1e-9);
+    // A wider slot first, then the same slot again (its identical rerun: the
+    // outer edge of each orbit has no clearance margin over the first cut).
+    for first_width in [7.9, operation().width_mm] {
+        let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+        let mut first = operation();
+        first.width_mm = first_width;
+        drive(&first, &mut stock);
+        let mut op = operation();
+        op.entry = None;
+        let (motions, removed, p, _) = drive(&op, &mut stock);
+        assert_eq!(p.report().helical_entries, 0, "after a {first_width} mm slot");
+        assert!(!motions.iter().any(|m| matches!(m.curve, Curve::Helix { .. })));
+        for (m, v) in motions.iter().zip(&removed) {
+            if m.kind == MoveKind::Plunge {
+                assert!(*v <= 1e-9);
+            }
         }
+        assert!(p.report().seed_entry_policy.contains("else_refused"));
     }
-    assert!(p.report().seed_entry_policy.contains("else_refused"));
+}
+
+/// The straight-plunge proofs of all depth passes share one work budget.
+/// Each pass's proof revisits the committed history of the passes before it,
+/// so a per-pass allowance grows with the square of the pass count: 133
+/// shallow passes on a fresh slot spend about two million visits that way.
+/// Shared, the work stays within the budget and every pass still enters on
+/// its helix.
+#[test]
+fn slot_plunge_proofs_share_one_work_budget() {
+    // `PLUNGE_PROOF_WORK` in src/slot.rs.
+    const BUDGET: usize = 1_000_000;
+    let mut op = operation();
+    op.floor_z_mm = 6.;
+    op.stepdown_mm = 0.03;
+    op.entry = Some(helix_entry(3.));
+    let mut stock = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    let (motions, _, p, _) = drive(&op, &mut stock);
+    let report = p.report();
+    assert!(report.depth_passes > 130, "{}", report.depth_passes);
+    assert!(
+        report.plunge_proof_work <= BUDGET,
+        "plunge-proof work {} exceeds the shared budget",
+        report.plunge_proof_work
+    );
+    assert_eq!(report.helical_entries, report.depth_passes);
+    assert!(motions.iter().any(|m| matches!(m.curve, Curve::Helix { .. })));
 }
 
 #[test]
