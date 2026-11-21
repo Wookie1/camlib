@@ -161,15 +161,13 @@ class WaterlineTest(unittest.TestCase):
 
         # Raw stock stands above the level on every side of the loop: a lead
         # from beside it onto the wall would cut the raw stock from the side,
-        # so every level enters on a ramp along its loop instead (#46 WL3; a
-        # link from the level above would drag through the raw stock too),
+        # so the island enters on a ramp along its loop instead (#46 WL3);
         # nothing plunges into the stock and nothing warns.
         config = example().waterline_job()
         report, entries = run(config)
         self.assertNotIn("moved_entries", report)
         self.assertNotIn("wall_entries", report)
         self.assertGreater(report["helical_entries"], 0)
-        self.assertNotIn("ramp_links", report)
         self.assertEqual(entries, [])
         # A blank roughed to 0.3 mm over the island and 0.1 mm over the base
         # (the benchmark's): the island is entered once on a ramp, and every

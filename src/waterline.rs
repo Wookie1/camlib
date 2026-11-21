@@ -785,6 +785,15 @@ pub struct WaterlineReport {
     /// then the lower contour cut in full over the ramp.
     #[serde(skip_serializing_if = "is_zero")]
     pub ramp_links: usize,
+    /// Links between levels not taken (the lower loop entered after a
+    /// retract instead), by the check that refused them: the stock the link
+    /// would meet, the link's part clearance, the ramp's part clearance.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub links_refused_stock: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub links_refused_link_clearance: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub links_refused_ramp_clearance: usize,
     pub cut_segments: usize,
     pub loops_completed: usize,
     pub requested_bottom_z_mm: f64,
@@ -959,8 +968,10 @@ impl Stack {
 }
 /// A move waiting to be handed out: curve, kind and feed (None: rapid).
 type Queued = (Curve, MoveKind, Option<f64>);
-/// A piece's moves, and (ramp link, moved entries, helical entries).
-type Job = (Vec<Queued>, (bool, usize, usize));
+/// A piece's moves, and (ramp link, moved entries, helical entries, links
+/// refused by [the stock met, the link's part clearance, the ramp's part
+/// clearance]).
+type Job = (Vec<Queued>, (bool, usize, usize, [usize; 3]));
 /// Ball end mills (#46): the pieces of every level in stacks, the stack
 /// being cut, the piece just cut (the tool stands at its end), whether the
 /// emitter has fallen back to level order, and the moves of the piece being
@@ -1161,6 +1172,39 @@ fn ramp_curves(edges: &[Stroke], from: f64, to: f64, length: f64) -> Vec<Curve> 
         end[2] = to;
     }
     out
+}
+/// The longest gap (in ball radii) an in-between level may leave between
+/// the fragments it keeps of a contour for the contour to be cut whole (#46).
+const BRIDGE_RADII: f64 = 4.;
+/// Whether the runs an in-between level keeps of a closed contour leave only
+/// gaps along it shorter than `max_gap` (#46), measured along the contour
+/// from the end of each run to the start of the next.
+fn runs_bridge(ring: &[[f64; 2]], runs: &[Vec<[f64; 2]>], max_gap: f64) -> bool {
+    let strokes: Vec<Stroke> = ring
+        .iter()
+        .zip(ring.iter().cycle().skip(1))
+        .take(ring.len())
+        .map(|(a, b)| Stroke::line(*a, *b))
+        .collect();
+    let total: f64 = strokes.iter().map(stroke_length).sum();
+    let mut spans: Vec<(f64, f64)> = runs
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            (
+                nearest_on_loop(&strokes, r[0]).0,
+                nearest_on_loop(&strokes, r[r.len() - 1]).0,
+            )
+        })
+        .collect();
+    if total <= 0. || spans.is_empty() {
+        return false;
+    }
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    (0..spans.len()).all(|i| {
+        let next = spans[(i + 1) % spans.len()].0;
+        (next - spans[i].1).rem_euclid(total) < max_gap
+    })
 }
 /// How near a vertex of a loop a split (where a ramp ends, where a link
 /// meets the loop, where a moved start lies) is moved onto it (#46): a
@@ -1613,6 +1657,9 @@ impl WaterlinePlan {
             stacks: 0,
             stacks_level_ordered: 0,
             ramp_links: 0,
+            links_refused_stock: 0,
+            links_refused_link_clearance: 0,
+            links_refused_ramp_clearance: 0,
             cut_segments: 0,
             loops_completed: 0,
             requested_bottom_z_mm: op.bottom_z_mm,
@@ -1943,7 +1990,17 @@ impl WaterlinePlan {
                 let whole = runs.len() == 1
                     && runs[0].first() == closed.first()
                     && runs[0].last() == closed.last();
-                if whole {
+                // An in-between level that keeps the contour in fragments
+                // with only short gaps between them cuts it whole (#46):
+                // one closed loop the level above links to, not a retract
+                // and an entry per fragment. Never where slope or region
+                // limits cut the contour: those parts must stay uncut.
+                let bridged = !whole
+                    && depth > 0
+                    && slope.is_none()
+                    && region.is_none()
+                    && runs_bridge(&ring, &runs, BRIDGE_RADII * self.radius);
+                if whole || bridged {
                     // Entirely within the limits: keep the original contour.
                     loops.push((
                         owner,
@@ -2319,6 +2376,9 @@ impl WaterlinePlan {
             self.report.ramp_links += usize::from(counts.0);
             self.report.moved_entries += counts.1;
             self.report.helical_entries += counts.2;
+            self.report.links_refused_stock += counts.3[0];
+            self.report.links_refused_link_clearance += counts.3[1];
+            self.report.links_refused_ramp_clearance += counts.3[2];
             self.report.loops_completed += 1;
             let emission = self.emission.as_mut().unwrap();
             emission.stacks[s].next += 1;
@@ -2433,6 +2493,7 @@ impl WaterlinePlan {
                 .unwrap_or(self.op.plunge_mm_min),
         );
         let stack = &e.stacks[s];
+        let mut refused = [0; 3];
         let above = (stack.next > 0)
             .then(|| stack.pieces[stack.next - 1])
             .filter(|&q| e.last == Some(q) && e.current == Some(s));
@@ -2469,11 +2530,28 @@ impl WaterlinePlan {
                     }
                     vec![]
                 };
-            if self.path_clear(&link, &mut work, cancel)?
-                && self.path_clear(&ramp, &mut work, cancel)?
-                && self.stock_met(stock, self.position, [p[0], p[1]], za, &mut work, cancel)?
-                    <= za - z + self.op.tolerance_mm
-            {
+            let link_clear = self.path_clear(&link, &mut work, cancel)?;
+            let ramp_clear = link_clear && self.path_clear(&ramp, &mut work, cancel)?;
+            // The link may meet no more stock than the level gap it ramps
+            // down, or than the lower level's own cut meets where the link
+            // arrives (the stock the finishing lap removes there anyway):
+            // never a deeper cut from the side than the waterline takes.
+            let (met, bound) = if ramp_clear {
+                (
+                    self.stock_met(stock, self.position, [p[0], p[1]], za, &mut work, cancel)?,
+                    (za - z).max(self.stock_under_ball(stock, p, z, &mut work, cancel)?),
+                )
+            } else {
+                (0., 0.)
+            };
+            refused = if !link_clear {
+                [0, 1, 0]
+            } else if !ramp_clear {
+                [0, 0, 1]
+            } else {
+                [1, 0, 0]
+            };
+            if link_clear && ramp_clear && met <= bound + self.op.tolerance_mm {
                 let mut moves: Vec<Queued> = link
                     .into_iter()
                     .map(|c| (c, MoveKind::Lead, cut_feed))
@@ -2484,7 +2562,7 @@ impl WaterlinePlan {
                         .into_iter()
                         .map(|c| (c, MoveKind::Cut, cut_feed)),
                 );
-                return Ok((moves, (true, 0, 0)));
+                return Ok((moves, (true, 0, 0, [0; 3])));
             }
         }
         let heights = self.op.settings().heights;
@@ -2574,7 +2652,7 @@ impl WaterlinePlan {
             strokes.iter().map(|e| e.curve(z)).collect()
         };
         moves.extend(flat.into_iter().map(|c| (c, MoveKind::Cut, cut_feed)));
-        Ok((moves, (false, moved, helical)))
+        Ok((moves, (false, moved, helical, refused)))
     }
     /// The moves off the piece just cut: up at the feed to the feed height,
     /// then a rapid to the retract height (`last`: the clearance height).
@@ -2632,6 +2710,51 @@ impl WaterlinePlan {
             }
         }
         Ok(true)
+    }
+    /// How deep the ball standing with its tip at `z` over `p` meets stock that
+    /// is not the part (#46): what a cut at that point removes, on the stock
+    /// grid, measured like `stock_met`.
+    fn stock_under_ball(
+        &self,
+        stock: &Stock,
+        p: [f64; 2],
+        z: f64,
+        work: &mut SurfaceWork,
+        cancel: &impl CancelSignal,
+    ) -> Result<f64, String> {
+        let r = self.radius;
+        let spec = stock.spec();
+        let [nx, ny] = stock.dimensions();
+        let [wx, wy] = stock.cell_widths_mm();
+        let half = wx.hypot(wy) / 2.;
+        let cells = stock.cells();
+        let index = |v: f64, k: usize, w: f64, n: usize| {
+            (((v - spec.min_mm[k]) / w).floor().max(0.) as usize).min(n)
+        };
+        let mut worst: f64 = 0.;
+        for j in index(p[1] - r, 1, wy, ny)..index(p[1] + r, 1, wy, ny).saturating_add(1).min(ny) {
+            for i in
+                index(p[0] - r, 0, wx, nx)..index(p[0] + r, 0, wx, nx).saturating_add(1).min(nx)
+            {
+                let cell = j * nx + i;
+                let c = stock.cell_center(cell).unwrap();
+                let d = (c[0] - p[0]).hypot(c[1] - p[1]);
+                if d >= r {
+                    continue;
+                }
+                let excess = cells[cell].upper_mm - (z + r - (r * r - d * d).sqrt());
+                if excess <= worst || excess <= self.op.tolerance_mm {
+                    continue;
+                }
+                cancelled(cancel)?;
+                let part = self.surface.contact(c, half, work, cancel)?.center_z;
+                if cells[cell].upper_mm <= part + self.op.tolerance_mm {
+                    continue;
+                }
+                worst = excess;
+            }
+        }
+        Ok(worst)
     }
     /// How deep (mm above the swept ball's lower surface) the ball with its
     /// tip at `z`, moving straight from `a` to `b`, meets stock that is not
@@ -2812,4 +2935,36 @@ pub(crate) fn flat_level_loops(
         }
     }
     Ok((loops, error))
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    /// A 10 x 10 square contour and the runs kept of it, as arc-length spans.
+    fn kept(spans: &[(f64, f64)]) -> (Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>) {
+        let ring = vec![[0., 0.], [10., 0.], [10., 10.], [0., 10.]];
+        let strokes: Vec<Stroke> = ring
+            .iter()
+            .zip(ring.iter().cycle().skip(1))
+            .take(4)
+            .map(|(a, b)| Stroke::line(*a, *b))
+            .collect();
+        let at = |s: f64| loop_point_tangent(&strokes, s).0;
+        let runs = spans.iter().map(|&(a, b)| vec![at(a), at(b)]).collect();
+        (ring, runs)
+    }
+    #[test]
+    fn in_between_fragments_with_short_gaps_are_cut_whole() {
+        // Gaps of 2, 3 and 2 mm (the last across the contour's start) with a
+        // 4 mm limit: cut whole. One gap of 6 mm: kept as fragments (#46).
+        let (ring, runs) = kept(&[(1., 10.), (12., 25.), (28., 39.)]);
+        assert!(runs_bridge(&ring, &runs, 4.));
+        let (ring, runs) = kept(&[(1., 10.), (16., 39.)]);
+        assert!(!runs_bridge(&ring, &runs, 4.));
+        // A single fragment leaving one short gap: whole; a long one: not.
+        let (ring, runs) = kept(&[(2., 39.)]);
+        assert!(runs_bridge(&ring, &runs, 4.));
+        let (ring, runs) = kept(&[(2., 30.)]);
+        assert!(!runs_bridge(&ring, &runs, 4.));
+    }
 }

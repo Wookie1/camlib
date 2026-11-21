@@ -2176,3 +2176,144 @@ fn declared_ramps_stream_on_a_curved_part() {
         }
     }
 }
+#[test]
+fn links_meet_no_more_than_the_lap_below_cuts() {
+    use camlib::{
+        motion::{MoveKind, WorkFrame},
+        stock::{HeightBounds, InitialStock, Stock},
+        waterline::WaterlinePlan,
+    };
+    // The faceted cap finished from a terraced roughed blank (1.5 mm steps,
+    // 0.3 mm allowance: more stock over the cap than the in-between levels'
+    // 0.125 to 0.5 mm gaps): levels are linked from the one above (#46), and
+    // no link meets more stock than the level gap it ramps down or than the
+    // lap it leads to cuts - never a deeper cut from the side than the
+    // finishing pass itself takes. Measured by the sweeps on the live stock.
+    let mut m = fixture();
+    let cancel = AtomicBool::new(false);
+    let op = cap_operation(&m);
+    let spec = m.stock.height().unwrap().clone();
+    let probe = Stock::new(spec.clone()).unwrap();
+    let [nx, ny] = probe.dimensions();
+    let [wx, wy] = probe.cell_widths_mm();
+    let cap = |x: f64, y: f64| {
+        let r2 = (x - 12.).powi(2) + (y - 8.).powi(2);
+        if r2 >= 144. { 1. } else { (-6. + (144. - r2).sqrt()).max(1.) }
+    };
+    let mut bounds = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+            // Roughed in 1.5 mm steps leaving 0.3 mm: the cell stands at the
+            // first roughing level at or above the cap's highest point over
+            // it plus the allowance (terraces up to 1.8 mm over the cap).
+            let (cx, cy) = ((12f64).clamp(x0, x0 + wx), (8f64).clamp(y0, y0 + wy));
+            let top = (1. + ((cap(cx, cy) + 0.3 - 1.) / 1.5).ceil() * 1.5).min(10.);
+            bounds.push(HeightBounds {
+                lower_mm: top,
+                upper_mm: top,
+            });
+        }
+    }
+    let initial = InitialStock {
+        source_id: "cap-allowance".into(),
+        revision: "1".into(),
+        source_sha256: "0".repeat(64),
+        source_to_setup: WorkFrame::identity(),
+        uncertainty_mm: 0.,
+        representation: "whole_cell_top_down".into(),
+        bounds,
+    };
+    let mut stock = Stock::from_initial(spec.clone(), &initial).unwrap();
+    m.initial_stock = Some(initial);
+    let mut plan =
+        WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    // The plan on the live stock: every motion, the deepest any cell sank
+    // under it, and for a link the deepest away from the rim of the ball
+    // where the link starts (a whole cell straddling that rim cannot say
+    // whether its material lay inside the ball's reach there).
+    let tool = m.tools[0].prepare().unwrap();
+    let (r, half) = (2., 0.4f64.hypot(0.4) / 2.);
+    let mut moves: Vec<(camlib::motion::Motion, f64, f64)> = vec![];
+    // For each link: the stock before it, and then what the first cut of the
+    // lap it leads to would have met on that stock - the stock the lap meets
+    // where the link arrives, had the link not cut it first.
+    let mut before_link: Option<camlib::stock::StockSnapshot> = None;
+    let mut lap_would_cut: Vec<(usize, f64)> = vec![];
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        if motion.kind == MoveKind::Lead && moves.last().is_some_and(|(m, _, _)| m.kind == MoveKind::Cut) {
+            before_link = Some(stock.snapshot());
+        } else if motion.kind == MoveKind::Cut
+            && let Some(snapshot) = before_link.take()
+        {
+            let earlier = Stock::from_snapshot(snapshot).unwrap();
+            let would = earlier
+                .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+                .unwrap()
+                .changes()
+                .iter()
+                .map(|c| c.before.upper_mm - c.after.upper_mm)
+                .fold(0., f64::max);
+            lap_would_cut.push((moves.len(), would));
+        } else if motion.kind != MoveKind::Plunge {
+            before_link = None;
+        }
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        let a = motion.curve.start();
+        let (mut cut, mut off_rim) = (0f64, 0f64);
+        for c in d.changes() {
+            let sank = c.before.upper_mm - c.after.upper_mm;
+            cut = cut.max(sank);
+            let center = stock.cell_center(c.index as usize).unwrap();
+            let from_start = (center[0] - a[0]).hypot(center[1] - a[1]);
+            if (from_start - r).abs() > half {
+                off_rim = off_rim.max(sank);
+            }
+        }
+        stock.apply_delta(&d).unwrap();
+        moves.push((motion, cut, off_rim));
+    }
+    let motions: Vec<_> = moves.iter().map(|(m, _, _)| m.clone()).collect();
+    let error = stream_error(&m, &motions);
+    assert!(error.is_none(), "{error:?}");
+    let report = plan.report();
+    println!(
+        "links {} refused stock {} link-clear {} ramp-clear {} helical {} stacks {}",
+        report.ramp_links,
+        report.links_refused_stock,
+        report.links_refused_link_clearance,
+        report.links_refused_ramp_clearance,
+        report.helical_entries,
+        report.stacks
+    );
+    // Measured: 12 of the 13 level changes linked (one refused by the stock
+    // it would meet); with links bounded by the level gap alone, most of the
+    // in-between levels here would retract instead.
+    assert!(report.ramp_links >= 12, "{} links", report.ramp_links);
+    // Every link (a lead right after a cut, at the upper level) cuts no
+    // deeper than the level gap it ramps down, or than the lap it leads to
+    // would cut where the link arrives (on the stock before the link).
+    let mut links = 0;
+    for (i, (motion, _, off_rim)) in moves.iter().enumerate() {
+        if motion.kind != MoveKind::Lead || i == 0 || moves[i - 1].0.kind != MoveKind::Cut {
+            continue;
+        }
+        let first = (i + 1..moves.len())
+            .find(|&k| moves[k].0.kind == MoveKind::Cut)
+            .unwrap();
+        let would = lap_would_cut
+            .iter()
+            .find(|(k, _)| *k == first)
+            .map(|(_, w)| *w)
+            .unwrap();
+        let gap = motion.curve.end()[2] - moves[first].0.curve.end()[2];
+        assert!(
+            *off_rim <= gap.max(would) + 1e-6,
+            "link {i} cut {off_rim} mm; its gap {gap} mm, its lap would cut {would} mm there"
+        );
+        links += 1;
+    }
+    println!("checked links {links}");
+}
