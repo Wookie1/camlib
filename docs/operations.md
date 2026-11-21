@@ -2035,11 +2035,13 @@ most the feed height, so in air) and ramps down along the loop to the level at
 the ramp angle as above; an open run goes along itself to half the depth and
 back to its start, at the same angle - then cuts it (`helical_entries`). If no entry exists the
 operation is refused, naming the level and the XY: rough or rest-rough there
-first. Where an entry reaches its level in stock more than one `stepdown_mm`
-deep, or a link more than one `stepdown_mm` beyond the level gap it descends
-(unroughed stock, such as a raw blank, or a rough in steps much deeper than the
-waterline's; a roughing allowance is expected), the report counts it
-(`deep_stock_entries`) and the simulation warns: rough or rest-rough first. The `waterline`, `waterline-dense` and
+first. Where an entry reaches its level in stock more than three
+`stepdown_mm` deep, or a link more than three `stepdown_mm` beyond the level
+gap it descends, the report counts it (`deep_stock_entries`) and the
+simulation warns: rough or rest-rough first. A rough in steps up to three
+times the finishing stepdown, plus its allowance, leaves no more than that
+on a slope and does not warn; a raw blank, or a gap the rough tool could not
+reach, does. The `waterline`, `waterline-dense` and
 `steep-and-shallow` benchmarks run on blanks roughed to 0.1 to 0.3 mm over
 the part.
 

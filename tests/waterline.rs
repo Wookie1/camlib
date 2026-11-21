@@ -983,12 +983,20 @@ fn drain(
 fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     use camlib::waterline::WaterlinePlan;
     // Raw stock to Z10 stands above every level everywhere: no point beside
-    // the wall is free of stock, so the loops keep the tangent lead on the
-    // wall, and the report counts them (the ball may come down into stock).
+    // the wall is free of stock. Levels Z3.5 and Z2.5 (1 mm stepdown), so
+    // the raw stock stands 6.5 mm - more than three stepdowns - above the
+    // first; the roughed band below stands 2.8 mm above it, as a rough in
+    // 3 mm steps (three stepdowns) leaves on a slope.
     let m = fixture();
     let cancel = AtomicBool::new(false);
+    let shallow = || {
+        let mut op = plate(&m);
+        op.stepdown_mm = 1.;
+        op.top_z_mm = 3.5;
+        op
+    };
     let mut plan = WaterlinePlan::prepare(
-        plate(&m),
+        shallow(),
         &m.tools[0],
         m.stock.height().unwrap(),
         m.initial_position_mm,
@@ -1004,8 +1012,9 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     // entry only where its lead is pure air); the island enters on a ramp.
     assert_eq!(plan.report().moved_entries, 0);
     assert!(plan.report().helical_entries >= 1);
-    // The ramp reaches its level with the raw stock standing far more than
-    // a stepdown above it: counted, so the simulation warns to rough first.
+    // The ramp reaches its level with the raw stock standing more than
+    // three stepdowns above it: counted, so the simulation warns to rough
+    // first.
     assert!(plan.report().deep_stock_entries >= 1);
     // Roughed: a point beside the wall is clear, but the roughed band runs
     // to Z6.3 within 3 mm of the plate, so a lead from it onto the wall
@@ -1013,7 +1022,7 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     // ramp instead (#46), and its lower levels are linked by ramps.
     let (mut stock, spec) = roughed(&m, 3.);
     let mut plan = WaterlinePlan::prepare(
-        plate(&m),
+        shallow(),
         &m.tools[0],
         &spec,
         m.initial_position_mm,
@@ -1024,7 +1033,8 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     drain(&m, &mut plan, &mut stock);
     assert_eq!(plan.report().moved_entries, 0);
     assert!(plan.report().helical_entries >= 1);
-    // Roughed stock leaves no more than a stepdown for any entry or link.
+    // Roughing in steps of three stepdowns is not counted (with a margin of
+    // one stepdown, the 2.8 mm band would be).
     assert_eq!(plan.report().deep_stock_entries, 0);
 }
 

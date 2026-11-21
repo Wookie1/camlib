@@ -794,11 +794,11 @@ pub struct WaterlineReport {
     pub links_refused_link_clearance: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub links_refused_ramp_clearance: usize,
-    /// Entry ramps and level links that meet stock more than one stepdown
-    /// deep where they reach the level (#46) - for a link, beyond the level
-    /// gap it descends: unroughed stock, such as a raw blank, which the
-    /// waterline cuts in full depth from the side. Rough or rest-rough
-    /// first; absent when none did.
+    /// Entry ramps and level links that meet stock more than three
+    /// stepdowns deep where they reach the level (#46) - for a link, beyond
+    /// the level gap it descends: unroughed stock, such as a raw blank or a
+    /// gap the rough tool could not reach, which the waterline cuts in full
+    /// depth from the side. Rough or rest-rough first; absent when none did.
     #[serde(skip_serializing_if = "is_zero")]
     pub deep_stock_entries: usize,
     pub cut_segments: usize,
@@ -1184,6 +1184,11 @@ fn ramp_curves(edges: &[Stroke], from: f64, to: f64, length: f64) -> Vec<Curve> 
 /// The longest gap (in ball radii) an in-between level may leave between
 /// the fragments it keeps of a contour for the contour to be cut whole (#46).
 const BRIDGE_RADII: f64 = 4.;
+/// How many stepdowns of stock an entry may meet where it reaches its level,
+/// or a link beyond the level gap it descends, before it counts as entering
+/// unroughed stock (#46): a rough in steps up to three times the finishing
+/// stepdown leaves that much (plus its allowance) on a slope.
+const DEEP_STEPDOWNS: f64 = 3.;
 /// Whether the runs an in-between level keeps of a closed contour leave only
 /// gaps along it shorter than `max_gap` (#46), measured along the contour
 /// from the end of each run to the start of the next.
@@ -2804,10 +2809,11 @@ impl WaterlinePlan {
                     [q[0], q[1]]
                 });
                 // Beyond the level gap the link and ramp descend (the
-                // level above cut down to it): roughing allowance is
-                // expected, more than a stepdown is unroughed stock.
+                // level above cut down to it): roughing in steps up to three
+                // stepdowns, plus its allowance, is expected; more is
+                // unroughed stock.
                 let deep = met.max(self.stock_under_ball(stock, end, z, &mut work, cancel)?)
-                    > za - z + self.op.stepdown_mm + self.op.tolerance_mm;
+                    > za - z + DEEP_STEPDOWNS * self.op.stepdown_mm + self.op.tolerance_mm;
                 let mut moves: Vec<Queued> = link
                     .into_iter()
                     .map(|c| (c, MoveKind::Lead, cut_feed))
@@ -2888,7 +2894,7 @@ impl WaterlinePlan {
         // ramp's.
         let end = descent.last().map_or(start, |c| c.end());
         let deep = self.stock_under_ball(stock, [end[0], end[1]], z, &mut work, cancel)?
-            > self.op.stepdown_mm + self.op.tolerance_mm;
+            > DEEP_STEPDOWNS * self.op.stepdown_mm + self.op.tolerance_mm;
         moves.push((plunge, MoveKind::Plunge, Some(self.op.plunge_mm_min)));
         if points[0].is_some() {
             moves.extend(descent.into_iter().map(|c| (c, MoveKind::Lead, cut_feed)));

@@ -162,17 +162,20 @@ class WaterlineTest(unittest.TestCase):
         # Raw stock stands above the level on every side of the loop: a lead
         # from beside it onto the wall would cut the raw stock from the side,
         # so the island enters on a ramp along its loop instead (#46 WL3);
-        # nothing plunges into the stock. The ramps reach their levels with
-        # the raw stock standing more than a stepdown above: one warning
-        # names the fix.
+        # nothing plunges into the stock. At a 1 mm stepdown the ramps reach
+        # their levels with the raw stock standing more than three stepdowns
+        # above: one warning names the fix.
+        import dataclasses
+
         config = example().waterline_job()
-        report, entries = run(config)
+        raw = dict(config, operations=(dataclasses.replace(config["operations"][0], stepdown_mm=1.0),))
+        report, entries = run(raw)
         self.assertNotIn("moved_entries", report)
         self.assertNotIn("wall_entries", report)
         self.assertGreater(report["helical_entries"], 0)
         self.assertGreater(report["deep_stock_entries"], 0)
         self.assertEqual(len(entries), 1)
-        self.assertIn("more than one stepdown deep", str(entries[0].message))
+        self.assertIn("more than three stepdowns deep", str(entries[0].message))
         self.assertIn("Rough or rest-rough first", str(entries[0].message))
         # A blank roughed to 0.3 mm over the island and 0.1 mm over the base
         # (the benchmark's): the island is entered once on a ramp, and every
