@@ -133,16 +133,14 @@ fn stock_digest(producer: &StreamProducer) -> Result<String, String> {
     Ok(format!("{:x}", h.finalize()))
 }
 fn clearance_dependency(stock: &crate::stock::Stock, operation: &Operation) -> Option<[u8; 32]> {
-    use crate::{adaptive::AdaptivePathStrategy::StockFront, roughing::RoughingClearing};
+    use crate::roughing::RoughingClearing;
+    // The engagement front reads the committed sweeps themselves
+    // (`Stock::committed_clearance_since`), not only the cell bounds the
+    // stock digest covers, so two stocks with equal cells but different
+    // committed sweeps must not share a cached plan.
     let sensitive = match operation {
-        Operation::AdaptivePocket(op) => op.path_strategy == StockFront,
-        Operation::Roughing(op) => matches!(
-            op.clearing,
-            RoughingClearing::Adaptive {
-                path_strategy: StockFront,
-                ..
-            }
-        ),
+        Operation::AdaptivePocket(_) => true,
+        Operation::Roughing(op) => matches!(op.clearing, RoughingClearing::Adaptive { .. }),
         _ => false,
     };
     sensitive.then(|| stock.committed_clearance_fingerprint())
@@ -1286,7 +1284,6 @@ fn control_turn(
 mod clearance_key_tests {
     use super::*;
     use crate::{
-        adaptive::AdaptivePathStrategy,
         motion::{Curve, MoveKind},
         stock::{Stock, SweepOptions},
         stream::StreamManifest,
@@ -1325,11 +1322,8 @@ mod clearance_key_tests {
             b.snapshot(),
             "the height image alone cannot distinguish these sweeps"
         );
-        let mut operation = manifest.operations[0].clone();
-        let Operation::AdaptivePocket(adaptive) = &mut operation else {
-            panic!("fixture");
-        };
-        adaptive.path_strategy = AdaptivePathStrategy::StockFront;
+        let operation = manifest.operations[0].clone();
+        assert!(matches!(operation, Operation::AdaptivePocket(_)), "fixture");
         assert_ne!(
             clearance_dependency(&a, &operation),
             clearance_dependency(&b, &operation)
@@ -1348,18 +1342,18 @@ mod clearance_key_tests {
             clearance_dependency(&a, &operation),
             clearance_dependency(&restored, &operation)
         );
-        let Operation::AdaptivePocket(adaptive) = &mut operation else {
+        let Operation::AdaptivePocket(adaptive) = &operation else {
             unreachable!();
         };
-        adaptive.path_strategy = AdaptivePathStrategy::DiskFront;
         let raster = Operation::Pocket(adaptive.pocket.clone());
-        assert_eq!(clearance_dependency(&a, &operation), None);
         assert_eq!(clearance_dependency(&a, &raster), None);
-        let rough: StreamManifest =
-            serde_json::from_str(include_str!("../fixtures/regressions/stock-front.json")).unwrap();
+        let rough: StreamManifest = serde_json::from_str(include_str!(
+            "../fixtures/operations/roughing-open-block.json"
+        ))
+        .unwrap();
         assert!(
             clearance_dependency(&a, &rough.operations[0]).is_some(),
-            "nested stock-front roughing also consumes the premise"
+            "adaptive roughing also consumes the premise"
         );
     }
 }

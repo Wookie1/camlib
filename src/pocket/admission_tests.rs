@@ -261,7 +261,6 @@ fn native_source_admission_measurement() {
         "Cargo.lock",
         "src/pocket.rs",
         "src/pocket/admission_tests.rs",
-        "src/adaptive_front.rs",
         "fixtures/operations/adaptive-pocket.json",
     ]
     .into_iter()
@@ -281,73 +280,4 @@ fn native_source_admission_measurement() {
         "{}",
         serde_json::json!({"reference":report["reference"],"admission":report["admission"],"p95_ratio":ratio,"gates":report["gates"]})
     );
-}
-
-#[test]
-fn source_approval_reuses_only_actual_complete_proofs_from_the_same_owner() {
-    let source = fixture(false, 0., [0., 0.], 0., 0., 1e-5);
-    let curve = Curve::Line {
-        start: [5., 5., 8.],
-        end: [6., 5., 8.],
-    };
-    let approval = source
-        .approve_guide_tube(&curve, 0.5)
-        .expect("interior complete tube");
-    assert!(source.guide_tube_fits(Stroke::line([5., 5.], [6., 5.]), 0.5));
-    assert!(approval.matches(&source, &curve, 0.5, 1e-5));
-    assert!(!approval.matches(&source, &curve, 0.6, 1e-5));
-    assert!(!approval.matches(&source, &curve, 0.5, 2e-5));
-    for changed in [
-        Curve::Line {
-            start: [5., 5., 7.],
-            end: [6., 5., 7.],
-        },
-        Curve::Line {
-            start: [5., 5., 8.],
-            end: [6.1, 5., 8.],
-        },
-        Curve::Line {
-            start: [6., 5., 8.],
-            end: [5., 5., 8.],
-        },
-    ] {
-        assert!(!approval.matches(&source, &changed, 0.5, 1e-5));
-    }
-    let foreign = fixture(false, 0., [0., 0.], 0., 0., 1e-5);
-    assert!(!approval.matches(&foreign, &curve, 0.5, 1e-5));
-    let outside = Curve::Line {
-        start: [-100., -100., 8.],
-        end: [-90., -100., 8.],
-    };
-    assert!(source.approve_guide_tube(&outside, 0.5).is_none());
-    let crossing = Curve::Line {
-        start: [5., 5., 8.],
-        end: [40., 5., 8.],
-    };
-    assert!(source.approve_guide_tube(&crossing, 0.5).is_none());
-    let curved = fixture(true, 0., [0., 0.], 0., 0., 1e-5);
-    let arc = Curve::Arc {
-        start: [20., 13., 8.],
-        end: [13., 20., 8.],
-        center: [13., 13., 8.],
-        plane: Plane::Xy,
-        sweep_rad: FRAC_PI_2,
-    };
-    let arc_approval = curved.approve_guide_tube(&arc, 0.5).unwrap();
-    assert!(arc_approval.matches(&curved, &arc, 0.5, 1e-5));
-    let mut other_sweep = arc.clone();
-    if let Curve::Arc { sweep_rad, .. } = &mut other_sweep {
-        *sweep_rad -= TAU;
-    }
-    assert!(!arc_approval.matches(&curved, &other_sweep, 0.5, 1e-5));
-    let mut other_plane = arc;
-    if let Curve::Arc { plane, .. } = &mut other_plane {
-        *plane = Plane::Yz;
-    }
-    assert!(curved.approve_guide_tube(&other_plane, 0.5).is_none());
-    let moved = source;
-    assert!(approval.matches(&moved, &curve, 0.5, 1e-5));
-    drop(moved);
-    let replacement = fixture(false, 0., [0., 0.], 0., 0., 1e-5);
-    assert!(!approval.matches(&replacement, &curve, 0.5, 1e-5));
 }

@@ -25,13 +25,11 @@ const FLOOR: f64 = 8.;
 fn fixture() -> StreamManifest {
     serde_json::from_str(include_str!("../fixtures/operations/adaptive-pocket.json")).unwrap()
 }
-/// The fixture's adaptive pocket, planned by the engagement front (the
-/// Python API's default; a manifest without `path_strategy` is disk_front).
+/// The fixture's adaptive pocket, planned by the engagement front.
 fn adaptive(m: &StreamManifest) -> AdaptivePocketOperation {
-    let Operation::AdaptivePocket(mut op) = m.operations[0].clone() else {
+    let Operation::AdaptivePocket(op) = m.operations[0].clone() else {
         panic!("fixture")
     };
-    op.path_strategy = AdaptivePathStrategy::EngagementFront;
     op
 }
 type Rect = [[f64; 2]; 2];
@@ -468,27 +466,15 @@ fn no_pocket_strategy_plans_nothing_in_a_slot_the_cutter_fits() {
     // engagement front plans in.
     for width in [5., 4.5, 4.2] {
         let slot = slot_rect(width);
-        for strategy in [
-            AdaptivePathStrategy::EngagementFront,
-            AdaptivePathStrategy::DiskFront,
-            AdaptivePathStrategy::StockFront,
-        ] {
-            for entry in [None, helix(), ramp(4.)] {
-                let front = strategy == AdaptivePathStrategy::EngagementFront;
-                if !front && entry.as_ref().is_some_and(|e| matches!(e, PocketEntry::Ramp(_))) {
-                    // Refused by name before planning (#219).
-                    continue;
-                }
-                let mut op = adaptive(&m);
-                set_region(&mut op.pocket, rectangle(slot));
-                op.path_strategy = strategy;
-                op.pocket.entry = entry.clone();
-                check(
-                    format!("adaptive {strategy:?} {width} mm {entry:?}"),
-                    slot,
-                    run(&m, Operation::AdaptivePocket(op)),
-                );
-            }
+        for entry in [None, helix(), ramp(4.)] {
+            let mut op = adaptive(&m);
+            set_region(&mut op.pocket, rectangle(slot));
+            op.pocket.entry = entry.clone();
+            check(
+                format!("adaptive EngagementFront {width} mm {entry:?}"),
+                slot,
+                run(&m, Operation::AdaptivePocket(op)),
+            );
         }
         for rest in [None, Some(0.01)] {
             for entry in [None, helix(), ramp(4.)] {
@@ -540,21 +526,6 @@ fn no_pocket_strategy_plans_nothing_in_a_slot_the_cutter_fits() {
         outcome(&format!("pocket rest=None 4.2 mm {:?}", None::<PocketEntry>)),
         None
     );
-    // The orbit strategies sweep a disk of radius 3 (cutter 2 + orbit 1):
-    // none fits a 5 mm slot, and that is refused with the sweep's size.
-    for strategy in ["DiskFront", "StockFront"] {
-        let error = outcome(&format!("adaptive {strategy} 5 mm None")).unwrap();
-        for part in [
-            "adaptive pocket adaptive: no orbit fits the area at (",
-            "sweep a disk of radius 3 mm (cutter radius 2 + orbit radius 1)",
-            "though the cutter fits it",
-            "path_strategy engagement_front",
-            "a smaller orbit_radius_mm",
-        ] {
-            assert!(error.contains(part), "{part:?} not in: {error}");
-        }
-        assert!(inside(named_point(&error), slot_rect(5.)), "{error}");
-    }
     // A helix radius that does not fit is refused before any motion, naming
     // what, where, what was tried and the options. The `Pocket` says it as
     // its entry fit (#250); the engagement front lists the area itself,
@@ -604,30 +575,14 @@ fn no_pocket_strategy_plans_nothing_in_a_slot_the_cutter_fits() {
         }
         assert!(inside(named_point(&error), slot_rect(5.)), "{error}");
     }
-    // A smaller orbit, as that message says, does fit and cut the slot.
-    let slot = slot_rect(5.);
-    let mut op = adaptive(&m);
-    set_region(&mut op.pocket, rectangle(slot));
-    op.path_strategy = AdaptivePathStrategy::DiskFront;
-    op.orbit_radius_mm = Some(0.25);
-    let seen = run(&m, Operation::AdaptivePocket(op));
-    assert_eq!(seen.error, None);
-    assert!(cut_to(&seen.stock, slot, FLOOR));
     // A region the cutter fits nowhere in (3 mm for a 4 mm cutter): the
     // operation can do nothing it was asked to, and every pocket operation
     // says so before any motion.
     let narrow = slot_rect(3.);
     let mut ops = vec![];
-    for strategy in [
-        AdaptivePathStrategy::EngagementFront,
-        AdaptivePathStrategy::DiskFront,
-        AdaptivePathStrategy::StockFront,
-    ] {
-        let mut op = adaptive(&m);
-        set_region(&mut op.pocket, rectangle(narrow));
-        op.path_strategy = strategy;
-        ops.push(("adaptive pocket adaptive", Operation::AdaptivePocket(op)));
-    }
+    let mut op = adaptive(&m);
+    set_region(&mut op.pocket, rectangle(narrow));
+    ops.push(("adaptive pocket adaptive", Operation::AdaptivePocket(op)));
     for rest in [None, Some(0.01)] {
         let mut op = adaptive(&m).pocket;
         set_region(&mut op, rectangle(narrow));
@@ -697,9 +652,7 @@ fn roughing_refuses_an_enclosed_slot_no_entry_fits() {
     let front = || {
         serde_json::json!({
             "kind": "adaptive", "path_strategy": "engagement_front",
-            "max_radial_engagement_mm": 0.5, "orbit_radius_mm": null,
-            "min_orbit_radius_mm": null, "local_orbit_tolerance_mm": null,
-            "boundary_tolerance_mm": 0.01,
+            "max_radial_engagement_mm": 0.5,
         })
     };
     let stock_edge_or_helix =
@@ -869,40 +822,6 @@ fn roughing_refuses_an_enclosed_slot_no_entry_fits() {
         // The slot's stock within the cutter's reach: about 12 x 2 mm.
         assert!(unresolved(layer) > unresolved(cut) + 15., "{layer}");
     }
-    // stock_front, whose orbits sweep more than the cutter (radius 1 + 0.5
-    // orbit, 0.1 off the walls: 3.2 mm, in a 2.8 mm slot): the layer lists
-    // the slot as an area no orbit fits in.
-    let orbits = serde_json::json!({
-        "kind": "adaptive", "path_strategy": "stock_front",
-        "max_radial_engagement_mm": 0.5, "orbit_radius_mm": null,
-        "min_orbit_radius_mm": null, "local_orbit_tolerance_mm": null,
-        "boundary_tolerance_mm": 0.01,
-    });
-    let m = roughing_from(1.5, orbits, stock_edge_or_helix(), NARROW);
-    let plan = OperationPlan::prepare(
-        m.operations[0].clone(),
-        &m.tools[0],
-        m.stock.height().unwrap(),
-        m.initial_position_mm,
-        1,
-        &AtomicBool::new(false),
-    )
-    .unwrap();
-    let report = serde_json::to_value(plan.report()).unwrap();
-    for layer in report["layers"].as_array().unwrap() {
-        let areas = layer["clearing"]["unentered_areas"].as_array().unwrap();
-        assert_eq!(areas.len(), 1, "{layer}");
-        assert_eq!(areas[0]["reason"], "no_orbit_fits");
-        assert_eq!(areas[0]["needed_mm"], 0.5);
-        let at = areas[0]["at_mm"].as_array().unwrap();
-        assert!(
-            inside(
-                [at[0].as_f64().unwrap(), at[1].as_f64().unwrap()],
-                slot(NARROW)
-            ),
-            "{layer}"
-        );
-    }
     // Raster and offset layers fit their entries before any motion: refused
     // there, or cut.
     for clearing in [
@@ -934,9 +853,7 @@ fn roughing_lists_an_area_whose_only_entry_is_a_forbidden_helix() {
     let front = || {
         serde_json::json!({
             "kind": "adaptive", "path_strategy": "engagement_front",
-            "max_radial_engagement_mm": 0.5, "orbit_radius_mm": null,
-            "min_orbit_radius_mm": null, "local_orbit_tolerance_mm": null,
-            "boundary_tolerance_mm": 0.01,
+            "max_radial_engagement_mm": 0.5,
         })
     };
     let stock_edge =

@@ -330,7 +330,6 @@ class MotionPolicyTest(unittest.TestCase):
         manifest = json.loads(
             (Path(__file__).resolve().parents[2] / 'fixtures/operations/adaptive-connected.json').read_text()
         )
-        manifest['operations'][0]['path_strategy'] = 'stock_front'
         tools = tuple(ToolAssembly.from_dict(t) for t in manifest['tools'])
         pose = tuple(manifest['initial_position_mm'])
         header = Program('connected-schedule', 'r1', tools, pose, (), tolerance_mm=manifest['sweep']['tolerance_mm'])
@@ -372,9 +371,10 @@ class MotionPolicyTest(unittest.TestCase):
             source_motion_count = sim.state.completed
             self.assertTrue(sim.state.finished)
         # Check preservation against the independently consumed stock stream.
-        # A fixed planner count (3205 on Linux, 3195 on Windows) tests the host's
-        # adaptive subdivision, not whether scheduling preserves every motion.
-        self.assertGreater(source_motion_count, 3000)
+        # A fixed planner count tests the host's adaptive subdivision, not
+        # whether scheduling preserves every motion. (The removed orbit planner
+        # made about 3,200 motions here; the engagement front about 220, #190.)
+        self.assertGreater(source_motion_count, 100)
         self.assertEqual(len(scheduled.report['segments']), source_motion_count)
         self.assertGreater(scheduled.report['feed_limited_motions'], 0)
         with Simulation(
@@ -392,4 +392,4 @@ class MotionPolicyTest(unittest.TestCase):
             self.assertEqual(replay.state.heights.tobytes(), saved)
         chunks = list(post_program(scheduled.program, machine))
         self.assertIn('M2', chunks[-1].text)
-        self.assertGreater(sum(len(c.motions) for c in chunks), 3000)
+        self.assertGreater(sum(len(c.motions) for c in chunks), 100)

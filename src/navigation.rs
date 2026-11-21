@@ -67,41 +67,28 @@ impl Groups {
 #[derive(Clone, Copy)]
 pub(crate) struct Guide {
     pub(crate) stroke: Stroke,
-    pub(crate) radius: f64,
-    pub(crate) coverage: f64,
     pub(crate) edge: usize,
 }
 pub(crate) struct GuideGraph {
     pub(crate) tours: Vec<Vec<Guide>>,
-    pub(crate) links: usize,
     pub(crate) work: usize,
 }
 pub(crate) struct GraphOptions {
-    pub bridge_radius: f64,
-    pub cutter_radius: f64,
-    pub coverage: f64,
-    pub local_sizing: bool,
     pub starting_work: usize,
 }
 pub(crate) fn graph(
     guides: &PocketPlan,
-    originals: Vec<(Stroke, f64, f64)>,
+    originals: Vec<(Stroke, f64)>,
     options: GraphOptions,
     cancel: &impl CancelSignal,
 ) -> Result<GuideGraph, String> {
-    let GraphOptions {
-        bridge_radius,
-        cutter_radius,
-        coverage,
-        local_sizing,
-        starting_work,
-    } = options;
+    let GraphOptions { starting_work } = options;
     let mut nodes = vec![];
     let mut node_radii: Vec<f64> = vec![];
     let mut ids = HashMap::new();
     let mut edges = vec![];
     let mut endpoints = vec![];
-    for (s, radius, coverage) in originals {
+    for (s, radius) in originals {
         if cancel.is_cancelled() {
             return Err("adaptive navigation cancelled".into());
         }
@@ -117,8 +104,6 @@ pub(crate) fn graph(
         }
         edges.push(Guide {
             stroke: s,
-            radius,
-            coverage,
             edge: edges.len(),
         });
         endpoints.push(pair);
@@ -151,7 +136,7 @@ pub(crate) fn graph(
         candidates.sort_unstable_by(bridge_cmp);
     }
     let mut candidates = candidates.into_iter();
-    let (mut links, mut work) = (0, starting_work);
+    let mut work = starting_work;
     loop {
         if groups.count <= guides.report().center_components {
             break;
@@ -161,7 +146,7 @@ pub(crate) fn graph(
         } else {
             candidates.next()
         };
-        let Some((preferred, _, a, b)) = candidate else {
+        let Some((_, _, a, b)) = candidate else {
             break;
         };
         if cancel.is_cancelled() {
@@ -175,32 +160,12 @@ pub(crate) fn graph(
         }
         work += guides.link_work_per_query(); // source sign query plus all source edge distances
         if guides.link_geometry_fits(nodes[a], nodes[b]) {
-            let mut radius = bridge_radius;
-            if preferred > bridge_radius {
-                work += guides.link_work_per_query();
-                if local_sizing {
-                    if let Some((lower, _)) =
-                        guides.guide_radius_bounds(Stroke::line(nodes[a], nodes[b]))
-                    {
-                        radius = (lower - cutter_radius).min(preferred).max(bridge_radius);
-                    }
-                } else if guides.link_geometry_fits_radius(
-                    nodes[a],
-                    nodes[b],
-                    preferred + cutter_radius,
-                ) {
-                    radius = preferred;
-                }
-            }
             groups.join(a, b);
             edges.push(Guide {
                 stroke: Stroke::line(nodes[a], nodes[b]),
-                radius,
-                coverage,
                 edge: edges.len(),
             });
             endpoints.push([a, b]);
-            links += 1;
         }
     }
     let mut adjacent = vec![vec![]; nodes.len()];
@@ -251,7 +216,7 @@ pub(crate) fn graph(
             tours.push(tour);
         }
     }
-    Ok(GuideGraph { tours, links, work })
+    Ok(GuideGraph { tours, work })
 }
 
 #[cfg(test)]
@@ -310,21 +275,23 @@ mod tests {
         let result = graph(
             &guides,
             vec![
-                (Stroke::line(points[0], points[1]), 1., 1.),
-                (Stroke::line(points[2], points[3]), 1., 1.),
+                (Stroke::line(points[0], points[1]), 1.),
+                (Stroke::line(points[2], points[3]), 1.),
             ],
-            GraphOptions {
-                bridge_radius: 1.,
-                cutter_radius: 2.,
-                coverage: 1.,
-                local_sizing: false,
-                starting_work: 0,
-            },
+            GraphOptions { starting_work: 0 },
             &|| false,
         )
         .unwrap();
-        assert_eq!(result.links, 1);
         assert_eq!(result.tours.len(), 1);
+        // One bridge link: every edge past the two originals is that link.
+        let mut links: Vec<_> = result.tours[0]
+            .iter()
+            .filter(|s| s.edge >= 2)
+            .map(|s| s.edge)
+            .collect();
+        links.sort_unstable();
+        links.dedup();
+        assert_eq!(links.len(), 1);
         let bridges: Vec<_> = result.tours[0].iter().filter(|s| s.edge >= 2).collect();
         assert!(!bridges.is_empty());
         for bridge in bridges {

@@ -41,9 +41,10 @@ class PocketCornerEngagementTest(unittest.TestCase):
         job = adaptive_job()
         with self.assertRaisesRegex(SimulationError, "max_corner_engagement_deg must be within"):
             self.run_pocket(job, max_corner_engagement_deg=180)
+        # The orbit planners were removed (#190): their names are refused first.
         for strategy in ("disk_front", "stock_front"):
             with (
                 self.subTest(strategy=strategy),
-                self.assertRaisesRegex(SimulationError, "requires path_strategy engagement_front"),
+                self.assertRaisesRegex(SimulationError, "unknown variant"),
             ):
                 self.run_pocket(job, path_strategy=strategy, max_corner_engagement_deg=150)

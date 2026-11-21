@@ -127,7 +127,6 @@ fn run_with(
     let Operation::AdaptivePocket(mut op) = m.operations[0].clone() else {
         panic!("fixture")
     };
-    op.path_strategy = AdaptivePathStrategy::EngagementFront;
     edit(&mut op);
     // The wire format round-trips the entry.
     let wire = serde_json::to_value(&op).unwrap();
@@ -358,10 +357,9 @@ fn adaptive_pocket_ramps_into_enclosed_material_and_proves_every_cut_after_it() 
     }
     // A job that asks for no ramp reports none: its report has no new field.
     let m = fixture();
-    let Operation::AdaptivePocket(mut op) = m.operations[0].clone() else {
+    let Operation::AdaptivePocket(op) = m.operations[0].clone() else {
         panic!("fixture")
     };
-    op.path_strategy = AdaptivePathStrategy::EngagementFront;
     let plan = OperationPlan::prepare(
         Operation::AdaptivePocket(op),
         &m.tools[0],
@@ -490,25 +488,6 @@ fn adaptive_pocket_ramps_along_a_slot_no_helix_fits() {
 
 #[test]
 fn adaptive_ramp_refusals_name_the_reason() {
-    // The orbit strategies start from a fitted seed circle.
-    for strategy in [
-        AdaptivePathStrategy::DiskFront,
-        AdaptivePathStrategy::StockFront,
-    ] {
-        let error = run(4., |op| {
-            op.pocket.entry = Some(ramp(4., Some(2.)));
-            op.path_strategy = strategy;
-        })
-        .err()
-        .unwrap();
-        for part in [
-            "RampEntry is not supported here",
-            "seed circle",
-            "engagement_front",
-        ] {
-            assert!(error.contains(part), "{error}");
-        }
-    }
     // An invalid ramp is refused before planning.
     let error = run(4., |op| op.pocket.entry = Some(ramp(0., None)))
         .err()
@@ -521,7 +500,6 @@ fn adaptive_ramp_refusals_name_the_reason() {
     let Operation::AdaptivePocket(op) = &mut m.operations[0] else {
         panic!("fixture")
     };
-    op.path_strategy = AdaptivePathStrategy::EngagementFront;
     op.pocket.entry = Some(ramp(4., None));
     let error = OperationPlan::prepare(
         m.operations[0].clone(),

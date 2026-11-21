@@ -75,13 +75,13 @@ class ClosedOrbitPosting(unittest.TestCase):
         self.assertEqual(chords[-1].end[:2], moved)
 
     def test_adaptive_orbits_post_at_three_decimals(self):
-        """The workload that found #58: every orbit stays one native block."""
+        """The adaptive pocket that found #58 (then cleared with orbits): every arc stays one native block."""
         from camlib.jobs import Job, Setup
         from camlib.post import Machine, ToolSetting
         from camlib.postprocessor import GCodeDialect
         from support.adaptive_pocket import adaptive_job
 
-        c = adaptive_job(path_strategy="disk_front")
+        c = adaptive_job()
         tool = c["tools"][0]
         setup = Setup("top", c["stock"], c["tools"], c["operations"], c["initial_position_mm"])
         job = Job("adaptive-orbits", c["revision"], (setup,))
@@ -114,7 +114,7 @@ class ClosedOrbitPosting(unittest.TestCase):
             lowering=LoweringOptions(native_arcs=True),
             accept={"unchecked_machine"},
         ).text
-        # Same blocks as at 6 decimals: no orbit had to be lowered to chords.
+        # Same blocks as at 6 decimals: no arc had to be lowered to chords.
         self.assertEqual(len(coarse.splitlines()), len(fine.splitlines()))
 
 

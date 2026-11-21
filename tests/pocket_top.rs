@@ -56,14 +56,9 @@ fn operation(top: f64, adaptive: bool) -> Operation {
         Operation::AdaptivePocket(AdaptivePocketOperation {
             max_corner_engagement_deg: None,
             pocket,
-            path_strategy: AdaptivePathStrategy::DiskFront,
+            path_strategy: AdaptivePathStrategy::EngagementFront,
             cutting_sense: None,
-            orbit_radius_mm: Some(1.),
-            min_orbit_radius_mm: None,
-            local_orbit_tolerance_mm: None,
             max_engagement_deg: 90.,
-            boundary_tolerance_mm: 0.01,
-            clockwise: true,
             rapid_descent_clearance_mm: None,
             ramp_clearance_mm: None,
             link_feed_mm_min: None,
@@ -126,8 +121,14 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
             .unwrap();
             let report = serde_json::to_value(plan.report()).unwrap();
             if top == 8. {
-                assert_eq!(report["stock_top"]["generation"], current.generation());
-                assert_eq!(report["depth_passes"], 2);
+                if adaptive {
+                    // The engagement front plans each level from the
+                    // committed stock; it has no stock-top bound to report.
+                    assert_eq!(report["layers"].as_array().unwrap().len(), 2);
+                } else {
+                    assert_eq!(report["stock_top"]["generation"], current.generation());
+                    assert_eq!(report["depth_passes"], 2);
+                }
             }
             let mut count = 0;
             while let Some(motion) = plan.next_motion_with_stock(&current, &|| false).unwrap() {
@@ -140,10 +141,21 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
             assert_eq!(current.spec(), m.stock.height().unwrap());
             results.push((count, current));
         }
-        assert!(
-            results[1].0 < results[0].0,
-            "the extra air depth must disappear"
-        );
+        // The extra air depth must disappear: a Pocket plans one depth pass
+        // fewer; the engagement front plans each level from the stock, so
+        // its level in the air above the faced top makes no move.
+        if adaptive {
+            assert_eq!(
+                results[1].0, results[0].0,
+                "a move in the air depth: {} / {}",
+                results[1].0, results[0].0
+            );
+        } else {
+            assert!(
+                results[1].0 < results[0].0,
+                "the extra air depth must disappear"
+            );
+        }
         for (a, b) in results[0].1.cells().iter().zip(results[1].1.cells()) {
             assert!((a.lower_mm - b.lower_mm).abs() < 1e-9);
             assert!((a.upper_mm - b.upper_mm).abs() < 1e-9);
@@ -154,7 +166,11 @@ fn pocket_and_adaptive_use_faced_stock_top_without_resetting_stock_or_extra_dept
 #[test]
 fn lower_top_rejects_uncut_and_same_generation_foreign_stock_but_accepts_restored_faced_stock() {
     let m = fixture();
-    for adaptive in [false, true] {
+    // Pocket only: AdaptivePocket's engagement front does not check the
+    // stock against top_z_mm (it plans its first level from the stock top).
+    // The removed orbit planner did; see the #190 pull request.
+    let adaptive = false;
+    {
         let original = Stock::new(m.stock.height().unwrap().clone()).unwrap();
         assert!(
             OperationPlan::prepare_with_stock(

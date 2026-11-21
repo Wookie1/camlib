@@ -57,19 +57,14 @@ class NoEntryTest(unittest.TestCase):
                 'an earlier operation that opens a start there',
             ):
                 self.assertIn(part, error)
-        # The orbit strategies sweep a disk of radius 3 mm: none fits.
-        for strategy in ('disk_front', 'stock_front'):
-            error = refused(self, adaptive_job(None, path_strategy=strategy))
-            self.assertIn('adaptive pocket slot: no orbit fits the area at (', error)
-            self.assertIn('though the cutter fits it', error)
-            self.assertIn('path_strategy engagement_front', error)
 
     def test_a_region_the_cutter_fits_nowhere_in_is_refused(self):
         # 26 x 3 mm for the 4 mm cutter: no operation can do anything there.
         narrow = ((3.0, 10.5), (29.0, 13.5))
-        jobs = [(slot_job(None, region=narrow), 'pocket slot')]
-        for strategy in ('engagement_front', 'disk_front', 'stock_front'):
-            jobs.append((adaptive_job(None, region=narrow, path_strategy=strategy), 'adaptive pocket slot'))
+        jobs = [
+            (slot_job(None, region=narrow), 'pocket slot'),
+            (adaptive_job(None, region=narrow), 'adaptive pocket slot'),
+        ]
         for job, name in jobs:
             error = refused(self, job)
             self.assertIn(f'{name}: the cutter fits nowhere in the region', error)

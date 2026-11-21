@@ -51,43 +51,6 @@ fn circular(c: &Curve) -> Option<(Vec3, Vec3, Vec3, f64)> {
         _ => None,
     }
 }
-fn point(c: &Curve, f: f64) -> Vec3 {
-    let a = c.start();
-    let b = c.end();
-    if f == 0. {
-        return a;
-    }
-    if f == 1. {
-        return b;
-    }
-    if let Some((_, _, o, s)) = circular(c) {
-        let r = distance([a[0], a[1]], [o[0], o[1]]);
-        let t = (a[1] - o[1]).atan2(a[0] - o[0]) + s * f;
-        [
-            o[0] + r * t.cos(),
-            o[1] + r * t.sin(),
-            a[2] + (b[2] - a[2]) * f,
-        ]
-    } else {
-        std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f)
-    }
-}
-fn part(c: &Curve, a: f64, b: f64) -> Curve {
-    let start = point(c, a);
-    let end = point(c, b);
-    if let Some((_, _, mut center, s)) = circular(c) {
-        center[2] = start[2];
-        Curve::Arc {
-            start,
-            end,
-            center,
-            plane: Plane::Xy,
-            sweep_rad: s * (b - a),
-        }
-    } else {
-        Curve::Line { start, end }
-    }
-}
 fn axis_distance(c: &Curve, p: [f64; 2], maximum: bool) -> f64 {
     let a = c.start();
     let b = c.end();
@@ -209,42 +172,12 @@ fn exact_height(c: &Curve, p: [f64; 2]) -> f64 {
         }
     }
 }
-fn exposure(q: f64, a: f64) -> f64 {
-    if q + 2. <= a {
-        0.
-    } else if q >= a + 2. {
-        360.
-    } else {
-        2. * ((a * a - q * q - 4.) / (4. * q))
-            .clamp(-1., 1.)
-            .acos()
-            .to_degrees()
-    }
-}
-fn certify(c: &Curve, disks: &[([f64; 2], f64)]) {
-    let mut stack = vec![(0., 1., 0)];
-    let mut work = 0;
-    while let Some((a, b, depth)) = stack.pop() {
-        let sub = part(c, a, b);
-        let mut clear = false;
-        for &(center, radius) in disks.iter().rev() {
-            work += 1;
-            if exposure(axis_distance(&sub, center, true), radius) <= 90. + 1e-6 {
-                clear = true;
-                break;
-            }
-        }
-        if !clear {
-            assert!(depth < 24 && work < 50_000_000, "uncertified exposure{c:?}");
-            let mid = (a + b) / 2.;
-            stack.extend([(a, mid, depth + 1), (mid, b, depth + 1)]);
-        }
-    }
-}
 // Independent complete disk coverage from previously emitted horizontal sweeps.
 // Distance to a closed curve is 1-Lipschitz: center distance + box half diagonal
 // bounds EVERY point in each tile. A sample alone never certifies a tile.
-fn certify_air_entry(c: &Curve, history: &[Curve]) {
+/// `at_floor`: a sweep at the descent's own end height also clears it (a
+/// descent that stops on a floor already cut).
+fn certify_air_entry(c: &Curve, history: &[Curve], at_floor: bool) {
     let p = [c.end()[0], c.end()[1]];
     assert_eq!(&c.start()[..2], &c.end()[..2]);
     let mut stack = vec![([p[0] - 2., p[1] - 2.], [p[0] + 2., p[1] + 2.], 0)];
@@ -259,7 +192,7 @@ fn certify_air_entry(c: &Curve, history: &[Curve]) {
         let clear = history.iter().any(|old| {
             work += 1;
             old.start()[2] == old.end()[2]
-                && old.start()[2] < c.end()[2]
+                && (old.start()[2] < c.end()[2] || at_floor && old.start()[2] == c.end()[2])
                 && axis_distance(old, mid, false) + extent < 2. - 1e-7
         });
         if !clear {
@@ -278,8 +211,14 @@ fn certify_air_entry(c: &Curve, history: &[Curve]) {
     }
 }
 fn check(mut m: StreamManifest, clockwise: bool, radius: Option<f64>, all_cells: bool) {
+    // An adaptive pocket's direction is its cutting sense: with the
+    // clockwise spindle, climb clears counter-clockwise.
     if let Operation::AdaptivePocket(op) = &mut m.operations[0] {
-        op.clockwise = clockwise;
+        op.cutting_sense = Some(if clockwise {
+            camlib::adaptive::CuttingSense::Conventional
+        } else {
+            camlib::adaptive::CuttingSense::Climb
+        });
     }
     let p = pocket(&mut m);
     p.boundary_clockwise = Some(clockwise);
@@ -302,7 +241,6 @@ fn check(mut m: StreamManifest, clockwise: bool, radius: Option<f64>, all_cells:
     let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
     let adaptive = matches!(m.operations[0], Operation::AdaptivePocket(_));
     let mut curves = vec![];
-    let mut disks = vec![];
     let mut helices = 0;
     // Entries are emitted one full turn per helix motion; consecutive turns
     // of one descent share endpoints.
@@ -317,7 +255,7 @@ fn check(mut m: StreamManifest, clockwise: bool, radius: Option<f64>, all_cells:
             source_tube(c);
         }
         if motion.kind == MoveKind::Link && c.start()[2] > c.end()[2] {
-            certify_air_entry(c, &curves);
+            certify_air_entry(c, &curves, false);
             air_entries += 1;
         }
         if let Some((_, _, center, sweep)) = circular(c) {
@@ -328,8 +266,24 @@ fn check(mut m: StreamManifest, clockwise: bool, radius: Option<f64>, all_cells:
                 if !continuation {
                     assert!(floor_circle.is_none());
                     helices += 1;
-                    disks.clear();
-                    if adaptive || helices == 1 {
+                    if adaptive {
+                        // The engagement front starts each helix on the
+                        // material its bore meets (ramp_clearance_mm unset):
+                        // at the stock's top there, never inside it.
+                        let bore = r + 2.;
+                        let mut top = f64::NEG_INFINITY;
+                        for (i, cell) in stock.cells().iter().enumerate() {
+                            let p = stock.cell_center(i).unwrap();
+                            if distance(p, [center[0], center[1]]) <= bore {
+                                top = top.max(cell.upper_mm);
+                            }
+                        }
+                        assert!(
+                            c.start()[2] >= top - 1e-6 && c.start()[2] <= top + 0.011,
+                            "helix {helices} starts at Z{} on stock at Z{top}",
+                            c.start()[2]
+                        );
+                    } else if helices == 1 {
                         assert_eq!(c.start()[2], 10.);
                     } else {
                         assert!(
@@ -350,7 +304,10 @@ fn check(mut m: StreamManifest, clockwise: bool, radius: Option<f64>, all_cells:
                 assert_eq!(sweep < 0., clockwise);
                 assert_eq!(motion.feed_mm_min, Some(150.));
                 turns += n.round() as usize;
-                floor_circle = Some((center, r, c.end()[2]));
+                // A Pocket's helix ends with a full circle at its floor.
+                if !adaptive {
+                    floor_circle = Some((center, r, c.end()[2]));
+                }
             } else if let Some((origin, radius, z)) = floor_circle.take() {
                 assert_eq!(center[0], origin[0]);
                 assert_eq!(center[1], origin[1]);
@@ -358,19 +315,12 @@ fn check(mut m: StreamManifest, clockwise: bool, radius: Option<f64>, all_cells:
                 assert_eq!(c.start()[2], z);
                 assert!((sweep.abs() - TAU).abs() < 1e-9);
             }
-        } else if motion.kind == MoveKind::Plunge {
-            assert!(c.end()[2] >= 10., "straight plunge into virgin material");
-        }
-        if adaptive && matches!(motion.kind, MoveKind::Cut | MoveKind::Link) && !disks.is_empty() {
-            certify(c, &disks);
-        }
-        if adaptive && motion.kind == MoveKind::Cut {
-            let (_, _, o, sweep) = circular(c).unwrap();
-            assert!((sweep.abs() - TAU).abs() < 1e-9);
-            disks.push((
-                [o[0], o[1]],
-                2. + distance([c.start()[0], c.start()[1]], [o[0], o[1]]),
-            ));
+        } else if motion.kind == MoveKind::Plunge && c.end()[2] < 10. {
+            // A Pocket plunges only in air. The engagement front also feeds
+            // down into a column its earlier sweeps cleared: the whole
+            // cutter disk there was swept at or below the plunge's end.
+            assert!(adaptive, "straight plunge into virgin material");
+            certify_air_entry(c, &curves, true);
         }
         let d = stock
             .preview_sweep(&t, &motion, 1., m.sweep, &cancel)
@@ -380,15 +330,27 @@ fn check(mut m: StreamManifest, clockwise: bool, radius: Option<f64>, all_cells:
     }
     plan.finish_report(&cancel).unwrap();
     let report = serde_json::to_value(plan.report()).unwrap();
-    assert_eq!(helices, 2);
-    assert_eq!(air_entries, usize::from(!adaptive));
     assert!(floor_circle.is_none());
-    assert_eq!(report["helical_entries"], 2);
-    assert_eq!(report["entry_turns"].as_u64().unwrap(), turns as u64);
-    assert!(report["entry_geometry_work"].as_u64().unwrap() > 0);
     if adaptive {
-        assert_eq!(report["seed_orbits"], 2);
-        assert!(report["max_bounded_engagement_deg"].as_f64().unwrap() <= 90.);
+        // At least one helix a level (this ring around an island takes four
+        // in all), counted here independently of the report.
+        assert!(helices >= 2);
+        assert_eq!(report["helical_entries"], helices);
+        // Each level's engagement is proven against its limit.
+        for layer in report["layers"].as_array().unwrap() {
+            assert!(
+                layer["clearing"]["proven_max_engagement_deg"]
+                    .as_f64()
+                    .unwrap()
+                    <= report["max_engagement_deg"].as_f64().unwrap() + 1e-9
+            );
+        }
+    } else {
+        assert_eq!(helices, 2);
+        assert_eq!(air_entries, 1);
+        assert_eq!(report["helical_entries"], 2);
+        assert_eq!(report["entry_turns"].as_u64().unwrap(), turns as u64);
+        assert!(report["entry_geometry_work"].as_u64().unwrap() > 0);
     }
     if all_cells {
         for (i, h) in stock.cells().iter().enumerate() {
@@ -424,9 +386,31 @@ fn real_cad_helix_entries_preserve_whole_source_stock_and_adaptive_exposure() {
 }
 #[test]
 fn explicit_entry_radius_uses_a_bounded_adaptive_approach_and_growth() {
-    for radius in [0.5, 0.1] {
-        check(fixture(true), true, Some(radius), false);
-    }
+    check(fixture(true), true, Some(0.5), false);
+    // A 0.1 mm helix is narrower than the engagement front works from: the
+    // level is refused when it starts, before any motion, naming the radii.
+    let mut m = fixture(true);
+    let Some(PocketEntry::Helix(h)) = &mut pocket(&mut m).entry else {
+        panic!("entry");
+    };
+    h.radius_mm = Some(0.1);
+    let mut plan = OperationPlan::prepare(
+        m.operations[0].clone(),
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let error = plan
+        .next_motion_with_stock(&stock, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(
+        error.contains("no helix fits") && error.contains("[0.1] mm"),
+        "{error}"
+    );
 }
 #[test]
 fn no_fit_bad_parameters_and_turn_limit_fail_before_any_motion() {
@@ -447,17 +431,23 @@ fn no_fit_bad_parameters_and_turn_limit_fail_before_any_motion() {
                 "radius" => h.radius_mm = Some(value),
                 _ => h.feed_mm_min = Some(value),
             }
-            assert!(
-                OperationPlan::prepare(
-                    m.operations[0].clone(),
-                    &m.tools[0],
-                    m.stock.height().unwrap(),
-                    m.initial_position_mm,
-                    1,
-                    &AtomicBool::new(false)
-                )
-                .is_err()
-            );
+            // Refused before any motion: when prepared, or (the adaptive
+            // pocket plans each level from the stock) when its first level
+            // starts.
+            let refused = OperationPlan::prepare(
+                m.operations[0].clone(),
+                &m.tools[0],
+                m.stock.height().unwrap(),
+                m.initial_position_mm,
+                1,
+                &AtomicBool::new(false),
+            )
+            .and_then(|mut plan| {
+                let stock = Stock::new(m.stock.height().unwrap().clone())?;
+                plan.next_motion_with_stock(&stock, &AtomicBool::new(false))
+            })
+            .is_err();
+            assert!(refused, "adaptive={adaptive} {field}={value}");
         }
     }
     for (width, radius, success) in [(4.15, None, false), (5., Some(1.), false), (5., None, true)] {

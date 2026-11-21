@@ -953,28 +953,10 @@ fn contour_ramp_refusals_and_default_serialisation() {
 }
 
 #[test]
-fn roughing_and_adaptive_refuse_a_ramp_entry_by_name() {
+fn roughing_refuses_a_ramp_entry_by_name() {
+    // AdaptivePocket ramps into enclosed material since its orbit planner
+    // was removed (#190); tests/ramp_entry_front.rs covers it.
     let cancel = AtomicBool::new(false);
-    let mut m: StreamManifest =
-        serde_json::from_str(include_str!("../fixtures/operations/helical-adaptive.json")).unwrap();
-    let Operation::AdaptivePocket(a) = &mut m.operations[0] else {
-        panic!("fixture");
-    };
-    a.pocket.entry = Some(PocketEntry::Ramp(ramp(3.)));
-    let error = OperationPlan::prepare(
-        m.operations[0].clone(),
-        &m.tools[0],
-        m.stock.height().unwrap(),
-        m.initial_position_mm,
-        1,
-        &cancel,
-    )
-    .map(|_| ())
-    .unwrap_err();
-    assert!(
-        error.contains("RampEntry is not supported") && error.contains("HelicalEntry"),
-        "{error}"
-    );
     let mut m: StreamManifest =
         serde_json::from_str(include_str!("../fixtures/operations/roughing.json")).unwrap();
     let Operation::Roughing(r) = &mut m.operations[0] else {

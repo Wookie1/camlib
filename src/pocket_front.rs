@@ -10,7 +10,7 @@
 //! air), and every cutting stroke is proven within the contact angle of the
 //! declared width, acos(1 - w/r).
 use crate::{
-    adaptive::{AdaptivePathStrategy, AdaptivePocketOperation, CuttingSense},
+    adaptive::{AdaptivePocketOperation, CuttingSense},
     entry::PocketEntry,
     motion::{Event, Motion, Vec3},
     pocket::ResidualStatus,
@@ -82,14 +82,7 @@ impl PocketFrontPlan {
         first_id: u64,
         cancel: &impl CancelSignal,
     ) -> Result<Self, String> {
-        debug_assert_eq!(op.path_strategy, AdaptivePathStrategy::EngagementFront);
         let pocket = &op.pocket;
-        if op.orbit_radius_mm.is_some()
-            || op.min_orbit_radius_mm.is_some()
-            || op.local_orbit_tolerance_mm.is_some()
-        {
-            return Err("engagement_front does not use orbits; leave orbit_radius_mm, min_orbit_radius_mm and local_orbit_tolerance_mm unset".into());
-        }
         if pocket.max_stay_down_mm.is_some() || pocket.rest_tolerance_mm.is_some() {
             return Err("engagement_front links through its own proven-clear moves and plans from the committed stock; leave max_stay_down_mm and rest_tolerance_mm unset".into());
         }

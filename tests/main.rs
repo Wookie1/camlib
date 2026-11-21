@@ -20,7 +20,6 @@ macro_rules! modules {
 
 modules! {
     adaptive,
-    adaptive_connected,
     adaptive_front_complete,
     assembly_reach,
     chamfer,

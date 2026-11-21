@@ -21,15 +21,7 @@ def part():
     return base.union(frustum).cut(opening)
 
 
-def roughing_job(
-    adaptive=False, *, routing=None, offset=False, omit_empty_cuts=False, stock_front=False, engagement_front=False
-):
-    # Adaptive roughing is engagement_front (Roughing refuses disk_front, #167).
-    engagement_front = engagement_front or (adaptive and not stock_front)
-    if engagement_front:
-        clearing = AdaptiveClearing(0.25)
-    if stock_front:
-        adaptive = True
+def roughing_job(adaptive=False, *, routing=None, offset=False, omit_empty_cuts=False):
     if offset and (adaptive or routing is not None):
         raise ValueError('offset selects OffsetClearing; use it without --adaptive/--economical')
     if adaptive and routing is not None:
@@ -38,19 +30,7 @@ def roughing_job(
         't1', EndMill('em2', diameter=2, flute_length=20, overall_length=50), 30, 60, (HolderSection(30, 60, 4, 4),)
     )
     clearing = (
-        clearing
-        if engagement_front
-        else AdaptiveClearing(
-            0.25,
-            orbit_radius_mm=0.5,
-            min_orbit_radius_mm=0.2,
-            local_orbit_tolerance_mm=0.05,
-            path_strategy='stock_front',
-        )
-        if adaptive
-        else OffsetClearing(0.8)
-        if offset
-        else RasterClearing(0.8, routing=routing)
+        AdaptiveClearing(0.25) if adaptive else OffsetClearing(0.8) if offset else RasterClearing(0.8, routing=routing)
     )
     operation = Roughing.from_solid(
         'rough',

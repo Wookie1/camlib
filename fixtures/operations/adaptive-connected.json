@@ -178,10 +178,7 @@
       "length_register": 1,
       "coolant": "flood",
       "kind": "adaptive_pocket",
-      "max_engagement_deg": 90,
-      "boundary_tolerance_mm": 0.01,
-      "clockwise": true,
-      "min_orbit_radius_mm": 0.25
+      "max_engagement_deg": 90
     }
   ]
 }
