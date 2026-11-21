@@ -962,6 +962,47 @@ impl PreparedRegion {
         }
         self.integer_boolean_prepared(other, operation, error)
     }
+    /// Subtract the union of overlapping cutter sweeps in one operation.
+    /// Intermediate capsule seams may touch or overlap, even though the
+    /// boundary of their combined sweep is unambiguous. Chording and grid
+    /// rounding use the same error budget as the two-region integer boolean.
+    pub(crate) fn subtract_sweeps(
+        &self,
+        sweeps: Vec<Component>,
+        cancel: &impl crate::stock::CancelSignal,
+    ) -> Result<PreparedConstruction, String> {
+        let tolerance = self.options.tolerance_mm;
+        let chord = tolerance / 8.;
+        let grid = (tolerance / 128.).max(1e-8);
+        let mut clipper = Clipper64::new();
+        clipper.add_subject(&integer_paths(self, self.origin, grid, chord)?);
+        for component in sweeps {
+            if cancel.is_cancelled() {
+                return Err("sweep subtraction cancelled".into());
+            }
+            let sweep = PlanarRegion {
+                version: 1,
+                units: "mm".into(),
+                name: "swept-capsule".into(),
+                boundary_error_mm: 0.,
+                components: vec![component],
+                source: serde_json::Value::Null,
+            }
+            .prepare(self.options)?;
+            clipper.add_clip(&integer_paths(&sweep, self.origin, grid, chord)?);
+        }
+        let mut closed = Vec::new();
+        if !clipper.execute(ClipType::Difference, FillRule::NonZero, &mut closed, None) {
+            return Err("integer sweep difference failed".into());
+        }
+        self.integer_result(
+            closed,
+            "clipper2_rust_1.2.0_chorded",
+            self.definition.boundary_error_mm + tolerance,
+            chord,
+            grid,
+        )
+    }
     fn integer_boolean_prepared(
         &self,
         other: &PreparedRegion,

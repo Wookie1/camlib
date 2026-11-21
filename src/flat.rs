@@ -3885,7 +3885,7 @@ fn level_loops(
             };
             for (_, need) in needs.iter_mut() {
                 if let Some(region) = need.take() {
-                    *need = subtract_swept(region, &swept, r, tolerance, guard)?;
+                    *need = subtract_swept(region, &swept, r, guard, cancel)?;
                 }
             }
             if index < outer_count {
@@ -3963,13 +3963,10 @@ fn subtract_swept(
     need: crate::planar::PreparedRegion,
     runs: &[Vec<crate::pocket::Stroke>],
     r: f64,
-    tolerance: f64,
     guard: f64,
+    cancel: &impl CancelSignal,
 ) -> Result<Option<crate::planar::PreparedRegion>, String> {
-    use crate::planar::{Boolean, Boundary, Component, ConstructionOptions, PlanarRegion};
-    let options = ConstructionOptions {
-        tolerance_mm: tolerance,
-    };
+    use crate::planar::{Boundary, Component};
     let mut capsules: Vec<Component> = vec![];
     let mut capsule = |a: [f64; 2], b: [f64; 2], radius: f64| {
         let d = [b[0] - a[0], b[1] - a[1]];
@@ -3991,6 +3988,9 @@ fn subtract_swept(
         });
     };
     for seg in runs.iter().flatten() {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
         match seg.arc {
             None => capsule(seg.a, seg.b, r),
             Some((c, sweep)) => {
@@ -4007,29 +4007,14 @@ fn subtract_swept(
             }
         }
     }
-    let mut need = need;
-    // Each capsule on its own: they overlap, and the components of one
-    // region must not.
-    for c in capsules {
-        if need.definition().components.is_empty() {
-            return Ok(None);
-        }
-        let swept = PlanarRegion {
-            version: 1,
-            units: "mm".into(),
-            name: "flat-swept-capsule".into(),
-            boundary_error_mm: 0.,
-            components: vec![c],
-            source: serde_json::Value::Null,
-        }
-        .prepare(options)
-        .map_err(|e| format!("flat-area swept region: {e}"))?;
-        need = need
-            .boolean_prepared(&swept, Boolean::Difference)
-            .map_err(|e| format!("flat-area swept region: {e}"))?
-            .into_parts()
-            .1;
+    if capsules.is_empty() {
+        return Ok(Some(need));
     }
+    let need = need
+        .subtract_sweeps(capsules, cancel)
+        .map_err(|e| format!("flat-area swept region: {e}"))?
+        .into_parts()
+        .1;
     // The remaining floor may be narrow where two sweeps nearly meet.
     // Keep it for trim_ring: eroding and regrowing it here would discard
     // material that neither cutter sweep covered.
