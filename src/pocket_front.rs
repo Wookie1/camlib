@@ -162,7 +162,7 @@ impl PocketFrontPlan {
         });
         let climb = op.cutting_sense.unwrap_or(CuttingSense::Climb) == CuttingSense::Climb;
         let guard = 16. * pocket.tolerance_mm;
-        let levels = ((pocket.top_z_mm - floor) / pocket.stepdown_mm - 1e-9)
+        let levels = ((pocket.top_z_mm - floor) / pocket.stepdown_mm)
             .ceil()
             .max(1.) as usize;
         let mut plans = VecDeque::new();

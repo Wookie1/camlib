@@ -320,6 +320,31 @@ fn top_inside_the_tolerance_band_never_cuts_deeper_than_a_stepdown() {
     }
 }
 
+#[test]
+fn adaptive_last_level_reaches_the_floor_for_a_fractional_final_step() {
+    let m = fixture();
+    let stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let floor = 8. - 5e-10;
+    let op = band_operation(10., true, |p| p.floor_z_mm = floor);
+    let plan = OperationPlan::prepare_with_stock(
+        op,
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &|| false,
+    )
+    .unwrap();
+    let report = serde_json::to_value(plan.report()).unwrap();
+    let tips: Vec<_> = report["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|layer| layer["tip_z_mm"].as_f64().unwrap())
+        .collect();
+    assert_eq!(tips, [9., 8., floor]);
+}
+
 fn band_operation(top: f64, adaptive: bool, edit: impl Fn(&mut PocketOperation)) -> Operation {
     let mut op = operation(top, adaptive);
     let pocket = match &mut op {
