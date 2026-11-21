@@ -580,6 +580,11 @@ pub struct StockTopReport {
     /// Stock cells above the top that the assembly proof examined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assembly_checked_cells: Option<usize>,
+    /// Highest stock above the authored top, within the stock model's band
+    /// (16 x tolerance_mm), where the cutter can reach it. The depth levels
+    /// are placed from it, so no level cuts deeper than a stepdown (#344).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachable_upper_z_mm: Option<f64>,
 }
 
 /// What a lower top needs to know about the operation, to judge stock left
@@ -700,9 +705,20 @@ impl Outside {
 /// judged by the tool assembly (`Outside`).
 pub(crate) struct StockTop {
     ceiling: f64,
+    /// The top the depths are planned from (`planning_top`).
+    planned: f64,
     identity: u64,
+    tool: ToolAssembly,
+    pending: Option<Motion>,
+    started: bool,
     outside: Outside,
     pub(crate) report: StockTopReport,
+}
+struct StockTopScan {
+    maximum: f64,
+    examined: usize,
+    reachable: Option<f64>,
+    tall: Option<f64>,
 }
 impl StockTop {
     pub(crate) fn prepare(
@@ -719,41 +735,68 @@ impl StockTop {
         if !tolerance.is_finite() || !(1e-7..=0.01).contains(&tolerance) {
             return Err("pocket tolerance_mm must be finite in [1e-7, 0.01]".into());
         }
+        // Checked here, against the authored top, because the depths may be
+        // planned from a higher one (below) that would hide it (#344).
+        if scope.lowest_tip_z >= top {
+            return Err(format!(
+                "operation {}: floor_z_mm plus bottom allowance (Z{}) must be below top_z_mm {top}",
+                scope.operation, scope.lowest_tip_z
+            ));
+        }
         let ceiling = top + 16. * tolerance;
         let mut outside = Outside::new(scope, tolerance)?;
-        let (maximum, examined) = Self::scan(stock, top, ceiling, &mut outside, cancel)?;
-        spec.max_mm[2] = top;
+        let scan = Self::scan(stock, top, ceiling, &outside, cancel)?;
+        let planned = Self::planning_top(top, scan.reachable);
+        spec.max_mm[2] = planned;
         stock.request_sweep_receipts();
-        let tall = outside.highest;
+        outside.highest = scan.tall;
         Ok((
             spec,
             Some(Self {
                 ceiling,
+                planned,
                 identity: stock.identity(),
+                tool: scope.tool.clone(),
+                pending: None,
+                started: false,
                 outside,
                 report: StockTopReport {
                     authored_top_z_mm: top,
-                    maximum_upper_z_mm: maximum,
+                    maximum_upper_z_mm: scan.maximum,
                     checked_cells: stock.cells().len(),
                     generation: stock.generation(),
-                    outside_upper_z_mm: tall,
-                    assembly_checked_cells: tall.map(|_| examined),
+                    outside_upper_z_mm: scan.tall,
+                    assembly_checked_cells: scan.tall.map(|_| scan.examined),
+                    reachable_upper_z_mm: scan.reachable,
                 },
             }),
         ))
     }
-    /// The highest stock, and how many cells above the top were examined.
+    /// The top the depths are planned from. Stock the top accepts within
+    /// the model's band may still stand above it where the cutter reaches:
+    /// the depths then start from the highest of it, so no depth of cut is
+    /// deeper than `stepdown_mm` below the stock model (#344). `stepdown_mm`
+    /// is a strict maximum: the model cannot tell a faced top's sweep error
+    /// from material, so that error is treated as material too.
+    fn planning_top(top: f64, reachable: Option<f64>) -> f64 {
+        reachable.filter(|h| *h > top).unwrap_or(top)
+    }
+    pub(crate) fn planned_top(&self) -> f64 {
+        self.planned
+    }
+    /// The highest stock, how many cells above the ceiling were examined,
+    /// and the highest stock above the top (up to the ceiling) that the
+    /// cutter can reach.
     fn scan(
         stock: &Stock,
         top: f64,
         ceiling: f64,
-        outside: &mut Outside,
+        o: &Outside,
         cancel: &impl CancelSignal,
-    ) -> Result<(f64, usize), String> {
+    ) -> Result<StockTopScan, String> {
         let mut maximum = f64::NEG_INFINITY;
         let [dx, dy] = stock.cell_widths_mm();
         let half = dx.hypot(dy) / 2.;
-        let o = &*outside;
         let reach = o
             .sections
             .iter()
@@ -762,12 +805,32 @@ impl StockTop {
         // Per section, the highest obstruction within its radius.
         let mut blocked = vec![None::<f64>; o.sections.len()];
         let mut examined = 0;
+        let mut reachable = None;
         for (i, cell) in stock.cells().iter().enumerate() {
             if i.is_multiple_of(1024) && cancel.is_cancelled() {
                 return Err("pocket stock-top inspection cancelled".into());
             }
             maximum = maximum.max(cell.upper_mm);
+            if cell.upper_mm <= top {
+                continue;
+            }
+            let p = stock.cell_center(i).ok_or("stock cell outside the grid")?;
+            // The distance from this cell to the region's bounding box bounds
+            // its distance to the region from below: far cells need no query.
+            let b = o.region_bounds;
+            let far = ((b[0] - p[0]).max(p[0] - b[2]).max(0.))
+                .hypot((b[1] - p[1]).max(p[1] - b[3]).max(0.))
+                - half;
             if cell.upper_mm <= ceiling {
+                // A centre in the proven centre set has clearance >= r - slack,
+                // so its cutter cannot reach outside the region by more
+                // than slack (plus the numerical guard).
+                if far <= o.guard + o.slack
+                    && o.upper_clearance_at(p)? + half + o.guard + o.slack >= 0.
+                {
+                    reachable =
+                        Some(reachable.map_or(cell.upper_mm, |h: f64| h.max(cell.upper_mm)));
+                }
                 continue;
             }
             let refuse = || {
@@ -776,14 +839,7 @@ impl StockTop {
                     cell.upper_mm
                 )
             };
-            let p = stock.cell_center(i).ok_or("stock cell outside the grid")?;
             examined += 1;
-            // The distance from this cell to the region's bounding box bounds
-            // its distance to the region from below: far cells need no query.
-            let b = o.region_bounds;
-            let far = ((b[0] - p[0]).max(p[0] - b[2]).max(0.))
-                .hypot((b[1] - p[1]).max(p[1] - b[3]).max(0.))
-                - half;
             if far > reach + o.guard + o.slack {
                 continue;
             }
@@ -844,33 +900,66 @@ impl StockTop {
                 o.operation, o.clearance
             ));
         }
-        outside.highest = tall;
-        Ok((maximum, examined))
+        Ok(StockTopScan {
+            maximum,
+            examined,
+            reachable,
+            tall,
+        })
     }
     pub(crate) fn validate(
         &mut self,
         stock: &Stock,
         cancel: &impl CancelSignal,
     ) -> Result<(), String> {
-        if stock.identity() != self.identity {
-            // Native monotone commits preserve this height bound. Foreign,
-            // restored or undone state is assessed afresh instead of trusted.
-            if !stock
-                .last_sweep_receipt()
-                .is_some_and(|r| r.base_identity == self.identity)
-            {
-                let (_, _) = Self::scan(
-                    stock,
-                    self.report.authored_top_z_mm,
-                    self.ceiling,
-                    &mut self.outside,
-                    cancel,
-                )?;
+        if let Some(pending) = &self.pending {
+            // Later depths and queued links depend on the *exact* preceding
+            // sweep. Rescanning the top cannot prove that a cleared layer
+            // is still clear on foreign or restored stock.
+            if !stock.last_sweep_receipt().is_some_and(|r| {
+                r.base_identity == self.identity
+                    && r.motion.commits(pending)
+                    && r.tool == self.tool
+                    && r.fraction == 1.
+            }) {
+                return Err(format!(
+                    "operation {}: commit the complete preceding motion with the matching cutter and stock before continuing; replan if the stock was replaced",
+                    self.outside.operation
+                ));
             }
-            self.identity = stock.identity();
+            self.pending = None;
+        } else if stock.identity() != self.identity {
+            // A preceding commit may already have been acknowledged by a
+            // call whose planning query was then interrupted.
+            if self.started {
+                return Err(format!(
+                    "operation {}: the stock changed during planning; replan against the replacement stock",
+                    self.outside.operation
+                ));
+            }
+            let scan = Self::scan(
+                stock,
+                self.report.authored_top_z_mm,
+                self.ceiling,
+                &self.outside,
+                cancel,
+            )?;
+            let needed = Self::planning_top(self.report.authored_top_z_mm, scan.reachable);
+            if needed > self.planned {
+                return Err(format!(
+                    "operation {}: the stock changed after planning: stock up to Z{needed} where the cutter reaches stands above Z{}, the top the depths were planned from; plan the operation again against this stock",
+                    self.outside.operation, self.planned
+                ));
+            }
+            self.outside.highest = scan.tall;
         }
+        self.identity = stock.identity();
         stock.request_sweep_receipts();
         Ok(())
+    }
+    pub(crate) fn expect_commit(&mut self, motion: &Motion) {
+        self.started = true;
+        self.pending = Some(motion.clone());
     }
     /// Refuse a planned motion that leaves the proven centre set below the
     /// remaining stock (or goes below the operation's lowest tip there).
@@ -1408,6 +1497,11 @@ impl PocketPlan {
         };
         let (envelope, bound) =
             StockTop::prepare(stock, op.top_z_mm, op.tolerance_mm, &scope, cancel)?;
+        // The depths start from the top `StockTop` planned (#344).
+        let mut op = op;
+        if let Some(b) = &bound {
+            op.top_z_mm = b.planned_top();
+        }
         let mut plan = Self::prepare(op, assembly, &envelope, initial, first_motion_id, cancel)?;
         if let Some(bound) = bound {
             plan.activate_layer(initial, first_motion_id, stock.spec())?;
@@ -2740,9 +2834,6 @@ impl PocketPlan {
         // Up to the motion before this one; the call that ends the plan
         // (it returns no motion) has them all.
         self.report.entry_proofs_unresolved = self.entry_proofs_unresolved();
-        if let Some(bound) = &mut self.stock_top {
-            bound.validate(stock, cancel)?;
-        }
         if self.operation.rest_tolerance_mm.is_some()
             || self.operation.entry.is_some()
             || self.report.empty_cuts.is_some()
@@ -2764,6 +2855,9 @@ impl PocketPlan {
                     .get_or_insert(stock.generation());
                 self.report.rest_through_generation = Some(stock.generation());
             }
+        }
+        if let Some(bound) = &mut self.stock_top {
+            bound.validate(stock, cancel)?;
         }
         if let Some(tool) = &self.rest_tool {
             // Skipped pieces and queued links assume every preceding emitted
@@ -2788,8 +2882,9 @@ impl PocketPlan {
             self.rest_stock_identity.get_or_insert(stock.identity());
         }
         let result = self.next_with_stock(Some(stock), cancel)?;
-        if let (Some(bound), Some(motion)) = (&self.stock_top, &result) {
+        if let (Some(bound), Some(motion)) = (&mut self.stock_top, &result) {
             bound.admit(motion)?;
+            bound.expect_commit(motion);
         }
         if self.rest_tool.is_some()
             && let Some(motion) = &result
@@ -3366,8 +3461,20 @@ mod stock_top_tests {
         let stock = walled();
         let (spec, bound) = StockTop::prepare(&stock, 8., 1e-5, &scope, &|| false).unwrap();
         assert_eq!(spec.max_mm[2], 8.);
-        let bound = bound.unwrap();
+        let mut bound = bound.unwrap();
         assert_eq!(bound.report.outside_upper_z_mm, Some(60.));
+        // A pre-motion replacement with no wall, but reachable stock above
+        // the planning top, must not erase the original stock's wall guard.
+        let mut replacement = stock.snapshot();
+        for cell in &mut replacement.cells {
+            cell.lower_mm = 8.;
+            cell.upper_mm = 8.;
+        }
+        replacement.cells[40 * 120 + 30].upper_mm = 8.0001;
+        let replacement = Stock::from_snapshot(replacement).unwrap();
+        let error = bound.validate(&replacement, &|| false).unwrap_err();
+        assert!(error.contains("stock changed after planning"), "{error}");
+        bound.validate(&stock, &|| false).unwrap();
         // Inside the centre set (3 mm in from the edge) at any planned depth.
         bound
             .admit(&motion(MoveKind::Cut, [13., 13., 4.], [19., 27., 4.]))
@@ -3393,5 +3500,25 @@ mod stock_top_tests {
                 "{error}"
             );
         }
+        // The caller may be interrupted after validating a full commit,
+        // but before asking the bound to record the next motion.
+        let mut stock = stock;
+        let cut = motion(MoveKind::Cut, [13., 13., 4.], [19., 27., 4.]);
+        bound.expect_commit(&cut);
+        let delta = stock
+            .preview_sweep(
+                &t.prepare().unwrap(),
+                &cut,
+                1.,
+                crate::stock::SweepOptions::default(),
+                &|| false,
+            )
+            .unwrap();
+        stock.apply_delta(&delta).unwrap();
+        bound.validate(&stock, &|| false).unwrap();
+        let restored = Stock::from_snapshot(stock.snapshot()).unwrap();
+        let error = bound.validate(&restored, &|| false).unwrap_err();
+        assert!(error.contains("stock changed during planning"), "{error}");
+        bound.validate(&stock, &|| false).unwrap();
     }
 }

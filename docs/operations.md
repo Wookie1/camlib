@@ -192,8 +192,24 @@ without a word:
 **A top below the remaining stock** (`Pocket` and `AdaptivePocket`, issue
 #129). `top_z_mm` may be below the stock's original top when earlier
 operations removed the material: the depth (and the cutting-length check) is
-then measured from `top_z_mm`. Every stock cell meeting the `region` must be at
-or below it. Stock may stand higher outside the region, for example a low
+then measured from `top_z_mm`, and an `AdaptivePocket` plans its first level
+from it (#344), so no level is deeper than `stepdown_mm`. Every stock cell
+meeting the `region` must be at or below it, within the stock model's band
+of 16 x `tolerance_mm`; the run checks this against the committed stock, so a
+lower top needs the stock (an `AdaptivePocket` planned without it is refused).
+Where stock inside that band stands above `top_z_mm` within the cutter's reach,
+the depths are measured from the highest of it instead
+(`stock_top.reachable_upper_z_mm` in the report, #344): `stepdown_mm` is a
+strict maximum below the stock model. The model cannot tell a faced top's
+sweep error from material, so a top faced to exactly `top_z_mm` can gain a last,
+nearly empty depth when the depth is a whole number of stepdowns. The floor is
+checked against the authored top first. If the stock changes before the first motion and
+stands higher than the top the depths were planned from, where the cutter
+reaches, the run refuses. After the first motion, the next move requires the
+complete preceding sweep to have been committed with the matching tool and
+stock. A replacement stock may have refilled earlier levels even if its top
+and generation still match; plan the operation again against that stock.
+Stock may stand higher outside the region, for example a low
 pocket beside a tall wall, when the tool assembly clears it:
 
 - Before any motion, the neck, shank and every holder section are checked
