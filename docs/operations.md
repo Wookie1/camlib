@@ -1993,13 +1993,17 @@ Within a stack, a closed loop below a closed loop is reached without a
 retract: a short link at the upper level to the nearest point of the lower
 loop, a ramp down along that loop to its level, then the whole loop cut flat
 from where the ramp ends, so the flat lap passes over the entire ramp again.
-The ramp is one lap, or with `entry=RampEntry(angle_deg=...)` the level gap
-over the tangent of the angle (at most one lap), at the entry's feed (default
-the plunge feed). The link, the ramp and the loop are proven clear of the
-part like every waterline move; a link is taken only where it meets no more
-stock than the level gap the ramp descends (measured on the stock grid),
-otherwise the loop is entered as below. The report's `ramp_links` counts the
-linked levels.
+The ramp is the level gap over the tangent of the ramp angle, at most one
+lap. Without an `entry` the angle is 3 degrees at the cutting feed
+(`feed_mm_min`): a ramp that shallow cuts no deeper than the flat lap after
+it, so it needs no slower feed. `entry=RampEntry(angle_deg, feed_mm_min=...)`
+sets both (its feed defaults to the plunge feed, as in every operation). The
+link, the ramp and the loop are proven clear of the part like every waterline
+move; a link is taken only where it meets no more stock than the level gap the
+ramp descends or than the lower loop's own cut meets where the link arrives
+(measured at stock-cell centres, so a cell's material can be under-counted by
+up to about 0.01 mm: tool load only, never the part), otherwise the loop is
+entered as below. The report's `ramp_links` counts the linked levels.
 
 A loop the tool is not already at - the first of a stack, an open run, or a
 loop a link could not reach - is entered after a retract, never by coming in
@@ -2011,11 +2015,15 @@ and the whole lead meets no stock above the level - pure air; a closed loop
 with no such point beside its start is sampled along its whole length and its
 start moves to the first one (`moved_entries`). Otherwise the ball plunges at
 the loop start to the lowest height the stock under it there is clear at (at
-most the feed height, so in air) and ramps down along the loop to the level -
-one lap or the declared angle as above; an open run goes along itself to half
-the depth and back to its start - then cuts it (`helical_entries`). If no
-entry exists the operation is refused, naming the level and the XY: rough or
-rest-rough there first. The `waterline`, `waterline-dense` and
+most the feed height, so in air) and ramps down along the loop to the level at
+the ramp angle as above; an open run goes along itself to half the depth and
+back to its start - then cuts it (`helical_entries`). If no entry exists the
+operation is refused, naming the level and the XY: rough or rest-rough there
+first. Where an entry reaches its level in stock more than one `stepdown_mm`
+deep, or a link more than one `stepdown_mm` beyond the level gap it descends
+(unroughed stock, such as a raw blank, or a rough in steps much deeper than the
+waterline's; a roughing allowance is expected), the report counts it
+(`deep_stock_entries`) and the simulation warns: rough or rest-rough first. The `waterline`, `waterline-dense` and
 `steep-and-shallow` benchmarks run on blanks roughed to 0.1 to 0.3 mm over
 the part.
 

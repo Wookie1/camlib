@@ -654,7 +654,7 @@ pub struct WaterlineOperation<G = SurfaceMesh> {
     /// clear at when the tool comes down to an island - descends at no more
     /// than this angle, at its feed (default the plunge feed); the ramp is at
     /// most one lap, so a deeper step descends steeper. Only `RampEntry`
-    /// (kind "ramp"). None: one lap per ramp, at the plunge feed.
+    /// (kind "ramp"). None: 3 degrees at the cutting feed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<crate::entry::PocketEntry>,
 }
@@ -761,7 +761,7 @@ pub struct WaterlineReport {
     /// did, and the loop rotates so it starts there. Absent when none moved.
     #[serde(skip_serializing_if = "is_zero")]
     pub moved_entries: usize,
-    /// Loops entered on a one-lap helix along the loop itself (#46): no
+    /// Loops entered on a ramp along the loop itself (#46): no
     /// point beside the loop within reach had the stock at or below the
     /// plunge height and the part clear, so the tool plunges at the loop
     /// start to the lowest height the stock under the ball there is clear
@@ -794,6 +794,13 @@ pub struct WaterlineReport {
     pub links_refused_link_clearance: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub links_refused_ramp_clearance: usize,
+    /// Entry ramps and level links that meet stock more than one stepdown
+    /// deep where they reach the level (#46) - for a link, beyond the level
+    /// gap it descends: unroughed stock, such as a raw blank, which the
+    /// waterline cuts in full depth from the side. Rough or rest-rough
+    /// first; absent when none did.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub deep_stock_entries: usize,
     pub cut_segments: usize,
     pub loops_completed: usize,
     pub requested_bottom_z_mm: f64,
@@ -854,9 +861,10 @@ pub struct WaterlinePlan {
     limits: Option<(f64, f64)>,
     /// Machining limits (containment, avoid areas).
     region_limits: Option<crate::limits::PreparedLimits>,
-    /// The declared ramp (#46): its angle sets how long a ramp along a
-    /// contour is (at most one lap), its feed the ramp's feed.
-    ramp_entry: Option<crate::entry::RampEntry>,
+    /// The ramp (#46): its angle sets how long a ramp along a contour is
+    /// (at most one lap), its feed the ramp's feed. Without a declared
+    /// entry, 3 degrees at the cutting feed.
+    ramp_entry: crate::entry::RampEntry,
     /// Ball end mills (#46): every level's pieces grouped into stacks, and
     /// the moves of the piece being cut. Built on the first motion.
     emission: Option<Emission>,
@@ -970,8 +978,8 @@ impl Stack {
 type Queued = (Curve, MoveKind, Option<f64>);
 /// A piece's moves, and (ramp link, moved entries, helical entries, links
 /// refused by [the stock met, the link's part clearance, the ramp's part
-/// clearance]).
-type Job = (Vec<Queued>, (bool, usize, usize, [usize; 3]));
+/// clearance], whether the entry or link met stock deeper than a stepdown).
+type Job = (Vec<Queued>, (bool, usize, usize, [usize; 3], bool));
 /// Ball end mills (#46): the pieces of every level in stacks, the stack
 /// being cut, the piece just cut (the tool stands at its end), whether the
 /// emitter has fallen back to level order, and the moves of the piece being
@@ -1335,10 +1343,17 @@ impl WaterlinePlan {
             .map(|l| crate::limits::PreparedLimits::new(l, radius, op.tolerance_mm))
             .transpose()?;
         let ramp_entry = match &op.entry {
-            None => None,
+            // No declared entry: ramp at 3 degrees at the cutting feed (#46);
+            // the ramp's cut is no deeper than a flat lap's, so it needs no
+            // slower feed.
+            None => crate::entry::RampEntry {
+                angle_rad: 3f64.to_radians(),
+                min_length_mm: None,
+                feed_mm_min: Some(op.feed_mm_min),
+            },
             Some(crate::entry::PocketEntry::Ramp(r)) => {
                 r.validate(op.tolerance_mm, op.plunge_mm_min)?;
-                Some(r.clone())
+                r.clone()
             }
             Some(_) => {
                 return Err(format!(
@@ -1660,6 +1675,7 @@ impl WaterlinePlan {
             links_refused_stock: 0,
             links_refused_link_clearance: 0,
             links_refused_ramp_clearance: 0,
+            deep_stock_entries: 0,
             cut_segments: 0,
             loops_completed: 0,
             requested_bottom_z_mm: op.bottom_z_mm,
@@ -2090,12 +2106,12 @@ impl WaterlinePlan {
     /// Open loops (runs the slope or region limits cut out of a contour)
     /// keep their start: a moved entry elsewhere on them would need a long
     /// lead no check covers. A loop with no qualifying point beside it
-    /// enters on a helix along itself: the lowest height the stock under the
+    /// enters on a ramp along itself: the lowest height the stock under the
     /// ball at the loop start is clear at (at most the feed height the rapid
-    /// descent stops at), the plunge there in air, then one lap along the
+    /// descent stops at), the plunge there in air, then a ramp along the
     /// loop down to the level, then the loop flat - never a vertical plunge
-    /// into stock. Every helix move carries the same part-clearance proof as
-    /// the loop's own moves (`helix_clear`); where neither entry exists the
+    /// into stock. Every ramp move carries the same part-clearance proof as
+    /// the loop's own moves (`path_clear`); where neither entry exists the
     /// operation is refused, naming the level and the start.
     ///
     /// Side-entry points are tried from `max(r/2, 1)` mm out, in steps of
@@ -2163,10 +2179,10 @@ impl WaterlinePlan {
                 helix.push(None);
                 continue;
             }
-            // No clear side entry anywhere on the loop: enter on a helix
+            // No clear side entry anywhere on the loop: enter on a ramp
             // along the loop itself (#46). The lowest height the stock under
             // the ball at the loop start is clear at, at most the feed
-            // height; the plunge there is in air and one lap descends from
+            // height; the plunge there is in air and the ramp descends from
             // it to the level.
             let top = stock.top_under_disk([start[0], start[1]], self.radius);
             let feed = self.op.settings().heights.feed;
@@ -2379,6 +2395,7 @@ impl WaterlinePlan {
             self.report.links_refused_stock += counts.3[0];
             self.report.links_refused_link_clearance += counts.3[1];
             self.report.links_refused_ramp_clearance += counts.3[2];
+            self.report.deep_stock_entries += usize::from(counts.4);
             self.report.loops_completed += 1;
             let emission = self.emission.as_mut().unwrap();
             emission.stacks[s].next += 1;
@@ -2486,12 +2503,7 @@ impl WaterlinePlan {
         let z = piece.z;
         let mut work = SurfaceWork::default();
         let cut_feed = Some(self.op.feed_mm_min);
-        let ramp_feed = Some(
-            self.ramp_entry
-                .as_ref()
-                .and_then(|r| r.feed_mm_min)
-                .unwrap_or(self.op.plunge_mm_min),
-        );
+        let ramp_feed = Some(self.ramp_entry.feed_mm_min.unwrap_or(self.op.plunge_mm_min));
         let stack = &e.stacks[s];
         let mut refused = [0; 3];
         let above = (stack.next > 0)
@@ -2552,6 +2564,15 @@ impl WaterlinePlan {
                 [1, 0, 0]
             };
             if link_clear && ramp_clear && met <= bound + self.op.tolerance_mm {
+                let end = ramp.last().map_or(p, |c| {
+                    let q = c.end();
+                    [q[0], q[1]]
+                });
+                // Beyond the level gap the link and ramp descend (the
+                // level above cut down to it): roughing allowance is
+                // expected, more than a stepdown is unroughed stock.
+                let deep = met.max(self.stock_under_ball(stock, end, z, &mut work, cancel)?)
+                    > za - z + self.op.stepdown_mm + self.op.tolerance_mm;
                 let mut moves: Vec<Queued> = link
                     .into_iter()
                     .map(|c| (c, MoveKind::Lead, cut_feed))
@@ -2562,7 +2583,7 @@ impl WaterlinePlan {
                         .into_iter()
                         .map(|c| (c, MoveKind::Cut, cut_feed)),
                 );
-                return Ok((moves, (true, 0, 0, [0; 3])));
+                return Ok((moves, (true, 0, 0, [0; 3], deep)));
             }
         }
         let heights = self.op.settings().heights;
@@ -2636,6 +2657,11 @@ impl WaterlinePlan {
                 self.op.id, start[0], start[1]
             ));
         }
+        // Where the entry reaches the level: the side lead's end or the
+        // ramp's.
+        let end = descent.last().map_or(start, |c| c.end());
+        let deep = self.stock_under_ball(stock, [end[0], end[1]], z, &mut work, cancel)?
+            > self.op.stepdown_mm + self.op.tolerance_mm;
         moves.push((plunge, MoveKind::Plunge, Some(self.op.plunge_mm_min)));
         if points[0].is_some() {
             moves.extend(descent.into_iter().map(|c| (c, MoveKind::Lead, cut_feed)));
@@ -2652,7 +2678,7 @@ impl WaterlinePlan {
             strokes.iter().map(|e| e.curve(z)).collect()
         };
         moves.extend(flat.into_iter().map(|c| (c, MoveKind::Cut, cut_feed)));
-        Ok((moves, (false, moved, helical, refused)))
+        Ok((moves, (false, moved, helical, refused, deep)))
     }
     /// The moves off the piece just cut: up at the feed to the feed height,
     /// then a rapid to the retract height (`last`: the clearance height).
@@ -2680,13 +2706,9 @@ impl WaterlinePlan {
         ]
     }
     /// How long a ramp along a closed loop `total` long is to descend `drop`
-    /// (#46): at the declared ramp angle, at most one lap; one lap when no
-    /// ramp is declared.
+    /// (#46): at the ramp angle, at most one lap.
     fn ramp_length(&self, drop: f64, total: f64) -> f64 {
-        match &self.ramp_entry {
-            Some(r) => (drop / r.angle_rad.tan()).min(total),
-            None => total,
-        }
+        (drop / self.ramp_entry.angle_rad.tan()).min(total)
     }
     /// The part-clearance proof of entry, link and ramp moves (#46): the
     /// ball centre along each line keeps the distance from the part that the

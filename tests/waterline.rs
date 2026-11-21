@@ -2,7 +2,6 @@ use camlib::surface::*;
 use camlib::waterline::{ContourOptions, prepare_contours};
 use std::sync::atomic::AtomicBool;
 
-
 fn options(h: f64, simplify: bool) -> ContourOptions {
     ContourOptions {
         method: camlib::waterline::ContourMethod::QuadTree,
@@ -1005,6 +1004,9 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     // entry only where its lead is pure air); the island enters on a ramp.
     assert_eq!(plan.report().moved_entries, 0);
     assert!(plan.report().helical_entries >= 1);
+    // The ramp reaches its level with the raw stock standing far more than
+    // a stepdown above it: counted, so the simulation warns to rough first.
+    assert!(plan.report().deep_stock_entries >= 1);
     // Roughed: a point beside the wall is clear, but the roughed band runs
     // to Z6.3 within 3 mm of the plate, so a lead from it onto the wall
     // below Z6.3 would cut the band from the side: the island enters on a
@@ -1022,6 +1024,8 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     drain(&m, &mut plan, &mut stock);
     assert_eq!(plan.report().moved_entries, 0);
     assert!(plan.report().helical_entries >= 1);
+    // Roughed stock leaves no more than a stepdown for any entry or link.
+    assert_eq!(plan.report().deep_stock_entries, 0);
 }
 
 /// Independent replay measure for the entry rule (#46): drives the plan
@@ -1308,14 +1312,17 @@ fn fully_blocked_loops_enter_on_a_helix() {
     );
     assert_eq!(plan.report().helical_entries, 1);
     assert_eq!(plan.report().moved_entries, 0);
-    // The helix ends at the level, at the loop start it began at.
-    let first = replay.helix_first_start.expect("a helix lap");
-    let last = replay.helix_last_end.expect("a helix lap");
+    // The ramp (the 3 degree default, #46) ends at the level, the level gap
+    // over tan 3 degrees along the loop from where it began - shorter than
+    // the loop, so it ends away from its start.
+    let first = replay.helix_first_start.expect("a ramp");
+    let last = replay.helix_last_end.expect("a ramp");
+    assert!((last[2] - 6.).abs() <= 1e-9, "the ramp ends at {last:?}");
+    assert!((first[2] - 7.).abs() <= 1e-9, "the ramp begins at {first:?}");
     assert!(
-        (last[0] - first[0]).abs() <= 1e-9 && (last[1] - first[1]).abs() <= 1e-9,
-        "the helix ends at {last:?}, it began at {first:?}"
+        (last[0] - first[0]).hypot(last[1] - first[1]) > 1.,
+        "the ramp ends at {last:?}, it began at {first:?}: a whole lap"
     );
-    assert!((last[2] - 6.).abs() <= 1e-9, "the helix ends at {last:?}");
 }
 
 #[test]
@@ -1389,7 +1396,7 @@ fn unblocked_loops_keep_their_start() {
     assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
     assert_eq!(plan.report().moved_entries, 0);
     assert_eq!(plan.report().helical_entries, 0);
-    assert_eq!(replay.motions, 335);
+    assert_eq!(replay.motions, 246);
     let first = replay.first_entry.expect("an entry plunge");
     assert!(
         (first[0] - 19.015079355936262).abs() <= 1e-9
@@ -1963,8 +1970,9 @@ fn levels_link_with_a_ramp_that_the_next_level_recuts() {
                     );
                 }
             }
+            // Without an entry the ramp is 3 degrees (#46), at most a lap.
             let expected = match &entry {
-                None => lap_length,
+                None => ((za - zb) / 3f64.to_radians().tan()).min(lap_length),
                 Some(_) => (za - zb) / angle.tan(),
             };
             assert!(
@@ -2186,17 +2194,22 @@ fn links_meet_no_more_than_the_lap_below_cuts() {
     let tool = m.tools[0].prepare().unwrap();
     let (r, half) = (2., 0.4f64.hypot(0.4) / 2.);
     let mut moves: Vec<(camlib::motion::Motion, f64, f64)> = vec![];
-    // For each link: the stock before it, and then what the first cut of the
-    // lap it leads to would have met on that stock - the stock the lap meets
-    // where the link arrives, had the link not cut it first.
-    let mut before_link: Option<camlib::stock::StockSnapshot> = None;
+    // For each link: the stock before it, and then what the lap's cut that
+    // arrives back where the link arrived (the flat lap passes over the whole
+    // ramp and ends there) would have met on that stock - the stock the lap
+    // meets where the link arrives, had the link not cut it first.
+    let mut before_link: Option<(camlib::stock::StockSnapshot, [f64; 2], usize)> = None;
     let mut lap_would_cut: Vec<(usize, f64)> = vec![];
     while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let end = motion.curve.end();
         if motion.kind == MoveKind::Lead && moves.last().is_some_and(|(m, _, _)| m.kind == MoveKind::Cut) {
-            before_link = Some(stock.snapshot());
+            before_link = Some((stock.snapshot(), [end[0], end[1]], moves.len()));
         } else if motion.kind == MoveKind::Cut
-            && let Some(snapshot) = before_link.take()
+            && before_link
+                .as_ref()
+                .is_some_and(|(_, p, _)| (end[0] - p[0]).hypot(end[1] - p[1]) <= 1e-6)
         {
+            let (snapshot, _, link) = before_link.take().unwrap();
             let earlier = Stock::from_snapshot(snapshot).unwrap();
             let would = earlier
                 .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
@@ -2205,8 +2218,8 @@ fn links_meet_no_more_than_the_lap_below_cuts() {
                 .iter()
                 .map(|c| c.before.upper_mm - c.after.upper_mm)
                 .fold(0., f64::max);
-            lap_would_cut.push((moves.len(), would));
-        } else if motion.kind != MoveKind::Plunge {
+            lap_would_cut.push((link, would));
+        } else if motion.kind == MoveKind::Rapid {
             before_link = None;
         }
         let d = stock
@@ -2247,7 +2260,7 @@ fn links_meet_no_more_than_the_lap_below_cuts() {
             .unwrap();
         let would = lap_would_cut
             .iter()
-            .find(|(k, _)| *k == first)
+            .find(|(k, _)| *k == i)
             .map(|(_, w)| *w)
             .unwrap();
         let gap = motion.curve.end()[2] - moves[first].0.curve.end()[2];

@@ -140,7 +140,7 @@ class WaterlineTest(unittest.TestCase):
             player.seek(Cursor(partial_motion - 1, 0.5))
             self.assertEqual(player.state.heights.tobytes(), partial)
 
-    def test_a_loop_without_a_clear_start_entry_moves_and_nothing_warns_a_roughed_blank_does_not(self):
+    def test_a_raw_blank_enters_on_a_ramp_and_warns_to_rough_first_a_roughed_blank_does_not(self):
         import warnings
 
         import cadquery as cq
@@ -162,13 +162,18 @@ class WaterlineTest(unittest.TestCase):
         # Raw stock stands above the level on every side of the loop: a lead
         # from beside it onto the wall would cut the raw stock from the side,
         # so the island enters on a ramp along its loop instead (#46 WL3);
-        # nothing plunges into the stock and nothing warns.
+        # nothing plunges into the stock. The ramps reach their levels with
+        # the raw stock standing more than a stepdown above: one warning
+        # names the fix.
         config = example().waterline_job()
         report, entries = run(config)
         self.assertNotIn("moved_entries", report)
         self.assertNotIn("wall_entries", report)
         self.assertGreater(report["helical_entries"], 0)
-        self.assertEqual(entries, [])
+        self.assertGreater(report["deep_stock_entries"], 0)
+        self.assertEqual(len(entries), 1)
+        self.assertIn("more than one stepdown deep", str(entries[0].message))
+        self.assertIn("Rough or rest-rough first", str(entries[0].message))
         # A blank roughed to 0.3 mm over the island and 0.1 mm over the base
         # (the benchmark's): the island is entered once on a ramp, and every
         # level below is reached by a ramp from the level above, no retract.
@@ -180,6 +185,7 @@ class WaterlineTest(unittest.TestCase):
         self.assertEqual(report["helical_entries"], 1)
         self.assertGreater(report["ramp_links"], 0)
         self.assertNotIn("wall_entries", report)
+        self.assertNotIn("deep_stock_entries", report)
         self.assertEqual(entries, [])
 
     def test_empty_above_part_level_and_invalid_offset_base(self):

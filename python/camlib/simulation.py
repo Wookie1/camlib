@@ -2158,6 +2158,17 @@ class Simulation:
                             CamWarning,
                             stacklevel=2,
                         )
+                    deep = data["report"].get("deep_stock_entries")
+                    if deep:
+                        # Waterline (#46): entry ramps or level links that met
+                        # stock deeper than one stepdown (unroughed stock).
+                        warnings.warn(
+                            f"operation {active!r} entered or linked {deep} loop(s) into stock more than one stepdown "
+                            "deep: the stock there is unroughed, or roughed in steps deeper than the waterline's, so "
+                            "the ball cuts it in full depth. Rough or rest-rough first",
+                            CamWarning,
+                            stacklevel=2,
+                        )
                     active, completed_operations = None, completed_operations + 1
                 elif data["stage"] == "events":
                     # Mid-operation events (a dwell at the bottom of a hole),
