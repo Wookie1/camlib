@@ -2283,18 +2283,14 @@ fn links_meet_no_more_than_the_lap_below_cuts() {
     assert!(links > 0, "no link was checked");
 }
 
-#[test]
-fn slope_limited_walls_are_cut_wall_by_wall_and_linked() {
+/// A gable roof (#46): ridge along Y at X12 Z7, eaves at X4 and X20 Z4
+/// (20.6 degree planes), on finishing stock 0.1 mm over it, with the slope
+/// limited to 25..90 degrees and levels Z6.8 down to Z4.4 every 0.4 mm. Sets
+/// the manifest's initial stock to it.
+fn roof(
+    m: &mut camlib::stream::StreamManifest,
+) -> (camlib::waterline::WaterlineOperation, camlib::stock::Stock, camlib::stock::StockSpec) {
     use camlib::stock::{HeightBounds, InitialStock, Stock};
-    use camlib::waterline::WaterlinePlan;
-    // A gable roof, ridge along Y at X12 Z7, eaves at X4 and X20 Z4 (20.6
-    // degree planes), on finishing stock 0.1 mm over it. With the slope
-    // limited to 25..90 degrees, each level keeps only the runs where the
-    // ball rides the gable ends - two walls of one contour. Each wall is cut
-    // top to bottom and its runs linked (#46), instead of a retract and an
-    // entry for every run.
-    let mut m = fixture();
-    let cancel = AtomicBool::new(false);
     let roof = |x: f64| 7. - ((x - 12.).abs() * 3. / 8.);
     let (a, b, c, d, e, f) = (
         [4., 4., 4.],
@@ -2304,7 +2300,7 @@ fn slope_limited_walls_are_cut_wall_by_wall_and_linked() {
         [12., 12., 7.],
         [20., 12., 4.],
     );
-    let mut op = operation(&m);
+    let mut op = operation(m);
     op.surface = mesh(vec![[a, b, e], [a, e, d], [b, c, f], [b, f, e]]);
     op.top_z_mm = 6.8;
     op.bottom_z_mm = 4.4;
@@ -2339,8 +2335,22 @@ fn slope_limited_walls_are_cut_wall_by_wall_and_linked() {
         representation: "whole_cell_top_down".into(),
         bounds,
     };
-    let mut stock = Stock::from_initial(spec.clone(), &initial).unwrap();
+    let stock = Stock::from_initial(spec.clone(), &initial).unwrap();
     m.initial_stock = Some(initial);
+    (op, stock, spec)
+}
+#[test]
+fn slope_limited_walls_are_cut_wall_by_wall_and_linked() {
+    use camlib::waterline::WaterlinePlan;
+    // A gable roof, ridge along Y at X12 Z7, eaves at X4 and X20 Z4 (20.6
+    // degree planes), on finishing stock 0.1 mm over it. With the slope
+    // limited to 25..90 degrees, each level keeps only the runs where the
+    // ball rides the gable ends - two walls of one contour. Each wall is cut
+    // top to bottom and its runs linked (#46), instead of a retract and an
+    // entry for every run.
+    let mut m = fixture();
+    let cancel = AtomicBool::new(false);
+    let (op, mut stock, spec) = roof(&mut m);
     let tolerance = op.tolerance_mm;
     let mut plan =
         WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
@@ -2434,4 +2444,100 @@ fn links_stay_out_of_avoid_areas_between_runs() {
             );
         }
     }
+}
+
+/// Every travelling descent (a ramp) is no steeper than the ramp angle, and
+/// every coordinate is finite.
+fn assert_ramps_within(moves: &[(camlib::motion::Motion, f64)], angle_deg: f64) {
+    use camlib::motion::MoveKind;
+    let limit = angle_deg.to_radians().tan();
+    let mut ramps = 0;
+    for (motion, _) in moves {
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        assert!(
+            a.iter().chain(b.iter()).all(|v| v.is_finite()),
+            "a {:?} move from {a:?} to {b:?}",
+            motion.kind
+        );
+        let run = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if motion.kind == MoveKind::Plunge && run > 1e-9 {
+            ramps += 1;
+            assert!(
+                (a[2] - b[2]).abs() <= limit * run + 1e-9,
+                "a ramp from {a:?} to {b:?} descends {} over {run} mm: {} degrees",
+                a[2] - b[2],
+                ((a[2] - b[2]).abs() / run).atan().to_degrees()
+            );
+        }
+    }
+    assert!(ramps > 0, "no ramp");
+}
+#[test]
+fn ramps_on_short_runs_keep_the_ramp_angle() {
+    use camlib::waterline::WaterlinePlan;
+    // The roof's runs at the in-between levels are about 2 mm long and the
+    // levels 0.4 mm apart: one out-and-back over a 2 mm run descends at
+    // about 5.7 degrees. The ramps take as many passes as the 3 degree
+    // default needs (#46).
+    let mut m = fixture();
+    let cancel = AtomicBool::new(false);
+    let (op, mut stock, spec) = roof(&mut m);
+    let mut plan =
+        WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    assert!(error.is_none(), "{error:?}");
+    assert_ramps_within(&moves, 3.);
+}
+#[test]
+fn a_tiny_ramp_descent_streams_finite_moves() {
+    use camlib::stock::{HeightBounds, InitialStock, Stock};
+    use camlib::waterline::WaterlinePlan;
+    // Finishing stock stands 0.0002 mm above the first level (Z2.5) all
+    // round the plate and high beyond, so the loop is entered on a ramp
+    // from Z2.5002: at 3
+    // degrees 0.0038 mm long, which used to snap to nothing and divide by
+    // zero (a NaN start). Every move stays finite, streams, and keeps the
+    // angle (#46).
+    let mut m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = plate(&m);
+    op.stepdown_mm = 1.;
+    op.top_z_mm = 2.5;
+    op.bottom_z_mm = 2.4;
+    // Within 4.4 mm of the plate the stock stands at Z2.5002 (the ball
+    // there, 2 mm out, stays on it); beyond, at Z6, so no point beside the
+    // loop offers a side entry.
+    let spec = m.stock.height().unwrap().clone();
+    let probe = Stock::new(spec.clone()).unwrap();
+    let [nx, ny] = probe.dimensions();
+    let [wx, wy] = probe.cell_widths_mm();
+    let mut bounds = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let (cx, cy) = ((i as f64 + 0.5) * wx, (j as f64 + 0.5) * wy);
+            let d = (8. - cx).max(cx - 16.).max(0.).hypot((5. - cy).max(cy - 11.).max(0.));
+            let top = if d <= 4.4 { 2.5002 } else { 6. };
+            bounds.push(HeightBounds {
+                lower_mm: top,
+                upper_mm: top,
+            });
+        }
+    }
+    let initial = InitialStock {
+        source_id: "skin".into(),
+        revision: "1".into(),
+        source_sha256: "0".repeat(64),
+        source_to_setup: camlib::motion::WorkFrame::identity(),
+        uncertainty_mm: 0.,
+        representation: "whole_cell_top_down".into(),
+        bounds,
+    };
+    let mut stock = Stock::from_initial(spec.clone(), &initial).unwrap();
+    m.initial_stock = Some(initial);
+    let mut plan =
+        WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    assert!(error.is_none(), "{error:?}");
+    assert!(plan.report().helical_entries >= 1, "entered on a ramp");
+    assert_ramps_within(&moves, 3.);
 }

@@ -54,10 +54,10 @@ class Waterline:
     # Ball end mills already reach every level of an island by a ramp along
     # its contour from the level above (#46), so this changes nothing there.
     ramp: bool = False
-    # Ball end mills (#46): RampEntry(angle_deg=..., feed_mm_min=...) sets how
-    # steep the ramp a level is reached by may be (at most one lap; deeper
-    # steps descend steeper) and its feed (default the plunge feed). None:
-    # 3 degrees at the cutting feed. Only RampEntry is accepted.
+    # Ball end mills (#46): RampEntry(angle_deg=..., feed_mm_min=...) sets the
+    # steepest the ramp a level is reached by may be (as many laps, or passes
+    # along a run, as the angle needs) and its feed (default the plunge feed).
+    # None: 3 degrees at the cutting feed. Only RampEntry is accepted.
     entry: object | None = None
 
     def to_dict(self):

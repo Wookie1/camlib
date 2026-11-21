@@ -1993,8 +1993,11 @@ Within a stack, a closed loop below a closed loop is reached without a
 retract: a short link at the upper level to the nearest point of the lower
 loop, a ramp down along that loop to its level, then the whole loop cut flat
 from where the ramp ends, so the flat lap passes over the entire ramp again.
-The ramp is the level gap over the tangent of the ramp angle, at most one
-lap. Without an `entry` the angle is 3 degrees at the cutting feed
+The ramp is never steeper than the ramp angle: the level gap over the
+tangent of the angle along the loop, and where one lap is too short for
+that, as many whole laps as the angle needs, each descending an equal share
+(refused by name past 1000 laps). The split onto a loop vertex only ever
+lengthens a ramp. Without an `entry` the angle is 3 degrees at the cutting feed
 (`feed_mm_min`): a ramp that shallow cuts no deeper than the flat lap after
 it, so it needs no slower feed. `entry=RampEntry(angle_deg, feed_mm_min=...)`
 sets both (its feed defaults to the plunge feed, as in every operation). The
@@ -2008,7 +2011,8 @@ entered as below. The report's `ramp_links` counts the linked levels.
 Open runs (the parts of a contour slope or region limits keep) are linked the
 same way: from the end of the run just cut to the start of the next one, at
 the upper level, then down along the run at the ramp angle to half the level
-gap and back to its start (no ramp at the same level), then the run cut. Where
+gap and back to its start (more such passes where the run is too short for
+the angle; no ramp at the same level), then the run cut. Where
 the straight link would cross the part (the runs of one wall all run the same
 way, so the next starts at the far end), the link goes back along the run just
 cut, at its level, to its point nearest the next start, then straight to it.

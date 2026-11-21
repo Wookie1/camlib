@@ -652,8 +652,8 @@ pub struct WaterlineOperation<G = SurfaceMesh> {
     /// Ball end mills (#46): the ramp a level is reached by, along its own
     /// contour - from the level above it, or from the height the stock is
     /// clear at when the tool comes down to an island - descends at no more
-    /// than this angle, at its feed (default the plunge feed); the ramp is at
-    /// most one lap, so a deeper step descends steeper. Only `RampEntry`
+    /// than this angle, at its feed (default the plunge feed), taking as many
+    /// laps (or passes along a run) as the angle needs. Only `RampEntry`
     /// (kind "ramp"). None: 3 degrees at the cutting feed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<crate::entry::PocketEntry>,
@@ -861,8 +861,8 @@ pub struct WaterlinePlan {
     limits: Option<(f64, f64)>,
     /// Machining limits (containment, avoid areas).
     region_limits: Option<crate::limits::PreparedLimits>,
-    /// The ramp (#46): its angle sets how long a ramp along a contour is
-    /// (at most one lap), its feed the ramp's feed. Without a declared
+    /// The ramp (#46): its angle is the steepest a ramp along a contour
+    /// descends (`loop_ramp`, `run_ramp`), its feed the ramp's feed. Without a declared
     /// entry, 3 degrees at the cutting feed.
     ramp_entry: crate::entry::RampEntry,
     /// Ball end mills (#46): every level's pieces grouped into stacks, and
@@ -1349,6 +1349,26 @@ fn snap_to_vertex(edges: &[Stroke], length: f64) -> f64 {
     } else {
         length
     }
+}
+/// Where to split a ramp `length` long along `edges` (#46): never shorter
+/// than `length` (a shorter ramp would be steeper than the angle), moved up
+/// onto the next vertex when that lies within `SNAP_MM` or when the vertex
+/// before lies within it (no sliver either side); at most the whole length.
+/// Positive for any positive `length`.
+fn ramp_split(edges: &[Stroke], length: f64) -> f64 {
+    let mut acc = 0.;
+    for e in edges {
+        let next = acc + stroke_length(e);
+        if next >= length {
+            return if next - length <= SNAP_MM || length - acc < SNAP_MM {
+                next
+            } else {
+                length
+            };
+        }
+        acc = next;
+    }
+    acc
 }
 /// A closed loop cut flat at `z` once round, from arc length `s` (where a
 /// ramp along it ended) back to `s`: the lap passes over the ramp again.
@@ -2298,6 +2318,9 @@ impl WaterlinePlan {
                 let mut d = step;
                 while found.is_none() && d < total - 1e-9 {
                     for &s in &[d, total - d] {
+                        // The candidate start is snapped first, so the lead
+                        // the checks below prove is the lead emitted.
+                        let s = snap_to_vertex(edges, s);
                         if s <= 1e-9
                             || s >= total - 1e-9
                             || tried.iter().any(|&t| (t - s).abs() <= 1e-9)
@@ -2310,7 +2333,7 @@ impl WaterlinePlan {
                             stock, q, t, center, plunge_z, step, reach, &mut work, cancel,
                         )?;
                         if found.is_some() {
-                            rotate_loop(edges, snap_to_vertex(edges, s));
+                            rotate_loop(edges, s);
                             break;
                         }
                     }
@@ -2705,7 +2728,7 @@ impl WaterlinePlan {
     /// Ramp link: when the tool has just finished the piece before this one
     /// in the same stack and this piece is a closed loop below it, a short
     /// link at the upper level to the nearest point P of this loop, a ramp
-    /// down along the loop from P (over `ramp_length`), then the whole loop
+    /// down along the loop from P (`loop_ramp`), then the whole loop
     /// flat from where the ramp ends - the flat lap passes over the ramp
     /// again. An open run (at the same level or below) is linked to its
     /// start, descended along itself and back (`out_and_back`), then cut;
@@ -2746,19 +2769,17 @@ impl WaterlinePlan {
             let mut strokes = piece.strokes.clone();
             let total: f64 = strokes.iter().map(stroke_length).sum();
             // A closed loop is entered at its nearest point P and ramped
-            // along over `ramp_length`; an open run at its start, along
-            // itself and back (no ramp at the same level).
+            // along it (`loop_ramp`); an open run at its start, along itself
+            // and back (`run_ramp`; no ramp at the same level).
             let (ramp, flat_from) = if piece.closed {
                 let (sp, _) = nearest_on_loop(&strokes, [self.position[0], self.position[1]]);
                 let sp = snap_to_vertex(&strokes, sp);
                 if sp > 1e-9 && sp < total - 1e-9 {
                     rotate_loop(&mut strokes, sp);
                 }
-                let length = snap_to_vertex(&strokes, self.ramp_length(za - z, total));
-                (ramp_curves(&strokes, za, z, length), length.min(total))
+                self.loop_ramp(&strokes, za, z)?
             } else if za > z + 1e-9 {
-                let length = snap_to_vertex(&strokes, self.ramp_length((za - z) / 2., total));
-                (out_and_back(&strokes, za, z, length), 0.)
+                (self.run_ramp(&strokes, za, z)?, 0.)
             } else {
                 (vec![], 0.)
             };
@@ -2926,17 +2947,14 @@ impl WaterlinePlan {
                 end: start,
             });
         } else if entry_z > z && piece.closed {
-            let total: f64 = strokes.iter().map(stroke_length).sum();
-            let length = snap_to_vertex(&strokes, self.ramp_length(entry_z - z, total));
-            descent = ramp_curves(&strokes, entry_z, z, length);
-            flat_from = length.min(total);
+            (descent, flat_from) = self.loop_ramp(&strokes, entry_z, z)?;
         } else if entry_z > z {
-            let total: f64 = strokes.iter().map(stroke_length).sum();
-            let length = snap_to_vertex(&strokes, self.ramp_length((entry_z - z) / 2., total));
-            descent = out_and_back(&strokes, entry_z, z, length);
+            descent = self.run_ramp(&strokes, entry_z, z)?;
         }
+        // The final proof of the moves emitted: the plunge, and the side
+        // lead or the ramp, against the part and the limits.
         if !self.path_clear(std::slice::from_ref(&plunge), &mut work, cancel)?
-            || (points[0].is_none() && !self.route_clear(&descent, &mut work, cancel)?)
+            || !self.route_clear(&descent, &mut work, cancel)?
         {
             return Err(format!(
                 "waterline operation {}: the entry to the loop at level Z{z} starting at ({:.4}, {:.4}) is not clear of the part or the machining limits; rough or rest-rough there first, or change the limits",
@@ -2991,10 +3009,68 @@ impl WaterlinePlan {
             ),
         ]
     }
-    /// How long a ramp along a closed loop `total` long is to descend `drop`
-    /// (#46): at the ramp angle, at most one lap.
-    fn ramp_length(&self, drop: f64, total: f64) -> f64 {
-        (drop / self.ramp_entry.angle_rad.tan()).min(total)
+    /// A ramp descending `from` -> `to` along a closed loop from its start
+    /// (#46), never steeper than the ramp angle: within one lap when that is
+    /// long enough (split where `ramp_split` allows), else whole laps each
+    /// descending an equal share, ending at the start. Returns the ramp and
+    /// where along the loop it ends (the flat lap starts there and passes
+    /// over the whole ramp). Refused by name past `MAX_RAMP_LEGS` laps.
+    fn loop_ramp(&self, edges: &[Stroke], from: f64, to: f64) -> Result<(Vec<Curve>, f64), String> {
+        let total: f64 = edges.iter().map(stroke_length).sum();
+        let length = (from - to) / self.ramp_entry.angle_rad.tan();
+        if length <= total {
+            let s = ramp_split(edges, length);
+            return Ok((ramp_curves(edges, from, to, s), s));
+        }
+        let laps = self.ramp_passes(length, total, from - to)?;
+        let step = (from - to) / laps as f64;
+        let mut curves = vec![];
+        for i in 0..laps {
+            curves.extend(ramp_curves(
+                edges,
+                from - i as f64 * step,
+                from - (i + 1) as f64 * step,
+                total,
+            ));
+        }
+        Ok((curves, 0.))
+    }
+    /// A ramp descending `from` -> `to` onto an open run, ending at its start
+    /// (#46), never steeper than the ramp angle: out along the run and back
+    /// over the same stretch, as many times as the angle needs.
+    fn run_ramp(&self, edges: &[Stroke], from: f64, to: f64) -> Result<Vec<Curve>, String> {
+        let total: f64 = edges.iter().map(stroke_length).sum();
+        // Each leg descends half of one out-and-back's share.
+        let leg = (from - to) / 2. / self.ramp_entry.angle_rad.tan();
+        if leg <= total {
+            return Ok(out_and_back(edges, from, to, ramp_split(edges, leg)));
+        }
+        let passes = self.ramp_passes(leg, total, from - to)?;
+        let step = (from - to) / passes as f64;
+        let mut curves = vec![];
+        for i in 0..passes {
+            curves.extend(out_and_back(
+                edges,
+                from - i as f64 * step,
+                from - (i + 1) as f64 * step,
+                total,
+            ));
+        }
+        Ok(curves)
+    }
+    /// How many passes of `total` a ramp `length` long needs, refused by
+    /// name past `MAX_RAMP_LEGS` (#46).
+    fn ramp_passes(&self, length: f64, total: f64, drop: f64) -> Result<usize, String> {
+        let passes = (length / total).ceil();
+        if !passes.is_finite() || passes > crate::entry::MAX_RAMP_LEGS || total <= 1e-9 {
+            return Err(format!(
+                "waterline operation {}: descending {drop:.4} mm at the ramp angle of {:.3} degrees along a contour {total:.4} mm long needs more than {} passes; declare a steeper RampEntry the tool allows",
+                self.op.id,
+                self.ramp_entry.angle_rad.to_degrees(),
+                crate::entry::MAX_RAMP_LEGS
+            ));
+        }
+        Ok(passes as usize)
     }
     /// The part-clearance proof of entry, link and ramp moves (#46): the
     /// ball centre along each line keeps the distance from the part that the
@@ -3316,5 +3392,87 @@ mod bridge_tests {
             bridge_open(&run, &kept, 4.),
             Some(vec![[10., 2.], [10., 10.], [0., 10.], [0., 0.]])
         );
+    }
+}
+#[cfg(test)]
+mod entry_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    #[test]
+    fn a_moved_side_entry_proves_the_lead_it_emits() {
+        // A square loop at Z3 whose start has no side entry (a stock wall at
+        // X15.2..15.6 stands under every ball beside it), so its start moves
+        // along it. The first sample, 1 mm along, lies 0.003 mm before the
+        // vertex V at (18.202, 8.2) it snaps to. One stock cell to Z6 is
+        // centred 1.998 mm past V along the loop: a lead onto the sample
+        // passes 2.001 mm from it (pure air, on the stock grid), a lead onto
+        // V passes within the ball radius. The lead emitted must be the lead
+        // proven (#46).
+        let m: crate::stream::StreamManifest =
+            serde_json::from_str(include_str!("../fixtures/operations/waterline.json")).unwrap();
+        let mut op = match &m.operations[0] {
+            crate::pocket::Operation::Waterline(p) => p.clone(),
+            _ => panic!("fixture"),
+        };
+        let (a, b, c, d) = ([8., 5., 6.], [16., 5., 6.], [16., 11., 6.], [8., 11., 6.]);
+        op.surface = crate::surface::SurfaceMesh {
+            version: 1,
+            units: "mm".into(),
+            surface_error_mm: 0.,
+            source: serde_json::Value::Null,
+            triangles: vec![[a, b, c], [a, c, d]].into(),
+        };
+        let cancel = AtomicBool::new(false);
+        let spec = m.stock.height().unwrap().clone();
+        let plan =
+            WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel)
+                .unwrap();
+        let probe = Stock::new(spec.clone()).unwrap();
+        let [nx, ny] = probe.dimensions();
+        let [wx, wy] = probe.cell_widths_mm();
+        let mut bounds = Vec::with_capacity(nx * ny);
+        for j in 0..ny {
+            for i in 0..nx {
+                let (cx, cy) = ((i as f64 + 0.5) * wx, (j as f64 + 0.5) * wy);
+                let wall = (15.2..15.6).contains(&cx);
+                let cell = (cx - 20.2).abs() < 1e-9 && (cy - 8.2).abs() < 1e-9;
+                let top = if wall || cell { 6. } else { 2. };
+                bounds.push(crate::stock::HeightBounds {
+                    lower_mm: top,
+                    upper_mm: top,
+                });
+            }
+        }
+        let initial = crate::stock::InitialStock {
+            source_id: "entry".into(),
+            revision: "1".into(),
+            source_sha256: "0".repeat(64),
+            source_to_setup: crate::motion::WorkFrame::identity(),
+            uncertainty_mm: 0.,
+            representation: "whole_cell_top_down".into(),
+            bounds,
+        };
+        let stock = Stock::from_initial(spec, &initial).unwrap();
+        let (s0, v, w, x) = ([17.199, 8.2], [18.202, 8.2], [18.202, 12.2], [17.199, 12.2]);
+        let mut loops = vec![vec![
+            Stroke::line(s0, v),
+            Stroke::line(v, w),
+            Stroke::line(w, x),
+            Stroke::line(x, s0),
+        ]];
+        let z = 3.;
+        let (points, _, moved, _) = plan.entries(&stock, &mut loops, z, z, &cancel).unwrap();
+        if let Some(p) = points[0] {
+            assert_eq!(moved, 1);
+            let start = loops[0][0].a;
+            let mut work = SurfaceWork::default();
+            let met = plan
+                .stock_met(&stock, [p[0], p[1], z], start, z, &mut work, &cancel)
+                .unwrap();
+            assert!(
+                met <= plan.op.tolerance_mm,
+                "the lead from {p:?} onto the moved start {start:?} meets {met} mm of stock"
+            );
+        }
     }
 }
