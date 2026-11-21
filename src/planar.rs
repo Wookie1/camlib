@@ -513,6 +513,11 @@ fn boundary_to_polyline(
         let mut intersect = None;
         p.visit_self_intersects_opt(
             &mut |i: PlineIntersect<f64>| {
+                if let PlineIntersect::Overlapping(hit) = &i
+                    && adjacent_lines_only_share_vertex(&p, hit.start_index1, hit.start_index2)
+                {
+                    return cavalier_contours::core::Control::Continue;
+                }
                 intersect = Some(i);
                 cavalier_contours::core::Control::Break(())
             },
@@ -535,6 +540,25 @@ fn boundary_to_polyline(
         }
     }
     Ok(p)
+}
+
+/// The arc backend can report overlapping adjacent short chords in a mixed
+/// loop. Strictly ordered projections on either axis prove that two straight
+/// segments share just the middle vertex, independently of the backend.
+fn adjacent_lines_only_share_vertex(p: &Polyline<f64>, i: usize, j: usize) -> bool {
+    let n = p.vertex_count();
+    let first = if (i + 1) % n == j {
+        i
+    } else if (j + 1) % n == i {
+        j
+    } else {
+        return false;
+    };
+    let a = p.at(first);
+    let b = p.at((first + 1) % n);
+    let c = p.at((first + 2) % n);
+    let ordered = |a, b, c| (a < b && b < c) || (c < b && b < a);
+    a.bulge == 0. && b.bulge == 0. && (ordered(a.x, b.x, c.x) || ordered(a.y, b.y, c.y))
 }
 
 fn boundary_neighbors(p: &Polyline<f64>, index: usize) -> [[f64; 3]; 4] {

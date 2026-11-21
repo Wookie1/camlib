@@ -3958,7 +3958,7 @@ fn without_slivers(
 /// `need` without what the disk of radius `r` sweeps along the strokes of
 /// `runs` (straight strokes as capsules; arcs by their chords, each capsule's
 /// radius reduced by the chord's sagitta so it stays inside the arc's swept
-/// disk), then without slivers; `None` when nothing is left.
+/// disk); `None` when nothing is left.
 fn subtract_swept(
     need: crate::planar::PreparedRegion,
     runs: &[Vec<crate::pocket::Stroke>],
@@ -4030,7 +4030,10 @@ fn subtract_swept(
             .into_parts()
             .1;
     }
-    without_slivers(need, guard)
+    // The remaining floor may be narrow where two sweeps nearly meet.
+    // Keep it for trim_ring: eroding and regrowing it here would discard
+    // material that neither cutter sweep covered.
+    Ok((!need.definition().components.is_empty()).then_some(need))
 }
 
 /// Whether a loop carries no geometry the kernel vouches for: its total

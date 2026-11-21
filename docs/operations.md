@@ -1639,7 +1639,8 @@ cutter diameter. An inner pass is planned only while floor remains deeper than
 the passes before it reach (more than a sliver thinner than the offset kernel's
 stated error, which it cannot tell from a line), and it is cut only along the
 stretches whose disk reaches that floor, less what the passes already kept at
-its depth sweep. A gap between two kept stretches is cut through when that
+its depth sweep. Floor remaining between those cutter sweeps stays eligible for
+subsequent passes, even where the remaining strip is narrow. A gap between two kept stretches is cut through when that
 takes no longer than a new entry's descent from the feed height at the plunge
 feed, or is at most two stepovers. Offset loops are cut as arcs (the offsets'
 cavalier bulges), an arc proven by its chords, each chord held to the same

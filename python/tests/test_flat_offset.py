@@ -38,6 +38,14 @@ STEPPED = dict(
     bosses=[(8, 4, 4, 16, 12, 7)],
     extent=(0, 0, 24, 16),
 )
+# Doubling the footprint puts short, nearly parallel chords next to each
+# other on a remaining-floor boundary that also contains arcs.
+STEPPED_DOUBLE = dict(
+    boxes=[(0, 0, 0, 48, 32, 4)],
+    pockets=[],
+    bosses=[(16, 8, 4, 32, 24, 7)],
+    extent=(0, 0, 48, 32),
+)
 # A block with a pocket; in the pocket a short island and, 3 mm beside it
 # (narrower than the 4 mm tool), a boss standing well above the block.
 ISLAND = dict(
@@ -198,21 +206,23 @@ def stock_top_near(grid, heights, p, radius):
 def points(m, n=None):
     c = m["curve"]
     a, b = c["start"], c["end"]
-    length = math.hypot(b[0] - a[0], b[1] - a[1])
-    n = n or max(2, int(length / 0.05) + 1)
-    return [[a[k] + (b[k] - a[k]) * i / (n - 1) for k in range(3)] for i in range(n)]
-
-
-def arc_points(c, step=0.05):
-    a, ce = c["start"], c["center"]
-    rho = math.hypot(a[0] - ce[0], a[1] - ce[1])
-    a0 = math.atan2(a[1] - ce[1], a[0] - ce[0])
-    sweep = c["sweep_rad"]
-    n = max(2, int(rho * abs(sweep) / step) + 1)
-    return [
-        [ce[0] + rho * math.cos(a0 + sweep * i / (n - 1)), ce[1] + rho * math.sin(a0 + sweep * i / (n - 1)), a[2]]
-        for i in range(n)
-    ]
+    if c.get("kind", "line") == "line":
+        n = n or max(2, math.ceil(math.dist(a, b) / 0.05) + 1)
+        return [[a[k] + (b[k] - a[k]) * i / (n - 1) for k in range(3)] for i in range(n)]
+    u, v, w = {"xy": (0, 1, 2), "xz": (2, 0, 1), "yz": (1, 2, 0)}[c["plane"]]
+    center, sweep = c["center"], c["sweep_rad"]
+    radius = math.hypot(a[u] - center[u], a[v] - center[v])
+    start = math.atan2(a[v] - center[v], a[u] - center[u])
+    n = n or max(2, math.ceil(math.hypot(radius * sweep, b[w] - a[w]) / 0.05) + 1)
+    samples = []
+    for i in range(n):
+        t = i / (n - 1)
+        q = list(a)
+        q[u] = center[u] + radius * math.cos(start + t * sweep)
+        q[v] = center[v] + radius * math.sin(start + t * sweep)
+        q[w] = a[w] + t * (b[w] - a[w])
+        samples.append(q)
+    return samples
 
 
 def vertical_plunges(motions):
@@ -241,6 +251,20 @@ def seg_distance(p, a, b):
     return math.hypot(p[0] - ax - t * vx, p[1] - ay - t * vy)
 
 
+def level_distance(p, c):
+    a, b = c["start"], c["end"]
+    if c.get("kind", "line") == "line":
+        return seg_distance(p, a, b)
+    assert c["plane"] == "xy" and a[2] == b[2]
+    x, y = c["center"][:2]
+    start = math.atan2(a[1] - y, a[0] - x)
+    angle = math.atan2(p[1] - y, p[0] - x)
+    sweep = c["sweep_rad"]
+    if ((angle - start) * math.copysign(1, sweep)) % math.tau <= abs(sweep):
+        return abs(math.hypot(p[0] - x, p[1] - y) - math.hypot(a[0] - x, a[1] - y))
+    return min(math.dist(p, a[:2]), math.dist(p, b[:2]))
+
+
 def rect_outline_distance(p, r):
     """Distance from p to the outline of rectangle r = (x0, y0, x1, y1)."""
     x0, y0, x1, y1 = r
@@ -255,11 +279,19 @@ _cache = {}
 
 def cached(name):
     if name not in _cache:
-        _cache[name] = run({"stepped": STEPPED, "island": ISLAND}[name])
+        _cache[name] = run({"stepped": STEPPED, "island": ISLAND, "double": STEPPED_DOUBLE}[name])
     return _cache[name]
 
 
 class FlatOffsetTest(unittest.TestCase):
+    def test_measurement_follows_arc_and_helix_instead_of_chord(self):
+        c = dict(kind="arc", plane="xy", start=[2, 0, 4], end=[-2, 0, 4], center=[0, 0, 4], sweep_rad=-math.pi)
+        self.assertEqual(level_distance((0, 0), c), 2)
+        self.assertEqual(level_distance((0, -2), c), 0)
+        self.assertAlmostEqual(level_distance((0, 2), c), math.sqrt(8))
+        h = dict(c, kind="helix", end=[-2, 0, 2])
+        self.assertTrue(np.allclose(points({"curve": h}, 3)[1], [0, -2, 3]))
+
     def test_few_entries_and_links_at_depth(self):
         # Entries are the vertical plunges. The stepped part needs one per
         # ring along an edge or wall that cannot be linked to (boss top,
@@ -339,18 +371,18 @@ class FlatOffsetTest(unittest.TestCase):
     def test_coverage_of_every_reachable_flat_point(self):
         # Every flat point at least a radius (+0.01) from the part standing
         # above it lies under the tool's disk on some cut at its level.
-        for name, spec in (("stepped", STEPPED), ("island", ISLAND)):
+        for name, spec in (("stepped", STEPPED), ("island", ISLAND), ("double", STEPPED_DOUBLE)):
             _, motions, *_ = cached(name)
             field = Field(spec)
             x0, y0, x1, y1 = spec["extent"]
+            levels = {z: level_cuts(motions, z) for z in np.unique(field.H) if z > 0}
             worst = (0.0, None)
             for x in np.arange(x0 + 0.125, x1, 0.25):
                 for y in np.arange(y0 + 0.125, y1, 0.25):
                     z = float(height(spec, np.array(x), np.array(y)))
                     if z <= 0 or field.clearance((x, y), z) < R + 0.01:
                         continue
-                    segs = [(m["curve"]["start"], m["curve"]["end"]) for m in level_cuts(motions, z)]
-                    d = min((seg_distance((x, y), a, b) for a, b in segs), default=math.inf)
+                    d = min((level_distance((x, y), m["curve"]) for m in levels[z]), default=math.inf)
                     if d > worst[0]:
                         worst = (d, (x, y, z))
             self.assertLessEqual(
@@ -459,7 +491,7 @@ class FlatOffsetTest(unittest.TestCase):
                 if m["kind"] not in ("cut", "link", "lead") or abs(c["end"][2] - z) > 1e-6:
                     continue
                 H = np.array(snap[1::2]).reshape(ny, nx)
-                ps = points(m) if c.get("kind", "line") == "line" else arc_points(c)
+                ps = points(m)
                 length = sum(math.dist(p[:2], q[:2]) for p, q in zip(ps, ps[1:]))
                 live = [bool((H[(X - p[0]) ** 2 + (Y - p[1]) ** 2 < (R - 0.1) ** 2] > z + 0.02).any()) for p in ps]
                 total += length
@@ -591,12 +623,7 @@ class FlatOffsetTest(unittest.TestCase):
             for m in motions:
                 if m["kind"] == "rapid":
                     continue
-                ps = (
-                    arc_points(m["curve"])
-                    if m["curve"].get("kind") == "arc" and m["curve"].get("plane") == "xy"
-                    else points(m, 9)
-                )
-                for p in ps:
+                for p in points(m, None if m["curve"].get("kind") == "arc" else 9):
                     c = field.clearance(p, p[2])
                     if c < worst[0]:
                         worst = (c, (m["id"], m["kind"], [round(v, 4) for v in p]))
