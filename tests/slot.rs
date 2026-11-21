@@ -1885,3 +1885,62 @@ fn slot_stock_thinner_than_the_tolerance_is_not_air() {
     assert_eq!(helices.last().unwrap().curve.end()[2], op.floor_z_mm);
     assert_eq!(p.report().max_air_plunge_mm, 0.);
 }
+
+/// A cut elsewhere in the same stock cell proves nothing about the entry's
+/// footprint. With the fixture's stock as one 40 mm cell, a thin slot at Y18
+/// (pass at Z9.995 under the stock top Z10) needs a helix on fresh stock and
+/// still needs one after a separate slot at Y5 lowered that cell's lower
+/// bound: refused without an entry, a helix from the stock top with one.
+#[test]
+fn slot_a_cut_elsewhere_in_the_cell_does_not_clear_the_entry() {
+    let m = fixture();
+    let mut spec = m.stock.height().unwrap().clone();
+    spec.cell_size_mm = 40.;
+    let cancel = AtomicBool::new(false);
+    let prepare = |op: TrochoidalSlotOperation| {
+        SlotPlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap()
+    };
+    let mut thin = operation();
+    thin.start_mm = Some([8., 18.]);
+    thin.end_mm = Some([28., 18.]);
+    thin.floor_z_mm = 9.995;
+    thin.tolerance_mm = 0.01;
+    thin.boundary_tolerance_mm = 0.4;
+    thin.max_engagement_deg = 150.;
+    // Runs `op` on `stock`: Ok(motions) or the planner's refusal.
+    let run = |op: &TrochoidalSlotOperation, stock: &mut Stock| -> Result<Vec<Motion>, String> {
+        let mut p = prepare(op.clone());
+        let mut motions = vec![];
+        while let Some(motion) = p.next_motion_with_stock(stock, &cancel)? {
+            commit(stock, &motion);
+            motions.push(motion);
+        }
+        Ok(motions)
+    };
+    let mut first = operation();
+    first.start_mm = Some([8., 5.]);
+    first.end_mm = Some([28., 5.]);
+    let fresh = || Stock::new(spec.clone()).unwrap();
+    let thin_floor = thin.floor_z_mm;
+    let after_first = || {
+        let mut stock = fresh();
+        run(&first, &mut stock).unwrap();
+        assert!(stock.cells()[0].lower_mm < thin_floor);
+        stock
+    };
+    for (scene, mut stock) in [("fresh", fresh()), ("after the Y5 slot", after_first())] {
+        let mut bare = thin.clone();
+        bare.entry = None;
+        let error = run(&bare, &mut stock.clone()).unwrap_err();
+        assert!(error.contains("depth pass 1 would plunge"), "{scene}: {error}");
+        thin.entry = Some(helix_entry(3.));
+        let motions = run(&thin, &mut stock).unwrap();
+        let plunge = motions.iter().find(|m| m.kind == MoveKind::Plunge).unwrap();
+        assert_eq!(plunge.curve.end()[2], thin.top_z_mm, "{scene}");
+        let helix = motions
+            .iter()
+            .find(|m| matches!(m.curve, Curve::Helix { .. }))
+            .unwrap_or_else(|| panic!("{scene}: no helix"));
+        assert_eq!(helix.curve.start()[2], thin.top_z_mm, "{scene}");
+    }
+}

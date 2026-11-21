@@ -40,6 +40,9 @@ use std::f64::consts::TAU;
 /// per-query allowance is unbounded in total; once the shared budget is
 /// spent the plan keeps its bounded orbits and queries no more.
 const STOCK_QUERY_WORK: usize = 1_000_000;
+/// History-clearance work for one depth pass's straight-plunge proof; out of
+/// work the plunge is not proven and the pass takes its helix or is refused.
+const PLUNGE_PROOF_WORK: u64 = 1_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1075,15 +1078,42 @@ impl SlotPlan {
                         .top_under_disk([c[0], c[1]], self.radius + self.cutter_radius)
                         .min(previous);
                     let air = top.max(z);
-                    // A straight plunge only where no stock is known above the
-                    // pass depth (no cell's lower bound above it: any known
-                    // thickness, however thin, takes the helix or is refused)
-                    // and what may be there is within the planning tolerance
-                    // (a cut to this depth leaves its cells' upper bounds a
-                    // sweep's rounding above it).
-                    let known =
-                        stock.known_top_under_disk([c[0], c[1]], self.radius + self.cutter_radius);
-                    let helix_top = if known <= z && air - z <= self.op.tolerance_mm {
+                    // A straight plunge to the pass depth only where it is
+                    // proven to cut nothing: no cell's upper bound under the
+                    // disk stands above the pass (a conservative bound), or
+                    // the committed cutter sweeps prove the seed orbit at the
+                    // pass depth removes nothing new (the flat air-move
+                    // proof, footprint by footprint, where a floor cut to
+                    // exactly this depth may be touched). The orbit runs
+                    // through the plunge's end, so its sweep holds the
+                    // plunging cutter's footprint. A cut to this depth leaves
+                    // its cells' upper bounds a sweep's rounding above it,
+                    // and a cut elsewhere in the same cell proves nothing
+                    // here. Any other stock above the pass, however thin,
+                    // takes the helix or is refused.
+                    let start = self.orbit_start(0., z);
+                    let seed = Motion {
+                        id: self.next_id,
+                        operation: self.op.id.clone(),
+                        tool: self.op.tool.clone(),
+                        kind: MoveKind::Air,
+                        curve: Curve::Arc {
+                            start,
+                            end: start,
+                            center: c,
+                            plane: Plane::Xy,
+                            sweep_rad: if self.op.clockwise { -TAU } else { TAU },
+                        },
+                        feed_mm_min: Some(self.op.entry_feed_mm_min),
+                    };
+                    let mut work = PLUNGE_PROOF_WORK;
+                    let helix_top = if air <= z
+                        || stock.flat_history_clearance(
+                            &seed,
+                            self.cutter_radius,
+                            &mut work,
+                            cancel,
+                        )? {
                         z
                     } else if let Some(h) = helix(&self.op) {
                         let turns = h.turns(self.radius, air - z).map_err(|e| {

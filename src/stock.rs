@@ -974,6 +974,20 @@ impl Stock {
         self.history_clearance_impl(motion, radius, height, work, cancel, false)
     }
 
+    /// `history_clearance` for a flat cutter on a horizontal line or XY arc
+    /// (the air-move proof): no new removal at its constant Z, where touching
+    /// a floor cut to exactly that height is allowed. Not flat, unproven or
+    /// out of `work`: `false`.
+    pub(crate) fn flat_history_clearance(
+        &self,
+        motion: &Motion,
+        radius: f64,
+        work: &mut u64,
+        cancel: &impl CancelSignal,
+    ) -> Result<bool, String> {
+        self.history_clearance_impl(motion, radius, 0., work, cancel, true)
+    }
+
     fn history_clearance_impl(
         &self,
         motion: &Motion,
@@ -1314,14 +1328,6 @@ impl Stock {
     /// `r` at `xy` can touch (whole cells: an overestimate, never an
     /// underestimate); the stock's bottom where it touches none.
     pub fn top_under_disk(&self, xy: [f64; 2], r: f64) -> f64 {
-        self.max_under_disk(xy, r, |h| h.upper_mm)
-    }
-    /// The highest lower bound over the same cells: stock known to stand at
-    /// least this high there (the stock's bottom where none is known).
-    pub fn known_top_under_disk(&self, xy: [f64; 2], r: f64) -> f64 {
-        self.max_under_disk(xy, r, |h| h.lower_mm)
-    }
-    fn max_under_disk(&self, xy: [f64; 2], r: f64, height: impl Fn(&HeightBounds) -> f64) -> f64 {
         let [wx, wy] = self.step;
         let reach = r + 0.5 * wx.hypot(wy);
         let range = |c: f64, lo: f64, w: f64, n: usize| {
@@ -1335,7 +1341,7 @@ impl Stock {
                 let k = j * self.nx + i;
                 let c = self.cell_center(k).unwrap_or(xy);
                 if (c[0] - xy[0]).hypot(c[1] - xy[1]) <= reach {
-                    top = top.max(height(&self.cells[k]));
+                    top = top.max(self.cells[k].upper_mm);
                 }
             }
         }
