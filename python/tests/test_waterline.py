@@ -48,7 +48,11 @@ class WaterlineTest(unittest.TestCase):
                         self.assertIsNone(sim._process.poll())
                         self.assertFalse(sim.state.finished)
             self.assertTrue(first and sim.state.finished)
-            self.assertEqual(levels, {8, 6, 4, 2.5})
+            # #46: the 70 degree flanks get depth-1 in-between levels on the
+            # full gaps (7, 5); the short last gap (4, 2.5) would gain less
+            # than contour_error_mm and gets none; levels_completed and
+            # last_level_z below are unchanged.
+            self.assertEqual(levels, {8, 7, 6, 5, 4, 2.5})
             self.assertEqual(report["levels_completed"], 4)
             self.assertEqual(report["last_level_z_mm"], 2.5)
             self.assertGreater(report["cut_segments"], 0)
@@ -217,3 +221,51 @@ class WaterlineTest(unittest.TestCase):
         with self.assertRaisesRegex((ValueError, SimulationError), "unknown|variant"):
             with Simulation(**config) as sim:
                 list(sim.run_operations())
+
+    def test_ball_job_reports_the_scallop_bound_and_a_flat_cutter_has_neither_key(self):
+        # #46: a ball waterline reports the in-between-level scallop bound (the
+        # same scallop a vertical wall gets at the stepdown, plus the path
+        # tolerance) and the contact angle below which the bound is not
+        # claimed; a flat cutter's report has neither key.
+        config = example().waterline_job()
+        stepdown = config["operations"][0].stepdown_mm
+        with Simulation(**config) as sim:
+            reports = [u.report for u in sim.run_operations() if isinstance(u, OperationUpdate) and u.stage == "end"]
+            self.assertTrue(sim.state.finished)
+        # R = 2, stepdown 2: scallop_mm = 2 - sqrt(4 - 1) + contour_error_mm,
+        # K = 2; the bound is not claimed below asin(min(1, stepdown/(2^K D)))
+        # degrees, D = 2 sqrt(R^2 - (R - scallop_mm)^2) (the formulas of #46).
+        e = config["operations"][0].contour_error_mm
+        scallop_mm = min(2.0 - math.sqrt(4.0 - stepdown**2 / 4.0) + e, 2.0)
+        d = 2.0 * math.sqrt(4.0 - (2.0 - scallop_mm) ** 2)
+        k = 0
+        while stepdown / 2.0 ** (k + 1) >= scallop_mm:
+            k += 1
+        self.assertEqual(k, 2)
+        self.assertAlmostEqual(reports[0]["scallop_mm"], scallop_mm, places=12)
+        self.assertAlmostEqual(
+            reports[0]["scallop_from_deg"],
+            math.degrees(math.asin(min(1.0, stepdown / (2.0**k * d)))),
+            places=12,
+        )
+        # The island's 70 degree flanks are not vertical, so they get
+        # in-between levels (#46).
+        self.assertGreater(reports[0]["scallop_levels"], 0)
+        # The same job with a flat end mill claims no scallop bound.
+        flat_tool = ToolAssembly(
+            "flat4",
+            EndMill("fe4", diameter=4, flute_length=20, overall_length=50),
+            30,
+            60,
+            (HolderSection(30, 60, 4, 4),),
+        )
+        flat_config = dict(
+            config,
+            tools=(flat_tool,),
+            operations=(replace(config["operations"][0], tool=flat_tool),),
+        )
+        with Simulation(**flat_config) as sim:
+            reports = [u.report for u in sim.run_operations() if isinstance(u, OperationUpdate) and u.stage == "end"]
+            self.assertTrue(sim.state.finished)
+        self.assertNotIn("scallop_mm", reports[0])
+        self.assertNotIn("scallop_from_deg", reports[0])

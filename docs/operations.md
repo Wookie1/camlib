@@ -1997,6 +1997,32 @@ its contour from the level above, instead of a flat lap and a step down; the
 lowest level is then cut once more flat. Each ramp follows a contour proven
 clear at its own level and stays above that level, so it cannot gouge.
 
+In-between levels: between two main levels a ball end mill's plan adds
+sub-levels where the main levels are too far apart along the surface (on a
+slope at contact angle t the passes of levels `stepdown_mm` apart are
+`stepdown_mm / sin(t)` apart along it) and halving would lower the scallop by
+more than the path tolerance `contour_error_mm` — a level is added only where
+it lowers the scallop by more than the tolerance the caller already declares.
+The bound is the scallop of a vertical wall at this stepdown plus the
+tolerance: `scallop_mm = R - sqrt(R^2 - stepdown_mm^2/4) + contour_error_mm`
+(R the ball radius; capped at R when `stepdown_mm^2/4 >= R^2`). The widest
+spacing along the surface that keeps that bound is
+`D = 2 sqrt(R^2 - (R - scallop_mm)^2)`; sub-levels halve their gap (depth 1,
+2, ... while the spacing still exceeds the bound) and keep only the parts of
+the parent contour whose greatest contact angle satisfies
+`sin(t) < P / D - 1e-9`, with `P` the parent level spacing of that gap (so a
+short last gap needs fewer levels), which keeps passes at most `D` apart
+along the surface. An exactly vertical wall never gets a sub-level (the 1e-9
+tie). The report's `scallop_levels` counts the sub-levels that cut, and
+`scallop_from_deg` is the contact angle below which the bound is NOT claimed
+(`asin(min(1, stepdown_mm / (2^K D)))`, K the deepest sub-level); ball end
+mills only — flat and bull-nose reports have neither field. The cost: at
+coarse stepdowns every wall that is not exactly vertical gets extra levels (a
+70-degree flank gets depth-1 levels at the gap midpoints), so cycle and
+planning time grow on drafted or curved parts; once the stepdown is fine
+enough that the wall scallop's gain is under the tolerance, no sub-levels are
+added and the cycle is unchanged.
+
 Depth: when the remaining stock stands no higher above `bottom_z_mm` than the
 cutting length, every level is within the flutes. Where it stands higher (a
 part taller than the flutes, finished from roughed stock, e.g. a mesh stock

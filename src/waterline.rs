@@ -723,6 +723,26 @@ pub struct WaterlineReport {
     pub levels: usize,
     pub levels_completed: usize,
     pub empty_levels: usize,
+    /// Ball end mills: in-between levels on shallow slopes (#46) that cut
+    /// something. Skipped when none did.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub scallop_levels: usize,
+    /// Ball end mills: the scallop bound the in-between levels keep: the
+    /// scallop of a vertical wall at this stepdown, `R -
+    /// sqrt(R^2 - stepdown_mm^2/4)` (R the ball radius; the radius itself
+    /// when stepdown^2/4 >= R^2), plus the path tolerance `contour_error_mm`,
+    /// capped at the ball radius — a level is added only where it lowers the
+    /// scallop by more than the tolerance. None for flat and bull-nose
+    /// cutters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scallop_mm: Option<f64>,
+    /// Ball end mills: below this contact angle (degrees from the tool axis)
+    /// the scallop bound is NOT claimed:
+    /// `asin(min(1, stepdown_mm / (2^K * D)))`, with K the deepest sub-level
+    /// and `D = 2 * sqrt(R^2 - (R - scallop_mm)^2)` the widest spacing along
+    /// the surface the bound allows. None for flat and bull-nose cutters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scallop_from_deg: Option<f64>,
     /// Loops entered on the wall (the tangent lead) because no point beside
     /// the wall within reach had the stock at or below the plunge height, the
     /// part clear and the limits allowing it: the ball may come down into
@@ -769,7 +789,12 @@ pub struct WaterlinePlan {
     position: Vec3,
     next_id: u64,
     expected_generation: Option<u64>,
-    level: usize,
+    /// Every level in cutting order: main levels (depth 0) at today's
+    /// heights, then the in-between scallop levels inserted between them
+    /// (#46). Flat and bull-nose cutters have main levels only.
+    schedule: Vec<LevelSlot>,
+    /// Position in `schedule`.
+    slot: usize,
     profile: Option<ProfileMotion>,
     finished_loops: usize,
     drained: bool,
@@ -794,6 +819,24 @@ fn is_zero(n: &usize) -> bool {
 type SideEntries = (Vec<Option<[f64; 2]>>, usize);
 /// How far out (in cutter radii) a loop's side entry is searched.
 const SIDE_ENTRY_REACH_RADII: f64 = 4.;
+
+/// One level of the cutting schedule: a main level (`depth` 0) at today's
+/// height, or an in-between scallop level of depth k between two main levels
+/// (#46). Cutting order is descending z.
+struct LevelSlot {
+    z: f64,
+    depth: usize,
+    /// Ramp mode: the main level a main level descends from (None for the
+    /// first main level and for sub-levels, which are cut flat).
+    ramp_from: Option<f64>,
+    /// Ramp mode: the lowest main level is cut once more flat.
+    last_main: bool,
+    /// Sub-levels only: a sample is kept while the sine of its greatest
+    /// contact angle stays under this — the parent level spacing of the
+    /// level's gap over the widest allowed spacing `D`, minus the 1e-9 tie
+    /// (#46). Infinity on main levels, which keep every sample.
+    keep_below: f64,
+}
 
 impl WaterlinePlan {
     pub fn prepare_with_stock(
@@ -1030,6 +1073,143 @@ impl WaterlinePlan {
             guard,
         )?;
         let levels = ((op.top_z_mm - op.bottom_z_mm) / op.stepdown_mm).ceil() as usize + 1;
+        // Main level tip heights, highest first: today's levels, unchanged.
+        let main_z: Vec<f64> = (0..levels)
+            .map(|i| {
+                if i + 1 == levels {
+                    op.bottom_z_mm
+                } else {
+                    (op.top_z_mm - i as f64 * op.stepdown_mm).max(op.bottom_z_mm)
+                }
+            })
+            .collect();
+        let mut schedule: Vec<LevelSlot> = (0..levels)
+            .map(|i| LevelSlot {
+                z: main_z[i],
+                depth: 0,
+                ramp_from: (i > 0).then(|| main_z[i - 1]),
+                last_main: i + 1 == levels,
+                keep_below: f64::INFINITY,
+            })
+            .collect();
+        // In-between levels on shallow slopes (#46), ball end mills only. On
+        // a slope at contact angle t the passes of levels stepdown apart are
+        // stepdown / sin(t) apart along the surface, so fillets, domes and
+        // shallow slopes get a large scallop. The bound is the scallop of a
+        // vertical wall at this stepdown plus the path tolerance: a level is
+        // added only where it lowers the scallop by more than
+        // contour_error_mm. The widest spacing along the surface that keeps
+        // the bound is D; between two main levels, sub-levels of depth k
+        // (halving) keep only the parts whose parent spacing along the
+        // surface was still too wide (`sin(t) < P / D - 1e-9`, P the parent
+        // spacing of that gap), which brings the spacing under D and the
+        // scallop under scallop_mm.
+        let (scallop_mm, scallop_from_deg) = if matches!(cutter.shape, CutterShape::Ball) {
+            let quarter = op.stepdown_mm * op.stepdown_mm / 4.;
+            let wall = if quarter >= radius * radius {
+                radius
+            } else {
+                radius - (radius * radius - quarter).sqrt()
+            };
+            let scallop = (wall + op.contour_error_mm).min(radius);
+            // The widest spacing along the surface that still leaves the
+            // bound (`scallop` is at most the radius, so the square root is
+            // real): the flat-surface ball scallop at spacing D is
+            // R - sqrt(R^2 - D^2/4) = scallop.
+            let d = 2. * (radius * radius - (radius - scallop) * (radius - scallop)).sqrt();
+            // Deepest useful sub-level: a level spacing smaller than the
+            // scallop itself buys nothing. When the bound reaches the ball
+            // radius (a stepdown of the ball diameter or more) no sub-level
+            // can lower it: none are added, so K = 0.
+            let mut k_max = 0usize;
+            if scallop < radius {
+                while op.stepdown_mm / 2f64.powi(k_max as i32 + 1) >= scallop {
+                    k_max += 1;
+                }
+            }
+            // A gap gets depth-k sub-levels only if some upward-facing
+            // triangle shallow enough to need them (0 < sin(t) <
+            // (za - zb) / 2^(k-1) / D - 1e-9 for that gap, with the same
+            // 1e-9 tie as the keep test; exactly horizontal ones skipped)
+            // can be contacted at a level of the gap: a ball contacting a
+            // triangle at tip z has z in the triangle's [zmin - R, zmax].
+            // Conservative: a kept sample's contact is on such a triangle,
+            // so no gap that could keep samples is skipped.
+            let gaps = levels - 1;
+            if k_max > 0 && gaps > 0 {
+                let mut eligible = vec![false; gaps * k_max];
+                for tri in op.surface.triangles.iter() {
+                    let (a, b, c) = (tri[0], tri[1], tri[2]);
+                    let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                    let n = [
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    ];
+                    let len = n[0].hypot(n[1]).hypot(n[2]);
+                    if len <= 1e-12 || n[2] <= 0. {
+                        // Degenerate, or facing down.
+                        continue;
+                    }
+                    let sin_t = (n[0] * n[0] + n[1] * n[1]).sqrt() / len;
+                    if sin_t <= 1e-9 {
+                        // Exactly horizontal.
+                        continue;
+                    }
+                    let zmin = a[2].min(b[2]).min(c[2]);
+                    let zmax = a[2].max(b[2]).max(c[2]);
+                    // Overlapping gaps: main_z[i] > zmin - R and
+                    // main_z[i + 1] < zmax (main_z descending).
+                    let start = main_z.partition_point(|&z| z >= zmax).saturating_sub(1);
+                    let end = main_z.partition_point(|&z| z > zmin - radius).min(gaps);
+                    if start >= end {
+                        continue;
+                    }
+                    for k in 1..=k_max {
+                        for gap in start..end {
+                            let parent = (main_z[gap] - main_z[gap + 1]) / 2f64.powi(k as i32 - 1);
+                            if sin_t < parent / d - 1e-9 {
+                                eligible[(k - 1) * gaps + gap] = true;
+                            }
+                        }
+                    }
+                }
+                for gap in 0..gaps {
+                    let (za, zb) = (main_z[gap], main_z[gap + 1]);
+                    for k in 1..=k_max {
+                        if !eligible[(k - 1) * gaps + gap] {
+                            continue;
+                        }
+                        let step = (za - zb) / 2f64.powi(k as i32);
+                        // A depth-k level keeps a sample only where the
+                        // parent spacing along the surface was too wide:
+                        // sin(tg) < P / D - 1e-9, P the parent spacing of
+                        // this gap (#46).
+                        let keep_below = (za - zb) / 2f64.powi(k as i32 - 1) / d - 1e-9;
+                        let mut j = 1;
+                        while za - j as f64 * step > zb {
+                            schedule.push(LevelSlot {
+                                z: za - j as f64 * step,
+                                depth: k,
+                                ramp_from: None,
+                                last_main: false,
+                                keep_below,
+                            });
+                            j += 2;
+                        }
+                    }
+                }
+                schedule.sort_by(|a, b| b.z.total_cmp(&a.z));
+            }
+            let from = (op.stepdown_mm / (2f64.powi(k_max as i32) * d))
+                .min(1.)
+                .asin()
+                .to_degrees();
+            (Some(scallop), Some(from))
+        } else {
+            (None, None)
+        };
         let surface = op.surface.prepare(op.floor_z_mm, op.tolerance_mm, cancel)?;
         let flat_target = matches!(cutter.shape, CutterShape::Flat | CutterShape::Bull { .. })
             .then(|| PreparedRoughingTarget::prepare(op.surface.clone(), op.tolerance_mm, cancel))
@@ -1056,6 +1236,9 @@ impl WaterlinePlan {
             levels,
             levels_completed: 0,
             empty_levels: 0,
+            scallop_levels: 0,
+            scallop_mm,
+            scallop_from_deg,
             wall_entries: 0,
             cut_segments: 0,
             loops_completed: 0,
@@ -1090,7 +1273,8 @@ impl WaterlinePlan {
             position: initial,
             next_id: first_id,
             expected_generation: None,
-            level: 0,
+            schedule,
+            slot: 0,
             profile: None,
             finished_loops: 0,
             drained: false,
@@ -1104,26 +1288,18 @@ impl WaterlinePlan {
             flat_corner,
         })
     }
-    fn level_options(&self, level: usize) -> (f64, ContourOptions) {
-        let z = if level + 1 == self.report.levels {
-            self.op.bottom_z_mm
-        } else {
-            (self.op.top_z_mm - level as f64 * self.op.stepdown_mm).max(self.op.bottom_z_mm)
-        };
-        (
-            z,
-            ContourOptions {
-                method: self.op.contour_method,
-                center_z_mm: z + self.radius,
-                radius_mm: self.inflated,
-                protected_radius_mm: self.protected,
-                normal_error_mm: self.op.contour_error_mm,
-                tolerance_mm: self.op.tolerance_mm,
-                xy_min_mm: [self.spec.min_mm[0], self.spec.min_mm[1]],
-                xy_max_mm: [self.spec.max_mm[0], self.spec.max_mm[1]],
-                simplify: self.op.simplify,
-            },
-        )
+    fn contour_options(&self, z: f64) -> ContourOptions {
+        ContourOptions {
+            method: self.op.contour_method,
+            center_z_mm: z + self.radius,
+            radius_mm: self.inflated,
+            protected_radius_mm: self.protected,
+            normal_error_mm: self.op.contour_error_mm,
+            tolerance_mm: self.op.tolerance_mm,
+            xy_min_mm: [self.spec.min_mm[0], self.spec.min_mm[1]],
+            xy_max_mm: [self.spec.max_mm[0], self.spec.max_mm[1]],
+            simplify: self.op.simplify,
+        }
     }
     /// Contours of the current level. Upcoming levels are computed in an
     /// ordered parallel batch (one per core, twice over) and consumed in order;
@@ -1139,13 +1315,18 @@ impl WaterlinePlan {
         // a batch of two per core, one thread each.
         let quad = self.op.contour_method == ContourMethod::QuadTree;
         let batch = if quad { workers } else { 2 * workers };
-        let end = (self.level + batch).min(self.report.levels);
+        let end = (self.slot + batch).min(self.schedule.len());
         let inner = if quad {
-            (workers / (end - self.level).max(1)).max(1)
+            (workers / (end - self.slot).max(1)).max(1)
         } else {
             1
         };
-        let jobs: Vec<_> = (self.level..end).map(|l| self.level_options(l)).collect();
+        let jobs: Vec<_> = (self.slot..end)
+            .map(|i| {
+                let slot = &self.schedule[i];
+                (slot.z, self.contour_options(slot.z))
+            })
+            .collect();
         let surface = &self.surface;
         let values = crate::roughing::parallel::ordered(
             jobs.len(),
@@ -1224,15 +1405,24 @@ impl WaterlinePlan {
                 }
                 self.finished_loops += profile.closed_loops;
                 self.profile = None;
-                self.level += 1;
-                self.report.levels_completed += 1;
+                // A completed main level counts as today; a completed
+                // in-between level (it was not empty, so it cut) counts in
+                // scallop_levels (#46).
+                if self.schedule[self.slot].depth == 0 {
+                    self.report.levels_completed += 1;
+                } else {
+                    self.report.scallop_levels += 1;
+                }
+                self.slot += 1;
             }
-            if self.level == self.report.levels {
+            if self.slot == self.schedule.len() {
                 self.drained = true;
                 return Ok(None);
             }
+            let depth = self.schedule[self.slot].depth;
+            let keep_below = self.schedule[self.slot].keep_below;
             if let Some(target) = &self.flat_target {
-                let (z, _) = self.level_options(self.level);
+                let z = self.schedule[self.slot].z;
                 let (mut loops, error) = flat_level_loops(
                     target,
                     z,
@@ -1253,12 +1443,12 @@ impl WaterlinePlan {
                 }
                 self.report.last_level_z_mm = Some(z);
                 if loops.is_empty() {
-                    self.level += 1;
+                    self.slot += 1;
                     self.report.empty_levels += 1;
                     self.report.levels_completed += 1;
                     continue;
                 }
-                let (ramp_from, passes) = self.ramp_setup();
+                let (ramp_from, passes) = self.ramp_setup(self.slot);
                 let mut profile = ProfileMotion::new(
                     self.op.settings(),
                     &self.spec,
@@ -1296,7 +1486,7 @@ impl WaterlinePlan {
                 if self.op.reverse {
                     ring.reverse();
                 }
-                if self.limits.is_none() && self.region_limits.is_none() {
+                if depth == 0 && self.limits.is_none() && self.region_limits.is_none() {
                     loops.push(
                         ring.iter()
                             .zip(ring.iter().cycle().skip(1))
@@ -1315,14 +1505,18 @@ impl WaterlinePlan {
                     self.limits,
                     &self.region_limits,
                 );
-                // The ball's center on this level, and how far a contour
-                // sample may lie from the offset surface (inside it down to
-                // the protected radius, outside it by the contour error).
+                // An in-between level keeps only the parts whose parent
+                // spacing along the surface was too wide: the greatest
+                // contact angle at the sample must satisfy
+                // sin(tg) < keep_below — the parent spacing of the level's
+                // gap over the widest allowed spacing D, minus the 1e-9 tie
+                // (#46); the tie keeps an exactly vertical wall (sin = 1)
+                // from ever getting a level.
                 let center_z = z + self.radius;
                 let band = (self.inflated - self.protected).max(0.) + self.op.contour_error_mm;
                 let tolerance = self.op.tolerance_mm;
                 let mut runs = crate::finishing::filter_runs(vec![closed.clone()], spacing, |p| {
-                    if let Some((lo, hi)) = slope {
+                    if slope.is_some() || keep_below.is_finite() {
                         let (least, greatest) = level_contact_angles(
                             surface,
                             [p[0], p[1], center_z],
@@ -1332,7 +1526,12 @@ impl WaterlinePlan {
                             &mut slope_work,
                             cancel,
                         )?;
-                        if greatest < lo - 1e-9 || least > hi + 1e-9 {
+                        if greatest.sin() >= keep_below {
+                            return Ok(false);
+                        }
+                        if let Some((lo, hi)) = slope
+                            && (greatest < lo - 1e-9 || least > hi + 1e-9)
+                        {
                             return Ok(false);
                         }
                     }
@@ -1379,15 +1578,22 @@ impl WaterlinePlan {
             self.report.work = work;
             self.report.certificate_tests = certificates;
             self.report.certificate_nodes = certificate_nodes;
-            self.report.last_level_z_mm = Some(z);
-            self.report.level_reports.push(contours.report);
+            // These keep their meaning for main levels only (#46); an
+            // in-between level still adds its contour work and certificates
+            // above.
+            if depth == 0 {
+                self.report.last_level_z_mm = Some(z);
+                self.report.level_reports.push(contours.report);
+            }
             if empty {
-                self.level += 1;
-                self.report.empty_levels += 1;
-                self.report.levels_completed += 1;
+                self.slot += 1;
+                if depth == 0 {
+                    self.report.empty_levels += 1;
+                    self.report.levels_completed += 1;
+                }
                 continue;
             }
-            let (ramp_from, passes) = self.ramp_setup();
+            let (ramp_from, passes) = self.ramp_setup(self.slot);
             let plunge_z = ramp_from.map_or(z, |from| from.max(z));
             let (entry_points, wall) = self.side_entries(stock, &loops, z, plunge_z, cancel)?;
             self.report.wall_entries += wall;
@@ -1487,15 +1693,18 @@ impl WaterlinePlan {
         }
         Ok((result, wall))
     }
-    /// Ramp: the current level descends from the one above (none for the
-    /// first level); the lowest level is cut once more flat.
-    fn ramp_setup(&self) -> (Option<f64>, usize) {
+    /// Ramp: a main level descends from the one above (none for the first
+    /// main level); the lowest main level is cut once more flat. In-between
+    /// levels are cut flat at their own z, one pass (#46).
+    fn ramp_setup(&self, slot: usize) -> (Option<f64>, usize) {
         if !self.op.ramp {
             return (None, 1);
         }
-        let from = (self.level > 0).then(|| self.level_options(self.level - 1).0);
-        let last = self.level + 1 == self.report.levels;
-        (from, if last { 2 } else { 1 })
+        let slot = &self.schedule[slot];
+        if slot.depth > 0 {
+            return (None, 1);
+        }
+        (slot.ramp_from, if slot.last_main { 2 } else { 1 })
     }
 }
 

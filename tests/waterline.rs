@@ -346,7 +346,11 @@ fn cad_frustum_levels_stream_actual_stock_and_preserve_every_target_cell() {
             curves.push(motion.curve);
         }
         plan.finish_report(&cancel).unwrap();
-        assert_eq!(levels, vec![7., 5., 3., 2.5]);
+        // #46: the 70 degree flanks get depth-1 in-between levels on the full
+        // gaps (8, 6, 4); the short last gap (3, 2.5) would gain less than
+        // contour_error_mm and gets none; the main levels and their report
+        // fields below are unchanged.
+        assert_eq!(levels, vec![8., 7., 6., 5., 4., 3., 2.5]);
         assert_eq!(plan.report().levels, 5);
         assert_eq!(plan.report().levels_completed, 5);
         assert_eq!(plan.report().empty_levels, 1);
@@ -996,4 +1000,387 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     .unwrap();
     drain(&m, &mut plan, &mut stock);
     assert_eq!(plan.report().wall_entries, 0);
+}
+
+// In-between levels on shallow slopes keep the scallop bounded (#46).
+
+/// A faceted spherical cap: sphere radius 12 centred (12, 8, -6), everything
+/// above z 1 (top at z 6), triangulated on a 0.25 mm XY grid over the
+/// 24 x 16 stock like `parallel_quad_tree_gives_exactly_the_serial_contours`.
+fn spherical_cap() -> SurfaceMesh {
+    let z = |x: f64, y: f64| {
+        let r2 = (x - 12.).powi(2) + (y - 8.).powi(2);
+        if r2 >= 144. {
+            1.
+        } else {
+            (-6. + (144. - r2).sqrt()).max(1.)
+        }
+    };
+    let mut triangles = vec![];
+    for i in 0..96 {
+        for j in 0..64 {
+            let p = |a: usize, b: usize| {
+                let (x, y) = (a as f64 * 0.25, b as f64 * 0.25);
+                [x, y, z(x, y)]
+            };
+            triangles.push([p(i, j), p(i + 1, j), p(i + 1, j + 1)]);
+            triangles.push([p(i, j), p(i + 1, j + 1), p(i, j + 1)]);
+        }
+    }
+    mesh(triangles)
+}
+/// The fixture's ball operation on the spherical cap, stepdown 1 (R = 2, so
+/// scallop_mm = 2 - sqrt(3.75) + 0.01, K = 3, scallop_from_deg =
+/// asin(min(1, 1/(2^K * D))) with D = 2 sqrt(R^2 - (R - scallop_mm)^2)).
+fn cap_operation(m: &camlib::stream::StreamManifest) -> camlib::waterline::WaterlineOperation {
+    let mut op = operation(m);
+    op.surface = spherical_cap();
+    op.stepdown_mm = 1.;
+    op.top_z_mm = 5.8;
+    op.bottom_z_mm = 1.5;
+    op
+}
+/// The main level heights of an operation, the way the planner computes them.
+fn main_levels(op: &camlib::waterline::WaterlineOperation) -> Vec<f64> {
+    let levels = ((op.top_z_mm - op.bottom_z_mm) / op.stepdown_mm).ceil() as usize + 1;
+    (0..levels)
+        .map(|i| {
+            if i + 1 == levels {
+                op.bottom_z_mm
+            } else {
+                (op.top_z_mm - i as f64 * op.stepdown_mm).max(op.bottom_z_mm)
+            }
+        })
+        .collect()
+}
+/// Every sub-level height the halving rule can place between main levels
+/// (depths 1..=k_max, odd multiples of the gap over 2^k below the upper
+/// level), whether or not a gap turns out eligible for them.
+fn all_sub_levels(mains: &[f64], k_max: usize) -> Vec<f64> {
+    let mut subs = vec![];
+    for w in mains.windows(2) {
+        let (za, zb) = (w[0], w[1]);
+        for k in 1..=k_max {
+            let step = (za - zb) / 2f64.powi(k as i32);
+            let mut j = 1;
+            while za - j as f64 * step > zb {
+                subs.push(za - j as f64 * step);
+                j += 2;
+            }
+        }
+    }
+    subs
+}
+#[test]
+fn shallow_slopes_get_in_between_levels_and_the_scallop_stays_bounded() {
+    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let op = cap_operation(&m);
+    let mut plan = WaterlinePlan::prepare(
+        op.clone(),
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    // Ball-centre points of every cut, densified every 0.05 mm.
+    let mut centres: Vec<[f64; 3]> = vec![];
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+        if motion.kind == MoveKind::Cut {
+            let (a, b) = (motion.curve.start(), motion.curve.end());
+            let len = ((b[0] - a[0]).hypot(b[1] - a[1])).hypot(b[2] - a[2]);
+            let n = (len / 0.05).ceil().max(1.) as usize;
+            for k in 0..=n {
+                let t = k as f64 / n as f64;
+                let p: [f64; 3] = std::array::from_fn(|i| a[i] + t * (b[i] - a[i]));
+                centres.push([p[0], p[1], p[2] + 2.]);
+            }
+        }
+    }
+    plan.finish_report(&cancel).unwrap();
+    let report = plan.report();
+    // The bound and its reported values, from the formulas (#46): the same
+    // scallop as a vertical wall plus the path tolerance, capped at R.
+    let scallop_mm = (2. - (4.0f64 - 1. / 4.).sqrt() + op.contour_error_mm).min(2.);
+    // The widest spacing along the surface that keeps the bound, the deepest
+    // useful sub-level, and the angle below which the bound is not claimed.
+    let d = 2. * (4.0f64 - (2. - scallop_mm) * (2. - scallop_mm)).sqrt();
+    let mut k = 0usize;
+    while 1. / 2f64.powi(k as i32 + 1) >= scallop_mm {
+        k += 1;
+    }
+    let scallop_from_deg = (1. / (2f64.powi(k as i32) * d)).min(1.).asin().to_degrees();
+    let bound =
+        scallop_mm + op.contour_error_mm + op.safety_margin_mm + op.stock_to_leave_mm + 0.02;
+    // INDEPENDENT measure (no planner angles): analytic sphere points against
+    // the ball centres.
+    let mut worst = (f64::NEG_INFINITY, [0f64; 3], 0f64);
+    let mut checked = 0usize;
+    for ti in 0..180 {
+        let t = (ti as f64 * 0.5).to_radians();
+        if t < scallop_from_deg.to_radians() + 2f64.to_radians() {
+            continue;
+        }
+        for az in 0..180 {
+            let a = (az as f64 * 2.).to_radians();
+            let p = [
+                12. + 12. * t.sin() * a.cos(),
+                8. + 12. * t.sin() * a.sin(),
+                -6. + 12. * t.cos(),
+            ];
+            let tip = p[2] + 2. * t.cos() - 2.;
+            if !(tip > 1.5 + 0.2 && tip < 5.8 - 0.2) {
+                continue;
+            }
+            if !(p[0] >= 2.5 && p[0] <= 21.5 && p[1] >= 2.5 && p[1] <= 13.5) {
+                continue;
+            }
+            checked += 1;
+            let e = centres
+                .iter()
+                .map(|c| ((p[0] - c[0]).hypot(p[1] - c[1])).hypot(p[2] - c[2]) - 2.)
+                .fold(f64::INFINITY, f64::min);
+            if e > worst.0 {
+                worst = (e, p, t.to_degrees());
+            }
+        }
+    }
+    assert!(checked > 100, "independent measure checked only {checked} points");
+    assert!(
+        worst.0 <= bound,
+        "scallop bound {bound} exceeded: worst e = {} at p = {:?}, contact angle {} deg",
+        worst.0,
+        worst.1,
+        worst.2
+    );
+    assert!(report.scallop_levels > 0, "no in-between level cut anything");
+    assert!(
+        (report.scallop_mm.unwrap() - scallop_mm).abs() < 1e-12,
+        "scallop_mm {} != {scallop_mm}",
+        report.scallop_mm.unwrap()
+    );
+    assert!(
+        (report.scallop_from_deg.unwrap() - scallop_from_deg).abs() < 1e-12,
+        "scallop_from_deg {} != {scallop_from_deg}",
+        report.scallop_from_deg.unwrap()
+    );
+}
+#[test]
+fn vertical_walls_get_no_in_between_levels() {
+    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
+    // A box with vertical walls: its top face is exactly horizontal, and a
+    // vertical wall is a 90 degree contact, which the 1e-9 tie of the keep
+    // test drops at depth 1, so no in-between level cuts anything (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = operation(&m);
+    op.surface = mesh(box_top(6.));
+    let mut plan = WaterlinePlan::prepare(
+        op.clone(),
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mut flat_cut_z = vec![];
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        if motion.kind == MoveKind::Cut && a[2] == b[2] {
+            flat_cut_z.push(b[2]);
+        }
+    }
+    plan.finish_report(&cancel).unwrap();
+    assert_eq!(plan.report().scallop_levels, 0);
+    // R = 2, stepdown 2: scallop_mm = 2 - sqrt(4 - 1) + 0.01, K = 2, so the
+    // bound is not claimed below asin(min(1, 2/(2^K D))) degrees.
+    let scallop_mm = (2. - (4.0f64 - 1.).sqrt() + op.contour_error_mm).min(2.);
+    let d = 2. * (4.0f64 - (2. - scallop_mm) * (2. - scallop_mm)).sqrt();
+    let mut k = 0usize;
+    while 2. / 2f64.powi(k as i32 + 1) >= scallop_mm {
+        k += 1;
+    }
+    assert_eq!(k, 2);
+    let scallop_from_deg = (2. / (2f64.powi(k as i32) * d)).min(1.).asin().to_degrees();
+    assert!(
+        (plan.report().scallop_from_deg.unwrap() - scallop_from_deg).abs() < 1e-12,
+        "scallop_from_deg {} != {scallop_from_deg}",
+        plan.report().scallop_from_deg.unwrap()
+    );
+    let levels = main_levels(&op);
+    assert_eq!(levels, vec![8., 6., 4., 2.5]);
+    for z in flat_cut_z {
+        assert!(
+            levels.iter().any(|l| (l - z).abs() < 1e-9),
+            "flat cut at {z} is not a main level {levels:?}"
+        );
+    }
+}
+#[test]
+fn sloped_flanks_get_in_between_levels() {
+    use camlib::{stock::Stock, waterline::WaterlinePlan};
+    // The frustum fixture's 70 degree flanks are not vertical: with the same
+    // scallop as a vertical wall they get in-between levels (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let op = operation(&m);
+    let mut plan = WaterlinePlan::prepare(
+        op,
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+    }
+    plan.finish_report(&cancel).unwrap();
+    assert!(
+        plan.report().scallop_levels > 0,
+        "no in-between level cut anything on the 70 degree flanks"
+    );
+}
+#[test]
+fn fine_stepdowns_add_no_levels_below_the_path_tolerance() {
+    use camlib::{stock::Stock, waterline::WaterlinePlan};
+    // At a 0.1 mm stepdown the wall scallop is ~0.0006 mm; an in-between
+    // level must lower the scallop by more than contour_error_mm (0.01) to
+    // be added, and nothing on the frustum gains that much: the 70 degree
+    // flanks' spacing along the surface is already under the widest spacing
+    // the bound allows, so no level cuts anything (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = operation(&m);
+    op.stepdown_mm = 0.1;
+    let mut plan = WaterlinePlan::prepare(
+        op,
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+    }
+    plan.finish_report(&cancel).unwrap();
+    assert_eq!(plan.report().scallop_levels, 0);
+}
+#[test]
+fn in_between_levels_respect_slope_limits() {
+    use camlib::{motion::MoveKind, stock::Stock, surface::SurfaceWork, waterline::WaterlinePlan};
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = cap_operation(&m);
+    op.slope_from_deg = 40.;
+    let mut plan = WaterlinePlan::prepare(
+        op.clone(),
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let surface = op.surface.prepare(op.floor_z_mm, 1e-5, &cancel).unwrap();
+    let mut work = SurfaceWork::default();
+    let mains = main_levels(&op);
+    let mut sub_level_cuts = 0usize;
+    // The cap is faceted on a 0.25 mm grid of a radius-12 sphere, so
+    // neighbouring facet normals differ by up to atan(0.25*sqrt(2)/12) =
+    // 1.69 degrees; the drop-ball measure here and the planner's level
+    // contact can land on neighbouring facets, so a cut the planner admitted
+    // at 40 degrees can measure 1.69 degrees less here.
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+        if motion.kind != MoveKind::Cut {
+            continue;
+        }
+        let end = motion.curve.end();
+        if !mains.iter().any(|l| (l - end[2]).abs() < 1e-9) {
+            sub_level_cuts += 1;
+        }
+        let angle = surface
+            .contact([end[0], end[1]], 2.005, &mut work, &cancel)
+            .unwrap()
+            .contact_angle(2.005)
+            .to_degrees();
+        assert!(
+            angle >= 40. - 1.69 - 1e-6,
+            "cut end at ({:?}) has contact angle {angle}",
+            &end[..2]
+        );
+    }
+    assert!(sub_level_cuts > 0, "no cut lay on an in-between level");
+}
+#[test]
+fn ramp_cuts_in_between_levels_flat() {
+    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = cap_operation(&m);
+    op.ramp = true;
+    let mut plan = WaterlinePlan::prepare(
+        op,
+        &m.tools[0],
+        m.stock.height().unwrap(),
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
+    let tool = m.tools[0].prepare().unwrap();
+    let mains = main_levels(&cap_operation(&m));
+    let subs = all_sub_levels(&mains, 3);
+    let mut sub_level_cuts = 0usize;
+    while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+        if motion.kind != MoveKind::Cut {
+            continue;
+        }
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        if subs.iter().any(|s| (s - b[2]).abs() < 1e-9) {
+            assert_eq!(a[2], b[2], "sub-level cut at z {} ramps from {}", b[2], a[2]);
+            sub_level_cuts += 1;
+        }
+    }
+    assert!(sub_level_cuts > 0, "no cut lay on an in-between level");
 }
