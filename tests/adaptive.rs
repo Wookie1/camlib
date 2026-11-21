@@ -15,10 +15,8 @@ fn operation() -> AdaptivePocketOperation {
     };
     p
 }
-/// What the sampled check may read above the proven limit: the oracle's
-/// discs leave slivers step^2 / (8 r) deep between samples r / 20 apart, and
-/// it counts whole degrees of the leading half-circle. Scale-free, as in the
-/// roughing tests.
+/// Sampling allowance in degrees for the leading half-circle, as in the
+/// roughing tests. Clearance uses distances to the swept lines and arcs.
 pub(crate) const LEADING_SLACK_DEG: f64 = 3.;
 
 /// #190: the independent, sampled leading-contact check from the roughing
@@ -28,25 +26,65 @@ pub(crate) const LEADING_SLACK_DEG: f64 = 3.;
 /// code: material is the stock footprint less what earlier centres swept.
 /// Returns the worst contact, in degrees, over all levels.
 pub(crate) fn leading_contact_deg(motions: &[Motion], r: f64, footprint: [[f64; 2]; 2]) -> f64 {
+    let flat_feeds: Vec<_> = motions
+        .iter()
+        .filter(|m| {
+            let c = &m.curve;
+            m.kind.cuts() && c.start()[2] == c.end()[2] && !matches!(c, Curve::Helix { .. })
+        })
+        .collect();
+    let checked = |m: &Motion| matches!(m.kind, MoveKind::Cut | MoveKind::Link);
+    let mut depths: Vec<_> = flat_feeds
+        .iter()
+        .filter(|m| checked(m))
+        .map(|m| m.curve.start()[2])
+        .collect();
+    depths.sort_by(f64::total_cmp);
+    depths.dedup();
     let mut worst = 0f64;
-    let mut leading = LeadingOracle::new(r, footprint);
-    let mut depth = f64::INFINITY;
-    for motion in motions {
-        let c = &motion.curve;
-        let flat = c.start()[2] == c.end()[2] && !matches!(c, Curve::Helix { .. });
-        if !flat || !motion.kind.cuts() {
-            continue;
+    for z in depths {
+        let mut leading = LeadingOracle::new(r, footprint);
+        let last = flat_feeds
+            .iter()
+            .rposition(|m| checked(m) && m.curve.start()[2] == z)
+            .unwrap();
+        for &m in &flat_feeds[..=last] {
+            let tip = m.curve.start()[2];
+            // A deeper flat-end cut cleared this plane. A higher one did not.
+            if tip <= z {
+                leading.feed(&m.curve, tip == z && checked(m));
+            }
         }
-        if c.start()[2] < depth - 1e-7 {
-            // A new level: nothing is cleared at this depth yet.
-            worst = worst.max(leading.worst_deg);
-            leading = LeadingOracle::new(r, footprint);
-            depth = c.start()[2];
-        }
-        leading.feed(c, matches!(motion.kind, MoveKind::Cut | MoveKind::Link));
+        worst = worst.max(leading.worst_deg);
     }
-    worst.max(leading.worst_deg)
+    worst
 }
+#[test]
+fn leading_contact_keeps_shallow_cuts_out_of_deeper_stock() {
+    let line = |id, kind, z| Motion {
+        id,
+        kind,
+        operation: "pocket".into(),
+        tool: "mill".into(),
+        feed_mm_min: Some(600.),
+        curve: Curve::Line {
+            start: [5., 5., z],
+            end: [15., 5., z],
+        },
+    };
+    let footprint = [[0., 0.], [26., 26.]];
+    let upper = line(1, MoveKind::Lead, 8.);
+    let lower = line(2, MoveKind::Cut, 8. - 5e-8);
+    assert!(leading_contact_deg(&[upper.clone(), lower.clone()], 2., footprint) >= 175.);
+    let mut start = lower.clone();
+    start.kind = MoveKind::Lead;
+    start.curve = Curve::Line {
+        start: [2., 2., 8. - 5e-8],
+        end: [3., 2., 8. - 5e-8],
+    };
+    assert!(leading_contact_deg(&[start, upper, lower], 2., footprint) >= 175.);
+}
+
 /// #190: the sampled check measures what it claims, so a pocket test that
 /// passes it says something: a slot through fresh stock reads the full
 /// leading half-circle, and a pass beside it at width w reads acos(1 - w / r)
