@@ -56,8 +56,8 @@ class Waterline:
     ramp: bool = False
     # Ball end mills (#46): RampEntry(angle_deg=..., feed_mm_min=...) sets how
     # steep the ramp a level is reached by may be (at most one lap; deeper
-    # steps descend steeper) and its feed. None: one lap per ramp, at the
-    # plunge feed. Only RampEntry is accepted.
+    # steps descend steeper) and its feed (default the plunge feed). None:
+    # 3 degrees at the cutting feed. Only RampEntry is accepted.
     entry: object | None = None
 
     def to_dict(self):

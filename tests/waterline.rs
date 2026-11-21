@@ -1035,10 +1035,10 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
 /// the ball disk below the ball tip (`Stock::top_under_disk` - tip z). A
 /// descent that stays on one XY is a vertical plunge: it must meet no stock
 /// deeper than the operation tolerance. A descending Plunge that travels is
-/// a helix entry along the loop: it cuts the wall like the loop's own moves,
-/// so it may meet stock, and the test bounds that by the level gap the lap
+/// a ramp entry along the loop: it cuts the wall like the loop's own moves,
+/// so it may meet stock, and the test bounds that by the level gap the ramp
 /// descends. Also records the move count, the first entry plunge's end, the
-/// helix lap's first start and last end, and the cut length per level, to
+/// ramp's first start and last end, and the cut length per level, to
 /// compare with values measured at 2017dcc.
 #[derive(Debug)]
 struct Replay {
@@ -1254,9 +1254,9 @@ fn fully_blocked_loops_enter_on_a_helix() {
     // single waterline level Z6: the stock under the ball stands a full
     // millimetre above the level at every point beside the loop, on and off
     // it, so no side entry exists anywhere on the loop. The entry must be
-    // the one-lap helix along the loop itself: a plunge to the lowest height
-    // the stock under the ball at the loop start is clear at (the stock top
-    // Z7), then one lap down to the level (#46).
+    // the ramp along the loop itself: a plunge to the lowest height the
+    // stock under the ball at the loop start is clear at (the stock top Z7),
+    // then a 3 degree ramp (the default) down to the level (#46).
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let spec = StockSpec {
@@ -1296,7 +1296,7 @@ fn fully_blocked_loops_enter_on_a_helix() {
     // The whole plan streams: every motion starts where the previous one
     // ended, with an increasing id (what the simulation and the UI check).
     assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
-    // The entry plunge stops at the stock top Z7, in air; the helix lap
+    // The entry plunge stops at the stock top Z7, in air; the ramp
     // meets the wall it cuts, never deeper than the level gap it descends.
     assert!(replay.vertical_plunges > 0);
     assert!(
@@ -1883,8 +1883,8 @@ fn levels_link_with_a_ramp_that_the_next_level_recuts() {
     // it), levels 6, 4 and 2.5 (closed loops): each level is reached from
     // the one above without a retract - a ramp down along the lower loop
     // from the upper level, then that loop cut in full over the ramp (#46).
-    // Undeclared, the ramp is one lap; with a declared angle its length is
-    // the level gap over tan(angle).
+    // Undeclared, the ramp is 3 degrees; with a declared angle its length is
+    // the level gap over tan(angle) (at most one lap either way).
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let angle = 10f64.to_radians();
