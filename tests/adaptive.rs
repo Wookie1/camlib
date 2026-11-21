@@ -1,6 +1,7 @@
 use camlib::{
     adaptive::*, motion::*, planar::*, pocket::Operation, stock::*, stream::StreamManifest,
 };
+use crate::roughing::LeadingOracle;
 use std::{
     f64::consts::{PI, TAU},
     sync::atomic::AtomicBool,
@@ -14,6 +15,177 @@ fn operation() -> AdaptivePocketOperation {
     };
     p
 }
+/// Sampling allowance in degrees for the leading half-circle, as in the
+/// roughing tests. Clearance uses distances to the swept lines and arcs.
+pub(crate) const LEADING_SLACK_DEG: f64 = 3.;
+
+/// #190: the independent, sampled leading-contact check from the roughing
+/// tests (`LeadingOracle`), run over an adaptive pocket's motions. Per depth
+/// level, flat feed moves clear their sweep; every cutting and stay-down link
+/// stroke has its leading contact measured first. No planner, prover or stock
+/// code: material is the stock footprint less what earlier centres swept.
+/// Returns the worst contact, in degrees, over all levels.
+pub(crate) fn leading_contact_deg(motions: &[Motion], r: f64, footprint: [[f64; 2]; 2]) -> f64 {
+    let flat_feeds: Vec<_> = motions
+        .iter()
+        .filter(|m| {
+            let c = &m.curve;
+            m.kind.cuts() && c.start()[2] == c.end()[2] && !matches!(c, Curve::Helix { .. })
+        })
+        .collect();
+    let checked = |m: &Motion| matches!(m.kind, MoveKind::Cut | MoveKind::Link);
+    let mut depths: Vec<_> = flat_feeds
+        .iter()
+        .filter(|m| checked(m))
+        .map(|m| m.curve.start()[2])
+        .collect();
+    depths.sort_by(f64::total_cmp);
+    depths.dedup();
+    let mut worst = 0f64;
+    for z in depths {
+        let mut leading = LeadingOracle::new(r, footprint);
+        let last = flat_feeds
+            .iter()
+            .rposition(|m| checked(m) && m.curve.start()[2] == z)
+            .unwrap();
+        for &m in &flat_feeds[..=last] {
+            let tip = m.curve.start()[2];
+            // A deeper flat-end cut cleared this plane. A higher one did not.
+            if tip <= z {
+                leading.feed(&m.curve, tip == z && checked(m));
+            }
+        }
+        worst = worst.max(leading.worst_deg);
+    }
+    worst
+}
+#[test]
+fn leading_contact_keeps_shallow_cuts_out_of_deeper_stock() {
+    let line = |id, kind, z| Motion {
+        id,
+        kind,
+        operation: "pocket".into(),
+        tool: "mill".into(),
+        feed_mm_min: Some(600.),
+        curve: Curve::Line {
+            start: [5., 5., z],
+            end: [15., 5., z],
+        },
+    };
+    let footprint = [[0., 0.], [26., 26.]];
+    let upper = line(1, MoveKind::Lead, 8.);
+    let lower = line(2, MoveKind::Cut, 8. - 5e-8);
+    assert!(leading_contact_deg(&[upper.clone(), lower.clone()], 2., footprint) >= 175.);
+    let mut start = lower.clone();
+    start.kind = MoveKind::Lead;
+    start.curve = Curve::Line {
+        start: [2., 2., 8. - 5e-8],
+        end: [3., 2., 8. - 5e-8],
+    };
+    assert!(leading_contact_deg(&[start, upper, lower], 2., footprint) >= 175.);
+}
+
+/// #190: the sampled check measures what it claims, so a pocket test that
+/// passes it says something: a slot through fresh stock reads the full
+/// leading half-circle, and a pass beside it at width w reads acos(1 - w / r)
+/// (within the sampling slack above, and the whole-degree count below).
+#[test]
+fn leading_contact_check_reads_a_slot_and_a_side_step() {
+    let r = 2.;
+    let line = |y: f64, from: f64, to: f64| Curve::Line {
+        start: [from, y, 9.],
+        end: [to, y, 9.],
+    };
+    let mut leading = LeadingOracle::new(r, [[0., 0.], [26., 26.]]);
+    leading.feed(&line(5., 2., 24.), true);
+    assert!(leading.worst_deg >= 175., "slot read {}", leading.worst_deg);
+    for w in [0.5, 1., 1.5] {
+        let mut leading = LeadingOracle::new(r, [[0., 0.], [26., 26.]]);
+        // The first pass runs right through the stock, so the second meets
+        // no end of it (where it would cut a wider arc, and the check says so).
+        leading.feed(&line(5., -3., 29.), false);
+        leading.feed(&line(5. + w, 2., 24.), true);
+        let exact = (1f64 - w / r).acos().to_degrees();
+        assert!(
+            leading.worst_deg <= exact + LEADING_SLACK_DEG && leading.worst_deg >= exact - 2.,
+            "w {w}: read {} against {exact}",
+            leading.worst_deg
+        );
+    }
+}
+
+/// #190 review: the reading does not depend on how a cut is split into
+/// moves. The same straight cut through fresh stock, fed as one move or as
+/// many moves shorter than the sampling step, reads the full leading
+/// half-circle; so does a side step split the same way read its width.
+#[test]
+fn leading_contact_check_does_not_depend_on_move_length() {
+    let r = 2.;
+    let footprint = [[0., 0.], [26., 26.]];
+    let split = |leading: &mut LeadingOracle, y: f64, from: f64, to: f64, n: usize| {
+        for i in 0..n {
+            let a = from + (to - from) * i as f64 / n as f64;
+            let b = from + (to - from) * (i + 1) as f64 / n as f64;
+            leading.feed(
+                &Curve::Line {
+                    start: [a, y, 9.],
+                    end: [b, y, 9.],
+                },
+                true,
+            );
+        }
+    };
+    for n in [1, 200] {
+        let mut leading = LeadingOracle::new(r, footprint);
+        split(&mut leading, 5., 10., 10.1, n);
+        assert!(leading.worst_deg >= 175., "{n} moves: slot read {}", leading.worst_deg);
+    }
+    let w = 1.;
+    let exact = (1f64 - w / r).acos().to_degrees();
+    for n in [1, 200] {
+        let mut leading = LeadingOracle::new(r, footprint);
+        leading.feed(
+            &Curve::Line {
+                start: [-3., 5., 9.],
+                end: [29., 5., 9.],
+            },
+            false,
+        );
+        split(&mut leading, 5. + w, 10., 10.1, n);
+        assert!(
+            leading.worst_deg <= exact + LEADING_SLACK_DEG && leading.worst_deg >= exact - 2.,
+            "{n} moves: side step read {} against {exact}",
+            leading.worst_deg
+        );
+    }
+}
+
+/// #190 review: an unchecked lead does not clear stock ahead of its end. A
+/// short checked cut that continues a lead reads the full slot whether the
+/// lead is one move or 2,000.
+#[test]
+fn leading_contact_check_reads_a_cut_after_a_lead_whatever_the_lead_split() {
+    let r = 2.;
+    let footprint = [[0., 0.], [26., 26.]];
+    let line = |from: f64, to: f64| Curve::Line {
+        start: [from, 5., 9.],
+        end: [to, 5., 9.],
+    };
+    for n in [1, 2000] {
+        let mut leading = LeadingOracle::new(r, footprint);
+        for i in 0..n {
+            let a = 9. + i as f64 / n as f64;
+            leading.feed(&line(a, a + 1. / n as f64), false);
+        }
+        leading.feed(&line(10., 10.0005), true);
+        assert!(
+            leading.worst_deg >= 175.,
+            "lead in {n} moves: the cut read {}",
+            leading.worst_deg
+        );
+    }
+}
+
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
@@ -1748,6 +1920,13 @@ fn engagement_front_pocket_clears_the_region_once_within_its_engagement() {
         assert!(c["proven_max_engagement_deg"].as_f64().unwrap() <= limit);
         assert!(c["engagement_proved_strokes"].as_u64().unwrap() > 10);
     }
+    // Independent of that proof (#190): the sampled leading contact of every
+    // cutting and link stroke, against the 26 x 26 mm stock.
+    let worst = leading_contact_deg(&motions, 2., [[0., 0.], [26., 26.]]);
+    assert!(
+        worst <= limit + LEADING_SLACK_DEG,
+        "{worst} > {limit} + {LEADING_SLACK_DEG} degree sampling slack"
+    );
     // Far less motion than the orbits for the same pocket.
     let cut = |list: &[Motion]| -> f64 {
         list.iter()
@@ -1965,6 +2144,13 @@ fn engagement_front_pocket_links_feed_fast_only_clear_of_stock() {
     let plain = front_run(|_| ()).unwrap();
     let fast = front_run(|op| op.link_feed_mm_min = Some(3000.)).unwrap();
     let (r, cutting) = (2., 600.);
+    // #190: link and cutting strokes keep their sampled leading contact
+    // within acos(1 - 1.5 / 2), with and without the link feed.
+    let limit = (1f64 - 1.5 / r).acos().to_degrees();
+    for run in [&plain, &fast] {
+        let worst = leading_contact_deg(&run.motions, r, [[0., 0.], [26., 26.]]);
+        assert!(worst <= limit + LEADING_SLACK_DEG, "{worst} > {limit}");
+    }
     let (mut fast_mm, mut slow_mm) = (0f64, 0f64);
     for (i, motion) in fast.motions.iter().enumerate() {
         if motion.kind != MoveKind::Link {
@@ -2249,6 +2435,7 @@ fn engagement_front_reports_the_material_its_wall_pass_left() {
     };
     let r = m.tools[0].cutter.diameter_mm / 2.;
     let level = op.pocket.floor_z_mm;
+    let op_stepover = op.pocket.stepover_mm;
     let tool = m.tools[0].prepare().unwrap();
     let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
     let mut plan = OperationPlan::prepare_with_stock(
@@ -2260,7 +2447,7 @@ fn engagement_front_reports_the_material_its_wall_pass_left() {
         &|| false,
     )
     .unwrap();
-    let mut flat = vec![];
+    let (mut flat, mut motions) = (vec![], vec![]);
     while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
         if matches!(motion.kind, MoveKind::Cut | MoveKind::Lead | MoveKind::Link)
             && motion.curve.start()[2] == motion.curve.end()[2]
@@ -2272,8 +2459,14 @@ fn engagement_front_reports_the_material_its_wall_pass_left() {
             .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
             .unwrap();
         stock.apply_delta(&delta).unwrap();
+        motions.push(motion);
     }
     plan.finish_report(&|| false).unwrap();
+    // #190: the sampled leading contact of every cutting and link stroke,
+    // wall pass included, within acos(1 - stepover / r).
+    let limit = (1f64 - op_stepover / r).acos().to_degrees();
+    let worst = leading_contact_deg(&motions, r, [[0., 0.], [26., 26.]]);
+    assert!(worst <= limit + LEADING_SLACK_DEG, "{worst} > {limit}");
     let report = serde_json::to_value(plan.report()).unwrap();
     let layers = report["layers"].as_array().unwrap();
     assert_eq!(layers.len(), 1, "{report}");
@@ -2358,6 +2551,7 @@ fn engagement_front_reports_the_material_a_curved_wall_pass_left() {
     };
     let r = m.tools[0].cutter.diameter_mm / 2.;
     let level = op.pocket.floor_z_mm;
+    let op_stepover = op.pocket.stepover_mm;
     let tool = m.tools[0].prepare().unwrap();
     let mut stock = Stock::new(m.stock.height().unwrap().clone()).unwrap();
     let mut plan = OperationPlan::prepare_with_stock(
@@ -2369,7 +2563,7 @@ fn engagement_front_reports_the_material_a_curved_wall_pass_left() {
         &|| false,
     )
     .unwrap();
-    let mut flat = vec![];
+    let (mut flat, mut motions) = (vec![], vec![]);
     while let Some(motion) = plan.next_motion_with_stock(&stock, &|| false).unwrap() {
         if matches!(motion.kind, MoveKind::Cut | MoveKind::Lead | MoveKind::Link)
             && motion.curve.start()[2] == motion.curve.end()[2]
@@ -2381,8 +2575,13 @@ fn engagement_front_reports_the_material_a_curved_wall_pass_left() {
             .preview_sweep(&tool, &motion, 1., m.sweep, &|| false)
             .unwrap();
         stock.apply_delta(&delta).unwrap();
+        motions.push(motion);
     }
     plan.finish_report(&|| false).unwrap();
+    // #190: the sampled leading contact, as for the square pocket.
+    let limit = (1f64 - op_stepover / r).acos().to_degrees();
+    let worst = leading_contact_deg(&motions, r, [[0., 0.], [26., 26.]]);
+    assert!(worst <= limit + LEADING_SLACK_DEG, "{worst} > {limit}");
     let report = serde_json::to_value(plan.report()).unwrap();
     let clearing = &report["layers"][0]["clearing"];
     assert_eq!(clearing["wall_passes"].as_u64().unwrap(), 1, "{clearing}");
