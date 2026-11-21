@@ -2272,3 +2272,82 @@ fn links_meet_no_more_than_the_lap_below_cuts() {
     }
     assert!(links > 0, "no link was checked");
 }
+
+#[test]
+fn slope_limited_walls_are_cut_wall_by_wall_and_linked() {
+    use camlib::stock::{HeightBounds, InitialStock, Stock};
+    use camlib::waterline::WaterlinePlan;
+    // A gable roof, ridge along Y at X12 Z7, eaves at X4 and X20 Z4 (20.6
+    // degree planes), on finishing stock 0.1 mm over it. With the slope
+    // limited to 25..90 degrees, each level keeps only the runs where the
+    // ball rides the gable ends - two walls of one contour. Each wall is cut
+    // top to bottom and its runs linked (#46), instead of a retract and an
+    // entry for every run.
+    let mut m = fixture();
+    let cancel = AtomicBool::new(false);
+    let roof = |x: f64| 7. - ((x - 12.).abs() * 3. / 8.);
+    let (a, b, c, d, e, f) = (
+        [4., 4., 4.],
+        [12., 4., 7.],
+        [20., 4., 4.],
+        [4., 12., 4.],
+        [12., 12., 7.],
+        [20., 12., 4.],
+    );
+    let mut op = operation(&m);
+    op.surface = mesh(vec![[a, b, e], [a, e, d], [b, c, f], [b, f, e]]);
+    op.top_z_mm = 6.8;
+    op.bottom_z_mm = 4.4;
+    op.stepdown_mm = 0.4;
+    op.slope_from_deg = 25.;
+    let spec = m.stock.height().unwrap().clone();
+    let probe = Stock::new(spec.clone()).unwrap();
+    let [nx, ny] = probe.dimensions();
+    let [wx, wy] = probe.cell_widths_mm();
+    let mut bounds = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+            let inside = x0 + wx > 4. && x0 < 20. && y0 + wy > 4. && y0 < 12.;
+            let top = if inside {
+                roof(x0.clamp(4., 20.)).max(roof((x0 + wx).clamp(4., 20.))) + 0.1
+            } else {
+                0.
+            };
+            bounds.push(HeightBounds {
+                lower_mm: top,
+                upper_mm: top,
+            });
+        }
+    }
+    let initial = InitialStock {
+        source_id: "roof".into(),
+        revision: "1".into(),
+        source_sha256: "0".repeat(64),
+        source_to_setup: camlib::motion::WorkFrame::identity(),
+        uncertainty_mm: 0.,
+        representation: "whole_cell_top_down".into(),
+        bounds,
+    };
+    let mut stock = Stock::from_initial(spec.clone(), &initial).unwrap();
+    m.initial_stock = Some(initial);
+    let tolerance = op.tolerance_mm;
+    let mut plan =
+        WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    let replay = replay(&m, &mut plan, &mut stock);
+    assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
+    let report = plan.report();
+    // Every vertical plunge stops in air.
+    assert!(replay.worst_vertical <= tolerance + 1e-6, "{}", replay.worst_vertical);
+    let pieces = report.loops_completed;
+    assert!(pieces >= 10, "{pieces} runs");
+    // Every run is reached by a link or by an entry plunge (measured: 30
+    // runs, 24 links, 6 entries; one entry per run before #46's open-run
+    // links).
+    assert_eq!(report.ramp_links + replay.vertical_plunges, pieces);
+    assert!(
+        replay.vertical_plunges * 4 <= pieces,
+        "{pieces} runs, {} entries",
+        replay.vertical_plunges
+    );
+}

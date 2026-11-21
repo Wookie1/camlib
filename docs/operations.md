@@ -2005,7 +2005,23 @@ ramp descends or than the lower loop's own cut meets where the link arrives
 up to about 0.01 mm: tool load only, never the part), otherwise the loop is
 entered as below. The report's `ramp_links` counts the linked levels.
 
-A loop the tool is not already at - the first of a stack, an open run, or a
+Open runs (the parts of a contour slope or region limits keep) are linked the
+same way: from the end of the run just cut to the start of the next one, at
+the upper level, then down along the run at the ramp angle to half the level
+gap and back to its start (no ramp at the same level), then the run cut. Where
+the straight link would cross the part (the runs of one wall all run the same
+way, so the next starts at the far end), the link goes back along the run just
+cut, at its level, to its point nearest the next start, then straight to it.
+The same proofs and stock bound apply. In a stack the next piece is the
+nearest one that is ready - a piece may go before pieces it is more than two
+cutter radii from (bounding boxes), unless one of them is a closed loop - so the
+separate walls of one contour are cut one after the other, each top to bottom,
+instead of switching walls at every level. On an in-between level under
+limits, the fragments the scallop rule keeps within one run the limits allow
+are cut as one piece when the gaps between them are under four cutter radii
+(the gaps are inside the limits).
+
+A loop the tool is not already at - the first of a stack, a run, or a
 loop a link could not reach - is entered after a retract, never by coming in
 from the side into a full cut and never by plunging into material: a side
 entry (a plunge beside the loop, at the nearest point `max(r/2, 1)` mm out and
@@ -2017,7 +2033,7 @@ start moves to the first one (`moved_entries`). Otherwise the ball plunges at
 the loop start to the lowest height the stock under it there is clear at (at
 most the feed height, so in air) and ramps down along the loop to the level at
 the ramp angle as above; an open run goes along itself to half the depth and
-back to its start - then cuts it (`helical_entries`). If no entry exists the
+back to its start, at the same angle - then cuts it (`helical_entries`). If no entry exists the
 operation is refused, naming the level and the XY: rough or rest-rough there
 first. Where an entry reaches its level in stock more than one `stepdown_mm`
 deep, or a link more than one `stepdown_mm` beyond the level gap it descends

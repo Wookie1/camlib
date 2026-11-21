@@ -1214,6 +1214,43 @@ fn runs_bridge(ring: &[[f64; 2]], runs: &[Vec<[f64; 2]>], max_gap: f64) -> bool 
         (next - spans[i].1).rem_euclid(total) < max_gap
     })
 }
+/// The fragments an in-between level keeps of one run the slope or region
+/// limits allow (#46), cut as one piece when every gap between them along
+/// the run is shorter than `max_gap`: the stretch of `run` from the first
+/// fragment's start to the last one's end. The gaps lie inside the limits
+/// (only the scallop rule left them out), so cutting them stays within
+/// what the operation may cut. None when the fragments do not bridge.
+fn bridge_open(run: &[[f64; 2]], kept: &[Vec<[f64; 2]>], max_gap: f64) -> Option<Vec<[f64; 2]>> {
+    if kept.len() < 2 {
+        return None;
+    }
+    let strokes: Vec<Stroke> = run.windows(2).map(|w| Stroke::line(w[0], w[1])).collect();
+    let at = |p: [f64; 2]| nearest_on_loop(&strokes, p).0;
+    let spans: Vec<(f64, f64)> = kept
+        .iter()
+        .map(|k| (at(k[0]), at(k[k.len() - 1])))
+        .collect();
+    if !spans
+        .windows(2)
+        .all(|w| w[1].0 >= w[0].1 && w[1].0 - w[0].1 < max_gap)
+    {
+        return None;
+    }
+    let (from, to) = (spans[0].0, spans[spans.len() - 1].1);
+    let mut out = vec![kept[0][0]];
+    let mut acc = 0.;
+    for (e, w) in strokes.iter().zip(run.windows(2)) {
+        acc += stroke_length(e);
+        if acc > from + 1e-9 && acc < to - 1e-9 {
+            out.push(w[1]);
+        }
+    }
+    let last = kept[kept.len() - 1][kept[kept.len() - 1].len() - 1];
+    if out.last() != Some(&last) {
+        out.push(last);
+    }
+    Some(out)
+}
 /// How near a vertex of a loop a split (where a ramp ends, where a link
 /// meets the loop, where a moved start lies) is moved onto it (#46): a
 /// sliver shorter than this rounds to nothing in a program posted at three
@@ -1222,6 +1259,41 @@ const SNAP_MM: f64 = 0.005;
 /// An arc length along a loop moved onto a vertex when within `SNAP_MM` of
 /// one: the ramp then ends, and the flat lap after it starts, exactly at
 /// that vertex, never leaving a sliver no post can express.
+/// The descent onto an open run from `from` to `to` (#46): an open run ends
+/// away from its start, so along its first `length` to half the depth and
+/// back over the same stretch to the level, ending at its start (the flat
+/// pass then cuts over all of it).
+fn out_and_back(edges: &[Stroke], from: f64, to: f64, length: f64) -> Vec<Curve> {
+    let mid = (from + to) / 2.;
+    // A stretch too short to post descends over the whole run instead.
+    let length = if length > SNAP_MM {
+        length
+    } else {
+        edges.iter().map(stroke_length).sum()
+    };
+    let out = ramp_curves(edges, from, mid, length);
+    // The same points back: a point `s` along the run is at `from - (from
+    // - mid) s / length` going out and at `to + (mid - to) s / length`
+    // coming back.
+    let back_z = |z: f64| to + (mid - to) * (from - z) / (from - mid);
+    let back: Vec<Curve> = out
+        .iter()
+        .rev()
+        .map(|c| {
+            let (a, b) = (c.start(), c.end());
+            Curve::Line {
+                start: [b[0], b[1], back_z(b[2])],
+                end: [a[0], a[1], back_z(a[2])],
+            }
+        })
+        .collect();
+    let mut curves = out;
+    curves.extend(back);
+    if let Some(Curve::Line { end, .. }) = curves.last_mut() {
+        end[2] = to;
+    }
+    curves
+}
 fn snap_to_vertex(edges: &[Stroke], length: f64) -> f64 {
     let mut acc = 0.;
     for e in edges {
@@ -1974,8 +2046,10 @@ impl WaterlinePlan {
                 let center_z = z + self.radius;
                 let band = (self.inflated - self.protected).max(0.) + self.op.contour_error_mm;
                 let tolerance = self.op.tolerance_mm;
-                let mut runs = crate::finishing::filter_runs(vec![closed.clone()], spacing, |p| {
-                    if slope.is_some() || keep_below.is_finite() {
+                // `scallop`: also the in-between level's own rule; without
+                // it, only what the slope and region limits allow.
+                let mut keep = |p: [f64; 2], scallop: bool| -> Result<bool, String> {
+                    if slope.is_some() || scallop && keep_below.is_finite() {
                         let (least, greatest) = level_contact_angles(
                             surface,
                             [p[0], p[1], center_z],
@@ -1985,7 +2059,7 @@ impl WaterlinePlan {
                             &mut slope_work,
                             cancel,
                         )?;
-                        if greatest.sin() >= keep_below {
+                        if scallop && greatest.sin() >= keep_below {
                             return Ok(false);
                         }
                         if let Some((lo, hi)) = slope
@@ -2002,7 +2076,42 @@ impl WaterlinePlan {
                         return Ok(false);
                     }
                     Ok(true)
-                })?;
+                };
+                let join = |mut runs: Vec<Vec<[f64; 2]>>| {
+                    if runs.len() >= 2
+                        && runs[0].first() == closed.first()
+                        && runs.last().unwrap().last() == closed.last()
+                    {
+                        // A run through the ring's start: join its two halves.
+                        let first = runs.remove(0);
+                        runs.last_mut().unwrap().extend(first.into_iter().skip(1));
+                    }
+                    runs
+                };
+                let limited = depth > 0 && (slope.is_some() || region.is_some());
+                let runs = if limited {
+                    // An in-between level under limits (#46): within each
+                    // run the limits allow, the fragments the scallop rule
+                    // keeps are cut as one piece across short gaps.
+                    let mut runs = vec![];
+                    for run in join(crate::finishing::filter_runs(
+                        vec![closed.clone()],
+                        spacing,
+                        |p| keep(p, false),
+                    )?) {
+                        let kept =
+                            crate::finishing::filter_runs(vec![run.clone()], spacing, |p| {
+                                keep(p, true)
+                            })?;
+                        match bridge_open(&run, &kept, BRIDGE_RADII * self.radius) {
+                            Some(piece) => runs.push(piece),
+                            None => runs.extend(kept),
+                        }
+                    }
+                    runs
+                } else {
+                    crate::finishing::filter_runs(vec![closed.clone()], spacing, |p| keep(p, true))?
+                };
                 let whole = runs.len() == 1
                     && runs[0].first() == closed.first()
                     && runs[0].last() == closed.last();
@@ -2028,14 +2137,7 @@ impl WaterlinePlan {
                     ));
                     continue;
                 }
-                if runs.len() >= 2
-                    && runs[0].first() == closed.first()
-                    && runs.last().unwrap().last() == closed.last()
-                {
-                    // A run through the ring's start: join its two halves.
-                    let first = runs.remove(0);
-                    runs.last_mut().unwrap().extend(first.into_iter().skip(1));
-                }
+                let runs = if limited { runs } else { join(runs) };
                 loops.extend(runs.into_iter().map(|run| {
                     (
                         owner,
@@ -2361,6 +2463,7 @@ impl WaterlinePlan {
         cancel: &impl CancelSignal,
     ) -> Result<Option<Vec<Queued>>, String> {
         loop {
+            self.nearest_at_level();
             let candidates = self.pick();
             if candidates.is_empty() {
                 return Ok(None);
@@ -2404,6 +2507,79 @@ impl WaterlinePlan {
             emission.level_order = level_order;
             return Ok(Some(moves));
         }
+    }
+    /// In the stack being cut, the next piece is the nearest one that is
+    /// ready (#46): a piece may go before the pieces ahead of it in the
+    /// stack's top-down order when none of those it skips lies within two
+    /// cutter radii of it (bounding boxes) and none of them is a closed loop.
+    /// The runs slope or region limits cut a contour into - separate walls
+    /// of one ring - are then cut wall by wall, top to bottom, each wall's
+    /// levels linked, instead of switching walls at every level. Order only:
+    /// every move keeps its own proofs on the live stock.
+    fn nearest_at_level(&mut self) {
+        let position = [self.position[0], self.position[1]];
+        let margin = 2. * self.radius;
+        let Some(e) = self.emission.as_mut() else {
+            return;
+        };
+        let Some(s) = e.current.filter(|_| !e.level_order) else {
+            return;
+        };
+        let stack = &e.stacks[s];
+        if stack.done() || stack.deferred {
+            return;
+        }
+        let bbox = |k: usize| {
+            let mut b = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            for st in &e.pieces[k].strokes {
+                for p in [st.a, st.b] {
+                    b = [
+                        b[0].min(p[0]),
+                        b[1].min(p[1]),
+                        b[2].max(p[0]),
+                        b[3].max(p[1]),
+                    ];
+                }
+            }
+            b
+        };
+        let apart = |a: [f64; 4], b: [f64; 4]| {
+            a[0] > b[2] + margin
+                || b[0] > a[2] + margin
+                || a[1] > b[3] + margin
+                || b[1] > a[3] + margin
+        };
+        let distance = |k: usize| {
+            let piece = &e.pieces[k];
+            let q = if piece.closed {
+                nearest_on_loop(&piece.strokes, position).1
+            } else {
+                piece.strokes[0].a
+            };
+            (q[0] - position[0]).hypot(q[1] - position[1])
+        };
+        let rest = &stack.pieces[stack.next..];
+        let boxes: Vec<[f64; 4]> = rest.iter().map(|&k| bbox(k)).collect();
+        let mut best = (distance(rest[0]), 0);
+        for j in 1..rest.len() {
+            if e.pieces[rest[j - 1]].closed || e.pieces[rest[j]].closed {
+                break;
+            }
+            if !(0..j).all(|i| apart(boxes[i], boxes[j])) {
+                continue;
+            }
+            let d = distance(rest[j]);
+            if d < best.0 {
+                best = (d, j);
+            }
+        }
+        let next = stack.next;
+        e.stacks[s].pieces[next..=next + best.1].rotate_right(1);
     }
     /// Whether any feed move of a job would fail the reach check against the
     /// live stock (always false when the check does not run).
@@ -2476,14 +2652,18 @@ impl WaterlinePlan {
     /// The moves that cut piece `k` of stack `s` (#46) from where the tool
     /// is, and (ramp link, moved entries, helical entries).
     ///
-    /// Ramp link: when the tool has just finished the closed loop above it
+    /// Ramp link: when the tool has just finished the piece before this one
     /// in the same stack and this piece is a closed loop below it, a short
     /// link at the upper level to the nearest point P of this loop, a ramp
     /// down along the loop from P (over `ramp_length`), then the whole loop
     /// flat from where the ramp ends - the flat lap passes over the ramp
-    /// again. Taken only when the link, the ramp and the loop are proven
+    /// again. An open run (at the same level or below) is linked to its
+    /// start, descended along itself and back (`out_and_back`), then cut;
+    /// from an open run a link the part blocks goes back along that run
+    /// first. Taken only when the link, the ramp and the piece are proven
     /// clear of the part and the link meets no more stock (measured on the
-    /// stock grid, `stock_met`) than the level gap the ramp descends.
+    /// stock grid, `stock_met`) than the level gap the ramp descends or the
+    /// piece's own cut where the link arrives.
     ///
     /// Otherwise an entry, after a retract: a side entry (plunge beside the
     /// loop, a horizontal lead onto it) only where the lead is pure air;
@@ -2510,26 +2690,40 @@ impl WaterlinePlan {
             .then(|| stack.pieces[stack.next - 1])
             .filter(|&q| e.last == Some(q) && e.current == Some(s));
         if let Some(q) = above
-            && e.pieces[q].closed
-            && piece.closed
-            && z < e.pieces[q].z - 1e-9
+            && (z < e.pieces[q].z - 1e-9 || !piece.closed && z <= e.pieces[q].z + 1e-9)
         {
             let za = e.pieces[q].z;
             let mut strokes = piece.strokes.clone();
             let total: f64 = strokes.iter().map(stroke_length).sum();
-            let (sp, _) = nearest_on_loop(&strokes, [self.position[0], self.position[1]]);
-            let sp = snap_to_vertex(&strokes, sp);
-            if sp > 1e-9 && sp < total - 1e-9 {
-                rotate_loop(&mut strokes, sp);
-            }
-            // P is the rotated loop's own first point, so the ramp starts
-            // exactly where the link ends.
+            // A closed loop is entered at its nearest point P and ramped
+            // along over `ramp_length`; an open run at its start, along
+            // itself and back (no ramp at the same level).
+            let (ramp, flat_from) = if piece.closed {
+                let (sp, _) = nearest_on_loop(&strokes, [self.position[0], self.position[1]]);
+                let sp = snap_to_vertex(&strokes, sp);
+                if sp > 1e-9 && sp < total - 1e-9 {
+                    rotate_loop(&mut strokes, sp);
+                }
+                let length = snap_to_vertex(&strokes, self.ramp_length(za - z, total));
+                (ramp_curves(&strokes, za, z, length), length.min(total))
+            } else if za > z + 1e-9 {
+                let length = snap_to_vertex(&strokes, self.ramp_length((za - z) / 2., total));
+                (out_and_back(&strokes, za, z, length), 0.)
+            } else {
+                (vec![], 0.)
+            };
+            let mut flat: Vec<Curve> = if piece.closed {
+                flat_lap(&strokes, flat_from, z)
+            } else {
+                strokes.iter().map(|e| e.curve(z)).collect()
+            };
+            let mut ramp = ramp;
+            // P is the (rotated) piece's own first point, so the ramp - or,
+            // without one, the flat pass - starts exactly where the link ends.
             let p = strokes[0].a;
-            let length = snap_to_vertex(&strokes, self.ramp_length(za - z, total));
-            let mut ramp = ramp_curves(&strokes, za, z, length);
-            // A link too short to post (the two levels' loops meet within
-            // the snapping distance) is left out: the ramp starts exactly
-            // where the tool stands.
+            // A link too short to post (the two pieces meet within the
+            // snapping distance) is left out: the ramp or the flat pass
+            // starts exactly where the tool stands.
             let link: Vec<Curve> =
                 if (p[0] - self.position[0]).hypot(p[1] - self.position[1]) > SNAP_MM {
                     vec![Curve::Line {
@@ -2537,20 +2731,61 @@ impl WaterlinePlan {
                         end: [p[0], p[1], za],
                     }]
                 } else {
-                    if let Some(Curve::Line { start, .. }) = ramp.first_mut() {
+                    if let Some(Curve::Line { start, .. }) = ramp.first_mut().or(flat.first_mut()) {
                         *start = self.position;
                     }
                     vec![]
                 };
-            let link_clear = self.path_clear(&link, &mut work, cancel)?;
+            let mut link = link;
+            let mut link_clear = self.path_clear(&link, &mut work, cancel)?;
+            // From an open run, a straight link can cut across the part
+            // (runs of one wall all run the same way, so the next one starts
+            // at the far end): back along the run just cut, at its level, to
+            // its point nearest P, then straight to P (#46).
+            if !link_clear && !e.pieces[q].closed && !link.is_empty() {
+                let back: Vec<Stroke> = e.pieces[q]
+                    .strokes
+                    .iter()
+                    .rev()
+                    .map(|e| e.reversed())
+                    .collect();
+                let (sq, _) = nearest_on_loop(&back, [p[0], p[1]]);
+                let sq = snap_to_vertex(&back, sq);
+                let mut path = if sq > 1e-9 {
+                    ramp_curves(&back, za, za, sq)
+                } else {
+                    vec![]
+                };
+                if let Some(Curve::Line { start, .. }) = path.first_mut() {
+                    *start = self.position;
+                }
+                let q_end = path.last().map_or(self.position, |c| c.end());
+                if (p[0] - q_end[0]).hypot(p[1] - q_end[1]) > SNAP_MM {
+                    path.push(Curve::Line {
+                        start: q_end,
+                        end: [p[0], p[1], za],
+                    });
+                } else if let Some(Curve::Line { end, .. }) = path.last_mut() {
+                    *end = [p[0], p[1], za];
+                }
+                if !path.is_empty() && self.path_clear(&path, &mut work, cancel)? {
+                    link = path;
+                    link_clear = true;
+                }
+            }
             let ramp_clear = link_clear && self.path_clear(&ramp, &mut work, cancel)?;
             // The link may meet no more stock than the level gap it ramps
             // down, or than the lower level's own cut meets where the link
             // arrives (the stock the finishing lap removes there anyway):
             // never a deeper cut from the side than the waterline takes.
             let (met, bound) = if ramp_clear {
+                let mut met: f64 = 0.;
+                for c in &link {
+                    let (a, b) = (c.start(), c.end());
+                    met = met.max(self.stock_met(stock, a, [b[0], b[1]], za, &mut work, cancel)?);
+                }
                 (
-                    self.stock_met(stock, self.position, [p[0], p[1]], za, &mut work, cancel)?,
+                    met,
                     (za - z).max(self.stock_under_ball(stock, p, z, &mut work, cancel)?),
                 )
             } else {
@@ -2578,11 +2813,7 @@ impl WaterlinePlan {
                     .map(|c| (c, MoveKind::Lead, cut_feed))
                     .collect();
                 moves.extend(ramp.into_iter().map(|c| (c, MoveKind::Plunge, ramp_feed)));
-                moves.extend(
-                    flat_lap(&strokes, length.min(total), z)
-                        .into_iter()
-                        .map(|c| (c, MoveKind::Cut, cut_feed)),
-                );
+                moves.extend(flat.into_iter().map(|c| (c, MoveKind::Cut, cut_feed)));
                 return Ok((moves, (true, 0, 0, [0; 3], deep)));
             }
         }
@@ -2641,13 +2872,9 @@ impl WaterlinePlan {
             descent = ramp_curves(&strokes, entry_z, z, length);
             flat_from = length.min(total);
         } else if entry_z > z {
-            // An open run ends away from its start: along it to half the
-            // depth and back along it to the level, ending at its start.
-            let mid = (entry_z + z) / 2.;
             let total: f64 = strokes.iter().map(stroke_length).sum();
-            let back: Vec<Stroke> = strokes.iter().rev().map(|e| e.reversed()).collect();
-            descent = ramp_curves(&strokes, entry_z, mid, total);
-            descent.extend(ramp_curves(&back, mid, z, total));
+            let length = snap_to_vertex(&strokes, self.ramp_length((entry_z - z) / 2., total));
+            descent = out_and_back(&strokes, entry_z, z, length);
         }
         if !self.path_clear(std::slice::from_ref(&plunge), &mut work, cancel)?
             || (points[0].is_none() && !self.path_clear(&descent, &mut work, cancel)?)
