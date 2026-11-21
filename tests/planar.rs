@@ -249,6 +249,24 @@ fn all_boolean_operations_match_rectangle_area_identities() {
 }
 
 #[test]
+fn mixed_boundary_distinguishes_ordered_short_chords_from_backtracking() {
+    let mut boundary = Boundary {
+        vertices: vec![
+            [0., 0., 0.],
+            [0.000002422, 0.000243125, 0.],
+            [-0.000002187, 0.004437265, 0.],
+            [-0.000002187, 2., -0.25],
+            [2., 2., 0.],
+            [2., 0., 0.],
+        ],
+    };
+    prepared(&single(boundary.clone()));
+    // The third vertex now lies halfway back along the preceding line.
+    boundary.vertices[2] = [0.000001211, 0.0001215625, 0.];
+    assert!(single(boundary).prepare(ConstructionOptions::default()).is_err());
+}
+
+#[test]
 fn curved_siblings_cannot_hide_a_straight_loop_self_intersection() {
     // Nonzero signed area, so the area guard alone cannot reject this crossing.
     let crossing = Boundary {
