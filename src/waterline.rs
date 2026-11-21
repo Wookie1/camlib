@@ -1225,15 +1225,52 @@ fn runs_bridge(ring: &[[f64; 2]], runs: &[Vec<[f64; 2]>], max_gap: f64) -> bool 
 /// fragment's start to the last one's end. The gaps lie inside the limits
 /// (only the scallop rule left them out), so cutting them stays within
 /// what the operation may cut. None when the fragments do not bridge.
+/// The arc length along `edges` (an open polyline) of the point nearest `p`
+/// at or after arc length `from`.
+fn position_from(edges: &[Stroke], p: [f64; 2], from: f64) -> f64 {
+    let mut best = (f64::INFINITY, from);
+    let mut acc = 0.;
+    for e in edges {
+        let l = stroke_length(e);
+        if acc + l >= from - 1e-9 {
+            let (a, b) = (e.a, e.b);
+            let lo = if l > 0. {
+                ((from - acc) / l).clamp(0., 1.)
+            } else {
+                0.
+            };
+            let t = if l > 0. {
+                (((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / (l * l))
+                    .clamp(lo, 1.)
+            } else {
+                0.
+            };
+            let q = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+            let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+            if d < best.0 - 1e-12 {
+                best = (d, acc + t * l);
+            }
+        }
+        acc += l;
+    }
+    best.1
+}
 fn bridge_open(run: &[[f64; 2]], kept: &[Vec<[f64; 2]>], max_gap: f64) -> Option<Vec<[f64; 2]>> {
     if kept.len() < 2 {
         return None;
     }
     let strokes: Vec<Stroke> = run.windows(2).map(|w| Stroke::line(w[0], w[1])).collect();
-    let at = |p: [f64; 2]| nearest_on_loop(&strokes, p).0;
+    // The fragments lie along the run in order: each point is placed at or
+    // after the previous one, so a run that closes on itself (its last point
+    // its first) does not map a fragment ending at the seam back to its start.
+    let mut last = 0.;
     let spans: Vec<(f64, f64)> = kept
         .iter()
-        .map(|k| (at(k[0]), at(k[k.len() - 1])))
+        .map(|k| {
+            let a = position_from(&strokes, k[0], last);
+            last = position_from(&strokes, k[k.len() - 1], a);
+            (a, last)
+        })
         .collect();
     if !spans
         .windows(2)
@@ -2468,7 +2505,7 @@ impl WaterlinePlan {
         cancel: &impl CancelSignal,
     ) -> Result<Option<Vec<Queued>>, String> {
         loop {
-            self.nearest_at_level();
+            let reordered = self.nearest_at_level();
             let candidates = self.pick();
             if candidates.is_empty() {
                 return Ok(None);
@@ -2480,6 +2517,15 @@ impl WaterlinePlan {
                 if self.reach_refused(&job.0, stock, cancel) {
                     if !level_order {
                         let emission = self.emission.as_mut().unwrap();
+                        // The refused piece goes back to its place: the
+                        // level-order fallback then sees the stack's pieces
+                        // top-down, the higher ones (which may clear what
+                        // the refused one would meet) first.
+                        if let Some((rs, next, best)) = reordered
+                            && rs == s
+                        {
+                            emission.stacks[s].pieces[next..=next + best].rotate_left(1);
+                        }
                         emission.stacks[s].deferred = true;
                         emission.current = None;
                         self.report.stacks_level_ordered += 1;
@@ -2520,19 +2566,17 @@ impl WaterlinePlan {
     /// The runs slope or region limits cut a contour into - separate walls
     /// of one ring - are then cut wall by wall, top to bottom, each wall's
     /// levels linked, instead of switching walls at every level. Order only:
-    /// every move keeps its own proofs on the live stock.
-    fn nearest_at_level(&mut self) {
+    /// every move keeps its own proofs on the live stock. Returns the
+    /// rotation made (stack, first index, how far the piece moved), so a
+    /// refused piece can go back to its place.
+    fn nearest_at_level(&mut self) -> Option<(usize, usize, usize)> {
         let position = [self.position[0], self.position[1]];
         let margin = 2. * self.radius;
-        let Some(e) = self.emission.as_mut() else {
-            return;
-        };
-        let Some(s) = e.current.filter(|_| !e.level_order) else {
-            return;
-        };
+        let e = self.emission.as_mut()?;
+        let s = e.current.filter(|_| !e.level_order)?;
         let stack = &e.stacks[s];
         if stack.done() || stack.deferred {
-            return;
+            return None;
         }
         let bbox = |k: usize| {
             let mut b = [
@@ -2585,6 +2629,7 @@ impl WaterlinePlan {
         }
         let next = stack.next;
         e.stacks[s].pieces[next..=next + best.1].rotate_right(1);
+        (best.1 > 0).then_some((s, next, best.1))
     }
     /// Whether any feed move of a job would fail the reach check against the
     /// live stock (always false when the check does not run).
@@ -2728,7 +2773,9 @@ impl WaterlinePlan {
             let p = strokes[0].a;
             // A link too short to post (the two pieces meet within the
             // snapping distance) is left out: the ramp or the flat pass
-            // starts exactly where the tool stands.
+            // starts exactly where the tool stands. That changes the first
+            // ramp or cut move, which is then proven again below.
+            let snapped_flat = ramp.is_empty();
             let link: Vec<Curve> =
                 if (p[0] - self.position[0]).hypot(p[1] - self.position[1]) > SNAP_MM {
                     vec![Curve::Line {
@@ -2741,8 +2788,12 @@ impl WaterlinePlan {
                     }
                     vec![]
                 };
+            let snapped_flat = snapped_flat && link.is_empty();
             let mut link = link;
-            let mut link_clear = self.path_clear(&link, &mut work, cancel)?;
+            // Every link segment is proven against the part and the
+            // machining limits (a straight link can cross an avoid area
+            // between two runs the limits keep).
+            let mut link_clear = self.route_clear(&link, &mut work, cancel)?;
             // From an open run, a straight link can cut across the part
             // (runs of one wall all run the same way, so the next one starts
             // at the far end): back along the run just cut, at its level, to
@@ -2773,12 +2824,14 @@ impl WaterlinePlan {
                 } else if let Some(Curve::Line { end, .. }) = path.last_mut() {
                     *end = [p[0], p[1], za];
                 }
-                if !path.is_empty() && self.path_clear(&path, &mut work, cancel)? {
+                if !path.is_empty() && self.route_clear(&path, &mut work, cancel)? {
                     link = path;
                     link_clear = true;
                 }
             }
-            let ramp_clear = link_clear && self.path_clear(&ramp, &mut work, cancel)?;
+            let ramp_clear = link_clear
+                && self.route_clear(&ramp, &mut work, cancel)?
+                && (!snapped_flat || self.route_clear(&flat[..1], &mut work, cancel)?);
             // The link may meet no more stock than the level gap it ramps
             // down, or than the lower level's own cut meets where the link
             // arrives (the stock the finishing lap removes there anyway):
@@ -2883,10 +2936,10 @@ impl WaterlinePlan {
             descent = out_and_back(&strokes, entry_z, z, length);
         }
         if !self.path_clear(std::slice::from_ref(&plunge), &mut work, cancel)?
-            || (points[0].is_none() && !self.path_clear(&descent, &mut work, cancel)?)
+            || (points[0].is_none() && !self.route_clear(&descent, &mut work, cancel)?)
         {
             return Err(format!(
-                "waterline operation {}: the entry to the loop at level Z{z} starting at ({:.4}, {:.4}) is not clear of the part; rough or rest-rough there first",
+                "waterline operation {}: the entry to the loop at level Z{z} starting at ({:.4}, {:.4}) is not clear of the part or the machining limits; rough or rest-rough there first, or change the limits",
                 self.op.id, start[0], start[1]
             ));
         }
@@ -2965,6 +3018,31 @@ impl WaterlinePlan {
             }
         }
         Ok(true)
+    }
+    /// Whether every one of `curves` is proven inside the machining limits
+    /// (#46): cutting moves stay out of the avoid areas and inside the
+    /// containment, like the loops the limits keep (always true without
+    /// limits). Leads are not checked by the run's `LinkGuard`, so a link or
+    /// ramp the emitter builds is checked here.
+    fn allowed(&self, curves: &[Curve]) -> Result<bool, String> {
+        let Some(limits) = &self.region_limits else {
+            return Ok(true);
+        };
+        for c in curves {
+            if !limits.allows_curve(c, true)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// Part clearance (`path_clear`) and the machining limits (`allowed`).
+    fn route_clear(
+        &self,
+        curves: &[Curve],
+        work: &mut SurfaceWork,
+        cancel: &impl CancelSignal,
+    ) -> Result<bool, String> {
+        Ok(self.path_clear(curves, work, cancel)? && self.allowed(curves)?)
     }
     /// How deep the ball standing with its tip at `z` over `p` meets stock that
     /// is not the part (#46): what a cut at that point removes, on the stock
@@ -3221,5 +3299,22 @@ mod bridge_tests {
         assert!(runs_bridge(&ring, &runs, 4.));
         let (ring, runs) = kept(&[(2., 30.)]);
         assert!(!runs_bridge(&ring, &runs, 4.));
+    }
+    #[test]
+    fn bridged_fragments_follow_a_run_that_closes_at_its_seam() {
+        // A region limit admits the whole 10 x 10 square, so the run the
+        // limits allow closes on itself; the scallop rule keeps two
+        // fragments 2 mm apart, the second ending at the seam. The bridged
+        // piece follows the square to the seam, never the diagonal back to
+        // the run's start (#46).
+        let run = vec![[0., 0.], [10., 0.], [10., 10.], [0., 10.], [0., 0.]];
+        let kept = vec![
+            vec![[10., 2.], [10., 10.], [0., 10.]],
+            vec![[0., 8.], [0., 0.]],
+        ];
+        assert_eq!(
+            bridge_open(&run, &kept, 4.),
+            Some(vec![[10., 2.], [10., 10.], [0., 10.], [0., 0.]])
+        );
     }
 }

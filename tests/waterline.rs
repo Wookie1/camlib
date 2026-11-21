@@ -2361,3 +2361,77 @@ fn slope_limited_walls_are_cut_wall_by_wall_and_linked() {
         replay.vertical_plunges
     );
 }
+
+#[test]
+fn links_stay_out_of_avoid_areas_between_runs() {
+    use camlib::limits::{AvoidArea, Limits};
+    use camlib::planar::{Boundary, Component, PlanarRegion};
+    use camlib::{motion::MoveKind, waterline::WaterlinePlan};
+    // The plate's contours at Z5, Z4 and Z3 run along Y3 south of it; a small
+    // avoid area on that line (X11..13, Y2.5..3.5, to Z7) cuts each contour
+    // into one open run whose ends face each other across it. Beside the
+    // plate there is no stock, so a straight link from one level's end to
+    // the next level's start meets none and keeps its part clearance - and
+    // would run through the avoid area. Every link and ramp is checked
+    // against the limits too (#46): no move but a rapid comes within the
+    // cutter radius of the area below its top.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = plate(&m);
+    op.stepdown_mm = 1.;
+    op.top_z_mm = 5.;
+    op.bottom_z_mm = 3.;
+    let area = [11., 2.5, 13., 3.5];
+    op.limits = Some(Limits {
+        contain: None,
+        avoid: vec![AvoidArea {
+            region: PlanarRegion {
+                version: 1,
+                units: "mm".into(),
+                name: "avoid".into(),
+                boundary_error_mm: 0.,
+                source: serde_json::Value::Null,
+                components: vec![Component {
+                    outer: Boundary {
+                        vertices: vec![
+                            [area[0], area[1], 0.],
+                            [area[2], area[1], 0.],
+                            [area[2], area[3], 0.],
+                            [area[0], area[3], 0.],
+                        ],
+                    },
+                    holes: vec![],
+                }],
+            },
+            top_z_mm: 7.,
+        }],
+    });
+    let (mut stock, spec) = roughed(&m, 0.);
+    let mut plan =
+        WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    assert!(error.is_none(), "{error:?}");
+    assert!(plan.report().ramp_links > 0, "the levels are linked");
+    let distance = |p: [f64; 3]| {
+        let dx = (area[0] - p[0]).max(p[0] - area[2]).max(0.);
+        let dy = (area[1] - p[1]).max(p[1] - area[3]).max(0.);
+        dx.hypot(dy)
+    };
+    for (motion, _) in &moves {
+        if motion.kind == MoveKind::Rapid {
+            continue;
+        }
+        let (a, b) = (motion.curve.start(), motion.curve.end());
+        let steps = ((b[0] - a[0]).hypot(b[1] - a[1]) / 0.05).ceil().max(1.) as usize;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let p = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])];
+            assert!(
+                p[2] >= 7. || distance(p) >= 2. - 1e-6,
+                "a {:?} move from {a:?} to {b:?} passes {p:?}, {} mm from the avoid area",
+                motion.kind,
+                distance(p)
+            );
+        }
+    }
+}
