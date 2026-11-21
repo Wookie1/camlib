@@ -159,24 +159,28 @@ class WaterlineTest(unittest.TestCase):
             entries = [w for w in caught if issubclass(w.category, CamWarning) and "loop(s)" in str(w.message)]
             return reports[0], entries
 
-        # Raw stock stands above the level on every side of the loop's given
-        # start, but a clear entry exists along the loop: the start moves to
-        # it (the report's moved_entries), nothing plunges into the stock and
-        # nothing warns (#46).
+        # Raw stock stands above the level on every side of the loop: a lead
+        # from beside it onto the wall would cut the raw stock from the side,
+        # so every level enters on a ramp along its loop instead (#46 WL3; a
+        # link from the level above would drag through the raw stock too),
+        # nothing plunges into the stock and nothing warns.
         config = example().waterline_job()
         report, entries = run(config)
-        self.assertGreater(report["moved_entries"], 0)
+        self.assertNotIn("moved_entries", report)
         self.assertNotIn("wall_entries", report)
-        self.assertNotIn("helical_entries", report)
+        self.assertGreater(report["helical_entries"], 0)
+        self.assertNotIn("ramp_links", report)
         self.assertEqual(entries, [])
         # A blank roughed to 0.3 mm over the island and 0.1 mm over the base
-        # (the benchmark's): every loop enters beside its given start.
+        # (the benchmark's): the island is entered once on a ramp, and every
+        # level below is reached by a ramp from the level above, no retract.
         base = cq.Workplane("XY").box(24, 16, 2.1, centered=(False, False, False))
         island = cq.Workplane("XY").workplane(offset=2).center(12, 8).rect(16.7, 10.7).extrude(6.3, taper=20)
         roughed = StockSpec.from_mesh(export_stock_mesh(base.union(island)), 0.4)
         report, entries = run(dict(config, stock=roughed))
         self.assertNotIn("moved_entries", report)
-        self.assertNotIn("helical_entries", report)
+        self.assertEqual(report["helical_entries"], 1)
+        self.assertGreater(report["ramp_links"], 0)
         self.assertNotIn("wall_entries", report)
         self.assertEqual(entries, [])
 

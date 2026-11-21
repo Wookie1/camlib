@@ -523,7 +523,12 @@ fn waterline_heights_keep_rapids_above_feed_height_and_end_at_clearance() {
         match motion.kind {
             MoveKind::Rapid => assert!(a[2] >= feed && b[2] >= feed, "{motion:?}"),
             MoveKind::Retract => assert_eq!(b[2], feed),
-            MoveKind::Plunge => assert_eq!(a[2], feed),
+            // A vertical plunge comes down from the feed height; a ramp
+            // along a contour (a travelling plunge, #46) starts where the
+            // level above or the clear stock height left the tool.
+            MoveKind::Plunge if (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9 => {
+                assert_eq!(a[2], feed)
+            }
             _ => {}
         }
     }
@@ -920,7 +925,13 @@ fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
     let r = 2.;
     let (mut plunges, mut beside) = (0, 0);
     while let Some(motion) = plan.next_motion_with_stock(&stock, &cancel).unwrap() {
-        if motion.kind == MoveKind::Plunge {
+        // Vertical plunges only: a ramp along a contour (a travelling
+        // plunge, #46) cuts the wall like the loop's own moves.
+        let vertical = {
+            let (a, b) = (motion.curve.start(), motion.curve.end());
+            (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9
+        };
+        if motion.kind == MoveKind::Plunge && vertical {
             let p = motion.curve.end();
             let [nx, ny] = stock.dimensions();
             let [wx, wy] = stock.cell_widths_mm();
@@ -950,11 +961,13 @@ fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
             .unwrap();
         stock.apply_delta(&d).unwrap();
     }
-    assert!(plunges > 0 && beside > 0, "{plunges} {beside}");
-    assert_eq!(
-        (plan.report().moved_entries, plan.report().helical_entries),
-        (0, 0)
-    );
+    // The island enters on a ramp from the band top (a lead from beside the
+    // band into it would cut it from the side, #46 WL3) and its lower levels
+    // follow by ramps: the one vertical plunge stops on the band top.
+    println!("plunges {plunges} beside {beside}");
+    assert!(plunges > 0);
+    assert_eq!(plan.report().moved_entries, 0);
+    assert!(plan.report().helical_entries >= 1);
 }
 /// Plan the whole operation, committing each move to the stock.
 fn drain(
@@ -990,13 +1003,17 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     .unwrap();
     let mut stock = camlib::stock::Stock::new(m.stock.height().unwrap().clone()).unwrap();
     drain(&m, &mut plan, &mut stock);
-    // Raw stock stands above every level, but the stock ends: candidates
-    // beyond its edge have no stock under the ball at all (clear air per the
-    // stock test), so the loops move their starts to entries there (#46).
+    // Raw stock stands above every level: a point beyond the stock's edge
+    // has no stock under the ball, but the lead from it onto the wall would
+    // run through the raw stock, so no side entry is taken (#46: a side
+    // entry only where its lead is pure air); the island enters on a ramp.
     println!("raw plate: moved {} helical {}", plan.report().moved_entries, plan.report().helical_entries);
-    assert!(plan.report().moved_entries > 0);
-    assert_eq!(plan.report().helical_entries, 0);
-    // Roughed so that every loop has a free side entry: none is reported.
+    assert_eq!(plan.report().moved_entries, 0);
+    assert!(plan.report().helical_entries >= 1);
+    // Roughed: a point beside the wall is clear, but the roughed band runs
+    // to Z6.3 within 3 mm of the plate, so a lead from it onto the wall
+    // below Z6.3 would cut the band from the side: the island enters on a
+    // ramp instead (#46), and its lower levels are linked by ramps.
     let (mut stock, spec) = roughed(&m, 3.);
     let mut plan = WaterlinePlan::prepare(
         plate(&m),
@@ -1008,10 +1025,8 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     )
     .unwrap();
     drain(&m, &mut plan, &mut stock);
-    assert_eq!(
-        (plan.report().moved_entries, plan.report().helical_entries),
-        (0, 0)
-    );
+    assert_eq!(plan.report().moved_entries, 0);
+    assert!(plan.report().helical_entries >= 1);
 }
 
 /// Independent replay measure for the entry rule (#46): drives the plan
@@ -1207,17 +1222,19 @@ fn blocked_loop_starts_move_to_a_clear_entry() {
         plan.report().moved_entries,
         plan.report().helical_entries
     );
-    // No vertical descent meets stock deeper than the tolerance, and no
-    // loop needs the helix: clear entries exist along the loop.
+    // No vertical descent meets stock deeper than the tolerance. A side
+    // entry is taken only where its lead onto the wall is pure air (#46
+    // WL3): every lead from a clear point here crosses the lump or its
+    // edge, so the island enters on a ramp along its loop, and the lower
+    // levels follow by ramps from the level above.
     assert!(replay.vertical_plunges > 0);
     assert!(
         replay.worst_vertical <= tolerance + 1e-6,
         "worst vertical plunge met stock {} deep",
         replay.worst_vertical
     );
-    assert_eq!(replay.helix_moves, 0);
-    assert!(plan.report().moved_entries >= 1);
-    assert_eq!(plan.report().helical_entries, 0);
+    assert_eq!(plan.report().moved_entries, 0);
+    assert!(plan.report().helical_entries >= 1);
     // The loop still cuts its full contour: the cut lengths per level
     // measured at 2017dcc (the contour depends only on the part).
     for (z, len) in [
@@ -1369,9 +1386,11 @@ fn open_runs_enter_on_a_helix_that_returns_to_their_start() {
 #[test]
 fn unblocked_loops_keep_their_start() {
     use camlib::waterline::WaterlinePlan;
-    // The frustum fixture, roughed so every loop enters beside its given
-    // start: the whole-loop search never runs, no loop enters on a helix,
-    // and the moves are the ones measured at 2017dcc (#46).
+    // The frustum fixture, roughed so the island enters beside its given
+    // start: the whole-loop search never runs, no loop enters on a helix.
+    // Its lower levels are reached by ramps from the level above (#46 WL3):
+    // the first entry and every level's cut length are the ones measured
+    // at 2017dcc; the moves are now 335 (184 with a retract per level).
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let tolerance = operation(&m).tolerance_mm;
@@ -1392,7 +1411,7 @@ fn unblocked_loops_keep_their_start() {
     println!("replay {replay:?}");
     assert_eq!(plan.report().moved_entries, 0);
     assert_eq!(plan.report().helical_entries, 0);
-    assert_eq!(replay.motions, 184);
+    assert_eq!(replay.motions, 335);
     let first = replay.first_entry.expect("an entry plunge");
     assert!(
         (first[0] - 19.015079355936262).abs() <= 1e-9
@@ -1406,7 +1425,7 @@ fn unblocked_loops_keep_their_start() {
         "worst vertical plunge met stock {} deep",
         replay.worst_vertical
     );
-    assert_eq!(replay.helix_moves, 0);
+    assert!(plan.report().ramp_links > 0);
 }
 
 // In-between levels on shallow slopes keep the scallop bounded (#46).
@@ -1790,4 +1809,370 @@ fn ramp_cuts_in_between_levels_flat() {
         }
     }
     assert!(sub_level_cuts > 0, "no cut lay on an in-between level");
+}
+
+// Ball waterline cuts each island top to bottom and ramps between levels
+// (#46, WL3).
+
+/// Every motion of a plan with the deepest any stock cell sank under it
+/// (preview of its sweep on the live stock, committed in order: an
+/// independent measure of what the move actually cut), and the stream check
+/// of the whole plan (`stream_error`).
+fn trace(
+    m: &camlib::stream::StreamManifest,
+    plan: &mut camlib::waterline::WaterlinePlan,
+    stock: &mut camlib::stock::Stock,
+) -> (Vec<(camlib::motion::Motion, f64)>, Option<String>) {
+    let cancel = AtomicBool::new(false);
+    let tool = m.tools[0].prepare().unwrap();
+    let mut out = vec![];
+    while let Some(motion) = plan.next_motion_with_stock(stock, &cancel).unwrap() {
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        let cut = d
+            .changes()
+            .iter()
+            .map(|c| c.before.upper_mm - c.after.upper_mm)
+            .fold(0., f64::max);
+        stock.apply_delta(&d).unwrap();
+        out.push((motion, cut));
+    }
+    let motions: Vec<_> = out.iter().map(|(m, _)| m.clone()).collect();
+    let error = stream_error(m, &motions);
+    (out, error)
+}
+/// Top faces of boxes `[x0, y0, x1, y1, top]` with vertical walls down to
+/// the base.
+fn boxes(list: &[[f64; 5]]) -> SurfaceMesh {
+    mesh(
+        list.iter()
+            .flat_map(|&[x0, y0, x1, y1, z]| {
+                let (a, b, c, d) = ([x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]);
+                [[a, b, c], [a, c, d]]
+            })
+            .collect(),
+    )
+}
+fn travels(motion: &camlib::motion::Motion) -> bool {
+    let (a, b) = (motion.curve.start(), motion.curve.end());
+    (a[0] - b[0]).hypot(a[1] - b[1]) > 1e-9
+}
+#[test]
+fn two_islands_are_cut_one_at_a_time() {
+    use camlib::{motion::MoveKind, stock::Stock, waterline::WaterlinePlan};
+    // Two box islands 6 mm apart on the unroughed block, levels 6, 4, 2.5:
+    // each island is one stack, cut top to bottom before the other, so the
+    // cutting moves change island once (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = operation(&m);
+    op.surface = boxes(&[[3., 5., 8., 11., 6.], [14., 5., 19., 11., 6.]]);
+    op.top_z_mm = 6.;
+    let tolerance = op.tolerance_mm;
+    let spec = m.stock.height().unwrap().clone();
+    let mut stock = Stock::new(spec.clone()).unwrap();
+    let mut plan =
+        WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    assert!(error.is_none(), "{error:?}");
+    let report = plan.report();
+    assert_eq!((report.stacks, report.stacks_level_ordered), (2, 0));
+    let islands: Vec<bool> = moves
+        .iter()
+        .filter(|(m, _)| m.kind == MoveKind::Cut)
+        .map(|(m, _)| (m.curve.start()[0] + m.curve.end()[0]) / 2. > 11.)
+        .collect();
+    let switches = islands.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(switches, report.stacks - 1, "cutting moves change island {switches} times");
+    for (motion, cut) in &moves {
+        if motion.kind == MoveKind::Plunge && !travels(motion) {
+            assert!(*cut <= tolerance + 1e-6, "a vertical plunge cut {cut} mm of stock");
+        }
+    }
+}
+#[test]
+fn levels_link_with_a_ramp_that_the_next_level_recuts() {
+    use camlib::{motion::MoveKind, waterline::WaterlinePlan};
+    // One box island (top Z6.3) on roughed stock (to Z6.3 within 1 mm of
+    // it), levels 6, 4 and 2.5 (closed loops): each level is reached from
+    // the one above without a retract - a ramp down along the lower loop
+    // from the upper level, then that loop cut in full over the ramp (#46).
+    // Undeclared, the ramp is one lap; with a declared angle its length is
+    // the level gap over tan(angle).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let angle = 10f64.to_radians();
+    for entry in [None, Some(serde_json::json!({"kind": "ramp", "angle_rad": angle}))] {
+        let mut op = operation(&m);
+        // Every level (6, 4, 2.5) lies beside the box's walls, none on its
+        // top face.
+        op.surface = mesh(box_top(6.3));
+        op.entry = entry.clone().map(|e| serde_json::from_value(e).unwrap());
+        let error_mm = op.contour_error_mm;
+        let (mut stock, spec) = roughed(&m, 1.);
+        let mut plan =
+            WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel)
+                .unwrap();
+        let (moves, error) = trace(&m, &mut plan, &mut stock);
+        assert!(error.is_none(), "{error:?}");
+        let summary: Vec<String> = moves
+            .iter()
+            .map(|(m, cut)| {
+                let (a, b) = (m.curve.start(), m.curve.end());
+                format!("{:?} {:.3}->{:.3} cut {:.3}", m.kind, a[2], b[2], cut)
+            })
+            .filter(|t| !t.starts_with("Cut"))
+            .collect();
+        println!("{entry:?}: {summary:?}");
+        assert_eq!(plan.report().ramp_links, 2, "{entry:?}");
+        let motions: Vec<&camlib::motion::Motion> = moves.iter().map(|(m, _)| m).collect();
+        let mut links = 0;
+        let mut i = 0;
+        while i < motions.len() {
+            // A ramp: a run of travelling plunges; linked when it follows a
+            // cut or a link lead at the level above (not an entry plunge).
+            if !(motions[i].kind == MoveKind::Plunge && travels(motions[i])) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < motions.len() && motions[i].kind == MoveKind::Plunge && travels(motions[i]) {
+                i += 1;
+            }
+            let before = motions[start - 1];
+            if !matches!(before.kind, MoveKind::Cut | MoveKind::Lead) {
+                continue;
+            }
+            links += 1;
+            let (za, zb) = (motions[start].curve.start()[2], motions[i - 1].curve.end()[2]);
+            assert!(za - zb > 1., "ramp from {za} to {zb}");
+            assert_eq!(before.curve.end()[2], za, "the link stays at the upper level");
+            // Monotonic descent along the lower loop.
+            let mut length = 0.;
+            for r in &motions[start..i] {
+                let (a, b) = (r.curve.start(), r.curve.end());
+                assert!(b[2] <= a[2] + 1e-12, "the ramp climbs: {a:?} -> {b:?}");
+                length += (b[0] - a[0]).hypot(b[1] - a[1]);
+            }
+            // The flat lap at the lower level that follows.
+            let lap: Vec<&camlib::motion::Motion> = motions[i..]
+                .iter()
+                .take_while(|m| m.kind == MoveKind::Cut)
+                .copied()
+                .collect();
+            assert!(lap.iter().all(|m| m.curve.start()[2] == zb && m.curve.end()[2] == zb));
+            let lap_length: f64 = lap
+                .iter()
+                .map(|m| {
+                    let (a, b) = (m.curve.start(), m.curve.end());
+                    (b[0] - a[0]).hypot(b[1] - a[1])
+                })
+                .sum();
+            // The flat lap passes over every point of the ramp (overlap).
+            let distance = |p: [f64; 3]| {
+                lap.iter()
+                    .map(|m| {
+                        let (a, b) = (m.curve.start(), m.curve.end());
+                        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                        let l2 = dx * dx + dy * dy;
+                        let t = if l2 > 0. {
+                            (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0., 1.)
+                        } else {
+                            0.
+                        };
+                        (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            };
+            for r in &motions[start..i] {
+                for p in [r.curve.start(), r.curve.end()] {
+                    assert!(
+                        distance(p) <= error_mm + 1e-6,
+                        "ramp point {p:?} is {} from the flat lap",
+                        distance(p)
+                    );
+                }
+            }
+            let expected = match &entry {
+                None => lap_length,
+                Some(_) => (za - zb) / angle.tan(),
+            };
+            assert!(
+                (length - expected).abs() <= 1e-6,
+                "ramp {length} mm, expected {expected} ({entry:?})"
+            );
+            // No retract between the levels.
+            assert!(
+                !motions[start..i]
+                    .iter()
+                    .any(|m| matches!(m.kind, MoveKind::Rapid | MoveKind::Retract))
+            );
+        }
+        assert_eq!(links, 2, "{entry:?}");
+    }
+}
+#[test]
+fn blocked_reorder_falls_back_to_level_order() {
+    use camlib::{
+        motion::WorkFrame,
+        stock::{HeightBounds, InitialStock, Stock},
+        waterline::WaterlinePlan,
+    };
+    // Islands A (near the start) and B, both top Z6.5, levels 6, 4, 2.5,
+    // with a ridge of uncut stock to Z9 between them, beside B's straight
+    // west wall, that only B's own levels cut away. The cutter's flutes are
+    // 4.5 mm long - enough for each island's own walls in any order - but
+    // finishing A first, its shank (from 4.5 mm above the tip) would meet
+    // the ridge at A's level 4, so A's stack falls back to level order and
+    // is finished after B has cut the ridge down (#46). Every move passes
+    // the reach check against the live stock.
+    let mut m = fixture();
+    m.tools[0].cutter.cutting_length_mm = 4.5;
+    let cancel = AtomicBool::new(false);
+    let mut op = operation(&m);
+    op.surface = boxes(&[[2., 5., 6., 11., 6.5], [11., 4., 15., 12., 6.5]]);
+    op.top_z_mm = 6.;
+    let spec = m.stock.height().unwrap().clone();
+    let probe = Stock::new(spec.clone()).unwrap();
+    let [nx, ny] = probe.dimensions();
+    let [wx, wy] = probe.cell_widths_mm();
+    let mut bounds = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+            let over = |a: f64, b: f64, c: f64, d: f64| x0 < b && x0 + wx > a && y0 < d && y0 + wy > c;
+            let top = if over(11., 15., 4., 12.) {
+                6.5
+            } else if over(8.5, 10., 6., 10.) {
+                9.
+            } else if over(2., 6., 5., 11.) {
+                6.5
+            } else {
+                2.
+            };
+            bounds.push(HeightBounds {
+                lower_mm: top,
+                upper_mm: top,
+            });
+        }
+    }
+    let initial = InitialStock {
+        source_id: "ridge".into(),
+        revision: "1".into(),
+        source_sha256: "0".repeat(64),
+        source_to_setup: WorkFrame::identity(),
+        uncertainty_mm: 0.,
+        representation: "whole_cell_top_down".into(),
+        bounds,
+    };
+    let mut stock = Stock::from_initial(spec.clone(), &initial).unwrap();
+    // The stream replays from the same blank (its own reach check is a
+    // second, independent proof of every move).
+    m.initial_stock = Some(initial.clone());
+    let mut plan = WaterlinePlan::prepare_with_stock(
+        op,
+        &m.tools[0],
+        &stock,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    assert!(error.is_none(), "{error:?}");
+    let report = plan.report();
+    println!(
+        "stacks {} level-ordered {} moves {}",
+        report.stacks,
+        report.stacks_level_ordered,
+        moves.len()
+    );
+    assert!(report.reach_proof.is_some(), "the reach check runs");
+    assert_eq!(report.stacks, 2);
+    assert!(report.stacks_level_ordered >= 1);
+}
+#[test]
+fn entries_ramp_instead_of_a_side_lead_into_stock() {
+    use camlib::{motion::MoveKind, waterline::WaterlinePlan};
+    // The plate in a roughed band of stock to Z6.3 within 3 mm of it: a
+    // point beside the wall clear of the band exists, but the lead from it
+    // onto the wall at a level below Z6.3 would run into the band - the tool
+    // coming in from the side into a full cut. The loops enter on a ramp
+    // along themselves instead (#46): no horizontal lead cuts stock deeper
+    // than the tolerance, measured by the sweep on the live stock.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let tolerance = plate(&m).tolerance_mm;
+    let (mut stock, spec) = roughed(&m, 3.);
+    let mut plan =
+        WaterlinePlan::prepare(plate(&m), &m.tools[0], &spec, m.initial_position_mm, 1, &cancel)
+            .unwrap();
+    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    assert!(error.is_none(), "{error:?}");
+    // Entry leads only: a lead right after a vertical plunge. (A link lead
+    // between two levels of an island is a ramp link, bounded by the level
+    // gap like the ramp after it.)
+    let worst = moves
+        .windows(2)
+        .filter(|w| {
+            let (before, lead) = (&w[0].0, &w[1].0);
+            before.kind == MoveKind::Plunge
+                && !travels(before)
+                && lead.kind == MoveKind::Lead
+                && lead.curve.start()[2] == lead.curve.end()[2]
+                && travels(lead)
+        })
+        .map(|w| w[1].1)
+        .fold(0., f64::max);
+    println!(
+        "worst lead cut {worst}, helical {} moved {} links {}",
+        plan.report().helical_entries,
+        plan.report().moved_entries,
+        plan.report().ramp_links
+    );
+    assert!(worst <= tolerance + 1e-6, "a side lead cut {worst} mm of stock");
+    assert!(plan.report().helical_entries >= 1);
+    for (motion, cut) in &moves {
+        if motion.kind == MoveKind::Plunge && !travels(motion) {
+            assert!(*cut <= tolerance + 1e-6, "a vertical plunge cut {cut} mm of stock");
+        }
+    }
+}
+#[test]
+fn declared_ramps_stream_on_a_curved_part() {
+    use camlib::{stock::Stock, waterline::WaterlinePlan};
+    // The faceted cap with a declared 5 degree ramp (#46): a ramp ends
+    // part-way along a loop, sometimes within rounding of a vertex, and the
+    // loops of neighbouring levels can meet within rounding where the link
+    // would be. Every motion must still stream - no sliver shorter than a
+    // motion may be, every motion starting where the last one ended.
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = cap_operation(&m);
+    op.entry = Some(
+        serde_json::from_value(serde_json::json!({"kind": "ramp", "angle_rad": 5f64.to_radians()}))
+            .unwrap(),
+    );
+    let spec = m.stock.height().unwrap().clone();
+    let mut stock = Stock::new(spec.clone()).unwrap();
+    let mut plan =
+        WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel).unwrap();
+    let (moves, error) = trace(&m, &mut plan, &mut stock);
+    println!(
+        "moves {} links {} helical {}",
+        moves.len(),
+        plan.report().ramp_links,
+        plan.report().helical_entries
+    );
+    assert!(error.is_none(), "{error:?}");
+    assert!(plan.report().helical_entries + plan.report().ramp_links > 0);
+    // Every line survives a post at three decimals: a sliver that rounds to
+    // nothing is refused when the posted program is decoded.
+    let round = |p: [f64; 3]| p.map(|v| (v * 1000.).round() as i64);
+    for (motion, _) in &moves {
+        if let camlib::motion::Curve::Line { start, end } = motion.curve {
+            assert_ne!(round(start), round(end), "{:?} {start:?} -> {end:?} rounds to nothing", motion.kind);
+        }
+    }
 }

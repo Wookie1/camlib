@@ -1976,34 +1976,55 @@ report's `shadow_error_mm` is the largest such error over the levels cut.
 `contour_error_mm`; `reverse` cuts the contours the other way;
 `safety_margin_mm` and `stock_to_leave_mm` work as for `Parallel`.
 
-A ball's contour is never entered by plunging into material: the entry is
-chosen from the live stock so the ball's tip never lands on the wall (it used
-to drop on the surface, up to 1.9 mm axially into stock). First the side
-entry: the nearest point, starting `max(r/2, 1)` mm from the loop and stepping
-out by that much up to 4 cutter radii, on either side of the loop's tangent,
-where the lead to the contour is clear of the surface, the machining limits
-allow the plunge and the lead, and the stock under the ball (the upper bound
-of every cell its disk can touch) is at or below the height it plunges to. The
-given start is tried first, so loops that enter cleanly today are unchanged; a
-closed loop with no clear entry beside its start is then sampled along its
-whole length at the same spacing and its start moves to the first clear sample
-(order and direction stay); open loops (runs the slope or region limits cut
-out of a contour) keep their start. Loops whose start moved are counted in the
-report's `moved_entries`. A loop with no clear point beside it anywhere is
-entered on a one-lap helix along itself: the ball plunges at the loop start to
-the lowest height the stock under it there is clear at (at most the feed
-height, so the plunge is in air), then one lap descends along the loop to the
-level and the loop is cut flat; these are counted in the report's
-`helical_entries` and warned about (`CamWarning`), since they gather exactly
-where roughing or rest-roughing is still needed. If neither entry exists the
-operation is refused, naming the level and the XY: rough or rest-rough there
-first. The `waterline`, `waterline-dense` and `steep-and-shallow`
-benchmarks run on blanks roughed to 0.1 to 0.3 mm over the part.
+Ball end mills cut one island at a time, top to bottom (#46). Every level is
+contoured first; its contours (and the runs the in-between levels, slope or
+region limits keep) are grouped into stacks: going down, a contour joins the
+stack whose contour at that stack's latest level it overlaps (islands grow
+downward, holes shrink), a contour overlapping none starts a stack, and one
+overlapping several merges them into a new stack cut after them. The tool
+finishes a stack before moving to the nearest next one. Where cutting a stack
+top to bottom would make a move fail the neck, shank or holder reach check
+against the live stock - typically a neighbour's uncut stock the shank would
+meet - that stack is deferred and finished last, level by level; the report's
+`stacks` and `stacks_level_ordered` count them. No check is relaxed to keep
+an order.
+
+Within a stack, a closed loop below a closed loop is reached without a
+retract: a short link at the upper level to the nearest point of the lower
+loop, a ramp down along that loop to its level, then the whole loop cut flat
+from where the ramp ends, so the flat lap passes over the entire ramp again.
+The ramp is one lap, or with `entry=RampEntry(angle_deg=...)` the level gap
+over the tangent of the angle (at most one lap), at the entry's feed (default
+the plunge feed). The link, the ramp and the loop are proven clear of the
+part like every waterline move; a link is taken only where it meets no more
+stock than the level gap the ramp descends (measured on the stock grid),
+otherwise the loop is entered as below. The report's `ramp_links` counts the
+linked levels.
+
+A loop the tool is not already at - the first of a stack, an open run, or a
+loop a link could not reach - is entered after a retract, never by coming in
+from the side into a full cut and never by plunging into material: a side
+entry (a plunge beside the loop, at the nearest point `max(r/2, 1)` mm out and
+on up to 4 cutter radii on either side of its tangent, then a horizontal lead
+onto it) only where the stock under the ball there is at or below the level
+and the whole lead meets no stock above the level - pure air; a closed loop
+with no such point beside its start is sampled along its whole length and its
+start moves to the first one (`moved_entries`). Otherwise the ball plunges at
+the loop start to the lowest height the stock under it there is clear at (at
+most the feed height, so in air) and ramps down along the loop to the level -
+one lap or the declared angle as above; an open run goes along itself to half
+the depth and back to its start - then cuts it (`helical_entries`). If no
+entry exists the operation is refused, naming the level and the XY: rough or
+rest-rough there first. The `waterline`, `waterline-dense` and
+`steep-and-shallow` benchmarks run on blanks roughed to 0.1 to 0.3 mm over
+the part.
 
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along
 its contour from the level above, instead of a flat lap and a step down; the
 lowest level is then cut once more flat. Each ramp follows a contour proven
-clear at its own level and stays above that level, so it cannot gouge.
+clear at its own level and stays above that level, so it cannot gouge. For
+ball end mills this is what the linking above already does for every island,
+so `ramp=True` changes nothing there; flat and bull-nose end mills keep it.
 
 In-between levels: between two main levels a ball end mill's plan adds
 sub-levels where the main levels are too far apart along the surface (on a

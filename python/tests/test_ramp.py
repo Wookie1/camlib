@@ -57,7 +57,15 @@ class RampTest(unittest.TestCase):
                             self.assertGreaterEqual(sim.state.heights[2 * i + 1], min(target(x0), target(x1)))
                 self.assertNotIn("violation", statuses)
                 cuts = [m for m in moves if m["kind"] == "cut"]
-                ramps = [m for m in cuts if m["curve"]["start"][2] > m["curve"]["end"][2]]
+                # A ball's ramps link its levels along the contours (#46): plunge
+                # moves at the ramp feed, travelling as they descend.
+                ramps = [
+                    m
+                    for m in moves
+                    if m["kind"] in ("cut", "plunge")
+                    and m["curve"]["start"][2] > m["curve"]["end"][2]
+                    and m["curve"]["start"][:2] != m["curve"]["end"][:2]
+                ]
                 self.assertTrue(ramps)
                 # Ramps never climb, and the lowest level is finished flat.
                 self.assertFalse(any(m["curve"]["end"][2] > m["curve"]["start"][2] for m in cuts))

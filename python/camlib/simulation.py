@@ -2158,18 +2158,6 @@ class Simulation:
                             CamWarning,
                             stacklevel=2,
                         )
-                    helical_entries = data["report"].get("helical_entries")
-                    if helical_entries:
-                        # Waterline: loops with no stock-free point beside them
-                        # enter on a one-lap helix along themselves (the report's
-                        # helical_entries); rough or rest-rough where they gather.
-                        warnings.warn(
-                            f"operation {active!r} entered {helical_entries} loop(s) on a helix: the stock stands "
-                            "above the level on every side of the loop, so the entry descends along it. Rough or "
-                            "rest-rough that area first",
-                            CamWarning,
-                            stacklevel=2,
-                        )
                     active, completed_operations = None, completed_operations + 1
                 elif data["stage"] == "events":
                     # Mid-operation events (a dwell at the bottom of a hole),

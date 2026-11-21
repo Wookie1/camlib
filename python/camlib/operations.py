@@ -51,10 +51,18 @@ class Waterline:
     feed_z_mm: float | None = None
     # Ramp: descend continuously along each level's contour from the level
     # above, instead of cutting each level flat (finished by one flat lap).
+    # Ball end mills already reach every level of an island by a ramp along
+    # its contour from the level above (#46), so this changes nothing there.
     ramp: bool = False
+    # Ball end mills (#46): RampEntry(angle_deg=..., feed_mm_min=...) sets how
+    # steep the ramp a level is reached by may be (at most one lap; deeper
+    # steps descend steeper) and its feed. None: one lap per ramp, at the
+    # plunge feed. Only RampEntry is accepted.
+    entry: object | None = None
 
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
+        _entry_dict(result)
         result.update(
             kind="waterline",
             tool=getattr(self.tool, "id", self.tool),

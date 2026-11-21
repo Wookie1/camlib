@@ -3,7 +3,7 @@
 use crate::{
     Point,
     finishing::{FinishingStockTop, StockCeiling},
-    motion::{Coolant, Motion, MoveKind, Vec3},
+    motion::{Coolant, Curve, Motion, MoveKind, Vec3},
     pocket::{ResidualStatus, Stroke},
     profiles::{ProfileDepths, ProfileMotion, ProfileSettings, stroke_length},
     roughing::PreparedRoughingTarget,
@@ -643,9 +643,20 @@ pub struct WaterlineOperation<G = SurfaceMesh> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<crate::limits::Limits>,
     /// Descend continuously along each level's contour from the level above
-    /// (the lowest level is then cut once more flat).
+    /// (the lowest level is then cut once more flat). Ball end mills: every
+    /// level of an island is already reached by a ramp along its own contour
+    /// from the level above (#46), so this changes nothing there; flat and
+    /// bull-nose end mills keep this behaviour.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ramp: bool,
+    /// Ball end mills (#46): the ramp a level is reached by, along its own
+    /// contour - from the level above it, or from the height the stock is
+    /// clear at when the tool comes down to an island - descends at no more
+    /// than this angle, at its feed (default the plunge feed); the ramp is at
+    /// most one lap, so a deeper step descends steeper. Only `RampEntry`
+    /// (kind "ramp"). None: one lap per ramp, at the plunge feed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<crate::entry::PocketEntry>,
 }
 impl<G> WaterlineOperation<G> {
     pub(crate) fn map_geometry<H, E>(
@@ -654,6 +665,7 @@ impl<G> WaterlineOperation<G> {
     ) -> Result<WaterlineOperation<H>, E> {
         Ok(WaterlineOperation {
             ramp: self.ramp,
+            entry: self.entry,
             limits: self.limits,
             contour_method: self.contour_method,
             id: self.id,
@@ -758,6 +770,21 @@ pub struct WaterlineReport {
     /// loop has a proven side entry.
     #[serde(skip_serializing_if = "is_zero")]
     pub helical_entries: usize,
+    /// Ball end mills (#46): the islands (stacks of contours, one per
+    /// connected wall region, a merge starting a new one) cut top to bottom
+    /// one at a time.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub stacks: usize,
+    /// Stacks whose top-to-bottom order a proof refused (the shank or holder
+    /// would meet stock a neighbour still carries): they were finished last,
+    /// level by level.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub stacks_level_ordered: usize,
+    /// Levels reached from the level above without a retract: a short link
+    /// at the upper level to the lower contour, then a ramp down along it,
+    /// then the lower contour cut in full over the ramp.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ramp_links: usize,
     pub cut_segments: usize,
     pub loops_completed: usize,
     pub requested_bottom_z_mm: f64,
@@ -818,6 +845,12 @@ pub struct WaterlinePlan {
     limits: Option<(f64, f64)>,
     /// Machining limits (containment, avoid areas).
     region_limits: Option<crate::limits::PreparedLimits>,
+    /// The declared ramp (#46): its angle sets how long a ramp along a
+    /// contour is (at most one lap), its feed the ramp's feed.
+    ramp_entry: Option<crate::entry::RampEntry>,
+    /// Ball end mills (#46): every level's pieces grouped into stacks, and
+    /// the moves of the piece being cut. Built on the first motion.
+    emission: Option<Emission>,
 }
 fn is_zero(n: &usize) -> bool {
     *n == 0
@@ -903,6 +936,264 @@ struct LevelSlot {
     keep_below: f64,
 }
 
+/// One piece a ball waterline level cuts (#46): a closed loop or an open run
+/// at tip height `z`, and the closed contour (`ring`) it was cut from.
+struct Piece {
+    z: f64,
+    ring: usize,
+    closed: bool,
+    strokes: Vec<Stroke>,
+}
+/// One island's (or hole's) pieces, top to bottom (#46), cut after its
+/// parents (the stacks a merged contour joins).
+struct Stack {
+    pieces: Vec<usize>,
+    parents: Vec<usize>,
+    next: usize,
+    deferred: bool,
+}
+impl Stack {
+    fn done(&self) -> bool {
+        self.next == self.pieces.len()
+    }
+}
+/// A move waiting to be handed out: curve, kind and feed (None: rapid).
+type Queued = (Curve, MoveKind, Option<f64>);
+/// A piece's moves, and (ramp link, moved entries, helical entries).
+type Job = (Vec<Queued>, (bool, usize, usize));
+/// Ball end mills (#46): the pieces of every level in stacks, the stack
+/// being cut, the piece just cut (the tool stands at its end), whether the
+/// emitter has fallen back to level order, and the moves of the piece being
+/// cut.
+struct Emission {
+    pieces: Vec<Piece>,
+    stacks: Vec<Stack>,
+    current: Option<usize>,
+    last: Option<usize>,
+    level_order: bool,
+    queue: VecDeque<Queued>,
+    finished: bool,
+}
+/// Groups the pieces into stacks (#46): top-down over the levels, a contour
+/// joins the stack whose contour at that stack's latest level it overlaps
+/// (islands grow downward, holes shrink); a contour overlapping none starts
+/// a stack, and one overlapping several starts a new stack cut after them
+/// (a merge). Pieces keep their level order within a stack.
+fn build_stacks(rings: &[Vec<[f64; 2]>], ring_slots: &[usize], pieces: &[Piece]) -> Vec<Stack> {
+    let boxes: Vec<[f64; 4]> = rings.iter().map(|r| ring_box(r)).collect();
+    let mut has_piece = vec![false; rings.len()];
+    for p in pieces {
+        has_piece[p.ring] = true;
+    }
+    let mut stacks: Vec<Stack> = vec![];
+    let mut frontier: Vec<Vec<usize>> = vec![];
+    let mut ring_stack = vec![usize::MAX; rings.len()];
+    let mut i = 0;
+    while i < rings.len() {
+        let mut j = i;
+        while j < rings.len() && ring_slots[j] == ring_slots[i] {
+            j += 1;
+        }
+        let mut joined: Vec<(usize, usize)> = vec![];
+        let mut merged: Vec<usize> = vec![];
+        for r in (i..j).filter(|&r| has_piece[r]) {
+            let hits: Vec<usize> = (0..stacks.len())
+                .filter(|&s| {
+                    frontier[s]
+                        .iter()
+                        .any(|&f| rings_overlap(&rings[f], &boxes[f], &rings[r], &boxes[r]))
+                })
+                .collect();
+            let s = if hits.len() == 1 {
+                hits[0]
+            } else {
+                stacks.push(Stack {
+                    pieces: vec![],
+                    parents: hits.clone(),
+                    next: 0,
+                    deferred: false,
+                });
+                frontier.push(vec![]);
+                merged.extend(hits);
+                stacks.len() - 1
+            };
+            ring_stack[r] = s;
+            joined.push((s, r));
+        }
+        let mut touched: Vec<usize> = joined.iter().map(|&(s, _)| s).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        for &s in &touched {
+            frontier[s] = joined
+                .iter()
+                .filter(|&&(t, _)| t == s)
+                .map(|&(_, r)| r)
+                .collect();
+        }
+        for s in merged {
+            if !touched.contains(&s) {
+                frontier[s].clear();
+            }
+        }
+        i = j;
+    }
+    for (k, p) in pieces.iter().enumerate() {
+        stacks[ring_stack[p.ring]].pieces.push(k);
+    }
+    stacks
+}
+fn ring_box(ring: &[[f64; 2]]) -> [f64; 4] {
+    ring.iter().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |b, p| {
+            [
+                b[0].min(p[0]),
+                b[1].min(p[1]),
+                b[2].max(p[0]),
+                b[3].max(p[1]),
+            ]
+        },
+    )
+}
+/// Even-odd point-in-polygon test of a closed ring.
+fn point_in_ring(p: [f64; 2], ring: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    for (a, b) in ring
+        .iter()
+        .zip(ring.iter().cycle().skip(1))
+        .take(ring.len())
+    {
+        if (a[1] > p[1]) != (b[1] > p[1])
+            && p[0] < a[0] + (p[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let cross = |o: [f64; 2], p: [f64; 2], q: [f64; 2]| {
+        (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+    };
+    let (d1, d2) = (cross(c, d, a), cross(c, d, b));
+    let (d3, d4) = (cross(a, b, c), cross(a, b, d));
+    (d1 > 0.) != (d2 > 0.) && (d3 > 0.) != (d4 > 0.)
+}
+/// Whether two closed contours' regions overlap: one contains a vertex of
+/// the other, or their edges cross.
+fn rings_overlap(a: &[[f64; 2]], ba: &[f64; 4], b: &[[f64; 2]], bb: &[f64; 4]) -> bool {
+    if ba[0] > bb[2] || bb[0] > ba[2] || ba[1] > bb[3] || bb[1] > ba[3] {
+        return false;
+    }
+    if point_in_ring(a[0], b) || point_in_ring(b[0], a) {
+        return true;
+    }
+    a.iter()
+        .zip(a.iter().cycle().skip(1))
+        .take(a.len())
+        .any(|(p, q)| {
+            b.iter()
+                .zip(b.iter().cycle().skip(1))
+                .take(b.len())
+                .any(|(r, s)| segments_cross(*p, *q, *r, *s))
+        })
+}
+/// The arc length and point of a loop (lines) nearest to `p`.
+fn nearest_on_loop(edges: &[Stroke], p: [f64; 2]) -> (f64, [f64; 2]) {
+    let mut best = (f64::INFINITY, 0., edges[0].a);
+    let mut acc = 0.;
+    for e in edges {
+        let l = stroke_length(e);
+        let (a, b) = (e.a, e.b);
+        let t = if l > 0. {
+            (((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / (l * l))
+                .clamp(0., 1.)
+        } else {
+            0.
+        };
+        let q = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+        let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+        if d < best.0 {
+            best = (d, acc + t * l, q);
+        }
+        acc += l;
+    }
+    (best.1, best.2)
+}
+/// A ramp along a loop from its start, `length` long, descending linearly
+/// from `from` to `to` (#46); it ends exactly at `to`.
+fn ramp_curves(edges: &[Stroke], from: f64, to: f64, length: f64) -> Vec<Curve> {
+    let mut out = vec![];
+    let mut acc = 0.;
+    for e in edges {
+        let l = stroke_length(e);
+        if l <= 0. {
+            continue;
+        }
+        let s1 = (acc + l).min(length);
+        let t = (s1 - acc) / l;
+        let mut q = [
+            e.a[0] + t * (e.b[0] - e.a[0]),
+            e.a[1] + t * (e.b[1] - e.a[1]),
+        ];
+        // Snapped like `rotate_loop` snaps its split: the flat lap that
+        // follows starts exactly where the ramp ends.
+        if (q[0] - e.b[0]).hypot(q[1] - e.b[1]) <= 1e-9 {
+            q = e.b;
+        }
+        let z0 = from + (to - from) * acc / length;
+        let z1 = from + (to - from) * s1 / length;
+        out.push(Curve::Line {
+            start: [e.a[0], e.a[1], z0],
+            end: [q[0], q[1], z1],
+        });
+        acc += l;
+        if acc >= length {
+            break;
+        }
+    }
+    if let Some(Curve::Line { end, .. }) = out.last_mut() {
+        end[2] = to;
+    }
+    out
+}
+/// How near a vertex of a loop a split (where a ramp ends, where a link
+/// meets the loop, where a moved start lies) is moved onto it (#46): a
+/// sliver shorter than this rounds to nothing in a program posted at three
+/// decimals (0.0005 mm), and nothing so short is worth a move.
+const SNAP_MM: f64 = 0.005;
+/// An arc length along a loop moved onto a vertex when within `SNAP_MM` of
+/// one: the ramp then ends, and the flat lap after it starts, exactly at
+/// that vertex, never leaving a sliver no post can express.
+fn snap_to_vertex(edges: &[Stroke], length: f64) -> f64 {
+    let mut acc = 0.;
+    for e in edges {
+        if (length - acc).abs() <= SNAP_MM {
+            return acc;
+        }
+        acc += stroke_length(e);
+    }
+    if (length - acc).abs() <= SNAP_MM {
+        acc
+    } else {
+        length
+    }
+}
+/// A closed loop cut flat at `z` once round, from arc length `s` (where a
+/// ramp along it ended) back to `s`: the lap passes over the ramp again.
+fn flat_lap(edges: &[Stroke], s: f64, z: f64) -> Vec<Curve> {
+    let total: f64 = edges.iter().map(stroke_length).sum();
+    let mut lap = edges.to_vec();
+    if s > 1e-9 && s < total - 1e-9 {
+        rotate_loop(&mut lap, s);
+    }
+    lap.iter().map(|e| e.curve(z)).collect()
+}
 impl WaterlinePlan {
     pub fn prepare_with_stock(
         op: WaterlineOperation,
@@ -999,6 +1290,19 @@ impl WaterlinePlan {
             .filter(|l| !l.is_empty())
             .map(|l| crate::limits::PreparedLimits::new(l, radius, op.tolerance_mm))
             .transpose()?;
+        let ramp_entry = match &op.entry {
+            None => None,
+            Some(crate::entry::PocketEntry::Ramp(r)) => {
+                r.validate(op.tolerance_mm, op.plunge_mm_min)?;
+                Some(r.clone())
+            }
+            Some(_) => {
+                return Err(format!(
+                    "waterline operation {}: only a ramp entry (RampEntry) is accepted: a ball waterline reaches every level by a ramp or helix along its own contour",
+                    op.id
+                ));
+            }
+        };
         crate::heights::require(
             "waterline",
             [
@@ -1306,6 +1610,9 @@ impl WaterlinePlan {
             scallop_from_deg,
             moved_entries: 0,
             helical_entries: 0,
+            stacks: 0,
+            stacks_level_ordered: 0,
+            ramp_links: 0,
             cut_segments: 0,
             loops_completed: 0,
             requested_bottom_z_mm: op.bottom_z_mm,
@@ -1352,6 +1659,8 @@ impl WaterlinePlan {
             region_limits,
             flat_target,
             flat_corner,
+            ramp_entry,
+            emission: None,
         })
     }
     fn contour_options(&self, z: f64) -> ContourOptions {
@@ -1452,6 +1761,9 @@ impl WaterlinePlan {
         if let Some(ceiling) = &mut self.stock_ceiling {
             ceiling.validate(stock, cancel)?;
         }
+        if self.flat_target.is_none() {
+            return self.next_ball_motion(stock, cancel);
+        }
         loop {
             cancelled(cancel)?;
             if self.next_id == u64::MAX {
@@ -1485,8 +1797,6 @@ impl WaterlinePlan {
                 self.drained = true;
                 return Ok(None);
             }
-            let depth = self.schedule[self.slot].depth;
-            let keep_below = self.schedule[self.slot].keep_below;
             if let Some(target) = &self.flat_target {
                 let z = self.schedule[self.slot].z;
                 let (mut loops, error) = flat_level_loops(
@@ -1535,6 +1845,22 @@ impl WaterlinePlan {
                 self.profile = Some(profile);
                 continue;
             }
+            unreachable!("ball end mills are planned by next_ball_motion");
+        }
+    }
+    /// Ball end mills (#46): every level's contours as the pieces the level
+    /// cuts - closed loops, or the runs the in-between levels, slope and
+    /// region limits keep - each tied to the closed contour it was cut from,
+    /// grouped into stacks (`build_stacks`). Fills the per-level report
+    /// fields as the levels are contoured.
+    fn plan_pieces(&mut self, cancel: &impl CancelSignal) -> Result<Emission, String> {
+        let mut rings: Vec<Vec<[f64; 2]>> = vec![];
+        let mut ring_slots: Vec<usize> = vec![];
+        let mut pieces: Vec<Piece> = vec![];
+        while self.slot < self.schedule.len() {
+            cancelled(cancel)?;
+            let depth = self.schedule[self.slot].depth;
+            let keep_below = self.schedule[self.slot].keep_below;
             let contours = self.next_contours(cancel)?;
             let z = contours.report.tip_z_mm;
             let work = sum(self.report.work, contours.report.work);
@@ -1547,19 +1873,23 @@ impl WaterlinePlan {
                 .certificate_nodes
                 .saturating_add(contours.report.certificate_nodes);
             let mut slope_work = SurfaceWork::default();
-            let mut loops: Vec<Vec<Stroke>> = vec![];
+            let mut loops: Vec<(usize, Vec<Stroke>)> = vec![];
             for mut ring in contours.loops {
                 if self.op.reverse {
                     ring.reverse();
                 }
+                let owner = rings.len();
+                rings.push(ring.clone());
+                ring_slots.push(self.slot);
                 if depth == 0 && self.limits.is_none() && self.region_limits.is_none() {
-                    loops.push(
+                    loops.push((
+                        owner,
                         ring.iter()
                             .zip(ring.iter().cycle().skip(1))
                             .take(ring.len())
                             .map(|(a, b)| Stroke::line(*a, *b))
                             .collect(),
-                    );
+                    ));
                     continue;
                 };
                 let mut closed = ring.clone();
@@ -1615,13 +1945,14 @@ impl WaterlinePlan {
                     && runs[0].last() == closed.last();
                 if whole {
                     // Entirely within the limits: keep the original contour.
-                    loops.push(
+                    loops.push((
+                        owner,
                         ring.iter()
                             .zip(ring.iter().cycle().skip(1))
                             .take(ring.len())
                             .map(|(a, b)| Stroke::line(*a, *b))
                             .collect(),
-                    );
+                    ));
                     continue;
                 }
                 if runs.len() >= 2
@@ -1633,52 +1964,54 @@ impl WaterlinePlan {
                     runs.last_mut().unwrap().extend(first.into_iter().skip(1));
                 }
                 loops.extend(runs.into_iter().map(|run| {
-                    run.windows(2)
-                        .map(|w| Stroke::line(w[0], w[1]))
-                        .collect::<Vec<_>>()
+                    (
+                        owner,
+                        run.windows(2)
+                            .map(|w| Stroke::line(w[0], w[1]))
+                            .collect::<Vec<_>>(),
+                    )
                 }));
             }
             let work = sum(work, slope_work);
-            let empty = loops.is_empty();
             cancelled(cancel)?;
             self.report.work = work;
             self.report.certificate_tests = certificates;
             self.report.certificate_nodes = certificate_nodes;
             // These keep their meaning for main levels only (#46); an
-            // in-between level still adds its contour work and certificates
-            // above.
+            // in-between level still adds its contour work and
+            // certificates above.
             if depth == 0 {
                 self.report.last_level_z_mm = Some(z);
                 self.report.level_reports.push(contours.report);
             }
-            if empty {
-                self.slot += 1;
+            if loops.is_empty() {
                 if depth == 0 {
                     self.report.empty_levels += 1;
                     self.report.levels_completed += 1;
                 }
-                continue;
+            } else if depth == 0 {
+                self.report.levels_completed += 1;
+            } else {
+                self.report.scallop_levels += 1;
             }
-            let (ramp_from, passes) = self.ramp_setup(self.slot);
-            let plunge_z = ramp_from.map_or(z, |from| from.max(z));
-            let (entry_points, helix, moved, entered) =
-                self.entries(stock, &mut loops, z, plunge_z, cancel)?;
-            self.report.moved_entries += moved;
-            self.report.helical_entries += entered;
-            let mut profile = ProfileMotion::new(
-                self.op.settings(),
-                &self.spec,
-                self.position,
-                loops,
-                ProfileDepths::Fixed { z },
-                passes,
-                self.next_id,
-            );
-            profile.ramp_from = ramp_from;
-            profile.entry_points = entry_points;
-            profile.helix_entries = helix;
-            self.profile = Some(profile);
+            pieces.extend(loops.into_iter().map(|(ring, strokes)| Piece {
+                z,
+                ring,
+                closed: crate::profiles::loop_closes(&strokes),
+                strokes,
+            }));
+            self.slot += 1;
         }
+        let stacks = build_stacks(&rings, &ring_slots, &pieces);
+        Ok(Emission {
+            pieces,
+            stacks,
+            current: None,
+            last: None,
+            level_order: false,
+            queue: std::collections::VecDeque::new(),
+            finished: false,
+        })
     }
     /// Per loop an entry that never plunges into stock (#46): a point beside
     /// the loop where the ball plunges before a horizontal lead onto it - the
@@ -1760,7 +2093,7 @@ impl WaterlinePlan {
                             stock, q, t, center, plunge_z, step, reach, &mut work, cancel,
                         )?;
                         if found.is_some() {
-                            rotate_loop(edges, s);
+                            rotate_loop(edges, snap_to_vertex(edges, s));
                             break;
                         }
                     }
@@ -1787,7 +2120,6 @@ impl WaterlinePlan {
                 ));
             }
             let zc = top.max(z).min(feed);
-            self.helix_clear(edges, z, zc, &mut work, cancel)?;
             entered += 1;
             points.push(None);
             helix.push(Some(zc));
@@ -1836,6 +2168,14 @@ impl WaterlinePlan {
                 if top > plunge_z + self.op.tolerance_mm {
                     continue;
                 }
+                // The lead onto the loop is pure air: it meets no stock above
+                // the level (#46), so the tool never comes in from the side
+                // into a full cut.
+                if self.stock_met(stock, [p[0], p[1], plunge_z], start, plunge_z, work, cancel)?
+                    > self.op.tolerance_mm
+                {
+                    continue;
+                }
                 if let Some(limits) = &self.region_limits {
                     let lead = crate::motion::Curve::Line {
                         start: [p[0], p[1], plunge_z],
@@ -1860,77 +2200,513 @@ impl WaterlinePlan {
         }
         Ok(None)
     }
-    /// The part-clearance proof of a helix entry (#46): the ball centre
-    /// along the plunge at the loop start and along every move of the
-    /// descending lap keeps the distance from the part that the loop's own
-    /// moves keep (`protected`). The lap descends linearly from `zc` at the
-    /// loop start to `z` at the lap end, the ramp `tabbed_loop` cuts. An
-    /// open run descends along itself to half the depth and back along
-    /// itself to `z`, ending at its start (ProfileMotion's helix entry): both
-    /// legs are proven.
-    fn helix_clear(
-        &self,
-        edges: &[Stroke],
-        z: f64,
-        zc: f64,
-        work: &mut SurfaceWork,
+    /// Ball end mills (#46): the next motion. On the first call every level is
+    /// contoured and its pieces grouped into stacks (`plan_pieces`); then one
+    /// job per piece is built against the live stock right before it is cut
+    /// (`job`) and its moves handed out one by one.
+    fn next_ball_motion(
+        &mut self,
+        stock: &Stock,
         cancel: &impl CancelSignal,
-    ) -> Result<(), String> {
-        let start = edges[0].curve(z).start();
-        if !self.surface.segment_clear(
-            [
-                start[0],
-                start[1],
-                self.op.settings().heights.feed + self.radius,
-            ],
-            [start[0], start[1], zc + self.radius],
-            self.protected,
-            work,
-            cancel,
-        )? {
-            return Err(format!(
-                "the plunge at the start to Z{zc:.4} is not clear of the part"
-            ));
+    ) -> Result<Option<Motion>, String> {
+        if self.emission.is_none() {
+            let emission = self.plan_pieces(cancel)?;
+            self.report.stacks = emission.stacks.len();
+            self.emission = Some(emission);
         }
-        let legs: Vec<(Vec<Stroke>, f64, f64)> = if crate::profiles::loop_closes(edges) {
-            vec![(edges.to_vec(), zc, z)]
-        } else {
-            let mid = (zc + z) / 2.;
-            let back = edges.iter().rev().map(|e| e.reversed()).collect();
-            vec![(edges.to_vec(), zc, mid), (back, mid, z)]
-        };
-        for (leg, from, to) in legs {
-            let total: f64 = leg.iter().map(stroke_length).sum();
-            let base = |s: f64| {
-                if total > 0. {
-                    from + (to - from) * s / total
-                } else {
-                    from
+        loop {
+            cancelled(cancel)?;
+            if self.next_id == u64::MAX {
+                return Err("waterline motion id space exhausted".into());
+            }
+            let emission = self.emission.as_mut().unwrap();
+            if let Some((curve, kind, feed)) = emission.queue.pop_front() {
+                if let Some(motion) = self.emit(curve, kind, feed, stock, cancel)? {
+                    return Ok(Some(motion));
                 }
-            };
-            let mut acc = 0.;
-            for e in &leg {
-                let l = stroke_length(e);
-                if l > 0. {
-                    let c = e.curve(z);
-                    let (a, b) = (c.start(), c.end());
-                    if !self.surface.segment_clear(
-                        [a[0], a[1], base(acc) + self.radius],
-                        [b[0], b[1], base(acc + l) + self.radius],
-                        self.protected,
-                        work,
-                        cancel,
-                    )? {
-                        return Err(format!(
-                            "the helix lap is not clear of the part at ({:.4}, {:.4})",
-                            a[0], a[1]
-                        ));
-                    }
+                continue;
+            }
+            if emission.finished {
+                self.drained = true;
+                return Ok(None);
+            }
+            match self.next_job(stock, cancel)? {
+                Some(moves) => self.emission.as_mut().unwrap().queue.extend(moves),
+                None => {
+                    let cut = self.emission.as_ref().unwrap().last.is_some();
+                    let moves = if cut { self.leave(true) } else { vec![] };
+                    let emission = self.emission.as_mut().unwrap();
+                    emission.queue.extend(moves);
+                    emission.finished = true;
                 }
-                acc += l;
             }
         }
-        Ok(())
+    }
+    /// One queued move as a motion (none for a zero-length line), checked for
+    /// the neck, shank and holder reach like every waterline feed move.
+    fn emit(
+        &mut self,
+        curve: Curve,
+        kind: MoveKind,
+        feed: Option<f64>,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Motion>, String> {
+        if matches!(curve, Curve::Line { start, end } if start == end) {
+            return Ok(None);
+        }
+        curve.prepare(self.op.tolerance_mm)?;
+        let motion = Motion {
+            id: self.next_id,
+            operation: self.op.id.clone(),
+            tool: self.op.tool.clone(),
+            kind,
+            curve,
+            feed_mm_min: feed,
+        };
+        if let Some(depth) = &self.move_depth {
+            depth.check(&motion, stock, cancel)?;
+        }
+        self.position = motion.curve.end();
+        self.next_id = motion.id + 1;
+        self.expected_generation = Some(stock.generation() + 1);
+        self.report.cut_segments += usize::from(motion.kind == MoveKind::Cut);
+        Ok(Some(motion))
+    }
+    /// The next piece's moves (#46), or None when every piece is cut. A
+    /// stack is cut top to bottom; the next stack is the nearest one whose
+    /// parents are done. If a job's moves would fail the reach check against
+    /// the live stock (the neck, shank or holder would meet stock a
+    /// neighbour still carries), its stack is deferred - the job is not cut -
+    /// and the deferred stacks are finished last, level by level: the
+    /// highest next piece whose job passes the check (the nearest of equal
+    /// height first); when none passes, the highest is cut and its failing
+    /// move refused as before.
+    fn next_job(
+        &mut self,
+        stock: &Stock,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Vec<Queued>>, String> {
+        loop {
+            let candidates = self.pick();
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            let level_order = candidates[0].2;
+            let mut chosen = None;
+            for &(s, k, _) in &candidates {
+                let job = self.job(stock, s, k, cancel)?;
+                if self.reach_refused(&job.0, stock, cancel) {
+                    if !level_order {
+                        let emission = self.emission.as_mut().unwrap();
+                        emission.stacks[s].deferred = true;
+                        emission.current = None;
+                        self.report.stacks_level_ordered += 1;
+                        break;
+                    }
+                    continue;
+                }
+                chosen = Some((s, k, job));
+                break;
+            }
+            if chosen.is_none() && level_order {
+                let (s, k, _) = candidates[0];
+                chosen = Some((s, k, self.job(stock, s, k, cancel)?));
+            }
+            let Some((s, k, (moves, counts))) = chosen else {
+                continue;
+            };
+            self.report.ramp_links += usize::from(counts.0);
+            self.report.moved_entries += counts.1;
+            self.report.helical_entries += counts.2;
+            self.report.loops_completed += 1;
+            let emission = self.emission.as_mut().unwrap();
+            emission.stacks[s].next += 1;
+            emission.current = Some(s);
+            emission.last = Some(k);
+            emission.level_order = level_order;
+            return Ok(Some(moves));
+        }
+    }
+    /// Whether any feed move of a job would fail the reach check against the
+    /// live stock (always false when the check does not run).
+    fn reach_refused(&self, moves: &[Queued], stock: &Stock, cancel: &impl CancelSignal) -> bool {
+        let Some(depth) = &self.move_depth else {
+            return false;
+        };
+        moves.iter().any(|(curve, kind, feed)| {
+            feed.is_some()
+                && depth
+                    .check(
+                        &Motion {
+                            id: 0,
+                            operation: self.op.id.clone(),
+                            tool: self.op.tool.clone(),
+                            kind: *kind,
+                            curve: curve.clone(),
+                            feed_mm_min: *feed,
+                        },
+                        stock,
+                        cancel,
+                    )
+                    .is_err()
+        })
+    }
+    /// The stacks and pieces to try next, and whether they are cut in level
+    /// order (deferred stacks). The current stack continues while it has
+    /// pieces; otherwise the nearest ready stack (its parents done); then the
+    /// deferred stacks, highest next piece first (the nearest of equal
+    /// height first).
+    fn pick(&self) -> Vec<(usize, usize, bool)> {
+        let Some(e) = self.emission.as_ref() else {
+            return vec![];
+        };
+        let ready = |s: usize| {
+            !e.stacks[s].done() && e.stacks[s].parents.iter().all(|&p| e.stacks[p].done())
+        };
+        let next = |s: usize| e.stacks[s].pieces[e.stacks[s].next];
+        if let Some(s) = e.current
+            && !e.level_order
+            && !e.stacks[s].deferred
+            && ready(s)
+        {
+            return vec![(s, next(s), false)];
+        }
+        let distance = |s: usize| {
+            let a = e.pieces[next(s)].strokes[0].a;
+            (a[0] - self.position[0]).hypot(a[1] - self.position[1])
+        };
+        if let Some(s) = (0..e.stacks.len())
+            .filter(|&s| ready(s) && !e.stacks[s].deferred)
+            .min_by(|&a, &b| distance(a).total_cmp(&distance(b)))
+        {
+            return vec![(s, next(s), false)];
+        }
+        let mut order: Vec<usize> = (0..e.stacks.len()).filter(|&s| ready(s)).collect();
+        if order.is_empty() {
+            order = (0..e.stacks.len())
+                .filter(|&s| !e.stacks[s].done())
+                .collect();
+        }
+        order.sort_by(|&a, &b| {
+            e.pieces[next(b)]
+                .z
+                .total_cmp(&e.pieces[next(a)].z)
+                .then(distance(a).total_cmp(&distance(b)))
+        });
+        order.into_iter().map(|s| (s, next(s), true)).collect()
+    }
+    /// The moves that cut piece `k` of stack `s` (#46) from where the tool
+    /// is, and (ramp link, moved entries, helical entries).
+    ///
+    /// Ramp link: when the tool has just finished the closed loop above it
+    /// in the same stack and this piece is a closed loop below it, a short
+    /// link at the upper level to the nearest point P of this loop, a ramp
+    /// down along the loop from P (over `ramp_length`), then the whole loop
+    /// flat from where the ramp ends - the flat lap passes over the ramp
+    /// again. Taken only when the link, the ramp and the loop are proven
+    /// clear of the part and the link meets no more stock (measured on the
+    /// stock grid, `stock_met`) than the level gap the ramp descends.
+    ///
+    /// Otherwise an entry, after a retract: a side entry (plunge beside the
+    /// loop, a horizontal lead onto it) only where the lead is pure air;
+    /// else the plunge at the loop start stops in air at the height the
+    /// stock under the ball there is clear at, and a ramp descends along the
+    /// loop to the level (an open run: along it and back, ending at its
+    /// start), then the piece flat. Never a vertical plunge into stock.
+    fn job(
+        &self,
+        stock: &Stock,
+        s: usize,
+        k: usize,
+        cancel: &impl CancelSignal,
+    ) -> Result<Job, String> {
+        let e = self.emission.as_ref().unwrap();
+        let piece = &e.pieces[k];
+        let z = piece.z;
+        let mut work = SurfaceWork::default();
+        let cut_feed = Some(self.op.feed_mm_min);
+        let ramp_feed = Some(
+            self.ramp_entry
+                .as_ref()
+                .and_then(|r| r.feed_mm_min)
+                .unwrap_or(self.op.plunge_mm_min),
+        );
+        let stack = &e.stacks[s];
+        let above = (stack.next > 0)
+            .then(|| stack.pieces[stack.next - 1])
+            .filter(|&q| e.last == Some(q) && e.current == Some(s));
+        if let Some(q) = above
+            && e.pieces[q].closed
+            && piece.closed
+            && z < e.pieces[q].z - 1e-9
+        {
+            let za = e.pieces[q].z;
+            let mut strokes = piece.strokes.clone();
+            let total: f64 = strokes.iter().map(stroke_length).sum();
+            let (sp, _) = nearest_on_loop(&strokes, [self.position[0], self.position[1]]);
+            let sp = snap_to_vertex(&strokes, sp);
+            if sp > 1e-9 && sp < total - 1e-9 {
+                rotate_loop(&mut strokes, sp);
+            }
+            // P is the rotated loop's own first point, so the ramp starts
+            // exactly where the link ends.
+            let p = strokes[0].a;
+            let length = snap_to_vertex(&strokes, self.ramp_length(za - z, total));
+            let mut ramp = ramp_curves(&strokes, za, z, length);
+            // A link too short to post (the two levels' loops meet within
+            // the snapping distance) is left out: the ramp starts exactly
+            // where the tool stands.
+            let link: Vec<Curve> =
+                if (p[0] - self.position[0]).hypot(p[1] - self.position[1]) > SNAP_MM {
+                    vec![Curve::Line {
+                        start: self.position,
+                        end: [p[0], p[1], za],
+                    }]
+                } else {
+                    if let Some(Curve::Line { start, .. }) = ramp.first_mut() {
+                        *start = self.position;
+                    }
+                    vec![]
+                };
+            if self.path_clear(&link, &mut work, cancel)?
+                && self.path_clear(&ramp, &mut work, cancel)?
+                && self.stock_met(stock, self.position, [p[0], p[1]], za, &mut work, cancel)?
+                    <= za - z + self.op.tolerance_mm
+            {
+                let mut moves: Vec<Queued> = link
+                    .into_iter()
+                    .map(|c| (c, MoveKind::Lead, cut_feed))
+                    .collect();
+                moves.extend(ramp.into_iter().map(|c| (c, MoveKind::Plunge, ramp_feed)));
+                moves.extend(
+                    flat_lap(&strokes, length.min(total), z)
+                        .into_iter()
+                        .map(|c| (c, MoveKind::Cut, cut_feed)),
+                );
+                return Ok((moves, (true, 0, 0)));
+            }
+        }
+        let heights = self.op.settings().heights;
+        let mut moves = self.leave(false);
+        if e.last.is_none() {
+            moves = vec![(
+                Curve::Line {
+                    start: self.position,
+                    end: [self.position[0], self.position[1], heights.clearance],
+                },
+                MoveKind::Rapid,
+                None,
+            )];
+        }
+        let travel = moves.last().map_or(self.position, |m| m.0.end());
+        let mut strokes = piece.strokes.clone();
+        let (points, helix, moved, helical) =
+            self.entries(stock, std::slice::from_mut(&mut strokes), z, z, cancel)?;
+        let start = strokes[0].curve(z).start();
+        let entry = points[0].unwrap_or([start[0], start[1]]);
+        let entry_z = helix[0].unwrap_or(z);
+        let approach = [
+            (
+                Curve::Line {
+                    start: travel,
+                    end: [entry[0], entry[1], travel[2]],
+                },
+                MoveKind::Rapid,
+                None,
+            ),
+            (
+                Curve::Line {
+                    start: [entry[0], entry[1], travel[2]],
+                    end: [entry[0], entry[1], heights.feed],
+                },
+                MoveKind::Rapid,
+                None,
+            ),
+        ];
+        moves.extend(approach);
+        let plunge = Curve::Line {
+            start: [entry[0], entry[1], heights.feed],
+            end: [entry[0], entry[1], entry_z],
+        };
+        let mut descent: Vec<Curve> = vec![];
+        let mut flat_from = 0.;
+        if points[0].is_some() {
+            descent.push(Curve::Line {
+                start: [entry[0], entry[1], z],
+                end: start,
+            });
+        } else if entry_z > z && piece.closed {
+            let total: f64 = strokes.iter().map(stroke_length).sum();
+            let length = snap_to_vertex(&strokes, self.ramp_length(entry_z - z, total));
+            descent = ramp_curves(&strokes, entry_z, z, length);
+            flat_from = length.min(total);
+        } else if entry_z > z {
+            // An open run ends away from its start: along it to half the
+            // depth and back along it to the level, ending at its start.
+            let mid = (entry_z + z) / 2.;
+            let total: f64 = strokes.iter().map(stroke_length).sum();
+            let back: Vec<Stroke> = strokes.iter().rev().map(|e| e.reversed()).collect();
+            descent = ramp_curves(&strokes, entry_z, mid, total);
+            descent.extend(ramp_curves(&back, mid, z, total));
+        }
+        if !self.path_clear(std::slice::from_ref(&plunge), &mut work, cancel)?
+            || (points[0].is_none() && !self.path_clear(&descent, &mut work, cancel)?)
+        {
+            return Err(format!(
+                "waterline operation {}: the entry to the loop at level Z{z} starting at ({:.4}, {:.4}) is not clear of the part; rough or rest-rough there first",
+                self.op.id, start[0], start[1]
+            ));
+        }
+        moves.push((plunge, MoveKind::Plunge, Some(self.op.plunge_mm_min)));
+        if points[0].is_some() {
+            moves.extend(descent.into_iter().map(|c| (c, MoveKind::Lead, cut_feed)));
+        } else {
+            moves.extend(
+                descent
+                    .into_iter()
+                    .map(|c| (c, MoveKind::Plunge, ramp_feed)),
+            );
+        }
+        let flat = if piece.closed {
+            flat_lap(&strokes, flat_from, z)
+        } else {
+            strokes.iter().map(|e| e.curve(z)).collect()
+        };
+        moves.extend(flat.into_iter().map(|c| (c, MoveKind::Cut, cut_feed)));
+        Ok((moves, (false, moved, helical)))
+    }
+    /// The moves off the piece just cut: up at the feed to the feed height,
+    /// then a rapid to the retract height (`last`: the clearance height).
+    fn leave(&self, last: bool) -> Vec<Queued> {
+        let h = self.op.settings().heights;
+        let p = self.position;
+        let top = if last { h.clearance } else { h.retract };
+        vec![
+            (
+                Curve::Line {
+                    start: p,
+                    end: [p[0], p[1], h.feed.max(p[2])],
+                },
+                MoveKind::Retract,
+                Some(self.op.feed_mm_min),
+            ),
+            (
+                Curve::Line {
+                    start: [p[0], p[1], h.feed.max(p[2])],
+                    end: [p[0], p[1], top.max(h.feed).max(p[2])],
+                },
+                MoveKind::Rapid,
+                None,
+            ),
+        ]
+    }
+    /// How long a ramp along a closed loop `total` long is to descend `drop`
+    /// (#46): at the declared ramp angle, at most one lap; one lap when no
+    /// ramp is declared.
+    fn ramp_length(&self, drop: f64, total: f64) -> f64 {
+        match &self.ramp_entry {
+            Some(r) => (drop / r.angle_rad.tan()).min(total),
+            None => total,
+        }
+    }
+    /// The part-clearance proof of entry, link and ramp moves (#46): the
+    /// ball centre along each line keeps the distance from the part that the
+    /// loop's own moves keep (`protected`).
+    fn path_clear(
+        &self,
+        curves: &[Curve],
+        work: &mut SurfaceWork,
+        cancel: &impl CancelSignal,
+    ) -> Result<bool, String> {
+        for c in curves {
+            let (a, b) = (c.start(), c.end());
+            if !self.surface.segment_clear(
+                [a[0], a[1], a[2] + self.radius],
+                [b[0], b[1], b[2] + self.radius],
+                self.protected,
+                work,
+                cancel,
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// How deep (mm above the swept ball's lower surface) the ball with its
+    /// tip at `z`, moving straight from `a` to `b`, meets stock that is not
+    /// the part (#46), on the stock grid: every cell whose centre the ball
+    /// passes over within its radius, against the swept ball's lower surface
+    /// at the centre, counting only what lies below the ball's surface where
+    /// it stands at `a` (what the move sweeps beyond it); a cell whose top
+    /// the part itself explains (no higher than a ball of the cell's half
+    /// diagonal resting on the part there) is part, which the part-clearance
+    /// proof covers. A measure for choosing links and side entries, not a
+    /// proof: whole cells cannot say where in the cell their material is.
+    fn stock_met(
+        &self,
+        stock: &Stock,
+        a: Vec3,
+        b: [f64; 2],
+        z: f64,
+        work: &mut SurfaceWork,
+        cancel: &impl CancelSignal,
+    ) -> Result<f64, String> {
+        let r = self.radius;
+        let spec = stock.spec();
+        let [nx, ny] = stock.dimensions();
+        let [wx, wy] = stock.cell_widths_mm();
+        let half = wx.hypot(wy) / 2.;
+        let cells = stock.cells();
+        let (lo, hi) = (
+            [a[0].min(b[0]) - r, a[1].min(b[1]) - r],
+            [a[0].max(b[0]) + r, a[1].max(b[1]) + r],
+        );
+        let index = |v: f64, k: usize, w: f64, n: usize| {
+            (((v - spec.min_mm[k]) / w).floor().max(0.) as usize).min(n)
+        };
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = dx * dx + dy * dy;
+        let mut worst: f64 = 0.;
+        for j in index(lo[1], 1, wy, ny)..index(hi[1], 1, wy, ny).saturating_add(1).min(ny) {
+            for i in index(lo[0], 0, wx, nx)..index(hi[0], 0, wx, nx).saturating_add(1).min(nx) {
+                let cell = j * nx + i;
+                let c = stock.cell_center(cell).unwrap();
+                let t = if len2 > 0. {
+                    (((c[0] - a[0]) * dx + (c[1] - a[1]) * dy) / len2).clamp(0., 1.)
+                } else {
+                    0.
+                };
+                let d = (c[0] - a[0] - t * dx).hypot(c[1] - a[1] - t * dy);
+                if d >= r {
+                    continue;
+                }
+                // Only what the move sweeps beyond the ball where it stands
+                // at `a`: a cell under the ball there is met no deeper than
+                // the ball's surface at the start already reached.
+                let envelope = z + r - (r * r - d * d).sqrt();
+                let d0 = (c[0] - a[0]).hypot(c[1] - a[1]);
+                let standing = if d0 < r {
+                    z + r - (r * r - d0 * d0).sqrt()
+                } else {
+                    f64::INFINITY
+                };
+                if envelope >= standing - 1e-12 {
+                    continue;
+                }
+                let excess = cells[cell].upper_mm.min(standing) - envelope;
+                if excess <= worst || excess <= self.op.tolerance_mm {
+                    continue;
+                }
+                cancelled(cancel)?;
+                let part = self.surface.contact(c, half, work, cancel)?.center_z;
+                if cells[cell].upper_mm <= part + self.op.tolerance_mm {
+                    continue;
+                }
+                worst = excess;
+            }
+        }
+        Ok(worst)
     }
     /// Ramp: a main level descends from the one above (none for the first
     /// main level); the lowest main level is cut once more flat. In-between
