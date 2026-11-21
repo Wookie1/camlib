@@ -140,7 +140,7 @@ class WaterlineTest(unittest.TestCase):
             player.seek(Cursor(partial_motion - 1, 0.5))
             self.assertEqual(player.state.heights.tobytes(), partial)
 
-    def test_a_loop_entered_on_the_wall_is_warned_about_and_a_roughed_blank_is_not(self):
+    def test_a_loop_without_a_clear_start_entry_moves_and_nothing_warns_a_roughed_blank_does_not(self):
         import warnings
 
         import cadquery as cq
@@ -156,24 +156,29 @@ class WaterlineTest(unittest.TestCase):
                         u.report for u in sim.run_operations() if isinstance(u, OperationUpdate) and u.stage == "end"
                     ]
                     self.assertTrue(sim.state.finished)
-            on_wall = [w for w in caught if issubclass(w.category, CamWarning) and "on the wall" in str(w.message)]
-            return reports[0], on_wall
+            entries = [w for w in caught if issubclass(w.category, CamWarning) and "loop(s)" in str(w.message)]
+            return reports[0], entries
 
-        # Raw stock stands above a level on every side of a loop: its entry
-        # stays on the wall, the report counts it and the run warns.
+        # Raw stock stands above the level on every side of the loop's given
+        # start, but a clear entry exists along the loop: the start moves to
+        # it (the report's moved_entries), nothing plunges into the stock and
+        # nothing warns (#46).
         config = example().waterline_job()
-        report, on_wall = run(config)
-        self.assertGreater(report["wall_entries"], 0)
-        self.assertEqual(len(on_wall), 1)
-        self.assertIn(f"entered {report['wall_entries']} loop(s) on the wall", str(on_wall[0].message))
+        report, entries = run(config)
+        self.assertGreater(report["moved_entries"], 0)
+        self.assertNotIn("wall_entries", report)
+        self.assertNotIn("helical_entries", report)
+        self.assertEqual(entries, [])
         # A blank roughed to 0.3 mm over the island and 0.1 mm over the base
-        # (the benchmark's): every loop has a stock-free point beside it.
+        # (the benchmark's): every loop enters beside its given start.
         base = cq.Workplane("XY").box(24, 16, 2.1, centered=(False, False, False))
         island = cq.Workplane("XY").workplane(offset=2).center(12, 8).rect(16.7, 10.7).extrude(6.3, taper=20)
         roughed = StockSpec.from_mesh(export_stock_mesh(base.union(island)), 0.4)
-        report, on_wall = run(dict(config, stock=roughed))
+        report, entries = run(dict(config, stock=roughed))
+        self.assertNotIn("moved_entries", report)
+        self.assertNotIn("helical_entries", report)
         self.assertNotIn("wall_entries", report)
-        self.assertEqual(on_wall, [])
+        self.assertEqual(entries, [])
 
     def test_empty_above_part_level_and_invalid_offset_base(self):
         config = example().waterline_job()

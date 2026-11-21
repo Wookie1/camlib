@@ -2158,13 +2158,14 @@ class Simulation:
                             CamWarning,
                             stacklevel=2,
                         )
-                    wall_entries = data["report"].get("wall_entries")
-                    if wall_entries:
-                        # Waterline: loops with no stock-free point beside the
-                        # wall keep the entry on it (the report's wall_entries).
+                    helical_entries = data["report"].get("helical_entries")
+                    if helical_entries:
+                        # Waterline: loops with no stock-free point beside them
+                        # enter on a one-lap helix along themselves (the report's
+                        # helical_entries); rough or rest-rough where they gather.
                         warnings.warn(
-                            f"operation {active!r} entered {wall_entries} loop(s) on the wall: the stock stands "
-                            "above the level on every side there, so the ball may come down into it. Rough or "
+                            f"operation {active!r} entered {helical_entries} loop(s) on a helix: the stock stands "
+                            "above the level on every side of the loop, so the entry descends along it. Rough or "
                             "rest-rough that area first",
                             CamWarning,
                             stacklevel=2,

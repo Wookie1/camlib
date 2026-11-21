@@ -5,7 +5,7 @@ use crate::{
     finishing::{FinishingStockTop, StockCeiling},
     motion::{Coolant, Motion, MoveKind, Vec3},
     pocket::{ResidualStatus, Stroke},
-    profiles::{ProfileDepths, ProfileMotion, ProfileSettings},
+    profiles::{ProfileDepths, ProfileMotion, ProfileSettings, stroke_length},
     roughing::PreparedRoughingTarget,
     stock::{CancelSignal, Stock, StockSpec},
     surface::{PreparedSurface, SurfaceMesh, SurfaceWork},
@@ -743,13 +743,21 @@ pub struct WaterlineReport {
     /// the surface the bound allows. None for flat and bull-nose cutters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scallop_from_deg: Option<f64>,
-    /// Loops entered on the wall (the tangent lead) because no point beside
-    /// the wall within reach had the stock at or below the plunge height, the
-    /// part clear and the limits allowing it: the ball may come down into
-    /// stock there. Rough or rest-rough that area, or find the loop in
-    /// `level_reports`; absent when every loop has a proven side entry.
+    /// Loops whose start moved to a clear side entry found along the loop
+    /// itself (#46): no point beside the given start had the stock at or
+    /// below the plunge height within reach, but a sample along the loop
+    /// did, and the loop rotates so it starts there. Absent when none moved.
     #[serde(skip_serializing_if = "is_zero")]
-    pub wall_entries: usize,
+    pub moved_entries: usize,
+    /// Loops entered on a one-lap helix along the loop itself (#46): no
+    /// point beside the loop within reach had the stock at or below the
+    /// plunge height and the part clear, so the tool plunges at the loop
+    /// start to the lowest height the stock under the ball there is clear
+    /// at (at most the feed height) and descends along the loop to the
+    /// level. Rough or rest-rough where these gather; absent when every
+    /// loop has a proven side entry.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub helical_entries: usize,
     pub cut_segments: usize,
     pub loops_completed: usize,
     pub requested_bottom_z_mm: f64,
@@ -814,9 +822,66 @@ pub struct WaterlinePlan {
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
-/// Per loop the side entry point (None: the tangent lead), and how many
-/// loops have none.
-type SideEntries = (Vec<Option<[f64; 2]>>, usize);
+/// Per loop the entry: a point beside the loop the tool plunges at (None
+/// for a loop entered on a helix along itself, from the height in the
+/// second vector), and how many loop starts moved and how many loops
+/// entered on a helix.
+type Entries = (Vec<Option<[f64; 2]>>, Vec<Option<f64>>, usize, usize);
+/// A loop whose last stroke ends where its first starts: a contour ring.
+/// Runs the slope or region limits cut out of a contour are open, and only
+/// a closed loop can move its start.
+fn loop_is_closed(edges: &[Stroke]) -> bool {
+    let a = edges[0].curve(0.).start();
+    let b = edges[edges.len() - 1].curve(0.).end();
+    (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9
+}
+/// The point and travel tangent at arc length `s` along a loop; the stroke
+/// containing `s` decides the tangent (waterline loops are polylines).
+fn loop_point_tangent(edges: &[Stroke], s: f64) -> ([f64; 2], [f64; 2]) {
+    let mut acc = 0.;
+    for e in edges {
+        let l = stroke_length(e);
+        if l > 0. && acc + l >= s {
+            let c = e.curve(0.);
+            let (a, b) = (c.start(), c.end());
+            let t = (s - acc) / l;
+            return (
+                [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])],
+                e.tangent(false),
+            );
+        }
+        acc += l;
+    }
+    let e = edges[edges.len() - 1];
+    let c = e.curve(0.).end();
+    ([c[0], c[1]], e.tangent(true))
+}
+/// Move a closed loop's start to arc length `s`: the order and direction
+/// stay, the stroke containing `s` is split there (#46).
+fn rotate_loop(edges: &mut Vec<Stroke>, s: f64) {
+    let mut acc = 0.;
+    for k in 0..edges.len() {
+        let l = stroke_length(&edges[k]);
+        if l > 0. && acc + l >= s {
+            let c = edges[k].curve(0.);
+            let (a, b) = (c.start(), c.end());
+            let t = (s - acc) / l;
+            let q = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+            let mut rotated: Vec<Stroke> = vec![];
+            if (q[0] - b[0]).hypot(q[1] - b[1]) > 1e-9 {
+                rotated.push(Stroke::line(q, [b[0], b[1]]));
+            }
+            rotated.extend(edges[k + 1..].iter().copied());
+            rotated.extend(edges[..k].iter().copied());
+            if (a[0] - q[0]).hypot(a[1] - q[1]) > 1e-9 {
+                rotated.push(Stroke::line([a[0], a[1]], q));
+            }
+            *edges = rotated;
+            return;
+        }
+        acc += l;
+    }
+}
 /// How far out (in cutter radii) a loop's side entry is searched.
 const SIDE_ENTRY_REACH_RADII: f64 = 4.;
 
@@ -1239,7 +1304,8 @@ impl WaterlinePlan {
             scallop_levels: 0,
             scallop_mm,
             scallop_from_deg,
-            wall_entries: 0,
+            moved_entries: 0,
+            helical_entries: 0,
             cut_segments: 0,
             loops_completed: 0,
             requested_bottom_z_mm: op.bottom_z_mm,
@@ -1595,8 +1661,10 @@ impl WaterlinePlan {
             }
             let (ramp_from, passes) = self.ramp_setup(self.slot);
             let plunge_z = ramp_from.map_or(z, |from| from.max(z));
-            let (entry_points, wall) = self.side_entries(stock, &loops, z, plunge_z, cancel)?;
-            self.report.wall_entries += wall;
+            let (entry_points, helix, moved, entered) =
+                self.entries(stock, &mut loops, z, plunge_z, cancel)?;
+            self.report.moved_entries += moved;
+            self.report.helical_entries += entered;
             let mut profile = ProfileMotion::new(
                 self.op.settings(),
                 &self.spec,
@@ -1608,90 +1676,261 @@ impl WaterlinePlan {
             );
             profile.ramp_from = ramp_from;
             profile.entry_points = entry_points;
+            profile.helix_entries = helix;
             self.profile = Some(profile);
         }
     }
-    /// Per loop, a point beside its start, away from the part, where the
-    /// ball plunges before a horizontal lead onto the loop: the stock the
-    /// roughing left against the wall is then cut sideways, not by the
-    /// ball's tip. A point is taken only where the lead (at the level's ball
-    /// centre height) is clear of the part (higher at the same XY is clear
-    /// too: the part is a downward-extruded surface), where the live stock
-    /// under the ball (the upper bound of every cell its disk can touch) is at
-    /// or below the height it plunges to, within the tolerance, and where the
-    /// plunge point and the lead are inside the machining limits.
+    /// Per loop an entry that never plunges into stock (#46): a point beside
+    /// the loop where the ball plunges before a horizontal lead onto it - the
+    /// stock the roughing left against the wall is then cut sideways, not by
+    /// the ball's tip - or, when no point beside the loop qualifies, a helix
+    /// along the loop itself. A point is taken only where the lead (at the
+    /// level's ball centre height) is clear of the part (higher at the same
+    /// XY is clear too: the part is a downward-extruded surface), where the
+    /// live stock under the ball (the upper bound of every cell its disk can
+    /// touch) is at or below the height it plunges to, within the tolerance,
+    /// and where the plunge point and the lead are inside the machining
+    /// limits.
     ///
-    /// Points are tried from `max(r/2, 1)` mm out, in steps of that, up to
-    /// `SIDE_ENTRY_REACH_RADII` radii, on both sides of the loop start (the
-    /// side farther from the part first). A loop with no such point keeps
-    /// the tangent lead on the wall, as before, and is counted in the report's
-    /// `wall_entries`: there the ball may come down into stock. (Refusing
-    /// would stop every waterline on stock that has not been roughed to the
-    /// level, ahead of the reach checks that name why.)
-    fn side_entries(
+    /// The search runs first at the loop's given start, then - a closed loop
+    /// only - at samples along the whole loop, `max(r/2, 1)` mm apart,
+    /// outward in both directions, nearest first; the first sample with a
+    /// point moves the loop's start there (order and direction stay, only
+    /// the start moves), so loops that enter cleanly today are unchanged.
+    /// Open loops (runs the slope or region limits cut out of a contour)
+    /// keep their start: a moved entry elsewhere on them would need a long
+    /// lead no check covers. A loop with no qualifying point beside it
+    /// enters on a helix along itself: the lowest height the stock under the
+    /// ball at the loop start is clear at (at most the feed height the rapid
+    /// descent stops at), the plunge there in air, then one lap along the
+    /// loop down to the level, then the loop flat - never a vertical plunge
+    /// into stock. Every helix move carries the same part-clearance proof as
+    /// the loop's own moves (`helix_clear`); where neither entry exists the
+    /// operation is refused, naming the level and the start.
+    ///
+    /// Side-entry points are tried from `max(r/2, 1)` mm out, in steps of
+    /// that, up to `SIDE_ENTRY_REACH_RADII` radii, on both sides of the loop
+    /// tangent (the side farther from the part first).
+    fn entries(
         &self,
         stock: &Stock,
-        loops: &[Vec<Stroke>],
+        loops: &mut [Vec<Stroke>],
         z: f64,
         plunge_z: f64,
         cancel: &impl CancelSignal,
-    ) -> Result<SideEntries, String> {
+    ) -> Result<Entries, String> {
         let step = (self.radius / 2.).max(1.);
         let reach = SIDE_ENTRY_REACH_RADII * self.radius;
         let center = z + self.radius;
         let mut work = SurfaceWork::default();
-        let mut result = Vec::with_capacity(loops.len());
-        let mut wall = 0;
-        for edges in loops {
+        let mut points = Vec::with_capacity(loops.len());
+        let mut helix = Vec::with_capacity(loops.len());
+        let (mut moved, mut entered) = (0, 0);
+        for edges in loops.iter_mut() {
             let start = edges[0].curve(z).start();
-            let t = edges[0].tangent(false);
-            let mut found = None;
-            let mut k = 1.;
-            while found.is_none() && k * step <= reach + 1e-9 {
-                let length = k * step;
-                let mut best: Option<([f64; 2], f64)> = None;
-                for sign in [1., -1.] {
-                    let p = [
-                        start[0] - sign * length * t[1],
-                        start[1] + sign * length * t[0],
-                    ];
-                    if !self.surface.segment_clear(
-                        [p[0], p[1], center],
-                        [start[0], start[1], center],
-                        self.protected,
-                        &mut work,
-                        cancel,
-                    )? {
-                        continue;
-                    }
-                    let top = stock.top_under_disk(p, self.radius);
-                    if top > plunge_z + self.op.tolerance_mm {
-                        continue;
-                    }
-                    if let Some(limits) = &self.region_limits {
-                        let lead = crate::motion::Curve::Line {
-                            start: [p[0], p[1], plunge_z],
-                            end: [start[0], start[1], plunge_z],
-                        };
-                        if !limits.allows(p, plunge_z)? || !limits.allows_curve(&lead, true)? {
+            let mut found = self.entry_at(
+                stock,
+                [start[0], start[1]],
+                edges[0].tangent(false),
+                center,
+                plunge_z,
+                step,
+                reach,
+                &mut work,
+                cancel,
+            )?;
+            // A closed loop with no clear entry at its start tries samples
+            // along the whole loop, nearest first, and moves its start to
+            // the first sample with one (#46).
+            if found.is_none() && loop_is_closed(edges) {
+                let total: f64 = edges.iter().map(stroke_length).sum();
+                let mut tried: Vec<f64> = vec![];
+                let mut d = step;
+                while found.is_none() && d < total - 1e-9 {
+                    for &s in &[d, total - d] {
+                        if s <= 1e-9
+                            || s >= total - 1e-9
+                            || tried.iter().any(|&t| (t - s).abs() <= 1e-9)
+                        {
                             continue;
                         }
+                        tried.push(s);
+                        let (q, t) = loop_point_tangent(edges, s);
+                        found = self.entry_at(
+                            stock, q, t, center, plunge_z, step, reach, &mut work, cancel,
+                        )?;
+                        if found.is_some() {
+                            rotate_loop(edges, s);
+                            break;
+                        }
                     }
-                    let d = self
-                        .surface
-                        .point_distance([p[0], p[1], center], &mut work, cancel)?
-                        .distance_mm;
-                    if best.is_none_or(|(_, b)| d > b) {
-                        best = Some((p, d));
+                    d += step;
+                }
+                moved += usize::from(found.is_some());
+            }
+            if let Some(p) = found {
+                points.push(Some(p));
+                helix.push(None);
+                continue;
+            }
+            // No clear side entry anywhere on the loop: enter on a helix
+            // along the loop itself (#46). The lowest height the stock under
+            // the ball at the loop start is clear at, at most the feed
+            // height; the plunge there is in air and one lap descends from
+            // it to the level.
+            let top = stock.top_under_disk([start[0], start[1]], self.radius);
+            let feed = self.op.settings().heights.feed;
+            if top > feed + self.op.tolerance_mm {
+                return Err(format!(
+                    "waterline operation {}: no entry for the loop at level Z{z} starting at ({:.4}, {:.4}): the stock under the ball there stands at Z{top:.4}, above the feed height Z{feed:.4} the entry plunge comes down from, and no point beside the loop within {reach:.3} mm has the stock at or below the plunge height; rough or rest-rough there first",
+                    self.op.id, start[0], start[1]
+                ));
+            }
+            let zc = top.max(z).min(feed);
+            self.helix_clear(edges, z, zc, &mut work, cancel)?;
+            entered += 1;
+            points.push(None);
+            helix.push(Some(zc));
+        }
+        Ok((points, helix, moved, entered))
+    }
+    /// The side-entry search at one point of a loop: beside it, from `step`
+    /// mm out in steps of `step` up to `reach`, on both sides of the tangent
+    /// `t` (the side farther from the part first), the point farthest from
+    /// the part at the nearest working distance where the lead to it (at the
+    /// level's ball centre height) is clear of the part, the live stock
+    /// under the ball is at or below the plunge height within the tolerance
+    /// and the limits allow the plunge and the lead.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_at(
+        &self,
+        stock: &Stock,
+        start: [f64; 2],
+        t: [f64; 2],
+        center: f64,
+        plunge_z: f64,
+        step: f64,
+        reach: f64,
+        work: &mut SurfaceWork,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<[f64; 2]>, String> {
+        let mut k = 1.;
+        while k * step <= reach + 1e-9 {
+            let length = k * step;
+            let mut best: Option<([f64; 2], f64)> = None;
+            for sign in [1., -1.] {
+                let p = [
+                    start[0] - sign * length * t[1],
+                    start[1] + sign * length * t[0],
+                ];
+                if !self.surface.segment_clear(
+                    [p[0], p[1], center],
+                    [start[0], start[1], center],
+                    self.protected,
+                    work,
+                    cancel,
+                )? {
+                    continue;
+                }
+                let top = stock.top_under_disk(p, self.radius);
+                if top > plunge_z + self.op.tolerance_mm {
+                    continue;
+                }
+                if let Some(limits) = &self.region_limits {
+                    let lead = crate::motion::Curve::Line {
+                        start: [p[0], p[1], plunge_z],
+                        end: [start[0], start[1], plunge_z],
+                    };
+                    if !limits.allows(p, plunge_z)? || !limits.allows_curve(&lead, true)? {
+                        continue;
                     }
                 }
-                found = best.map(|(p, _)| p);
-                k += 1.;
+                let d = self
+                    .surface
+                    .point_distance([p[0], p[1], center], work, cancel)?
+                    .distance_mm;
+                if best.is_none_or(|(_, b)| d > b) {
+                    best = Some((p, d));
+                }
             }
-            wall += usize::from(found.is_none());
-            result.push(found);
+            if let Some((p, _)) = best {
+                return Ok(Some(p));
+            }
+            k += 1.;
         }
-        Ok((result, wall))
+        Ok(None)
+    }
+    /// The part-clearance proof of a helix entry (#46): the ball centre
+    /// along the plunge at the loop start and along every move of the
+    /// descending lap keeps the distance from the part that the loop's own
+    /// moves keep (`protected`). The lap descends linearly from `zc` at the
+    /// loop start to `z` at the lap end, the ramp `tabbed_loop` cuts. An
+    /// open run descends along itself to half the depth and back along
+    /// itself to `z`, ending at its start (ProfileMotion's helix entry): both
+    /// legs are proven.
+    fn helix_clear(
+        &self,
+        edges: &[Stroke],
+        z: f64,
+        zc: f64,
+        work: &mut SurfaceWork,
+        cancel: &impl CancelSignal,
+    ) -> Result<(), String> {
+        let start = edges[0].curve(z).start();
+        if !self.surface.segment_clear(
+            [
+                start[0],
+                start[1],
+                self.op.settings().heights.feed + self.radius,
+            ],
+            [start[0], start[1], zc + self.radius],
+            self.protected,
+            work,
+            cancel,
+        )? {
+            return Err(format!(
+                "the plunge at the start to Z{zc:.4} is not clear of the part"
+            ));
+        }
+        let legs: Vec<(Vec<Stroke>, f64, f64)> = if crate::profiles::loop_closes(edges) {
+            vec![(edges.to_vec(), zc, z)]
+        } else {
+            let mid = (zc + z) / 2.;
+            let back = edges.iter().rev().map(|e| e.reversed()).collect();
+            vec![(edges.to_vec(), zc, mid), (back, mid, z)]
+        };
+        for (leg, from, to) in legs {
+            let total: f64 = leg.iter().map(stroke_length).sum();
+            let base = |s: f64| {
+                if total > 0. {
+                    from + (to - from) * s / total
+                } else {
+                    from
+                }
+            };
+            let mut acc = 0.;
+            for e in &leg {
+                let l = stroke_length(e);
+                if l > 0. {
+                    let c = e.curve(z);
+                    let (a, b) = (c.start(), c.end());
+                    if !self.surface.segment_clear(
+                        [a[0], a[1], base(acc) + self.radius],
+                        [b[0], b[1], base(acc + l) + self.radius],
+                        self.protected,
+                        work,
+                        cancel,
+                    )? {
+                        return Err(format!(
+                            "the helix lap is not clear of the part at ({:.4}, {:.4})",
+                            a[0], a[1]
+                        ));
+                    }
+                }
+                acc += l;
+            }
+        }
+        Ok(())
     }
     /// Ramp: a main level descends from the one above (none for the first
     /// main level); the lowest main level is cut once more flat. In-between

@@ -1976,20 +1976,28 @@ report's `shadow_error_mm` is the largest such error over the levels cut.
 `contour_error_mm`; `reverse` cuts the contours the other way;
 `safety_margin_mm` and `stock_to_leave_mm` work as for `Parallel`.
 
-A ball's contour is entered from beside the wall: the ball drops at a point
-moved away from the wall and then leads in sideways, so its tip never lands on
-the wall (it used to drop on the surface, up to 1.9 mm axially into stock). The
-point is chosen from the live stock. It is the nearest point, starting
-`max(r/2, 1)` mm from the loop and stepping out by that much up to 4 cutter
-radii, on either side of the loop start, where the lead to the contour is
-clear of the surface, the machining limits allow the plunge and the lead, and
-the stock under the ball (the upper bound of every cell its disk can touch) is
-at or below the height it plunges to. A loop with no such point keeps the
-tangent lead on the wall, as before, and is counted in the report's
-`wall_entries`, and the run warns (`CamWarning`): there the ball may come down
-into stock, so rough or rest-rough that area first. (It is not refused, because stock that has not been roughed to
-the level would then stop every waterline before the reach checks that name
-the real limit.) The `waterline`, `waterline-dense` and `steep-and-shallow`
+A ball's contour is never entered by plunging into material: the entry is
+chosen from the live stock so the ball's tip never lands on the wall (it used
+to drop on the surface, up to 1.9 mm axially into stock). First the side
+entry: the nearest point, starting `max(r/2, 1)` mm from the loop and stepping
+out by that much up to 4 cutter radii, on either side of the loop's tangent,
+where the lead to the contour is clear of the surface, the machining limits
+allow the plunge and the lead, and the stock under the ball (the upper bound
+of every cell its disk can touch) is at or below the height it plunges to. The
+given start is tried first, so loops that enter cleanly today are unchanged; a
+closed loop with no clear entry beside its start is then sampled along its
+whole length at the same spacing and its start moves to the first clear sample
+(order and direction stay); open loops (runs the slope or region limits cut
+out of a contour) keep their start. Loops whose start moved are counted in the
+report's `moved_entries`. A loop with no clear point beside it anywhere is
+entered on a one-lap helix along itself: the ball plunges at the loop start to
+the lowest height the stock under it there is clear at (at most the feed
+height, so the plunge is in air), then one lap descends along the loop to the
+level and the loop is cut flat; these are counted in the report's
+`helical_entries` and warned about (`CamWarning`), since they gather exactly
+where roughing or rest-roughing is still needed. If neither entry exists the
+operation is refused, naming the level and the XY: rough or rest-rough there
+first. The `waterline`, `waterline-dense` and `steep-and-shallow`
 benchmarks run on blanks roughed to 0.1 to 0.3 mm over the part.
 
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along

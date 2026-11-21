@@ -2,6 +2,7 @@ use camlib::surface::*;
 use camlib::waterline::{ContourOptions, prepare_contours};
 use std::sync::atomic::AtomicBool;
 
+
 fn options(h: f64, simplify: bool) -> ContourOptions {
     ContourOptions {
         method: camlib::waterline::ContourMethod::QuadTree,
@@ -950,7 +951,10 @@ fn every_entry_plunge_ends_at_or_above_the_stock_under_the_ball() {
         stock.apply_delta(&d).unwrap();
     }
     assert!(plunges > 0 && beside > 0, "{plunges} {beside}");
-    assert_eq!(plan.report().wall_entries, 0);
+    assert_eq!(
+        (plan.report().moved_entries, plan.report().helical_entries),
+        (0, 0)
+    );
 }
 /// Plan the whole operation, committing each move to the stock.
 fn drain(
@@ -986,7 +990,12 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     .unwrap();
     let mut stock = camlib::stock::Stock::new(m.stock.height().unwrap().clone()).unwrap();
     drain(&m, &mut plan, &mut stock);
-    assert!(plan.report().wall_entries > 0);
+    // Raw stock stands above every level, but the stock ends: candidates
+    // beyond its edge have no stock under the ball at all (clear air per the
+    // stock test), so the loops move their starts to entries there (#46).
+    println!("raw plate: moved {} helical {}", plan.report().moved_entries, plan.report().helical_entries);
+    assert!(plan.report().moved_entries > 0);
+    assert_eq!(plan.report().helical_entries, 0);
     // Roughed so that every loop has a free side entry: none is reported.
     let (mut stock, spec) = roughed(&m, 3.);
     let mut plan = WaterlinePlan::prepare(
@@ -999,7 +1008,405 @@ fn a_loop_with_no_stock_free_entry_is_reported_not_hidden() {
     )
     .unwrap();
     drain(&m, &mut plan, &mut stock);
-    assert_eq!(plan.report().wall_entries, 0);
+    assert_eq!(
+        (plan.report().moved_entries, plan.report().helical_entries),
+        (0, 0)
+    );
+}
+
+/// Independent replay measure for the entry rule (#46): drives the plan
+/// against the live stock (every move's sweep applied in order, like
+/// `drain`) and measures every Plunge or Rapid move that descends, walking
+/// it in steps of <= 0.1 mm and taking the deepest reach of the stock under
+/// the ball disk below the ball tip (`Stock::top_under_disk` - tip z). A
+/// descent that stays on one XY is a vertical plunge: it must meet no stock
+/// deeper than the operation tolerance. A descending Plunge that travels is
+/// a helix entry along the loop: it cuts the wall like the loop's own moves,
+/// so it may meet stock, and the test bounds that by the level gap the lap
+/// descends. Also records the move count, the first entry plunge's end, the
+/// helix lap's first start and last end, and the cut length per level, to
+/// compare with values measured at 2017dcc.
+#[derive(Debug)]
+struct Replay {
+    motions: usize,
+    first_entry: Option<[f64; 3]>,
+    cut_length_by_level: std::collections::BTreeMap<u64, f64>,
+    vertical_plunges: usize,
+    helix_moves: usize,
+    worst_vertical: f64,
+    worst_helix: f64,
+    helix_first_start: Option<[f64; 3]>,
+    helix_last_end: Option<[f64; 3]>,
+    /// The first motion the run's stream rejects (`StreamProducer` and
+    /// `StreamReceiver`, what the simulation and the UI play back): its
+    /// index, the error, and the motion against the previous end. None: the
+    /// whole plan streams.
+    stream_error: Option<String>,
+}
+
+/// Every motion of a plan through the stream the simulation plays back: the
+/// producer, and the receiver that rechecks each frame (attribution,
+/// continuity, increasing ids). The first rejection, described.
+fn stream_error(
+    m: &camlib::stream::StreamManifest,
+    motions: &[camlib::motion::Motion],
+) -> Option<String> {
+    use camlib::stream::{DEFAULT_FRAME_LIMIT, StreamProducer, StreamReceiver};
+    let cancel = AtomicBool::new(false);
+    let mut producer = StreamProducer::new(m.clone()).unwrap();
+    let mut receiver = StreamReceiver::new(m.clone()).unwrap();
+    let mut previous = m.initial_position_mm;
+    for (i, motion) in motions.iter().enumerate() {
+        let checked = producer
+            .push_motion(motion.clone(), DEFAULT_FRAME_LIMIT, &cancel)
+            .and_then(|frame| receiver.accept(&frame, DEFAULT_FRAME_LIMIT).map(|_| ()));
+        if let Err(error) = checked {
+            return Some(format!(
+                "motion {i} (id {}, {:?}) starts at {:?}, the previous ended at {previous:?}: {error}",
+                motion.id,
+                motion.kind,
+                motion.curve.start()
+            ));
+        }
+        previous = motion.curve.end();
+    }
+    None
+}
+
+fn replay(
+    m: &camlib::stream::StreamManifest,
+    plan: &mut camlib::waterline::WaterlinePlan,
+    stock: &mut camlib::stock::Stock,
+) -> Replay {
+    use camlib::motion::MoveKind;
+    let cancel = AtomicBool::new(false);
+    let tool = m.tools[0].prepare().unwrap();
+    let r = 2.; // the fixture ball4
+    let mut out = Replay {
+        motions: 0,
+        first_entry: None,
+        cut_length_by_level: Default::default(),
+        vertical_plunges: 0,
+        helix_moves: 0,
+        worst_vertical: f64::NEG_INFINITY,
+        worst_helix: f64::NEG_INFINITY,
+        helix_first_start: None,
+        helix_last_end: None,
+        stream_error: None,
+    };
+    let mut motions = vec![];
+    while let Some(motion) = plan.next_motion_with_stock(stock, &cancel).unwrap() {
+        motions.push(motion.clone());
+        out.motions += 1;
+        let a = motion.curve.start();
+        let b = motion.curve.end();
+        if motion.kind == MoveKind::Plunge && out.first_entry.is_none() {
+            out.first_entry = Some(b);
+        }
+        if motion.kind == MoveKind::Cut {
+            let key = (b[2] * 1e6).round() as u64;
+            *out.cut_length_by_level.entry(key).or_default() +=
+                ((b[0] - a[0]).hypot(b[1] - a[1])).hypot(b[2] - a[2]);
+        }
+        if b[2] < a[2] - 1e-12 && matches!(motion.kind, MoveKind::Plunge | MoveKind::Rapid) {
+            let travels = (a[0] - b[0]).hypot(a[1] - b[1]) > 1e-9;
+            let length = ((b[0] - a[0]).hypot(b[1] - a[1])).hypot(b[2] - a[2]);
+            let steps = (length / 0.1).ceil().max(1.) as usize;
+            let mut worst = f64::NEG_INFINITY;
+            for i in 0..=steps {
+                let t = i as f64 / steps as f64;
+                let p = [
+                    a[0] + t * (b[0] - a[0]),
+                    a[1] + t * (b[1] - a[1]),
+                    a[2] + t * (b[2] - a[2]),
+                ];
+                worst = worst.max(stock.top_under_disk([p[0], p[1]], r) - p[2]);
+            }
+            if travels && motion.kind == MoveKind::Plunge {
+                out.helix_moves += 1;
+                if out.helix_first_start.is_none() {
+                    out.helix_first_start = Some(a);
+                }
+                out.helix_last_end = Some(b);
+                out.worst_helix = out.worst_helix.max(worst);
+            } else {
+                out.vertical_plunges += 1;
+                out.worst_vertical = out.worst_vertical.max(worst);
+            }
+        }
+        let d = stock
+            .preview_sweep(&tool, &motion, 1., m.sweep, &cancel)
+            .unwrap();
+        stock.apply_delta(&d).unwrap();
+    }
+    out.stream_error = stream_error(m, &motions);
+    out
+}
+
+#[test]
+fn blocked_loop_starts_move_to_a_clear_entry() {
+    use camlib::{
+        motion::WorkFrame,
+        stock::{HeightBounds, InitialStock, Stock},
+        waterline::WaterlinePlan,
+    };
+    // The plate's Z6 loop starts at its contour's own start (measured at
+    // 2017dcc; the contour depends only on the part, not the stock). A lump
+    // of uncut stock at Z6.3 over every cell within 10.5 mm of that start
+    // blocks every candidate beside it - they are searched up to 8 mm out
+    // and the ball disk reaches 2.283 mm further - while points farther
+    // along the loop have clear air: the loop must move its start to a
+    // clear entry and never plunge into the lump (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let given_start = [16.201954570312502, 4.9751401953125];
+    println!("given Z6 loop start {given_start:?}");
+    let tolerance = plate(&m).tolerance_mm;
+    let spec = m.stock.height().unwrap().clone();
+    let probe = Stock::new(spec.clone()).unwrap();
+    let [nx, ny] = probe.dimensions();
+    let [wx, wy] = probe.cell_widths_mm();
+    let mut bounds = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let (x0, y0) = (i as f64 * wx, j as f64 * wy);
+            let dx = (x0 - given_start[0]).max(given_start[0] - x0 - wx).max(0.);
+            let dy = (y0 - given_start[1]).max(given_start[1] - y0 - wy).max(0.);
+            let top = if dx.hypot(dy) <= 10.5 { 6.3 } else { 2. };
+            bounds.push(HeightBounds {
+                lower_mm: top,
+                upper_mm: top,
+            });
+        }
+    }
+    let initial = InitialStock {
+        source_id: "roughed-plate".into(),
+        revision: "1".into(),
+        source_sha256: "0".repeat(64),
+        source_to_setup: WorkFrame::identity(),
+        uncertainty_mm: 0.,
+        representation: "whole_cell_top_down".into(),
+        bounds,
+    };
+    let mut stock = Stock::from_initial(spec.clone(), &initial).unwrap();
+    let mut plan = WaterlinePlan::prepare(
+        plate(&m),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let replay = replay(&m, &mut plan, &mut stock);
+    // The whole plan streams: every motion starts where the previous one
+    // ended, with an increasing id (what the simulation and the UI check).
+    assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
+    println!(
+        "replay {replay:?} moved {} helical {}",
+        plan.report().moved_entries,
+        plan.report().helical_entries
+    );
+    // No vertical descent meets stock deeper than the tolerance, and no
+    // loop needs the helix: clear entries exist along the loop.
+    assert!(replay.vertical_plunges > 0);
+    assert!(
+        replay.worst_vertical <= tolerance + 1e-6,
+        "worst vertical plunge met stock {} deep",
+        replay.worst_vertical
+    );
+    assert_eq!(replay.helix_moves, 0);
+    assert!(plan.report().moved_entries >= 1);
+    assert_eq!(plan.report().helical_entries, 0);
+    // The loop still cuts its full contour: the cut lengths per level
+    // measured at 2017dcc (the contour depends only on the part).
+    for (z, len) in [
+        (6_000_000, 28.968869111),
+        (4_000_000, 40.629012855),
+        (2_500_000, 40.629012855),
+    ] {
+        let cut = replay.cut_length_by_level.get(&z).copied().unwrap_or(0.);
+        assert!(
+            (cut - len).abs() <= 1e-6,
+            "level Z{} cut length {cut}",
+            z as f64 / 1e6
+        );
+    }
+}
+
+#[test]
+fn fully_blocked_loops_enter_on_a_helix() {
+    use camlib::{
+        stock::{Stock, StockSpec},
+        waterline::WaterlinePlan,
+    };
+    // An island 16..24 x 16..24 at Z6 in a 40x40 stock standing at Z7, the
+    // single waterline level Z6: the stock under the ball stands a full
+    // millimetre above the level at every point beside the loop, on and off
+    // it, so no side entry exists anywhere on the loop. The entry must be
+    // the one-lap helix along the loop itself: a plunge to the lowest height
+    // the stock under the ball at the loop start is clear at (the stock top
+    // Z7), then one lap down to the level (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let spec = StockSpec {
+        version: 1,
+        units: "mm".into(),
+        min_mm: [0., 0., 0.],
+        max_mm: [40., 40., 7.],
+        cell_size_mm: 0.4,
+        max_cells: 1_048_576,
+    };
+    let mut op = operation(&m);
+    let tolerance = op.tolerance_mm;
+    op.surface = SurfaceMesh {
+        version: 1,
+        units: "mm".into(),
+        surface_error_mm: 0.,
+        source: serde_json::Value::Null,
+        triangles: vec![
+            [[16., 16., 6.], [24., 16., 6.], [24., 24., 6.]],
+            [[16., 16., 6.], [24., 24., 6.], [16., 24., 6.]],
+        ]
+        .into(),
+    };
+    op.top_z_mm = 6.;
+    op.bottom_z_mm = 6.;
+    let mut stock = Stock::new(spec.clone()).unwrap();
+    let mut plan = WaterlinePlan::prepare(
+        op,
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let replay = replay(&m, &mut plan, &mut stock);
+    // The whole plan streams: every motion starts where the previous one
+    // ended, with an increasing id (what the simulation and the UI check).
+    assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
+    println!(
+        "replay {replay:?} moved {} helical {}",
+        plan.report().moved_entries,
+        plan.report().helical_entries
+    );
+    // The entry plunge stops at the stock top Z7, in air; the helix lap
+    // meets the wall it cuts, never deeper than the level gap it descends.
+    assert!(replay.vertical_plunges > 0);
+    assert!(
+        replay.worst_vertical <= tolerance + 1e-6,
+        "worst vertical plunge met stock {} deep",
+        replay.worst_vertical
+    );
+    assert!(replay.helix_moves > 0);
+    assert!(
+        replay.worst_helix <= 1. + 1e-6,
+        "the helix met stock {} deep, the level gap is 1",
+        replay.worst_helix
+    );
+    assert_eq!(plan.report().helical_entries, 1);
+    assert_eq!(plan.report().moved_entries, 0);
+    // The helix ends at the level, at the loop start it began at.
+    let first = replay.helix_first_start.expect("a helix lap");
+    let last = replay.helix_last_end.expect("a helix lap");
+    assert!(
+        (last[0] - first[0]).abs() <= 1e-9 && (last[1] - first[1]).abs() <= 1e-9,
+        "the helix ends at {last:?}, it began at {first:?}"
+    );
+    assert!((last[2] - 6.).abs() <= 1e-9, "the helix ends at {last:?}");
+}
+
+#[test]
+fn open_runs_enter_on_a_helix_that_returns_to_their_start() {
+    use camlib::{
+        stock::{Stock, StockSpec},
+        waterline::WaterlinePlan,
+    };
+    // The frustum fixture with slope limits from 65 degrees: the limits cut
+    // each contour into open runs (the flanks' seams measure 60..70
+    // degrees). An unroughed block standing at Z9, 1 mm above the top level,
+    // reaching 20 mm past the part on every side, so every point beside
+    // every run has stock above its level and the runs enter on a helix. An
+    // open run ends away from its start, so its helix must come back along
+    // it to the start the cut begins from: the whole plan streams (motion
+    // continuity, as the simulation and the UI check it), and no vertical
+    // plunge meets stock (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let mut op = operation(&m);
+    op.slope_from_deg = 65.;
+    let tolerance = op.tolerance_mm;
+    let spec = StockSpec {
+        version: 1,
+        units: "mm".into(),
+        min_mm: [-20., -20., 0.],
+        max_mm: [44., 36., 9.],
+        cell_size_mm: 0.4,
+        max_cells: 1_048_576,
+    };
+    let mut stock = Stock::new(spec.clone()).unwrap();
+    let mut plan = WaterlinePlan::prepare(op, &m.tools[0], &spec, m.initial_position_mm, 1, &cancel)
+        .unwrap();
+    let replay = replay(&m, &mut plan, &mut stock);
+    // The whole plan streams: every motion starts where the previous one
+    // ended, with an increasing id (what the simulation and the UI check).
+    assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
+    println!(
+        "replay {replay:?} moved {} helical {}",
+        plan.report().moved_entries,
+        plan.report().helical_entries
+    );
+    assert!(plan.report().helical_entries > 0);
+    assert!(replay.helix_moves > 0);
+    assert!(
+        replay.worst_vertical <= tolerance + 1e-6,
+        "worst vertical plunge met stock {} deep",
+        replay.worst_vertical
+    );
+}
+
+#[test]
+fn unblocked_loops_keep_their_start() {
+    use camlib::waterline::WaterlinePlan;
+    // The frustum fixture, roughed so every loop enters beside its given
+    // start: the whole-loop search never runs, no loop enters on a helix,
+    // and the moves are the ones measured at 2017dcc (#46).
+    let m = fixture();
+    let cancel = AtomicBool::new(false);
+    let tolerance = operation(&m).tolerance_mm;
+    let (mut stock, spec) = roughed(&m, 3.);
+    let mut plan = WaterlinePlan::prepare(
+        operation(&m),
+        &m.tools[0],
+        &spec,
+        m.initial_position_mm,
+        1,
+        &cancel,
+    )
+    .unwrap();
+    let replay = replay(&m, &mut plan, &mut stock);
+    // The whole plan streams: every motion starts where the previous one
+    // ended, with an increasing id (what the simulation and the UI check).
+    assert!(replay.stream_error.is_none(), "{:?}", replay.stream_error);
+    println!("replay {replay:?}");
+    assert_eq!(plan.report().moved_entries, 0);
+    assert_eq!(plan.report().helical_entries, 0);
+    assert_eq!(replay.motions, 184);
+    let first = replay.first_entry.expect("an entry plunge");
+    assert!(
+        (first[0] - 19.015079355936262).abs() <= 1e-9
+            && (first[1] - 5.168476859157234).abs() <= 1e-9
+            && (first[2] - 8.).abs() <= 1e-9,
+        "first entry {first:?}"
+    );
+    assert!(replay.vertical_plunges > 0);
+    assert!(
+        replay.worst_vertical <= tolerance + 1e-6,
+        "worst vertical plunge met stock {} deep",
+        replay.worst_vertical
+    );
+    assert_eq!(replay.helix_moves, 0);
 }
 
 // In-between levels on shallow slopes keep the scallop bounded (#46).

@@ -109,6 +109,14 @@ pub(crate) struct ProfileMotion {
     /// lead point (None for a loop: the tangent lead). Set by an operation
     /// that has proven the horizontal lead from it to the loop start clear.
     pub entry_points: Vec<Option<[f64; 2]>>,
+    /// Per loop, a height the loop enters on a helix along itself
+    /// (waterline #46): the tool plunges at the loop's own start to this
+    /// height - the lowest one the stock under the ball there is clear at,
+    /// proven part-clear by the operation - then descends along the loop
+    /// over exactly one lap to the depth and cuts the loop flat (the flat
+    /// lap is the second pass when the profile has one). Empty or None: the
+    /// loop enters at `entry_points` or the tangent lead.
+    pub helix_entries: Vec<Option<f64>>,
 }
 type CutMove = (crate::motion::Curve, crate::motion::MoveKind);
 /// Holding tabs on the tool-center loops: around each center (arc length),
@@ -120,6 +128,11 @@ pub(crate) struct TabPlan {
     pub half: f64,
     pub ramp: bool,
     pub centers: Vec<Vec<f64>>,
+}
+/// A loop whose last stroke ends exactly where its first starts: a lap along
+/// it returns to its start (a helix entry needs that, #46).
+pub(crate) fn loop_closes(strokes: &[Stroke]) -> bool {
+    strokes[strokes.len() - 1].b == strokes[0].a
 }
 pub(crate) fn stroke_length(s: &Stroke) -> f64 {
     // Ramp Z is interpolated by accumulated stroke length. A host-libm
@@ -512,6 +525,7 @@ impl ProfileMotion {
             entry_ramp: None,
             ramp_feed: 0.,
             entry_points: vec![],
+            helix_entries: vec![],
         }
     }
     /// The stretches of a loop at depth z the limits block, as arc-length
@@ -674,8 +688,16 @@ impl ProfileMotion {
                     }
                 }
             };
-            // A ramp pass enters at the height it descends from.
-            let entry_z = match self.ramp_from {
+            // A ramp pass enters at the height it descends from; a loop
+            // with a helix entry (waterline #46) enters at its own start at
+            // the height the stock there is clear at, on its first pass.
+            let entry_z = match self
+                .helix_entries
+                .get(self.ring)
+                .copied()
+                .flatten()
+                .or(self.ramp_from)
+            {
                 Some(from) if self.pass == 0 => from.max(z),
                 _ => z,
             };
@@ -749,7 +771,58 @@ impl ProfileMotion {
                             .as_ref()
                             .map(|p| (p, p.centers[self.ring].as_slice()));
                         let lifts = self.lifts(self.ring, z)?;
-                        let moves = if let Some(ramp) = &self.entry_ramp {
+                        let helix = if self.pass == 0 {
+                            self.helix_entries.get(self.ring).copied().flatten()
+                        } else {
+                            None
+                        };
+                        let moves = if let Some(zc) = helix {
+                            if tabs.is_some() {
+                                return Err(format!(
+                                    "operation {}: a helix entry cannot be combined with holding tabs: the tab would come down onto the helix. Remove the tabs or the entry",
+                                    s.id
+                                ));
+                            }
+                            let ring = &self.loops[self.ring];
+                            // One lap descending `zc` -> z along the loop
+                            // (the lap length sets the slope), then the loop
+                            // flat at the depth; with a second pass the flat
+                            // lap is that pass.
+                            let mut moves = vec![];
+                            if zc > z && loop_closes(ring) {
+                                moves.extend(
+                                    tabbed_loop(ring, z, zc, None, &lifts)?
+                                        .into_iter()
+                                        .map(|(curve, _)| (curve, MoveKind::Plunge)),
+                                );
+                            } else if zc > z {
+                                // An open run (a stretch of a contour the
+                                // slope or scallop limits keep) ends away from
+                                // its start: descend along it to half the
+                                // depth, then back along it to the depth, so
+                                // the lap ends at the start the cut begins
+                                // from (#46).
+                                let mid = (zc + z) / 2.;
+                                let total: f64 = ring.iter().map(stroke_length).sum();
+                                let back: Vec<Stroke> =
+                                    ring.iter().rev().map(|e| e.reversed()).collect();
+                                let back_lifts: Vec<(f64, f64, f64)> = lifts
+                                    .iter()
+                                    .rev()
+                                    .map(|&(a, b, h)| (total - b, total - a, h))
+                                    .collect();
+                                moves.extend(
+                                    tabbed_loop(ring, mid, zc, None, &lifts)?
+                                        .into_iter()
+                                        .chain(tabbed_loop(&back, z, mid, None, &back_lifts)?)
+                                        .map(|(curve, _)| (curve, MoveKind::Plunge)),
+                                );
+                            }
+                            if self.passes == 1 {
+                                moves.extend(tabbed_loop(ring, z, z, None, &lifts)?);
+                            }
+                            moves
+                        } else if let Some(ramp) = &self.entry_ramp {
                             if tabs.is_some() || !lifts.is_empty() {
                                 return Err(format!(
                                     "operation {}: a ramp entry cannot be combined with {}: the tool comes back down from them steeper than the ramp angle. Remove the entry or the {}",
