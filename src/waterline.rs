@@ -3462,17 +3462,16 @@ mod entry_tests {
         ]];
         let z = 3.;
         let (points, _, moved, _) = plan.entries(&stock, &mut loops, z, z, &cancel).unwrap();
-        if let Some(p) = points[0] {
-            assert_eq!(moved, 1);
-            let start = loops[0][0].a;
-            let mut work = SurfaceWork::default();
-            let met = plan
-                .stock_met(&stock, [p[0], p[1], z], start, z, &mut work, &cancel)
-                .unwrap();
-            assert!(
-                met <= plan.op.tolerance_mm,
-                "the lead from {p:?} onto the moved start {start:?} meets {met} mm of stock"
-            );
-        }
+        let p = points[0].expect("a side entry at a moved start");
+        assert_eq!(moved, 1, "the start moved");
+        let start = loops[0][0].a;
+        let mut work = SurfaceWork::default();
+        let met = plan
+            .stock_met(&stock, [p[0], p[1], z], start, z, &mut work, &cancel)
+            .unwrap();
+        assert!(
+            met <= plan.op.tolerance_mm,
+            "the lead from {p:?} onto the moved start {start:?} meets {met} mm of stock"
+        );
     }
 }
