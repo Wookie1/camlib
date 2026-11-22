@@ -456,10 +456,72 @@ class ToolChangeInPlace:
     fixtures). The first tool starts at the setup's initial position.
     Declare it only for a machine that behaves so (for LinuxCNC: an M6 with
     no configured tool-change move); posts must declare the same
-    (``Machine(tool_change_position_mode="preserve_spindle")``)."""
+    (``Machine(tool_change_position_mode="preserve_spindle")``).
+
+    ``retract_gauge_z_mm`` states a retract before every tool change of a
+    planned job: the old tool goes straight up at rapid until the spindle
+    gauge line is at that work Z, and the tool is changed there, so the new
+    tool's tip starts at that Z less its own gauge length. The retract is an
+    ordinary move of the operation before the change: checked against stock,
+    fixtures and machine travel, posted and decoded like any other. It only
+    goes up: a value below where an operation leaves the spindle is refused.
+    None (the default) plans no retract: the tool is changed where the last
+    operation stopped, and an operation whose longer tool would then start
+    below its clearance height is refused."""
+
+    retract_gauge_z_mm: float | None = None
+
+    def __post_init__(self):
+        z = self.retract_gauge_z_mm
+        if z is not None and (
+            isinstance(z, bool) or not isinstance(z, (int, float)) or not math.isfinite(z) or abs(z) > 1e6
+        ):
+            raise ValueError("retract_gauge_z_mm needs a finite work Z (or None: no retract)")
 
     def to_dict(self):
-        return {"in_place": True}
+        data = {"in_place": True}
+        if self.retract_gauge_z_mm is not None:
+            data["retract_gauge_z_mm"] = float(self.retract_gauge_z_mm)
+        return data
+
+
+@dataclass(frozen=True)
+class EndPosition:
+    """Where a milling program ends, in work coordinates
+    (``Setup(end_position=...)``): after the last operation its tool goes
+    straight up at rapid until the spindle gauge line is at ``gauge_z_mm``
+    (its tip at that Z less its gauge length), then, when ``xy_mm`` is given,
+    at rapid to that XY at the same height. Both are ordinary moves of the
+    last operation: streamed, checked against stock, fixtures and machine
+    travel, posted before the spindle and coolant stop and decoded like any
+    other. The Z move only goes up: a ``gauge_z_mm`` below where the last
+    operation leaves the spindle is refused. Without an end position the
+    program ends where its last operation stopped; none is ever assumed.
+
+    For three-axis milling setups. A lathe setup already ends at its turret
+    index position (``Setup.initial_position_mm``), and a cutting table has
+    no spindle gauge line: both refuse it."""
+
+    gauge_z_mm: float
+    xy_mm: tuple | None = None
+
+    def __post_init__(self):
+        xy = self.xy_mm
+        if xy is not None:
+            if not isinstance(xy, (list, tuple)) or len(xy) != 2:
+                raise ValueError("end position xy_mm needs two work coordinates (or None: X and Y stay)")
+            object.__setattr__(self, "xy_mm", tuple(xy))
+        if not all(
+            not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) and abs(v) <= 1e6
+            for v in (self.gauge_z_mm, *(self.xy_mm or ()))
+        ):
+            raise ValueError("end position needs finite work coordinates")
+
+    def to_dict(self):
+        data = {"gauge_z_mm": float(self.gauge_z_mm)}
+        if self.xy_mm is not None:
+            data["xy_mm"] = [float(v) for v in self.xy_mm]
+        return data
 
 
 @dataclass(frozen=True)
@@ -962,6 +1024,10 @@ def _parsed_manifest(digest, raw):
     return parsed
 
 
+def _finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
 class StockState:
     """Transactional Python consumer of native bounds, with a read-only cell view."""
 
@@ -977,7 +1043,16 @@ class StockState:
         if (
             not required
             <= set(m)
-            <= required | {"operations", "verification", "geometry", "tool_change", "rapid_retracts", "initial_stock"}
+            <= required
+            | {
+                "operations",
+                "verification",
+                "geometry",
+                "tool_change",
+                "rapid_retracts",
+                "initial_stock",
+                "end_position",
+            }
             or type(m["version"]) is not int
             or m["version"] not in (1, 2)
         ):
@@ -1040,7 +1115,14 @@ class StockState:
         self._gauges = {t["id"]: t["gauge_length_mm"] for t in m["tools"]}
         change = m.get("tool_change")
         if change is not None and (
-            (m["version"] != 1 or change != {"in_place": True})
+            (
+                m["version"] != 1
+                or change["in_place"] is not True
+                or set(change) - {"in_place", "retract_gauge_z_mm"}
+                # The producer plans the stated retract as an ordinary move
+                # (#374); a consumer only needs the change itself.
+                or not _finite_number(change.get("retract_gauge_z_mm", 0.0))
+            )
             if "in_place" in change
             else m["version"] != 1
             or (
@@ -1054,6 +1136,20 @@ class StockState:
         ):
             raise ProtocolError("invalid tool change pose")
         self._tool_change = change
+        # The producer plans the stated end position as ordinary moves
+        # (#378); a consumer only checks the declaration's shape.
+        end = m.get("end_position")
+        if end is not None and (
+            m["version"] != 1
+            or not isinstance(end, dict)
+            or set(end) - {"gauge_z_mm", "xy_mm"}
+            or not _finite_number(end.get("gauge_z_mm"))
+            or "xy_mm" in end
+            and not (
+                isinstance(end["xy_mm"], list) and len(end["xy_mm"]) == 2 and all(map(_finite_number, end["xy_mm"]))
+            )
+        ):
+            raise ProtocolError("invalid end position")
         # False only after restoring a checkpoint that does not record the
         # tool in the spindle (written before #168).
         self._last_tool_known = True
@@ -1703,6 +1799,7 @@ def simulation_manifest(
     rapid_retracts=True,
     turning=None,
     initial_stock=None,
+    end_position=None,
 ):
     """The JSON stream manifest a ``Simulation`` sends to ``cam-sim-stream``
     (also the setup manifest of a ``camlib.post.post_job`` input)."""
@@ -1729,6 +1826,13 @@ def simulation_manifest(
         manifest["tool_change"] = tool_change.to_dict() if hasattr(tool_change, "to_dict") else dict(tool_change)
     if type(rapid_retracts) is not bool:
         raise ValueError("rapid_retracts must be a bool")
+    if end_position is not None:
+        if turning is not None:
+            raise ValueError(
+                "a lathe run already ends at its turret index position (the setup's initial position); "
+                "an end position is a milling spindle's gauge Z and XY"
+            )
+        manifest["end_position"] = end_position.to_dict() if hasattr(end_position, "to_dict") else dict(end_position)
     if turning is not None:
         # A lathe run: its turning setup plans and checks every move.
         if operations or verification is not None or tool_change is not None:
@@ -1767,6 +1871,7 @@ class Simulation:
         rapid_retracts=True,
         turning=None,
         initial_stock=None,
+        end_position=None,
         _on_spawn=None,
     ):
         manifest = simulation_manifest(
@@ -1783,6 +1888,7 @@ class Simulation:
             rapid_retracts=rapid_retracts,
             turning=turning,
             initial_stock=initial_stock,
+            end_position=end_position,
         )
         self._regeneration = regeneration
         self.executable = _executable("cam-sim-stream", executable)

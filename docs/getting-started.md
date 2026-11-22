@@ -154,8 +154,13 @@ the old gauge length minus the new one: after a 75 mm tool, a 115 mm tool
 reaches 40 mm further down. The planner starts the new tool there, and the
 stock, fixture and machine-travel checks and the posted-program check all use
 that pose. An operation whose longer tool would arrive below its clearance
-height (in or close above the part) is refused, naming the change: retract
-higher before the change, or put the longer tool first. The first
+height (in or close above the part) is refused, naming the change: state a
+retract before the change, retract higher by hand, or put the longer tool
+first. `ToolChangeInPlace(retract_gauge_z_mm=150)` states the retract once
+for the setup: before every tool change the old tool goes straight up at
+rapid until the spindle gauge line is at work Z 150, as an ordinary checked
+and posted move, and the new tool starts with its tip at 150 less its gauge
+length. No retract height is assumed when you give none. The first
 tool starts at the setup's `initial_position_mm`. This is what a LinuxCNC
 machine does when its `M6` is not configured to move (see
 [Posts](posts.md#linuxcnc-tool-changes)); declare it only if yours behaves so.
@@ -188,6 +193,29 @@ setup = Setup("top", stock=..., tools=(mill, drill),
 step 5. `job.post` and `job.post_nc` refuse a setup that disagrees with the
 machine before planning, naming the tool, both poses and the setup to declare.
 Each posted tool change is also decoded and checked against the plan.
+
+## Where the program ends
+
+A program ends where its last operation retracted to: above the part, over
+the last cut. To end with the spindle clear of the work and the table where
+you want it, say where:
+
+```python
+from camlib import EndPosition
+
+setup = Setup("top", stock=..., tools=(mill, drill),
+              operations=(face, pocket, holes), initial_position_mm=(0, 0, 15),
+              # Gauge line 150 mm above the work origin, then over X-20 Y120.
+              end_position=EndPosition(gauge_z_mm=150, xy_mm=(-20, 120)))
+```
+
+After the last operation the tool goes straight up at rapid until the spindle
+gauge line is at `gauge_z_mm`, then at rapid to `xy_mm` (leave it out to keep
+X and Y). Both moves are planned, checked against stock, fixtures and machine
+travel, posted before the spindle and coolant stop, and decoded like every
+other move. camlib assumes no end position: give none and the program ends as
+it does today. Lathe setups end at their turret index position
+(`initial_position_mm`) and take no end position.
 
 ## Reading the results
 

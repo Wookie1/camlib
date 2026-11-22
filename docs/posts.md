@@ -84,7 +84,9 @@ Key settings:
   other rapid. With `tool_change_position_mode="preserve_spindle"` no axis
   moves at the tool change: the spindle gauge line stays, so the new tip is
   the old tip moved along Z by the old gauge length minus the new one. Plan
-  with `Setup(tool_change=ToolChangeInPlace())` (see
+  with `Setup(tool_change=ToolChangeInPlace())`, or with
+  `ToolChangeInPlace(retract_gauge_z_mm=...)` to have the program retract Z
+  to a stated height before each change (see
   [LinuxCNC tool changes](#linuxcnc-tool-changes)). `job.post` and
   `job.post_nc` refuse a setup whose tool-change pose disagrees with the
   machine's, before planning.
@@ -527,6 +529,81 @@ with that pose: an operation whose tool would arrive below its clearance
 height is refused with the change named, and the new tool's first moves are
 checked against stock and fixtures like any others. The mode needs the work Z axis along machine Z, and is refused
 for lathe turrets and for controllers that select a cutting edge with `T`/`D`.
+
+Because M6 moves nothing on such a machine, the program itself must take the
+spindle clear before the change when the next tool is longer. State where:
+`Setup(tool_change=ToolChangeInPlace(retract_gauge_z_mm=150))` plans, before
+every tool change, one rapid of the old tool straight up until the spindle
+gauge line is at work Z 150 (the 75 mm tool's tip at Z 75); the 115 mm tool
+is then changed in with its tip at Z 35. The post writes that rapid as an
+ordinary block before the change (here after an operation that stopped at
+Z 12 over X20 Y8), and the decoder reads it back as one:
+
+```
+G1 X20 Y8 Z12 F600
+G0 X20 Y8 Z75
+M9
+M5
+G54
+T2
+M6
+G43 H2
+```
+
+The retract is a planned move like any other: it is streamed with the run,
+checked against stock, fixtures and the machine's travel, and compared with
+the decoded program. camlib assumes no retract height: without the value the
+tool is changed where the last operation stopped, as before, and a job whose
+longer tool would then start below its clearance height is refused. A stated
+retract only goes up (a value below where an operation leaves the spindle is
+refused), and a value too low for the next tool's clearance height is refused
+naming the change and the height it needs. The value is a work Z of the
+spindle gauge line, so it is the same for every tool; it is not the
+controller's `G53`/`G28`/`G30` and no machine-coordinate block is written.
+
+### Program end position
+
+A post ends a program by stopping the spindle and coolant and writing its
+end code; it adds no move of its own (the Carvera post writes its
+`G53 G0 Z-3` only where the plan already ends at that height, see its
+notes), so the tool is left where the last operation retracted to. State where the program should end instead with
+`Setup(end_position=EndPosition(gauge_z_mm=..., xy_mm=None))`: the planner
+adds a Z rapid until the spindle gauge line is at that work Z and, when
+`xy_mm` is given, an XY rapid, after the last operation. Every mill post
+writes them as its ordinary rapids (`G0`, or `G1` at the declared traverse
+feed on a machine that declares one), before the stop and the end code, and
+its decoder reads them back like any other block. With the default post
+(LinuxCNC dialect), a 60 mm tool and
+`EndPosition(gauge_z_mm=100, xy_mm=(-10, 30))`:
+
+```
+G1 X20 Y8 Z12 F600
+G0 X20 Y8 Z40
+G0 X-10 Y30 Z40
+M9
+M5
+G49
+M2
+```
+
+and without an end position, byte for byte what it was:
+
+```
+G1 X20 Y8 Z12 F600
+M9
+M5
+G49
+M2
+```
+
+The positions are work coordinates of the active work offset, written as
+plain `G0` blocks: no `G53`, `G28` or `G30` block is written, since where
+those send a machine is its configuration. The moves are checked like any
+others (stock contact, fixtures, avoid areas, the declared travel, and the
+machine check on the decoded program), and an end position a check refuses
+is reported on that move. Lathe posts are unchanged: a lathe program already
+ends with the tool at the turret index position the setup starts from.
+Plasma and laser setups take no end position.
 
 ## Posting without Python (Rust, WebAssembly)
 
