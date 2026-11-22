@@ -133,11 +133,16 @@ solid, and reports in the mesh's `source`:
   part of the error. A solid whose tolerances alone exceed `max_error_mm` is
   refused; a loosely toleranced import needs a larger `max_error_mm`, or
   healing in the CAD system.
-- If the kernel's triangulation does not match a face's trims, the whole
-  solid is triangulated again, finer, then with the tolerances of the
-  adapter's private copy tightened (`tolerances_tightened_for_meshing`; the
-  error still charges the original ones). A face is never meshed on its own:
-  its edges would not be shared with its neighbours.
+- If the kernel's triangulation does not match a face's trims, camlib first
+  checks for self-intersecting UV trim polygons (for example at a zero-angle
+  tangent cusp, #360): offending curved chords are bisected at their mid
+  parameter on the real CAD edge across all incident faces
+  (`cusp_trim_bisections`) so the kernel can triangulate with the extra shared
+  nodes. If a mismatch remains, the whole solid is triangulated again, finer,
+  then with the tolerances of the adapter's private copy tightened
+  (`tolerances_tightened_for_meshing`; the error still charges the original
+  ones). A face is never meshed on its own: its edges would not be shared with
+  its neighbours.
 - Refusals name the face (`face 12 (BSPLINE, 48.300 mm2): ...`): a surface
   with no bound (a surface of revolution of a spline, an offset surface), a
   face no triangulation matches, or `max_facets` exceeded.

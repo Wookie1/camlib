@@ -17,6 +17,7 @@ their chords by the same hull property.
 """
 
 from collections import Counter
+from fractions import Fraction
 import math
 import time
 
@@ -689,6 +690,306 @@ def _face_data(face, cancel, spline=None):
     return adaptor, bounds, uv, indices, trim_error + clamp_error, trim_segments, trims
 
 
+# Tangent-cusp UV trim repair (#360).
+# Written and tested against OCP 7.9.3.1 / OpenCascade 7.9.x BRepMesh
+# IMeshTools stages, clearing IMeshData_Failure (on affected faces) and
+# IMeshData_SelfIntersectingWire (on their wires) so FaceDiscret triangulates
+# repaired faces. All IMeshData_* handles stay inside
+# `_repair_model_self_intersections` before `IMeshTools_Context.Clean()`.
+_MAX_CUSP_BISECTIONS_PER_FACE = 64
+
+
+def _orient2d_sign(a, b, c):
+    """Exact sign of orient2d(a, b, c): +1 CCW, -1 CW, 0 collinear."""
+    left = (a[0] - c[0]) * (b[1] - c[1])
+    right = (a[1] - c[1]) * (b[0] - c[0])
+    det = left - right
+    bound = 1e-12 * (abs(left) + abs(right))
+    if det > bound:
+        return 1
+    if det < -bound:
+        return -1
+    exact = (Fraction(a[0]) - Fraction(c[0])) * (Fraction(b[1]) - Fraction(c[1])) - (
+        Fraction(a[1]) - Fraction(c[1])
+    ) * (Fraction(b[0]) - Fraction(c[0]))
+    return 1 if exact > 0 else (-1 if exact < 0 else 0)
+
+
+def _on_segment(p, a, b):
+    return min(a[0], b[0]) <= p[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= p[1] <= max(a[1], b[1])
+
+
+def _foldback(p, shared, q):
+    if _orient2d_sign(p, shared, q) != 0:
+        return False
+    return (Fraction(p[0]) - Fraction(shared[0])) * (Fraction(q[0]) - Fraction(shared[0])) + (
+        Fraction(p[1]) - Fraction(shared[1])
+    ) * (Fraction(q[1]) - Fraction(shared[1])) > 0
+
+
+def _segments_improperly_intersect(a, b, c, d, adjacent=False):
+    """Exact test whether UV segments (a, b) and (c, d) cross or fold back."""
+    if max(a[0], b[0]) < min(c[0], d[0]) or max(c[0], d[0]) < min(a[0], b[0]):
+        return False
+    if max(a[1], b[1]) < min(c[1], d[1]) or max(c[1], d[1]) < min(a[1], b[1]):
+        return False
+    for shared, p in ((a, b), (b, a)):
+        if shared == c:
+            return not adjacent or _foldback(p, shared, d)
+        if shared == d:
+            return not adjacent or _foldback(p, shared, c)
+    o1 = _orient2d_sign(a, b, c)
+    o2 = _orient2d_sign(a, b, d)
+    o3 = _orient2d_sign(c, d, a)
+    o4 = _orient2d_sign(c, d, b)
+    if o1 * o2 < 0 and o3 * o4 < 0:
+        return True
+    return (
+        (o1 == 0 and _on_segment(c, a, b))
+        or (o2 == 0 and _on_segment(d, a, b))
+        or (o3 == 0 and _on_segment(a, c, d))
+        or (o4 == 0 and _on_segment(b, c, d))
+    )
+
+
+def _eval_pcurve_uv(top_edge, face_shape, ori, tm, ref_t, ref_pt, skip_line=False):
+    """Evaluate the 2D pcurve at `tm`, preserving any periodic UV shift."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve2d, BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Line
+    from OCP.TopoDS import TopoDS
+
+    adapt2d = BRepAdaptor_Curve2d(TopoDS.Edge_s(top_edge.Oriented(ori)), face_shape)
+    if skip_line and adapt2d.GetType() == GeomAbs_Line:
+        return None
+    pt = list(adapt2d.Value(tm).Coord())
+    surf = BRepAdaptor_Surface(face_shape)
+    if surf.IsUPeriodic() or surf.IsVPeriodic():
+        ref = adapt2d.Value(ref_t).Coord()
+        for axis, periodic, period in ((0, surf.IsUPeriodic(), surf.UPeriod), (1, surf.IsVPeriodic(), surf.VPeriod)):
+            if periodic:
+                span = period()
+                pt[axis] += round((ref_pt[axis] - ref[axis]) / span) * span
+    return pt[0], pt[1]
+
+
+def _find_uv_trim_conflict(mesh_face):
+    """Return conflicting UV trim chords if `mesh_face`'s boundary is not simple."""
+    from OCP.BRepTools import BRepTools
+
+    face_shape = mesh_face.GetFace()
+    outer = BRepTools.OuterWire_s(face_shape)
+    wires = []
+    entries = []
+    for wi in range(mesh_face.WiresNb()):
+        wire = mesh_face.GetWire(wi)
+        segs = []
+        for ei in range(wire.EdgesNb()):
+            edge = wire.GetEdge(ei)
+            ori = wire.GetEdgeOrientation(ei)
+            pcurves = [edge.GetPCurve(pi) for pi in range(edge.PCurvesNb())]
+            same = [p for p in pcurves if p.GetFace().GetFace().IsSame(face_shape)]
+            pc = next((p for p in same if p.GetOrientation() == ori), same[0] if same else None)
+            if pc is None or pc.ParametersNb() < 2:
+                continue
+            order = range(pc.ParametersNb()) if pc.IsForward() else range(pc.ParametersNb() - 1, -1, -1)
+            pts = [pc.GetPoint(k).Coord() for k in order]
+            prms = [pc.GetParameter(k) for k in order]
+            for a_pt, b_pt, ta, tb in zip(pts, pts[1:], prms, prms[1:]):
+                seg = (edge, ori, a_pt, b_pt, ta, tb)
+                if a_pt == b_pt:
+                    return [seg]
+                entries.append(
+                    (
+                        min(a_pt[0], b_pt[0]),
+                        max(a_pt[0], b_pt[0]),
+                        min(a_pt[1], b_pt[1]),
+                        max(a_pt[1], b_pt[1]),
+                        wi,
+                        len(segs),
+                        seg,
+                    )
+                )
+                segs.append(seg)
+        wires.append((wire.GetWire().IsSame(outer), segs))
+    entries.sort(key=lambda item: item[0])
+    for i, (_, maxx_i, miny_i, maxy_i, wi, si, seg_i) in enumerate(entries):
+        for j in range(i + 1, len(entries)):
+            minx_j, _, miny_j, maxy_j, wj, sj, seg_j = entries[j]
+            if minx_j > maxx_i:
+                break
+            if maxy_i < miny_j or maxy_j < miny_i:
+                continue
+            adjacent = wi == wj and abs(si - sj) in (1, len(wires[wi][1]) - 1)
+            if _segments_improperly_intersect(seg_i[2], seg_i[3], seg_j[2], seg_j[3], adjacent):
+                return [seg_i, seg_j]
+    for is_outer, segs in wires:
+        if segs:
+            area = sum(Fraction(s[2][0]) * Fraction(s[3][1]) - Fraction(s[2][1]) * Fraction(s[3][0]) for s in segs)
+            if (area > 0) != is_outer or area == 0:
+                return segs
+    return None
+
+
+def _bisect_model_edge(edge, t0, t1):
+    """Insert the CAD edge's mid-parameter node in every face of `edge`.
+
+    Returns None on success or a short reason string if insertion is refused.
+    """
+    low, high = (t0, t1) if t0 <= t1 else (t1, t0)
+    tm = 0.5 * (low + high)
+    if not (low < tm < high):
+        return 'below edge parameter resolution'
+    if edge.GetDegenerated():
+        return 'edge is degenerated, so a shared node cannot be inserted'
+    if not edge.GetSameParam() or not edge.GetSameRange():
+        return 'edge is not SameParameter/SameRange, so a shared node cannot be inserted'
+
+    def slot(seq):
+        for k in range(seq.ParametersNb() - 1):
+            if {seq.GetParameter(k), seq.GetParameter(k + 1)} == {low, high}:
+                return k + 1
+        return None
+
+    curve3d = edge.GetCurve()
+    pos3 = slot(curve3d)
+    if pos3 is None:
+        return '3D edge discretization slot not found for shared node insertion'
+    pcurves = []
+    for j in range(edge.PCurvesNb()):
+        pc = edge.GetPCurve(j)
+        pos2 = slot(pc)
+        if pos2 is None:
+            return '2D pcurve discretization slot not found for shared node insertion'
+        pcurves.append((pc, pos2))
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.gp import gp_Pnt2d
+
+    top_edge = edge.GetEdge()
+    pt3d = BRepAdaptor_Curve(top_edge).Value(tm)
+    inserts = []
+    for pc, pos2 in pcurves:
+        ref_pt = pc.GetPoint(pos2 - 1).Coord()
+        u, v = _eval_pcurve_uv(
+            top_edge, pc.GetFace().GetFace(), pc.GetOrientation(), tm, pc.GetParameter(pos2 - 1), ref_pt
+        )
+        inserts.append((pc, pos2, gp_Pnt2d(u, v)))
+    curve3d.InsertPoint(pos3, pt3d, tm)
+    for pc, pos2, pt2d in inserts:
+        pc.InsertPoint(pos2, pt2d, tm)
+    return None
+
+
+def _repair_model_self_intersections(model, faces, cancel, max_bisections=None):
+    """Bisect self-intersecting UV trim chords in `model` until every face is
+    simple, or return `(bisections, face_index_or_None, reason)`."""
+    import OCP.IMeshData as imd
+
+    cap = _MAX_CUSP_BISECTIONS_PER_FACE if max_bisections is None else max_bisections
+    face_count = model.FacesNb()
+    dirty = set(range(face_count))
+    per_face = Counter()
+    bisections = 0
+
+    def refuse(face_shape, detail):
+        idx = next((i for i, face in enumerate(faces) if face.wrapped.IsSame(face_shape)), None)
+        return bisections, idx, f'UV trim polygon self-intersects (tangent cusp){detail}'
+
+    while dirty:
+        _check_cancel(cancel)
+        fi = min(dirty)
+        mesh_face = model.GetFace(fi)
+        conflict = _find_uv_trim_conflict(mesh_face)
+        if conflict is None:
+            dirty.remove(fi)
+            continue
+        face_shape = mesh_face.GetFace()
+        if per_face[fi] >= cap:
+            return refuse(face_shape, f' after {cap} edge bisections')
+        candidates = []
+        for seg in conflict:
+            edge, ori, a, b, ta, tb = seg
+            if edge.GetDegenerated():
+                continue
+            mid = _eval_pcurve_uv(edge.GetEdge(), face_shape, ori, 0.5 * (ta + tb), ta, a, skip_line=True)
+            if mid is None:
+                continue
+            # Prefer a chord bowing into the face (mid on the right of a->b):
+            # bisecting it widens a tangent cusp rather than tightening it.
+            bow = 1 if _orient2d_sign(a, b, mid) < 0 else 0
+            candidates.append((bow, math.dist(a, b), abs(tb - ta), seg))
+        if not candidates:
+            return refuse(face_shape, ' on straight edges')
+        edge, _, _, _, ta, tb = max(candidates, key=lambda item: item[:3])[3]
+        err = _bisect_model_edge(edge, ta, tb)
+        if err is not None:
+            return refuse(face_shape, f': {err}')
+        bisections += 1
+        per_face[fi] += 1
+        for j in range(edge.PCurvesNb()):
+            affected = edge.GetPCurve(j).GetFace()
+            affected.UnsetStatus(imd.IMeshData_Failure)
+            for wi in range(affected.WiresNb()):
+                affected.GetWire(wi).UnsetStatus(imd.IMeshData_SelfIntersectingWire)
+            aff_shape = affected.GetFace()
+            for k in range(face_count):
+                if model.GetFace(k).GetFace().IsSame(aff_shape):
+                    dirty.add(k)
+                    break
+    return bisections, None, None
+
+
+def _mesh_solid_with_cusp_repair(shape, faces, deflection, interior_deflection, cancel):
+    """Run BRepMesh stages, bisecting self-intersecting UV trim chords before
+    face triangulation (#360)."""
+    ctx = None
+    try:
+        import OCP.BRepMesh as bm
+        from OCP.BRepTools import BRepTools
+        from OCP.IMeshTools import IMeshTools_Context, IMeshTools_Parameters
+        from OCP.Message import Message_ProgressRange
+
+        BRepTools.Clean_s(shape.wrapped)
+        ctx = IMeshTools_Context()
+        ctx.SetShape(shape.wrapped)
+        params = ctx.ChangeParameters()
+        params.Deflection = deflection
+        params.DeflectionInterior = interior_deflection
+        params.Angle = 0.5
+        params.AngleInterior = 1.0
+        params.MinSize = max(1e-7, deflection * IMeshTools_Parameters.RelMinSize_s())
+        params.Relative = False
+        params.InParallel = False
+        ctx.SetModelBuilder(bm.BRepMesh_ModelBuilder())
+        ctx.SetEdgeDiscret(bm.BRepMesh_EdgeDiscret())
+        ctx.SetModelHealer(bm.BRepMesh_ModelHealer())
+        ctx.SetPreProcessor(bm.BRepMesh_ModelPreProcessor())
+        ctx.SetFaceDiscret(bm.BRepMesh_FaceDiscret(bm.BRepMesh_MeshAlgoFactory()))
+        ctx.SetPostProcessor(bm.BRepMesh_ModelPostProcessor())
+        pre = (('BuildModel', ctx.BuildModel), ('DiscretizeEdges', ctx.DiscretizeEdges), ('HealModel', ctx.HealModel))
+        for stage, call in pre:
+            if not call():
+                return 0, None, f'BRepMesh {stage} failed during tangent cusp repair'
+        bisections, failed_face, reason = _repair_model_self_intersections(ctx.GetModel(), faces, cancel)
+        if reason is not None or bisections == 0:
+            return bisections, failed_face, reason
+        post = (
+            ('PreProcessModel', ctx.PreProcessModel),
+            ('DiscretizeFaces', lambda: ctx.DiscretizeFaces(Message_ProgressRange())),
+            ('PostProcessModel', ctx.PostProcessModel),
+        )
+        for stage, call in post:
+            if not call():
+                return bisections, None, f'BRepMesh {stage} failed during tangent cusp repair'
+        return bisections, None, None
+    except (ImportError, AttributeError) as error:
+        message = f'tangent cusp repair unavailable on this OCP version ({error})'
+        error.__traceback__ = None
+        return 0, None, message
+    finally:
+        if ctx is not None and hasattr(ctx, 'Clean'):
+            ctx.Clean()
+
+
 def _divide_at_c0(shape):
     """The solid with every face that is only C0 along a line divided there
     into C1 faces, and how many faces that added: a B-spline face with a
@@ -1105,8 +1406,38 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
     seed_deflection = first_seed
     problem = None
     tightened = False
+    cusp_bisections = 0
+
+    def collect_faces():
+        rows = []
+        for index, face in enumerate(faces):
+            try:
+                row = _face_data(face, cancel, splines[index])
+            except _MesherMismatch as error:
+                note = ''.join(f'; {name(index)} {msg}' for msg in seam_notes[index])
+                return (
+                    None,
+                    True,
+                    f'the CAD mesher cannot triangulate {name(index)} consistently with its trims: {error}{note}',
+                )
+            except ValueError as error:
+                if 'cancelled' in str(error):
+                    raise
+                raise ValueError(f'{name(index)}: {error}') from None
+            face_trim_error = row[4] + seam_errors[index]
+            if face_trim_error > budget / 2:
+                return (
+                    None,
+                    False,
+                    f'the trim approximation of {name(index)} is {face_trim_error:.3g} mm, more than half the '
+                    f'{budget:.3g} mm that max_error_mm leaves after the CAD tolerances ({2 * topology:.3g} mm)',
+                )
+            rows.append(row)
+        return rows, False, None
+
     for attempt in range(8):
         _check_cancel(cancel)
+        cusp_bisections = 0
         if attempt == 4:
             from OCP.ShapeFix import ShapeFix_ShapeTolerance
             from OCP.TopAbs import TopAbs_SHAPE
@@ -1128,27 +1459,20 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
             BRepMesh_IncrementalMesh(shape.wrapped, parameters)
         else:
             BRepMesh_IncrementalMesh(shape.wrapped, seed_deflection, False, 0.5, True)
-        data = []
-        problem = None
-        for index, face in enumerate(faces):
-            try:
-                row = _face_data(face, cancel, splines[index])
-            except _MesherMismatch as error:
-                note = ''.join(f'; {name(index)} {msg}' for msg in seam_notes[index])
-                problem = f'the CAD mesher cannot triangulate {name(index)} consistently with its trims: {error}{note}'
-                break
-            except ValueError as error:
-                if 'cancelled' in str(error):
-                    raise
-                raise ValueError(f'{name(index)}: {error}') from None
-            face_trim_error = row[4] + seam_errors[index]
-            if face_trim_error > budget / 2:
-                problem = (
-                    f'the trim approximation of {name(index)} is {face_trim_error:.3g} mm, more than half the '
-                    f'{budget:.3g} mm that max_error_mm leaves after the CAD tolerances ({2 * topology:.3g} mm)'
-                )
-                break
-            data.append(row)
+        data, mismatch, problem = collect_faces()
+        if mismatch:
+            # At a tangent cusp the kernel's UV trim chords can cross regardless
+            # of deflection (#360). Bisect offending chords on their CAD edges
+            # in all incident faces, then let the kernel triangulate with them.
+            bisections, failed_face, cusp_reason = _mesh_solid_with_cusp_repair(
+                shape, faces, seed_deflection, 2 * budget if coarse else seed_deflection, cancel
+            )
+            if cusp_reason is not None:
+                target = name(failed_face) if failed_face is not None else 'the solid'
+                problem = f'the CAD mesher cannot triangulate {target} consistently with its trims: {cusp_reason}'
+            elif bisections > 0:
+                cusp_bisections = bisections
+                data, _, problem = collect_faces()
         if problem is None:
             break
         seed_deflection /= step
@@ -1519,6 +1843,7 @@ def export_curved_solid(shape, *, max_error_mm, max_facets, source, cancel):
             tolerances_tightened_for_meshing=tightened,
             faces_divided_at_c0=divided,
             seams_straightened=straightened,
+            cusp_trim_bisections=cusp_bisections,
             extraction_ms=(time.perf_counter() - started) * 1000,
         ),
     )

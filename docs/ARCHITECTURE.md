@@ -416,7 +416,12 @@ work refuses the move, independent of optional verification settings.
   The CadQuery adapter (`python/camlib/_cad_surface.py`) meshes a solid
   watertight: one point per mesh node of the solid (edge-curve points on CAD
   edges, for all faces of the edge), every edge bisected in all its facets
-  at once, and the result checked edge by edge before it is returned. And
+  at once, and the result checked edge by edge before it is returned. Where
+  OpenCascade's trim chords cross in UV (such as a zero-angle tangent cusp,
+  #360), camlib detects the self-intersection with exact 2D predicates,
+  bisects the offending chord at its mid parameter on the real CAD edge in
+  every incident face, and lets OpenCascade's mesher triangulate with those
+  extra shared nodes before running the same trim and watertight checks. And
   every part shadow (`PreparedRoughingTarget::shadow_simplified`: roughing,
   rest roughing, waterline flat and bull-nose levels, `silhouette_region`)
   is closed by the mesh's declared `surface_error_mm`
