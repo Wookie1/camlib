@@ -14,21 +14,21 @@
       "retracts": 24
     },
     "finish-steep": {
-      "air_cut_mm": 445.057,
-      "cut_mm": 1487.12,
-      "cycle_seconds_exact_stop": 201.628,
-      "cycle_seconds_tangent": 193.037,
+      "air_cut_mm": 635.708,
+      "cut_mm": 1666.782,
+      "cycle_seconds_exact_stop": 344.046,
+      "cycle_seconds_tangent": 336.106,
       "link_mm": 0.0,
-      "moves": 1995,
-      "plunges": 501,
-      "rapid_mm": 352.982,
+      "moves": 2532,
+      "plunges": 1051,
+      "rapid_mm": 337.259,
       "removed_mm3": 0.0,
       "retracts": 13
     }
   },
   "toolpath": {
-    "cycle_seconds_exact_stop": 359.741,
-    "cycle_seconds_tangent": 347.45,
+    "cycle_seconds_exact_stop": 502.159,
+    "cycle_seconds_tangent": 490.519,
     "material": {
       "leftover_mm3": [
         0.0,
@@ -39,8 +39,8 @@
         151.979
       ]
     },
-    "moves": 2799,
+    "moves": 3336,
     "post_error": null,
-    "posted_blocks": 2830
+    "posted_blocks": 3367
   }
 }

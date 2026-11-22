@@ -4,8 +4,8 @@
     "finish-levels": {
       "air_cut_mm": 23.965,
       "cut_mm": 411.744,
-      "cycle_seconds_exact_stop": 45.25,
-      "cycle_seconds_tangent": 45.2,
+      "cycle_seconds_exact_stop": 77.957,
+      "cycle_seconds_tangent": 77.907,
       "link_mm": 0.0,
       "moves": 251,
       "plunges": 73,
@@ -15,8 +15,8 @@
     }
   },
   "toolpath": {
-    "cycle_seconds_exact_stop": 45.25,
-    "cycle_seconds_tangent": 45.2,
+    "cycle_seconds_exact_stop": 77.957,
+    "cycle_seconds_tangent": 77.907,
     "material": {
       "leftover_mm3": [
         33.219,

@@ -1997,16 +1997,14 @@ The ramp is never steeper than the ramp angle: the level gap over the
 tangent of the angle along the loop, and where one lap is too short for
 that, as many whole laps as the angle needs, each descending an equal share
 (refused by name past 1000 laps). The split onto a loop vertex only ever
-lengthens a ramp. Without an `entry` the angle is 3 degrees at the cutting feed
-(`feed_mm_min`): a ramp that shallow cuts no deeper than the flat lap after
-it, so it needs no slower feed. `entry=RampEntry(angle_deg, feed_mm_min=...)`
-sets both (its feed defaults to the plunge feed, as in every operation). The
-link, the ramp and the loop are proven clear of the part like every waterline
-move; a link is taken only where it meets no more stock than the level gap the
-ramp descends or than the lower loop's own cut meets where the link arrives
-(measured at stock-cell centres, so a cell's material can be under-counted by
-up to about 0.01 mm: tool load only, never the part), otherwise the loop is
-entered as below. The report's `ramp_links` counts the linked levels.
+lengthens a ramp. Without an `entry` the angle is 3 degrees. Descending moves
+use the declared plunge feed unless `RampEntry` supplies its own feed. On an
+open run, a declared `min_length_mm` is the minimum travel before reversal.
+The link, ramp and loop must all clear the part. Each link's maximum stock
+depth over the whole swept cutter is bounded by the larger of the level gap
+and the stock the finishing lap is guaranteed to meet at its arrival point,
+within the operation tolerance. The planner enters the loop separately when
+the live stock bounds cannot establish that limit. The report's `ramp_links` counts the linked levels.
 
 Open runs (the parts of a contour slope or region limits keep) are linked the
 same way: from the end of the run just cut to the start of the next one, at

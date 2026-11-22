@@ -1898,12 +1898,13 @@ fn levels_link_with_a_ramp_that_the_next_level_recuts() {
     let m = fixture();
     let cancel = AtomicBool::new(false);
     let angle = 10f64.to_radians();
-    for entry in [None, Some(serde_json::json!({"kind": "ramp", "angle_rad": angle}))] {
+    for entry in [None, Some(serde_json::json!({"kind": "ramp", "angle_rad": angle, "feed_mm_min": 79.}))] {
         let mut op = operation(&m);
         // Every level (6, 4, 2.5) lies beside the box's walls, none on its
         // top face.
         op.surface = mesh(box_top(6.3));
         op.entry = entry.clone().map(|e| serde_json::from_value(e).unwrap());
+        let expected_entry_feed = if entry.is_some() { 79. } else { op.plunge_mm_min };
         let error_mm = op.contour_error_mm;
         let (mut stock, spec) = roughed(&m, 1.);
         let mut plan =
@@ -1924,6 +1925,7 @@ fn levels_link_with_a_ramp_that_the_next_level_recuts() {
             }
             let start = i;
             while i < motions.len() && motions[i].kind == MoveKind::Plunge && travels(motions[i]) {
+                assert_eq!(motions[i].feed_mm_min, Some(expected_entry_feed));
                 i += 1;
             }
             let before = motions[start - 1];
@@ -2361,15 +2363,13 @@ fn slope_limited_walls_are_cut_wall_by_wall_and_linked() {
     assert!(replay.worst_vertical <= tolerance + 1e-6, "{}", replay.worst_vertical);
     let pieces = report.loops_completed;
     assert!(pieces >= 10, "{pieces} runs");
-    // Every run is reached by a link or by an entry plunge (measured: 30
-    // runs, 24 links, 6 entries; one entry per run before #46's open-run
-    // links).
+    // The two walls still cut as linked stacks. Six links the centre-only
+    // estimate used to allow need a new entry with whole-cell stock bounds.
+    // Pin both outcomes so dropping the stock check or disabling linking is
+    // observable, even when the surface verification accepts both paths.
     assert_eq!(report.ramp_links + replay.vertical_plunges, pieces);
-    assert!(
-        replay.vertical_plunges * 4 <= pieces,
-        "{pieces} runs, {} entries",
-        replay.vertical_plunges
-    );
+    assert_eq!((pieces, report.ramp_links, replay.vertical_plunges), (30, 18, 12));
+    assert!(report.links_refused_stock >= 6, "{} stock refusals", report.links_refused_stock);
 }
 
 #[test]

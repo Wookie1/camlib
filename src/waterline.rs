@@ -654,7 +654,7 @@ pub struct WaterlineOperation<G = SurfaceMesh> {
     /// clear at when the tool comes down to an island - descends at no more
     /// than this angle, at its feed (default the plunge feed), taking as many
     /// laps (or passes along a run) as the angle needs. Only `RampEntry`
-    /// (kind "ramp"). None: 3 degrees at the cutting feed.
+    /// (kind "ramp"). None: 3 degrees at the declared plunge feed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<crate::entry::PocketEntry>,
 }
@@ -863,7 +863,7 @@ pub struct WaterlinePlan {
     region_limits: Option<crate::limits::PreparedLimits>,
     /// The ramp (#46): its angle is the steepest a ramp along a contour
     /// descends (`loop_ramp`, `run_ramp`), its feed the ramp's feed. Without a declared
-    /// entry, 3 degrees at the cutting feed.
+    /// entry, 3 degrees at the declared plunge feed.
     ramp_entry: crate::entry::RampEntry,
     /// Ball end mills (#46): every level's pieces grouped into stacks, and
     /// the moves of the piece being cut. Built on the first motion.
@@ -1380,6 +1380,84 @@ fn flat_lap(edges: &[Stroke], s: f64, z: f64) -> Vec<Curve> {
     }
     lap.iter().map(|e| e.curve(z)).collect()
 }
+/// Bounds cutter penetration on a horizontal link. Where the finishing ball
+/// reaches at least as deep at the same XY, the finishing cut itself witnesses
+/// the load bound, even if the stock height there is uncertain.
+struct BallLink {
+    start: Vec3,
+    end: [f64; 2],
+    unit: [f64; 2],
+    length: f64,
+    radius: f64,
+    lap: Option<Vec3>,
+    limit: f64,
+}
+
+impl BallLink {
+    fn cell_depth(&self, c: [f64; 2], half: [f64; 2], height: f64, guard: f64, depth: u8) -> f64 {
+        let [hx, hy] = half;
+        let [ux, uy] = self.unit;
+        let [ax, ay, z] = self.start;
+        let [bx, by] = self.end;
+        let r = self.radius;
+        let (x, y) = (c[0] - ax, c[1] - ay);
+        let projection = ux.mul_add(x, uy * y);
+        let span = hx * ux.abs() + hy * uy.abs() + guard;
+        if projection + span <= 0. {
+            return 0.;
+        } // wholly behind the starting pose
+        let t = projection.clamp(0., self.length);
+        let d = ((x - t * ux).hypot(y - t * uy) - hx.hypot(hy))
+            .max((uy * x - ux * y).abs() - hx * uy.abs() - hy * ux.abs())
+            .max((ax.min(bx) - c[0]).max(c[0] - ax.max(bx)) - hx)
+            .max((ay.min(by) - c[1]).max(c[1] - ay.max(by)) - hy);
+        let d = (d - guard).max(0.);
+        if d > r {
+            return 0.;
+        }
+        let ball_height = |d: f64| r - ((r - d) * (r + d)).sqrt();
+        let bottom = z + ball_height(d) - guard;
+        let far = (x.abs() + hx).hypot(y.abs() + hy) + guard;
+        let top = if far < r {
+            height.min(z + ball_height(far) + guard)
+        } else {
+            height
+        };
+        let upper = (top - bottom).max(0.);
+        if upper <= self.limit {
+            return upper;
+        }
+        if let Some([px, py, pz]) = self.lap {
+            // Beyond the segment end its cap and the arrival disk have the
+            // same XY axis. Otherwise compare the worst heights on the box.
+            if [px, py] == self.end && projection - span >= self.length && pz <= z {
+                return 0.;
+            }
+            let far = ((c[0] - px).abs() + hx).hypot((c[1] - py).abs() + hy) + guard;
+            if far < r && pz + ball_height(far) + guard <= bottom {
+                return 0.;
+            }
+        }
+        // Refine an undecided cell, never its stock bounds. Exhaustion
+        // returns the conservative upper bound and refuses the link.
+        if depth == 0 {
+            return upper;
+        }
+        let sub = [hx / 2., hy / 2.];
+        let mut worst = 0f64;
+        for x in [-sub[0], sub[0]] {
+            for y in [-sub[1], sub[1]] {
+                let cut = self.cell_depth([c[0] + x, c[1] + y], sub, height, guard, depth - 1);
+                if cut > self.limit {
+                    return upper;
+                }
+                worst = worst.max(cut);
+            }
+        }
+        worst
+    }
+}
+
 impl WaterlinePlan {
     pub fn prepare_with_stock(
         op: WaterlineOperation,
@@ -1477,13 +1555,13 @@ impl WaterlinePlan {
             .map(|l| crate::limits::PreparedLimits::new(l, radius, op.tolerance_mm))
             .transpose()?;
         let ramp_entry = match &op.entry {
-            // No declared entry: ramp at 3 degrees at the cutting feed (#46);
-            // the ramp's cut is no deeper than a flat lap's, so it needs no
-            // slower feed.
+            // No declared entry: ramp at 3 degrees at the declared plunge feed (#46);
+            // an along-contour descent uses the same entry-feed policy as
+            // an explicit RampEntry with no feed override.
             None => crate::entry::RampEntry {
                 angle_rad: 3f64.to_radians(),
                 min_length_mm: None,
-                feed_mm_min: Some(op.feed_mm_min),
+                feed_mm_min: None,
             },
             Some(crate::entry::PocketEntry::Ramp(r)) => {
                 r.validate(op.tolerance_mm, op.plunge_mm_min)?;
@@ -2411,8 +2489,14 @@ impl WaterlinePlan {
                 // The lead onto the loop is pure air: it meets no stock above
                 // the level (#46), so the tool never comes in from the side
                 // into a full cut.
-                if self.stock_met(stock, [p[0], p[1], plunge_z], start, plunge_z, work, cancel)?
-                    > self.op.tolerance_mm
+                if self.stock_met(
+                    stock,
+                    [p[0], p[1], plunge_z],
+                    start,
+                    None,
+                    self.op.tolerance_mm,
+                    cancel,
+                )? > self.op.tolerance_mm
                 {
                     continue;
                 }
@@ -2858,15 +2942,20 @@ impl WaterlinePlan {
             // arrives (the stock the finishing lap removes there anyway):
             // never a deeper cut from the side than the waterline takes.
             let (met, bound) = if ramp_clear {
+                let bound = (za - z).max(self.lap_depth(stock, p, z, cancel)?);
                 let mut met: f64 = 0.;
                 for c in &link {
                     let (a, b) = (c.start(), c.end());
-                    met = met.max(self.stock_met(stock, a, [b[0], b[1]], za, &mut work, cancel)?);
+                    met = met.max(self.stock_met(
+                        stock,
+                        a,
+                        [b[0], b[1]],
+                        Some([p[0], p[1], z]),
+                        bound + self.op.tolerance_mm,
+                        cancel,
+                    )?);
                 }
-                (
-                    met,
-                    (za - z).max(self.stock_under_ball(stock, p, z, &mut work, cancel)?),
-                )
+                (met, bound)
             } else {
                 (0., 0.)
             };
@@ -3041,7 +3130,14 @@ impl WaterlinePlan {
     fn run_ramp(&self, edges: &[Stroke], from: f64, to: f64) -> Result<Vec<Curve>, String> {
         let total: f64 = edges.iter().map(stroke_length).sum();
         // Each leg descends half of one out-and-back's share.
-        let leg = (from - to) / 2. / self.ramp_entry.angle_rad.tan();
+        let minimum = self.ramp_entry.min_length_mm.unwrap_or(0.);
+        if minimum > total {
+            return Err(format!(
+                "waterline operation {}: open ramp span {total:.4} mm is shorter than min_length_mm {minimum:.4} mm for a reversal",
+                self.op.id
+            ));
+        }
+        let leg = ((from - to) / 2. / self.ramp_entry.angle_rad.tan()).max(minimum);
         if leg <= total {
             return Ok(out_and_back(edges, from, to, ramp_split(edges, leg)));
         }
@@ -3122,7 +3218,7 @@ impl WaterlinePlan {
     }
     /// How deep the ball standing with its tip at `z` over `p` meets stock that
     /// is not the part (#46): what a cut at that point removes, on the stock
-    /// grid, measured like `stock_met`.
+    /// grid. This centre-sampled estimate is used only for the rough-first warning.
     fn stock_under_ball(
         &self,
         stock: &Stock,
@@ -3165,79 +3261,105 @@ impl WaterlinePlan {
         }
         Ok(worst)
     }
-    /// How deep (mm above the swept ball's lower surface) the ball with its
-    /// tip at `z`, moving straight from `a` to `b`, meets stock that is not
-    /// the part (#46), on the stock grid: every cell whose centre the ball
-    /// passes over within its radius, against the swept ball's lower surface
-    /// at the centre, counting only what lies below the ball's surface where
-    /// it stands at `a` (what the move sweeps beyond it); a cell whose top
-    /// the part itself explains (no higher than a ball of the cell's half
-    /// diagonal resting on the part there) is part, which the part-clearance
-    /// proof covers. A measure for choosing links and side entries, not a
-    /// proof: whole cells cannot say where in the cell their material is.
+    /// A lower bound on stock the finishing lap encounters at its arrival
+    /// point. Only the guaranteed occupied height can authorize a deeper
+    /// link. The point nearest the ball axis in each cell is a witness.
+    fn lap_depth(
+        &self,
+        stock: &Stock,
+        p: [f64; 2],
+        z: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<f64, String> {
+        let r = self.radius;
+        let widths = stock.cell_widths_mm();
+        let mut depth = 0f64;
+        self.visit_ball_cells(stock, p, p, cancel, |center, heights, guard| {
+            let offset: [f64; 2] = std::array::from_fn(|k| {
+                ((center[k] - p[k]).abs() - widths[k] / 2.).max(0.) + guard
+            });
+            let d = offset[0].hypot(offset[1]) + guard;
+            if d < r {
+                let bottom = z + r - ((r - d) * (r + d)).sqrt();
+                depth = depth.max(heights.lower_mm - bottom - guard);
+            }
+        })?;
+        Ok(depth)
+    }
+
+    fn visit_ball_cells(
+        &self,
+        stock: &Stock,
+        a: [f64; 2],
+        b: [f64; 2],
+        cancel: &impl CancelSignal,
+        mut visit: impl FnMut([f64; 2], crate::stock::HeightBounds, f64),
+    ) -> Result<(), String> {
+        let spec = stock.spec();
+        let dims = stock.dimensions();
+        let widths = stock.cell_widths_mm();
+        let scale = a
+            .into_iter()
+            .chain(b)
+            .chain(spec.min_mm)
+            .chain(spec.max_mm)
+            .map(f64::abs)
+            .fold(self.radius.max(1.), f64::max);
+        let guard = 128. * f64::EPSILON * scale;
+        let range = |k: usize| {
+            let index =
+                |v: f64| (((v - spec.min_mm[k]) / widths[k]).floor().max(0.) as usize).min(dims[k]);
+            index(a[k].min(b[k]) - self.radius - guard)
+                ..index(a[k].max(b[k]) + self.radius + guard)
+                    .saturating_add(1)
+                    .min(dims[k])
+        };
+        for row in range(1) {
+            cancelled(cancel)?;
+            for col in range(0) {
+                let cell = row * dims[0] + col;
+                visit(stock.cell_center(cell).unwrap(), stock.cells()[cell], guard);
+            }
+        }
+        Ok(())
+    }
+
+    /// Upper bound over the entire swept disk and every closed stock cell.
+    /// Projection on any unit axis gives a lower bound on the distance of
+    /// two convex sets. Use the two grid axes and the segment normal; at
+    /// the ends also enclose the cell in its circumdisk. In particular a
+    /// high corner cannot disappear because its cell centre misses the ball.
     fn stock_met(
         &self,
         stock: &Stock,
         a: Vec3,
         b: [f64; 2],
-        z: f64,
-        work: &mut SurfaceWork,
+        lap: Option<Vec3>,
+        limit: f64,
         cancel: &impl CancelSignal,
     ) -> Result<f64, String> {
-        let r = self.radius;
-        let spec = stock.spec();
-        let [nx, ny] = stock.dimensions();
-        let [wx, wy] = stock.cell_widths_mm();
-        let half = wx.hypot(wy) / 2.;
-        let cells = stock.cells();
-        let (lo, hi) = (
-            [a[0].min(b[0]) - r, a[1].min(b[1]) - r],
-            [a[0].max(b[0]) + r, a[1].max(b[1]) + r],
-        );
-        let index = |v: f64, k: usize, w: f64, n: usize| {
-            (((v - spec.min_mm[k]) / w).floor().max(0.) as usize).min(n)
-        };
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let len2 = dx * dx + dy * dy;
-        let mut worst: f64 = 0.;
-        for j in index(lo[1], 1, wy, ny)..index(hi[1], 1, wy, ny).saturating_add(1).min(ny) {
-            for i in index(lo[0], 0, wx, nx)..index(hi[0], 0, wx, nx).saturating_add(1).min(nx) {
-                let cell = j * nx + i;
-                let c = stock.cell_center(cell).unwrap();
-                let t = if len2 > 0. {
-                    (((c[0] - a[0]) * dx + (c[1] - a[1]) * dy) / len2).clamp(0., 1.)
-                } else {
-                    0.
-                };
-                let d = (c[0] - a[0] - t * dx).hypot(c[1] - a[1] - t * dy);
-                if d >= r {
-                    continue;
-                }
-                // Only what the move sweeps beyond the ball where it stands
-                // at `a`: a cell under the ball there is met no deeper than
-                // the ball's surface at the start already reached.
-                let envelope = z + r - (r * r - d * d).sqrt();
-                let d0 = (c[0] - a[0]).hypot(c[1] - a[1]);
-                let standing = if d0 < r {
-                    z + r - (r * r - d0 * d0).sqrt()
-                } else {
-                    f64::INFINITY
-                };
-                if envelope >= standing - 1e-12 {
-                    continue;
-                }
-                let excess = cells[cell].upper_mm.min(standing) - envelope;
-                if excess <= worst || excess <= self.op.tolerance_mm {
-                    continue;
-                }
-                cancelled(cancel)?;
-                let part = self.surface.contact(c, half, work, cancel)?.center_z;
-                if cells[cell].upper_mm <= part + self.op.tolerance_mm {
-                    continue;
-                }
-                worst = excess;
-            }
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let length = dx.hypot(dy);
+        if length == 0. {
+            return Ok(0.);
         }
+        let link = BallLink {
+            start: a,
+            end: b,
+            unit: [dx / length, dy / length],
+            length,
+            radius: self.radius,
+            lap,
+            limit,
+        };
+        let half = stock.cell_widths_mm().map(|w| w / 2.);
+        let mut worst = 0f64;
+        self.visit_ball_cells(stock, [a[0], a[1]], b, cancel, |center, height, guard| {
+            if worst <= limit && height.upper_mm > a[2] + worst - guard {
+                worst = worst.max(link.cell_depth(center, half, height.upper_mm, guard, 5));
+            }
+        })?;
         Ok(worst)
     }
     /// Ramp: a main level descends from the one above (none for the first
@@ -3399,15 +3521,83 @@ mod entry_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     #[test]
-    fn a_moved_side_entry_proves_the_lead_it_emits() {
-        // A square loop at Z3 whose start has no side entry (a stock wall at
-        // X15.2..15.6 stands under every ball beside it), so its start moves
-        // along it. The first sample, 1 mm along, lies 0.003 mm before the
-        // vertex V at (18.202, 8.2) it snaps to. One stock cell to Z6 is
-        // centred 1.998 mm past V along the loop: a lead onto the sample
-        // passes 2.001 mm from it (pure air, on the stock grid), a lead onto
-        // V passes within the ball radius. The lead emitted must be the lead
-        // proven (#46).
+    fn accepted_link_cells_respect_the_stock_limit_or_the_finishing_ball() {
+        // Independent section of the swept sphere on a horizontal segment.
+        // Include cells behind and beyond its ends, at the rim, and on
+        // both sides of the small gap between endpoint footprints.
+        let link = BallLink {
+            start: [0., 0., 2.],
+            end: [0.8, 0.],
+            unit: [1., 0.],
+            length: 0.8,
+            radius: 1.,
+            lap: Some([0.8, 0., 1.8]),
+            limit: 0.2,
+        };
+        let bottom = |z: f64, d: f64| {
+            if d <= 1. {
+                z + 1. - (1. - d * d).sqrt()
+            } else {
+                f64::INFINITY
+            }
+        };
+        let mut decisions = [0; 2];
+        for ix in -6..11 {
+            for iy in -6..7 {
+                let center = [0.2 * f64::from(ix), 0.2 * f64::from(iy)];
+                let accepted = link.cell_depth(center, [0.1, 0.1], 4., 1e-12, 5) <= link.limit;
+                decisions[usize::from(accepted)] += 1;
+                if !accepted {
+                    continue;
+                }
+                for u in 0..=8 {
+                    for v in 0..=8 {
+                        let x = center[0] - 0.1 + f64::from(u) * 0.025;
+                        let y = center[1] - 0.1 + f64::from(v) * 0.025;
+                        let stock = 4f64.min(bottom(2., x.hypot(y)));
+                        let cut = stock - bottom(2., (x - x.clamp(0., 0.8)).hypot(y));
+                        let lap = stock - bottom(1.8, (x - 0.8).hypot(y));
+                        assert!(cut <= 0.2f64.max(lap) + 1e-12, "at {x},{y}: {cut} vs {lap}");
+                    }
+                }
+            }
+        }
+        assert!(decisions.into_iter().all(|count| count > 0));
+    }
+
+    #[test]
+    fn open_ramp_honors_the_declared_reversal_span() {
+        let manifest: crate::stream::StreamManifest =
+            serde_json::from_str(include_str!("../fixtures/operations/waterline.json")).unwrap();
+        let crate::pocket::Operation::Waterline(op) = &manifest.operations[0] else {
+            panic!("fixture");
+        };
+        let mut op = op.clone();
+        op.entry = Some(crate::entry::PocketEntry::Ramp(crate::entry::RampEntry {
+            angle_rad: 10f64.to_radians(),
+            min_length_mm: Some(4.),
+            feed_mm_min: None,
+        }));
+        let plan = WaterlinePlan::prepare(
+            op,
+            &manifest.tools[0],
+            manifest.stock.height().unwrap(),
+            manifest.initial_position_mm,
+            1,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let line = |x| [Stroke::line([0., 0.], [x, 0.])];
+        let ramp = plan.run_ramp(&line(6.), 1., 0.99).unwrap();
+        assert!(ramp.iter().map(|curve| curve.end()[0]).fold(0., f64::max) >= 4.);
+        assert!(
+            plan.run_ramp(&line(3.), 1., 0.99)
+                .unwrap_err()
+                .contains("min_length_mm")
+        );
+    }
+
+    fn stock_with_wall_and_isolated_cell(isolated_lower: f64) -> (WaterlinePlan, Stock) {
         let m: crate::stream::StreamManifest =
             serde_json::from_str(include_str!("../fixtures/operations/waterline.json")).unwrap();
         let mut op = match &m.operations[0] {
@@ -3438,7 +3628,7 @@ mod entry_tests {
                 let cell = (cx - 20.2).abs() < 1e-9 && (cy - 8.2).abs() < 1e-9;
                 let top = if wall || cell { 6. } else { 2. };
                 bounds.push(crate::stock::HeightBounds {
-                    lower_mm: top,
+                    lower_mm: if cell { isolated_lower } else { top },
                     upper_mm: top,
                 });
             }
@@ -3452,7 +3642,41 @@ mod entry_tests {
             representation: "whole_cell_top_down".into(),
             bounds,
         };
-        let stock = Stock::from_initial(spec, &initial).unwrap();
+        (plan, Stock::from_initial(spec, &initial).unwrap())
+    }
+
+    #[test]
+    fn stock_at_a_cell_edge_blocks_the_lead_and_uncertain_stock_cannot_authorize_it() {
+        let cancel = AtomicBool::new(false);
+        let (plan, stock) = stock_with_wall_and_isolated_cell(6.);
+        // The edge of the elevated cell at (20.2, 8.2) reaches X20.
+        // Its centre misses this lead by 2.1 mm; its left edge is only
+        // 1.9 mm from the centreline of the 2 mm ball. At the closest
+        // point the ball is below Z5 and the cell is solid up to Z6.
+        let rim = plan
+            .stock_met(&stock, [18.1, 4., 3.], [18.1, 10.], None, 1., &cancel)
+            .unwrap();
+        assert!(
+            rim >= 1.,
+            "the swept ball meets at least 1 mm of stock at the cell edge, got {rim}"
+        );
+        let (_, uncertain) = stock_with_wall_and_isolated_cell(2.);
+        // Both blanks have the same possible top. Only the first guarantees
+        // that the lower lap will actually cut anything at this location.
+        assert!(plan.lap_depth(&stock, [20.2, 8.2], 3., &cancel).unwrap() > 2.99);
+        assert_eq!(
+            plan.lap_depth(&uncertain, [20.2, 8.2], 3., &cancel)
+                .unwrap(),
+            0.
+        );
+    }
+
+    #[test]
+    fn a_moved_side_entry_proves_the_lead_it_emits() {
+        // The start moves away from the wall. Check the lead all the way to
+        // the snapped vertex against the elevated cell beside the contour.
+        let cancel = AtomicBool::new(false);
+        let (plan, stock) = stock_with_wall_and_isolated_cell(6.);
         let (s0, v, w, x) = ([17.199, 8.2], [18.202, 8.2], [18.202, 12.2], [17.199, 12.2]);
         let mut loops = vec![vec![
             Stroke::line(s0, v),
@@ -3465,9 +3689,15 @@ mod entry_tests {
         let p = points[0].expect("a side entry at a moved start");
         assert_eq!(moved, 1, "the start moved");
         let start = loops[0][0].a;
-        let mut work = SurfaceWork::default();
         let met = plan
-            .stock_met(&stock, [p[0], p[1], z], start, z, &mut work, &cancel)
+            .stock_met(
+                &stock,
+                [p[0], p[1], z],
+                start,
+                None,
+                plan.op.tolerance_mm,
+                &cancel,
+            )
             .unwrap();
         assert!(
             met <= plan.op.tolerance_mm,
