@@ -2,33 +2,33 @@
   "name": "waterline",
   "operations": {
     "finish-levels": {
-      "air_cut_mm": 27.875,
-      "cut_mm": 233.365,
-      "cycle_seconds_exact_stop": 34.047,
-      "cycle_seconds_tangent": 34.047,
+      "air_cut_mm": 23.965,
+      "cut_mm": 411.744,
+      "cycle_seconds_exact_stop": 77.957,
+      "cycle_seconds_tangent": 77.907,
       "link_mm": 0.0,
-      "moves": 116,
-      "plunges": 4,
-      "rapid_mm": 67.463,
-      "removed_mm3": 51.675,
-      "retracts": 4
+      "moves": 251,
+      "plunges": 73,
+      "rapid_mm": 28.234,
+      "removed_mm3": 58.077,
+      "retracts": 1
     }
   },
   "toolpath": {
-    "cycle_seconds_exact_stop": 34.047,
-    "cycle_seconds_tangent": 34.047,
+    "cycle_seconds_exact_stop": 77.957,
+    "cycle_seconds_tangent": 77.907,
     "material": {
       "leftover_mm3": [
-        33.23,
-        256.397
+        33.219,
+        249.994
       ],
       "overcut_mm3": [
         0.0,
-        91.427
+        95.052
       ]
     },
-    "moves": 116,
+    "moves": 251,
     "post_error": null,
-    "posted_blocks": 139
+    "posted_blocks": 274
   }
 }

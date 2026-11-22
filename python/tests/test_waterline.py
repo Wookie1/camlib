@@ -48,7 +48,11 @@ class WaterlineTest(unittest.TestCase):
                         self.assertIsNone(sim._process.poll())
                         self.assertFalse(sim.state.finished)
             self.assertTrue(first and sim.state.finished)
-            self.assertEqual(levels, {8, 6, 4, 2.5})
+            # #46: the 70 degree flanks get depth-1 in-between levels on the
+            # full gaps (7, 5); the short last gap (4, 2.5) would gain less
+            # than contour_error_mm and gets none; levels_completed and
+            # last_level_z below are unchanged.
+            self.assertEqual(levels, {8, 7, 6, 5, 4, 2.5})
             self.assertEqual(report["levels_completed"], 4)
             self.assertEqual(report["last_level_z_mm"], 2.5)
             self.assertGreater(report["cut_segments"], 0)
@@ -136,7 +140,7 @@ class WaterlineTest(unittest.TestCase):
             player.seek(Cursor(partial_motion - 1, 0.5))
             self.assertEqual(player.state.heights.tobytes(), partial)
 
-    def test_a_loop_entered_on_the_wall_is_warned_about_and_a_roughed_blank_is_not(self):
+    def test_a_raw_blank_enters_on_a_ramp_and_warns_to_rough_first_a_roughed_blank_does_not(self):
         import warnings
 
         import cadquery as cq
@@ -152,24 +156,40 @@ class WaterlineTest(unittest.TestCase):
                         u.report for u in sim.run_operations() if isinstance(u, OperationUpdate) and u.stage == "end"
                     ]
                     self.assertTrue(sim.state.finished)
-            on_wall = [w for w in caught if issubclass(w.category, CamWarning) and "on the wall" in str(w.message)]
-            return reports[0], on_wall
+            entries = [w for w in caught if issubclass(w.category, CamWarning) and "loop(s)" in str(w.message)]
+            return reports[0], entries
 
-        # Raw stock stands above a level on every side of a loop: its entry
-        # stays on the wall, the report counts it and the run warns.
+        # Raw stock stands above the level on every side of the loop: a lead
+        # from beside it onto the wall would cut the raw stock from the side,
+        # so the island enters on a ramp along its loop instead (#46 WL3);
+        # nothing plunges into the stock. At a 1 mm stepdown the ramps reach
+        # their levels with the raw stock standing more than three stepdowns
+        # above: one warning names the fix.
+        import dataclasses
+
         config = example().waterline_job()
-        report, on_wall = run(config)
-        self.assertGreater(report["wall_entries"], 0)
-        self.assertEqual(len(on_wall), 1)
-        self.assertIn(f"entered {report['wall_entries']} loop(s) on the wall", str(on_wall[0].message))
+        raw = dict(config, operations=(dataclasses.replace(config["operations"][0], stepdown_mm=1.0),))
+        report, entries = run(raw)
+        self.assertNotIn("moved_entries", report)
+        self.assertNotIn("wall_entries", report)
+        self.assertGreater(report["helical_entries"], 0)
+        self.assertGreater(report["deep_stock_entries"], 0)
+        self.assertEqual(len(entries), 1)
+        self.assertIn("more than three stepdowns deep", str(entries[0].message))
+        self.assertIn("Rough or rest-rough first", str(entries[0].message))
         # A blank roughed to 0.3 mm over the island and 0.1 mm over the base
-        # (the benchmark's): every loop has a stock-free point beside it.
+        # (the benchmark's): the island is entered once on a ramp, and every
+        # level below is reached by a ramp from the level above, no retract.
         base = cq.Workplane("XY").box(24, 16, 2.1, centered=(False, False, False))
         island = cq.Workplane("XY").workplane(offset=2).center(12, 8).rect(16.7, 10.7).extrude(6.3, taper=20)
         roughed = StockSpec.from_mesh(export_stock_mesh(base.union(island)), 0.4)
-        report, on_wall = run(dict(config, stock=roughed))
+        report, entries = run(dict(config, stock=roughed))
+        self.assertNotIn("moved_entries", report)
+        self.assertEqual(report["helical_entries"], 1)
+        self.assertGreater(report["ramp_links"], 0)
         self.assertNotIn("wall_entries", report)
-        self.assertEqual(on_wall, [])
+        self.assertNotIn("deep_stock_entries", report)
+        self.assertEqual(entries, [])
 
     def test_empty_above_part_level_and_invalid_offset_base(self):
         config = example().waterline_job()
@@ -217,3 +237,51 @@ class WaterlineTest(unittest.TestCase):
         with self.assertRaisesRegex((ValueError, SimulationError), "unknown|variant"):
             with Simulation(**config) as sim:
                 list(sim.run_operations())
+
+    def test_ball_job_reports_the_scallop_bound_and_a_flat_cutter_has_neither_key(self):
+        # #46: a ball waterline reports the in-between-level scallop bound (the
+        # same scallop a vertical wall gets at the stepdown, plus the path
+        # tolerance) and the contact angle below which the bound is not
+        # claimed; a flat cutter's report has neither key.
+        config = example().waterline_job()
+        stepdown = config["operations"][0].stepdown_mm
+        with Simulation(**config) as sim:
+            reports = [u.report for u in sim.run_operations() if isinstance(u, OperationUpdate) and u.stage == "end"]
+            self.assertTrue(sim.state.finished)
+        # R = 2, stepdown 2: scallop_mm = 2 - sqrt(4 - 1) + contour_error_mm,
+        # K = 2; the bound is not claimed below asin(min(1, stepdown/(2^K D)))
+        # degrees, D = 2 sqrt(R^2 - (R - scallop_mm)^2) (the formulas of #46).
+        e = config["operations"][0].contour_error_mm
+        scallop_mm = min(2.0 - math.sqrt(4.0 - stepdown**2 / 4.0) + e, 2.0)
+        d = 2.0 * math.sqrt(4.0 - (2.0 - scallop_mm) ** 2)
+        k = 0
+        while stepdown / 2.0 ** (k + 1) >= scallop_mm:
+            k += 1
+        self.assertEqual(k, 2)
+        self.assertAlmostEqual(reports[0]["scallop_mm"], scallop_mm, places=12)
+        self.assertAlmostEqual(
+            reports[0]["scallop_from_deg"],
+            math.degrees(math.asin(min(1.0, stepdown / (2.0**k * d)))),
+            places=12,
+        )
+        # The island's 70 degree flanks are not vertical, so they get
+        # in-between levels (#46).
+        self.assertGreater(reports[0]["scallop_levels"], 0)
+        # The same job with a flat end mill claims no scallop bound.
+        flat_tool = ToolAssembly(
+            "flat4",
+            EndMill("fe4", diameter=4, flute_length=20, overall_length=50),
+            30,
+            60,
+            (HolderSection(30, 60, 4, 4),),
+        )
+        flat_config = dict(
+            config,
+            tools=(flat_tool,),
+            operations=(replace(config["operations"][0], tool=flat_tool),),
+        )
+        with Simulation(**flat_config) as sim:
+            reports = [u.report for u in sim.run_operations() if isinstance(u, OperationUpdate) and u.stage == "end"]
+            self.assertTrue(sim.state.finished)
+        self.assertNotIn("scallop_mm", reports[0])
+        self.assertNotIn("scallop_from_deg", reports[0])

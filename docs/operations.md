@@ -1987,26 +1987,109 @@ report's `shadow_error_mm` is the largest such error over the levels cut.
 `contour_error_mm`; `reverse` cuts the contours the other way;
 `safety_margin_mm` and `stock_to_leave_mm` work as for `Parallel`.
 
-A ball's contour is entered from beside the wall: the ball drops at a point
-moved away from the wall and then leads in sideways, so its tip never lands on
-the wall (it used to drop on the surface, up to 1.9 mm axially into stock). The
-point is chosen from the live stock. It is the nearest point, starting
-`max(r/2, 1)` mm from the loop and stepping out by that much up to 4 cutter
-radii, on either side of the loop start, where the lead to the contour is
-clear of the surface, the machining limits allow the plunge and the lead, and
-the stock under the ball (the upper bound of every cell its disk can touch) is
-at or below the height it plunges to. A loop with no such point keeps the
-tangent lead on the wall, as before, and is counted in the report's
-`wall_entries`, and the run warns (`CamWarning`): there the ball may come down
-into stock, so rough or rest-rough that area first. (It is not refused, because stock that has not been roughed to
-the level would then stop every waterline before the reach checks that name
-the real limit.) The `waterline`, `waterline-dense` and `steep-and-shallow`
-benchmarks run on blanks roughed to 0.1 to 0.3 mm over the part.
+Ball end mills cut one island at a time, top to bottom (#46). Every level is
+contoured first; its contours (and the runs the in-between levels, slope or
+region limits keep) are grouped into stacks: going down, a contour joins the
+stack whose contour at that stack's latest level it overlaps (islands grow
+downward, holes shrink), a contour overlapping none starts a stack, and one
+overlapping several merges them into a new stack cut after them. The tool
+finishes a stack before moving to the nearest next one. Where cutting a stack
+top to bottom would make a move fail the neck, shank or holder reach check
+against the live stock - typically a neighbour's uncut stock the shank would
+meet - that stack is deferred and finished last, level by level; the report's
+`stacks` and `stacks_level_ordered` count them. No check is relaxed to keep
+an order.
+
+Within a stack, a closed loop below a closed loop is reached without a
+retract: a short link at the upper level to the nearest point of the lower
+loop, a ramp down along that loop to its level, then the whole loop cut flat
+from where the ramp ends, so the flat lap passes over the entire ramp again.
+The ramp is never steeper than the ramp angle: the level gap over the
+tangent of the angle along the loop, and where one lap is too short for
+that, as many whole laps as the angle needs, each descending an equal share
+(refused by name past 1000 laps). The split onto a loop vertex only ever
+lengthens a ramp. Without an `entry` the angle is 3 degrees. Descending moves
+use the declared plunge feed unless `RampEntry` supplies its own feed. On an
+open run, a declared `min_length_mm` is the minimum travel before reversal.
+The link, ramp and loop must all clear the part. Each link's maximum stock
+depth over the whole swept cutter is bounded by the larger of the level gap
+and the stock the finishing lap is guaranteed to meet at its arrival point,
+within the operation tolerance. The planner enters the loop separately when
+the live stock bounds cannot establish that limit. The report's `ramp_links` counts the linked levels.
+
+Open runs (the parts of a contour slope or region limits keep) are linked the
+same way: from the end of the run just cut to the start of the next one, at
+the upper level, then down along the run at the ramp angle to half the level
+gap and back to its start (more such passes where the run is too short for
+the angle; no ramp at the same level), then the run cut. Where
+the straight link would cross the part (the runs of one wall all run the same
+way, so the next starts at the far end), the link goes back along the run just
+cut, at its level, to its point nearest the next start, then straight to it.
+The same proofs and stock bound apply. In a stack the next piece is the
+nearest one that is ready - a piece may go before pieces it is more than two
+cutter radii from (bounding boxes), unless one of them is a closed loop - so the
+separate walls of one contour are cut one after the other, each top to bottom,
+instead of switching walls at every level. On an in-between level under
+limits, the fragments the scallop rule keeps within one run the limits allow
+are cut as one piece when the gaps between them are under four cutter radii
+(the gaps are inside the limits).
+
+A loop the tool is not already at - the first of a stack, a run, or a
+loop a link could not reach - is entered after a retract, never by coming in
+from the side into a full cut and never by plunging into material: a side
+entry (a plunge beside the loop, at the nearest point `max(r/2, 1)` mm out and
+on up to 4 cutter radii on either side of its tangent, then a horizontal lead
+onto it) only where the stock under the ball there is at or below the level
+and the whole lead meets no stock above the level - pure air; a closed loop
+with no such point beside its start is sampled along its whole length and its
+start moves to the first one (`moved_entries`). Otherwise the ball plunges at
+the loop start to the lowest height the stock under it there is clear at (at
+most the feed height, so in air) and ramps down along the loop to the level at
+the ramp angle as above; an open run goes along itself to half the depth and
+back to its start, at the same angle - then cuts it (`helical_entries`). If no entry exists the
+operation is refused, naming the level and the XY: rough or rest-rough there
+first. Where an entry reaches its level in stock more than three
+`stepdown_mm` deep, or a link more than three `stepdown_mm` beyond the level
+gap it descends, the report counts it (`deep_stock_entries`) and the
+simulation warns: rough or rest-rough first. A rough in steps up to three
+times the finishing stepdown, plus its allowance, leaves no more than that
+on a slope and does not warn; a raw blank, or a gap the rough tool could not
+reach, does. The `waterline`, `waterline-dense` and
+`steep-and-shallow` benchmarks run on blanks roughed to 0.1 to 0.3 mm over
+the part.
 
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along
 its contour from the level above, instead of a flat lap and a step down; the
 lowest level is then cut once more flat. Each ramp follows a contour proven
-clear at its own level and stays above that level, so it cannot gouge.
+clear at its own level and stays above that level, so it cannot gouge. For
+ball end mills this is what the linking above already does for every island,
+so `ramp=True` changes nothing there; flat and bull-nose end mills keep it.
+
+In-between levels: between two main levels a ball end mill's plan adds
+sub-levels where the main levels are too far apart along the surface (on a
+slope at contact angle t the passes of levels `stepdown_mm` apart are
+`stepdown_mm / sin(t)` apart along it) and halving would lower the scallop by
+more than the path tolerance `contour_error_mm` — a level is added only where
+it lowers the scallop by more than the tolerance the caller already declares.
+The bound is the scallop of a vertical wall at this stepdown plus the
+tolerance: `scallop_mm = R - sqrt(R^2 - stepdown_mm^2/4) + contour_error_mm`
+(R the ball radius; capped at R when `stepdown_mm^2/4 >= R^2`). The widest
+spacing along the surface that keeps that bound is
+`D = 2 sqrt(R^2 - (R - scallop_mm)^2)`; sub-levels halve their gap (depth 1,
+2, ... while the spacing still exceeds the bound) and keep only the parts of
+the parent contour whose greatest contact angle satisfies
+`sin(t) < P / D - 1e-9`, with `P` the parent level spacing of that gap (so a
+short last gap needs fewer levels), which keeps passes at most `D` apart
+along the surface. An exactly vertical wall never gets a sub-level (the 1e-9
+tie). The report's `scallop_levels` counts the sub-levels that cut, and
+`scallop_from_deg` is the contact angle below which the bound is NOT claimed
+(`asin(min(1, stepdown_mm / (2^K D)))`, K the deepest sub-level); ball end
+mills only — flat and bull-nose reports have neither field. The cost: at
+coarse stepdowns every wall that is not exactly vertical gets extra levels (a
+70-degree flank gets depth-1 levels at the gap midpoints), so cycle and
+planning time grow on drafted or curved parts; once the stepdown is fine
+enough that the wall scallop's gain is under the tolerance, no sub-levels are
+added and the cycle is unchanged.
 
 Depth: when the remaining stock stands no higher above `bottom_z_mm` than the
 cutting length, every level is within the flutes. Where it stands higher (a

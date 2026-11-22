@@ -2264,14 +2264,14 @@ class Simulation:
                             CamWarning,
                             stacklevel=2,
                         )
-                    wall_entries = data["report"].get("wall_entries")
-                    if wall_entries:
-                        # Waterline: loops with no stock-free point beside the
-                        # wall keep the entry on it (the report's wall_entries).
+                    deep = data["report"].get("deep_stock_entries")
+                    if deep:
+                        # Waterline (#46): entry ramps or level links that met
+                        # stock more than three stepdowns deep (unroughed stock).
                         warnings.warn(
-                            f"operation {active!r} entered {wall_entries} loop(s) on the wall: the stock stands "
-                            "above the level on every side there, so the ball may come down into it. Rough or "
-                            "rest-rough that area first",
+                            f"operation {active!r} entered or linked {deep} loop(s) into stock more than three stepdowns "
+                            "deep: the stock there is unroughed (a raw blank, or a gap the rough tool could not "
+                            "reach), so the ball cuts it in full depth. Rough or rest-rough first",
                             CamWarning,
                             stacklevel=2,
                         )
