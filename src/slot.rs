@@ -125,6 +125,10 @@ pub struct SlotReport {
     /// together (at most `PLUNGE_PROOF_WORK`).
     #[serde(skip_serializing_if = "is_zero")]
     pub plunge_proof_work: usize,
+    /// The shared plunge-proof budget ran out: later passes were not proven
+    /// clear for a straight plunge (they take their helix or are refused).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub plunge_proof_work_exhausted: bool,
     /// Lines and arcs of the centreline (1 for a straight slot).
     pub path_pieces: usize,
     /// Links across corners, inside the vertex orbit's disk.
@@ -693,6 +697,7 @@ impl SlotPlan {
             stock_query_work: 0,
             stock_query_work_exhausted: false,
             plunge_proof_work: 0,
+            plunge_proof_work_exhausted: false,
             path_pieces: pieces.len(),
             corner_links: 0,
             corner_arcs: 0,
@@ -1112,15 +1117,21 @@ impl SlotPlan {
                     };
                     let proven = air <= z || {
                         let before = self.plunge_work_left;
-                        let proven = self.plunge_work_left > 0
-                            && stock.flat_history_clearance(
+                        let proven = if self.plunge_work_left > 0 {
+                            stock.flat_history_clearance(
                                 &at_end,
                                 self.cutter_radius,
                                 &mut self.plunge_work_left,
                                 cancel,
-                            )?;
+                            )
+                        } else {
+                            Ok(false)
+                        };
+                        // Counted before a cancelled proof returns: the plan's
+                        // budget is spent either way.
                         self.report.plunge_proof_work += (before - self.plunge_work_left) as usize;
-                        proven
+                        self.report.plunge_proof_work_exhausted |= self.plunge_work_left == 0;
+                        proven?
                     };
                     let helix_top = if proven {
                         z
@@ -1134,11 +1145,28 @@ impl SlotPlan {
                             done: 0,
                         });
                         air
+                    } else if self.plunge_work_left == 0 {
+                        return Err(format!(
+                            "slot {}: depth pass {}: the stock up to Z{:.4} under the orbit's disk at \
+                             ({:.4}, {:.4}) is not proven clear of a plunge to Z{:.4}: the plunge proofs' \
+                             shared work budget ({PLUNGE_PROOF_WORK} visits) is spent; declare \
+                             entry=HelicalEntry(angle) to helix down on the orbit circle, or use fewer, \
+                             deeper passes",
+                            self.op.id,
+                            self.pass + 1,
+                            top,
+                            c[0],
+                            c[1],
+                            z
+                        ));
                     } else {
                         return Err(format!(
-                            "slot {}: depth pass {} would plunge {:.4} mm into stock at ({:.4}, {:.4}) \
-                             (stock up to Z{:.4} within the orbit's disk, pass at Z{:.4}); declare \
-                             entry=HelicalEntry(angle) to helix down on the orbit circle",
+                            "slot {}: depth pass {} would plunge up to {:.4} mm into stock at ({:.4}, {:.4}): \
+                             the stock cells under the orbit's disk reach Z{:.4} over the pass at Z{:.4}, \
+                             and no committed cut proves the plunge's footprint clear (a cut elsewhere in \
+                             a cell does not, nor one to the pass depth that the cells round above it); \
+                             declare entry=HelicalEntry(angle) to helix down on the orbit circle, or, if \
+                             this stock is already cut to the pass depth, use a finer stock cell_size_mm",
                             self.op.id,
                             self.pass + 1,
                             air - z,

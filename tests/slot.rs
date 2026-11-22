@@ -1822,6 +1822,9 @@ fn slot_plunge_proofs_share_one_work_budget() {
     );
     assert_eq!(report.helical_entries, report.depth_passes);
     assert!(motions.iter().any(|m| matches!(m.curve, Curve::Helix { .. })));
+    // The per-pass allowance would have spent about twice the budget here:
+    // the report says the shared budget ran out.
+    assert!(report.plunge_proof_work_exhausted);
 }
 
 #[test]
@@ -1964,6 +1967,9 @@ fn slot_a_cut_elsewhere_in_the_cell_does_not_clear_the_entry() {
         bare.entry = None;
         let error = run(&bare, &mut stock.clone()).unwrap_err();
         assert!(error.contains("depth pass 1 would plunge"), "{scene}: {error}");
+        // The refusal says what was not proven and both ways out.
+        assert!(error.contains("no committed cut proves"), "{scene}: {error}");
+        assert!(error.contains("HelicalEntry") && error.contains("cell_size_mm"), "{scene}: {error}");
         thin.entry = Some(helix_entry(3.));
         let motions = run(&thin, &mut stock).unwrap();
         let plunge = motions.iter().find(|m| m.kind == MoveKind::Plunge).unwrap();
@@ -1974,4 +1980,81 @@ fn slot_a_cut_elsewhere_in_the_cell_does_not_clear_the_entry() {
             .unwrap_or_else(|| panic!("{scene}: no helix"));
         assert_eq!(helix.curve.start()[2], thin.top_z_mm, "{scene}");
     }
+}
+
+/// A straight-plunge proof cancelled part way still reports the work it
+/// spent: the plan's shared budget is spent either way. The identical rerun
+/// of a slot proves its second pass's plunge from history. Cancelled at every
+/// check of the call that plans that plunge, wherever the cancellation lands
+/// inside the cover proof (after the history scan has spent at least one
+/// visit), the planner stops with it and its report counts the visits that
+/// proof made.
+#[test]
+fn a_cancelled_plunge_proof_reports_its_work() {
+    struct Counted {
+        calls: Cell<usize>,
+        limit: usize,
+    }
+    impl CancelSignal for Counted {
+        fn is_cancelled(&self) -> bool {
+            self.calls.set(self.calls.get() + 1);
+            self.calls.get() > self.limit
+        }
+    }
+    let mut cut = Stock::new(fixture().stock.height().unwrap().clone()).unwrap();
+    drive(&operation(), &mut cut);
+    let mut op = operation();
+    op.entry = None;
+    // Uncancelled: the cancel checks before and during the call that plans
+    // the second pass's plunge (the one whose proof reads history).
+    let counted = Counted {
+        calls: Cell::new(0),
+        limit: usize::MAX,
+    };
+    let mut p = plan(op.clone());
+    let mut stock = cut.clone();
+    let (mut plunges, mut call) = (0, None);
+    loop {
+        let before = counted.calls.get();
+        let Some(m) = p.next_motion_with_stock(&stock, &counted).unwrap() else {
+            break;
+        };
+        if m.kind == MoveKind::Plunge {
+            plunges += 1;
+            if plunges == 2 {
+                call = Some((before, counted.calls.get()));
+            }
+        }
+        commit(&mut stock, &m);
+    }
+    assert!(p.report().plunge_proof_work > 0, "the rerun proves a plunge");
+    let (before, after) = call.unwrap();
+    let mut in_proof = 0;
+    for limit in before..after {
+        let counted = Counted {
+            calls: Cell::new(0),
+            limit,
+        };
+        let mut p = plan(op.clone());
+        let mut stock = cut.clone();
+        let (error, reported) = loop {
+            // The work reported before the call that gets cancelled.
+            let reported = p.report().plunge_proof_work;
+            match p.next_motion_with_stock(&stock, &counted) {
+                Ok(Some(m)) => {
+                    commit(&mut stock, &m);
+                }
+                Ok(None) => panic!("not cancelled at check {limit}"),
+                Err(e) => break (e, reported),
+            }
+        };
+        if error.contains("swept clearance proof cancelled") {
+            in_proof += 1;
+            assert!(
+                p.report().plunge_proof_work > reported,
+                "a proof cancelled at check {limit} reports none of its work"
+            );
+        }
+    }
+    assert!(in_proof > 0, "no cancellation landed inside the cover proof");
 }
