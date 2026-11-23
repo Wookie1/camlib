@@ -450,3 +450,68 @@ class TrochoidalSlotAirFeedTest(unittest.TestCase):
         self.assertGreater(report["return_chords"], 0)
         self.assertGreater(report["return_chord_saved_mm"], 0)
         self.assertNotIn("air_fed_arcs", report)
+
+
+class TrochoidalSlotWallFinishTest(unittest.TestCase):
+    """#34: a slot cut narrow by an allowance, then a Contour on its walls, is cut to the drawn shape."""
+
+    def test_a_contour_on_the_slot_outline_finishes_both_walls(self):
+        from dataclasses import replace
+
+        from camlib.operations import Contour, HelicalEntry, RampEntry
+
+        width, allowance, floor, top = 6.0, 0.2, 8.0, 10.0
+        start, end = (8.0, 12.0), (20.0, 12.0)
+        r = width / 2
+        # The drawn slot: the centreline offset by half the width, round ends.
+        outline = Boundary(
+            ((start[0], start[1] - r, 0), (end[0], end[1] - r, 1), (end[0], end[1] + r, 0), (start[0], start[1] + r, 1))
+        )
+        plate = PlanarRegion(
+            "plate", (Component(Boundary(((0, 0, 0), (24, 0, 0), (24, 24, 0), (0, 24, 0))), (outline,)),)
+        )
+        drawn = ((end[0] - start[0]) * width + math.pi * r * r) * (top - floor)
+        band = (2 * (end[0] - start[0]) + 2 * math.pi * r) * allowance * (top - floor)
+        narrow = replace(
+            slot(), start_mm=start, end_mm=end, width_mm=width - 2 * allowance, floor_z_mm=floor, entry=HelicalEntry(3)
+        )
+        walls = Contour(
+            "walls",
+            tool(),
+            plate,
+            floor,
+            1,
+            12,
+            boundaries="holes",
+            entry=RampEntry(3),
+            feed_mm_min=600,
+            plunge_mm_min=150,
+            spindle_rpm=12000,
+            tool_number=1,
+            length_register=1,
+            coolant="flood",
+        )
+
+        def removed(*operations):
+            # A fine grid, so a 0.2 mm wall band covers whole cells.
+            with Simulation(
+                StockSpec((0, 0, 0), (24, 24, top), 0.05),
+                (tool(),),
+                operations=operations,
+                revision="walls",
+                initial_position_mm=(0, 0, 12),
+            ) as sim:
+                for _ in sim.run_operations():
+                    pass
+                self.assertTrue(sim.state.finished)
+                volume = sim.state.volume()
+            return volume["removed_lower_mm3"], volume["removed_upper_mm3"]
+
+        # The slot alone leaves its walls: certainly less than the drawn slot.
+        _, upper = removed(narrow)
+        self.assertLess(upper, drawn - band / 2)
+        # With the Contour on the hole walls the cut is the drawn slot: no less
+        # than it, and not certainly more.
+        lower, upper = removed(narrow, walls)
+        self.assertLessEqual(lower, drawn)
+        self.assertGreaterEqual(upper, drawn)

@@ -1301,6 +1301,31 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
   distance in `air_fed_mm` includes both arcs and straight returns. Without it, the returns are cut moves at
   `feed_mm_min`.
 
+### Finishing the walls
+
+The orbits leave the walls scalloped within `boundary_tolerance_mm`. For a
+finished wall, cut the slot narrower than drawn by an allowance on each side,
+then take the allowance off both walls with a `Contour` on the slot's outline,
+a hole in the part's footprint (`boundaries="holes"`). Each wall is then cut
+at the constant radial width of the allowance, an engagement of
+`acos(1 - allowance / tool_radius)` (26 degrees for 0.2 mm with a 4 mm tool),
+and its `RampEntry` comes down inside the space the slot already cleared:
+
+```python
+# The drawn slot from (x0, y) to (x1, y), width w: its centreline offset by
+# w/2 on both sides, with half-circle ends (bulge 1).
+outline = Boundary(((x0, y - w / 2, 0), (x1, y - w / 2, 1), (x1, y + w / 2, 0), (x0, y + w / 2, 1)))
+plate = PlanarRegion("plate", (Component(plate_outline, (outline,)),))
+TrochoidalSlot("slot", tool, start, end, width - 2 * allowance, top, floor,
+               stepdown, clearance, entry=HelicalEntry(3), ...)
+Contour("walls", tool, plate, floor, stepdown, clearance, boundaries="holes",
+        entry=RampEntry(3), ...)
+```
+
+`python/tests/test_slot.py` (`TrochoidalSlotWallFinishTest`) checks this on a
+fine stock grid: the slot alone leaves its walls, and with the `Contour` the
+removed volume is the drawn slot's.
+
 ## V-carve: `VCarve`
 
 Required: `region` (letters or a logo as a `PlanarRegion`), `top_z_mm`,
