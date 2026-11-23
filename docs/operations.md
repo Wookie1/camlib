@@ -1242,8 +1242,16 @@ TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
   runs on the orbit circle in the slot's sense). Other entries are refused.
   With no entry declared, a plunge into stock is refused, naming the pass;
   over stock a previous cut already cleared, every pass plunges through air
-  and needs none. The report counts `helical_entries` and `helix_turns`, and
-  `max_air_plunge_mm` is the deepest plunge below the stock top.
+  and needs none. A plunge to the pass depth counts as through air only where
+  no stock cell under the first orbit's disk stands above the pass, or where
+  the committed cuts prove the plunging cutter's footprint clear (a cut
+  elsewhere in a cell proves nothing; that proof shares one work budget,
+  `plunge_proof_work`, across all passes, and `plunge_proof_work_exhausted`
+  says when it ran out). A refusal says which applies and how to go on: a
+  `HelicalEntry`, a finer stock `cell_size_mm` over stock already cut to the
+  pass depth, or fewer, deeper passes. The report counts `helical_entries` and
+  `helix_turns`, and `max_air_plunge_mm` is the deepest plunge below the stock
+  top.
 
 - `path_mm` vertices are `(x, y, bulge_to_next)`, bulge = tan(sweep / 4) in
   [-1, 1] (at most a half turn per arc, as in `Boundary`); the last bulge is 0.
