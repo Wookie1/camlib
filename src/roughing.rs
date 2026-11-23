@@ -2,8 +2,7 @@
 //! See docs/retained-body-roughing.md; shadows are not tip-plane cross-sections.
 use crate::{
     Point,
-    adaptive::{AdaptivePathStrategy, AdaptivePlan, AdaptivePocketOperation, CuttingSense},
-    adaptive_front::FrontReport,
+    adaptive::{AdaptivePathStrategy, CuttingSense},
     motion::{Coolant, Event, Motion, Vec3},
     planar::{
         Boolean, Boundary, Component, ConstructionOptions, FilledHoles, PlanarRegion,
@@ -19,7 +18,7 @@ use crate::{
 use robust::{Coord, orient2d};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::VecDeque, sync::OnceLock};
+use std::collections::VecDeque;
 
 mod engagement_front;
 pub(crate) mod parallel;
@@ -654,16 +653,42 @@ pub enum RoughingClearing {
         routing: Option<RasterRouting>,
     },
     Adaptive {
-        #[serde(default, skip_serializing_if = "AdaptivePathStrategy::is_default")]
+        /// Always written: a saved program states which planner made it.
+        #[serde(default)]
         path_strategy: AdaptivePathStrategy,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cutting_sense: Option<CuttingSense>,
         max_radial_engagement_mm: f64,
-        orbit_radius_mm: Option<f64>,
-        min_orbit_radius_mm: Option<f64>,
-        local_orbit_tolerance_mm: Option<f64>,
-        boundary_tolerance_mm: f64,
     },
+}
+/// Reads a saved clearing, without the fields the removed orbit planners
+/// wrote into adaptive clearing that chose engagement_front (#190).
+fn clearing_from_saved<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RoughingClearing, D::Error> {
+    use serde::de::{Error, MapAccess, Visitor};
+    struct ClearingVisitor;
+    impl<'de> Visitor<'de> for ClearingVisitor {
+        type Value = RoughingClearing;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a roughing clearing object")
+        }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut fields = serde_json::Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if fields.contains_key(&key) {
+                    return Err(M::Error::custom(format!("duplicate field `{key}`")));
+                }
+                fields.insert(key, map.next_value()?);
+            }
+            if fields.get("kind").and_then(|k| k.as_str()) == Some("adaptive") {
+                crate::adaptive::drop_removed_orbit_fields(&mut fields, "adaptive clearing", &[])
+                    .map_err(M::Error::custom)?;
+            }
+            serde_json::from_value(serde_json::Value::Object(fields)).map_err(M::Error::custom)
+        }
+    }
+    deserializer.deserialize_map(ClearingVisitor)
 }
 fn default_coverage_margin() -> f64 {
     0.01
@@ -730,6 +755,7 @@ pub struct RoughingOperation<G = SurfaceMesh> {
     pub id: String,
     pub tool: String,
     pub target: G,
+    #[serde(deserialize_with = "clearing_from_saved")]
     pub clearing: RoughingClearing,
     pub top_z_mm: f64,
     pub floor_z_mm: f64,
@@ -873,7 +899,6 @@ pub struct RoughingReport {
 }
 enum LayerPlan {
     Pocket(Box<PocketPlan>),
-    Adaptive(Box<AdaptivePlan>),
     Engagement(Box<EngagementFrontPlan>),
 }
 impl LayerPlan {
@@ -883,35 +908,30 @@ impl LayerPlan {
     fn refusal(&self) -> Option<String> {
         match self {
             Self::Pocket(_) => None,
-            Self::Adaptive(p) => p.refusal(),
             Self::Engagement(p) => p.refusal(),
         }
     }
     fn construction_error_mm(&self) -> f64 {
         match self {
             Self::Pocket(p) => p.construction_error_mm(),
-            Self::Adaptive(p) => p.construction_error_mm(),
             Self::Engagement(p) => p.construction_error_mm(),
         }
     }
     fn activate(&mut self, p: Vec3, id: u64, spec: &StockSpec) -> Result<(), String> {
         match self {
             Self::Pocket(x) => x.activate_layer(p, id, spec),
-            Self::Adaptive(x) => x.activate_layer(p, id, spec),
             Self::Engagement(x) => x.activate_layer(p, id, spec),
         }
     }
     fn next(&mut self, s: &Stock, c: &impl CancelSignal) -> Result<Option<Motion>, String> {
         match self {
             Self::Pocket(x) => x.next_motion_with_stock(s, c),
-            Self::Adaptive(x) => x.next_motion_with_stock(s, c),
             Self::Engagement(x) => x.next_motion_with_stock(s, c),
         }
     }
     fn report(&self) -> serde_json::Value {
         let mut value = match self {
             Self::Pocket(x) => serde_json::to_value(x.report()).unwrap(),
-            Self::Adaptive(x) => serde_json::to_value(x.report()).unwrap(),
             Self::Engagement(x) => serde_json::to_value(x.report()).unwrap(),
         };
         // Layer contours remain separately queryable through the shadow API.
@@ -919,37 +939,21 @@ impl LayerPlan {
         value.as_object_mut().unwrap().remove("geometric_residual");
         value
     }
-    fn front_progress(&self) -> Option<FrontProgress> {
-        if let Self::Adaptive(plan) = self {
-            let r = plan.report();
-            return r.front.as_ref().map(|front| FrontProgress {
-                front: front.clone(),
-                max_bounded_engagement_deg: r.max_bounded_engagement_deg,
-                motions: r.motions,
-                seed_orbits: r.seed_orbits,
-                helical_entries: r.helical_entries,
-            });
-        }
-        None
-    }
     fn entries(&self) -> (usize, usize) {
         match self {
             Self::Pocket(x) => (x.report().stock_edge_entries, x.report().helical_entries),
-            Self::Adaptive(x) => (x.report().stock_edge_entries, x.report().helical_entries),
             Self::Engagement(x) => (x.report().stock_edge_entries, x.report().helical_entries),
         }
     }
     fn prefix(&self) -> Vec<Event> {
         match self {
             Self::Pocket(x) => x.prefix_events(),
-            Self::Adaptive(x) => x.prefix_events(),
             Self::Engagement(x) => x.prefix_events(),
         }
     }
     fn suffix(&self) -> Vec<Event> {
         match self {
             Self::Pocket(x) => x.suffix_events(),
-            Self::Adaptive(x) => x.suffix_events(),
             Self::Engagement(x) => x.suffix_events(),
         }
     }
@@ -961,28 +965,8 @@ impl LayerPlan {
                 x.finish_report(c)?;
                 Ok(())
             }
-            Self::Adaptive(x) => x.finish_report(c),
             Self::Engagement(x) => x.finish_report(c),
         }
-    }
-}
-// Snapshot only at the existing successful-motion reporting boundary. Reading
-// the live layer from report() would expose changes from a rejected/cancelled
-// planner attempt that the previous public report intentionally did not publish.
-struct FrontProgress {
-    front: FrontReport,
-    max_bounded_engagement_deg: f64,
-    motions: usize,
-    seed_orbits: usize,
-    helical_entries: usize,
-}
-impl FrontProgress {
-    fn apply(&self, report: &mut serde_json::Value) {
-        report["front"] = serde_json::to_value(&self.front).unwrap();
-        report["max_bounded_engagement_deg"] = self.max_bounded_engagement_deg.into();
-        report["motions"] = self.motions.into();
-        report["seed_orbits"] = self.seed_orbits.into();
-        report["helical_entries"] = self.helical_entries.into();
     }
 }
 pub struct RoughingPlan {
@@ -1003,8 +987,6 @@ pub struct RoughingPlan {
     prefix: Vec<Event>,
     suffix: Vec<Event>,
     report: RoughingReport,
-    front_progress: Option<FrontProgress>,
-    materialized_report: OnceLock<RoughingReport>,
     /// Why the first adaptive layer that made no motion left material it
     /// was asked to cut (an area no entry reaches, `LayerPlan::refusal`):
     /// the operation's refusal if no layer makes a motion (#250).
@@ -1198,40 +1180,27 @@ impl RoughingPlan {
                 + target.mesh.surface_error_mm
                 + 32. * op.tolerance_mm
         });
-        let (clearing, engagement, width, orbit) = match op.clearing {
-            RoughingClearing::Offset { .. } => ("offset", None, None, 0.),
-            RoughingClearing::Raster { .. } => ("raster", None, None, 0.),
+        let (clearing, engagement, width) = match op.clearing {
+            RoughingClearing::Offset { .. } => ("offset", None, None),
+            RoughingClearing::Raster { .. } => ("raster", None, None),
             RoughingClearing::Adaptive {
                 max_radial_engagement_mm: w,
-                orbit_radius_mm,
-                path_strategy,
                 ..
             } => {
                 if !w.is_finite() || w <= 0. || w > r {
                     return Err("adaptive roughing radial engagement must be positive and at most cutter radius".into());
                 }
-                // Width is an upper limit. A stricter native angle still
-                // honors it, including widths whose angle would exceed170deg.
-                let phi = if path_strategy == AdaptivePathStrategy::EngagementFront {
-                    // The contact angle of a straight pass of width w, less
-                    // the cutter's own trail: what engagement_front proves
-                    // every stroke against.
-                    (1. - w / r).acos().to_degrees()
-                } else {
-                    (2. * (1. - w / r).acos()).to_degrees().min(170.)
-                };
+                // The contact angle of a straight pass of width w, less the
+                // cutter's own trail: what the engagement front proves every
+                // stroke against.
+                let phi = (1. - w / r).acos().to_degrees();
                 if !(1. ..=170.).contains(&phi) {
                     return Err("adaptive roughing engagement is outside native 1..170 degree circumference bound".into());
                 }
-                (
-                    "adaptive",
-                    Some(phi),
-                    Some(w),
-                    orbit_radius_mm.unwrap_or(r / 2.),
-                )
+                ("adaptive", Some(phi), Some(w))
             }
         };
-        let margin = 4. * (r + op.radial_allowance_mm + orbit.max(r)) + guard;
+        let margin = 4. * (2. * r + op.radial_allowance_mm) + guard;
         let bounds = [
             [spec.min_mm[0] - margin, spec.min_mm[1] - margin],
             [spec.max_mm[0] + margin, spec.max_mm[1] + margin],
@@ -1267,16 +1236,10 @@ impl RoughingPlan {
         // through the air beside the stock and the air the layers above cut
         // (a layer's pocket starts at the stock top while the flutes span
         // it). They refuse it.
-        if !matches!(
-            op.clearing,
-            RoughingClearing::Adaptive {
-                path_strategy: AdaptivePathStrategy::EngagementFront,
-                ..
-            }
-        ) {
+        if !matches!(op.clearing, RoughingClearing::Adaptive { .. }) {
             op.entry.refuse_ramp(
                 &format!("roughing {}", op.id),
-                "offset and raster layers (and the disk_front and stock_front strategies) enter beside the stock or on a fitted helix, which the order and links of their passes are built on; AdaptiveClearing (path_strategy engagement_front) ramps into enclosed material",
+                "offset and raster layers enter beside the stock or on a fitted helix, which the order and links of their passes are built on; AdaptiveClearing (path_strategy engagement_front) ramps into enclosed material",
             )?;
         }
         let expanded = stock_region.prepare(options)?;
@@ -1337,80 +1300,16 @@ impl RoughingPlan {
         };
         front.validate(
             "roughing",
-            (!matches!(
-                op.clearing,
-                RoughingClearing::Adaptive {
-                    path_strategy: AdaptivePathStrategy::EngagementFront,
-                    ..
-                }
-            ))
-            .then_some(""),
+            (!matches!(op.clearing, RoughingClearing::Adaptive { .. })).then_some(""),
         )?;
         match op.clearing {
             RoughingClearing::Offset {
                 coverage_margin_mm, ..
             } => crate::pocket::validate_offset_margin(r, coverage_margin_mm)?,
-            RoughingClearing::Adaptive {
-                path_strategy: AdaptivePathStrategy::EngagementFront,
-                orbit_radius_mm,
-                min_orbit_radius_mm,
-                local_orbit_tolerance_mm,
-                ..
-            } => {
-                if orbit_radius_mm.is_some()
-                    || min_orbit_radius_mm.is_some()
-                    || local_orbit_tolerance_mm.is_some()
-                {
-                    return Err("engagement_front does not use orbits; leave orbit_radius_mm, min_orbit_radius_mm and local_orbit_tolerance_mm unset".into());
-                }
+            RoughingClearing::Adaptive { .. } => {
                 if op.omit_empty_cuts {
                     return Err("engagement_front plans every pass from the committed stock; omit_empty_cuts does not apply".into());
                 }
-            }
-            RoughingClearing::Adaptive {
-                path_strategy: AdaptivePathStrategy::DiskFront,
-                ..
-            } => {
-                // #167. disk_front covers a region it takes to be solid with
-                // orbits and never reads the stock. Roughing's region is the
-                // stock footprint grown by a margin, so that the stock's edge
-                // is no wall: disk_front then orbits through all the air
-                // beside the stock (75 m of 137 m on a 130 x 90 mm stock).
-                return Err(
-                    "Roughing does not clear with path_strategy disk_front (also what a program \
-                     saved without path_strategy asks for): it treats the whole region as \
-                     material and never reads the stock, so it orbits through the air beside \
-                     the stock. Use path_strategy engagement_front, AdaptiveClearing's default; \
-                     disk_front remains AdaptivePocket's strategy"
-                        .into(),
-                );
-            }
-            RoughingClearing::Adaptive {
-                path_strategy,
-                cutting_sense,
-                orbit_radius_mm,
-                min_orbit_radius_mm,
-                local_orbit_tolerance_mm,
-                boundary_tolerance_mm,
-                ..
-            } => {
-                AdaptivePocketOperation {
-                    max_corner_engagement_deg: None,
-                    pocket: template,
-                    path_strategy,
-                    cutting_sense,
-                    orbit_radius_mm,
-                    min_orbit_radius_mm,
-                    local_orbit_tolerance_mm,
-                    boundary_tolerance_mm,
-                    max_engagement_deg: engagement.unwrap(),
-                    clockwise: op.clockwise,
-                    rapid_descent_clearance_mm: None,
-                    ramp_clearance_mm: None,
-                    link_feed_mm_min: None,
-                    link_chip_thinning: false,
-                }
-                .validate_parameters(r)?;
             }
             RoughingClearing::Raster { .. } => (),
         }
@@ -1584,7 +1483,6 @@ impl RoughingPlan {
                             }))
                         }
                         RoughingClearing::Adaptive {
-                            path_strategy: AdaptivePathStrategy::EngagementFront,
                             max_radial_engagement_mm,
                             cutting_sense,
                             ..
@@ -1603,37 +1501,6 @@ impl RoughingPlan {
                             // for, not with the cusps between pass ends.
                             .with_wall_runs(true),
                         )),
-                        RoughingClearing::Adaptive {
-                            path_strategy,
-                            cutting_sense,
-                            orbit_radius_mm,
-                            min_orbit_radius_mm,
-                            local_orbit_tolerance_mm,
-                            boundary_tolerance_mm,
-                            ..
-                        } => LayerPlan::Adaptive(Box::new(AdaptivePlan::prepare(
-                            AdaptivePocketOperation {
-                                max_corner_engagement_deg: None,
-                                pocket,
-                                path_strategy,
-                                cutting_sense,
-                                orbit_radius_mm,
-                                min_orbit_radius_mm,
-                                local_orbit_tolerance_mm,
-                                boundary_tolerance_mm,
-                                max_engagement_deg: engagement.unwrap(),
-                                clockwise: op.clockwise,
-                                rapid_descent_clearance_mm: None,
-                                ramp_clearance_mm: None,
-                                link_feed_mm_min: None,
-                                link_chip_thinning: false,
-                            },
-                            tool,
-                            &layer_spec,
-                            initial,
-                            1,
-                            &cancel,
-                        )?)),
                     };
                     if let (Some((feed, radius)), LayerPlan::Pocket(p)) = (exterior_link, &mut plan)
                     {
@@ -1642,7 +1509,6 @@ impl RoughingPlan {
                     if op.omit_empty_cuts {
                         match &mut plan {
                             LayerPlan::Pocket(p) => p.enable_empty_cuts(),
-                            LayerPlan::Adaptive(p) => p.enable_empty_cuts(),
                             LayerPlan::Engagement(_) => (),
                         }
                     }
@@ -1657,9 +1523,6 @@ impl RoughingPlan {
                     }
                     let layer_guides = match &plan {
                         LayerPlan::Pocket(p) => p.report().xy_strokes,
-                        LayerPlan::Adaptive(p) => {
-                            p.report().guide_strokes + p.report().navigation_links
-                        }
                         LayerPlan::Engagement(_) => 0,
                     };
                     let report = RoughingLayerReport {
@@ -1784,23 +1647,11 @@ impl RoughingPlan {
             prefix,
             suffix,
             report,
-            front_progress: None,
-            materialized_report: OnceLock::new(),
             refusal: None,
         })
     }
     pub fn report(&self) -> &RoughingReport {
-        let Some(progress) = &self.front_progress else {
-            return &self.report;
-        };
-        // Ordinary Rust borrows keep a returned snapshot valid until the next
-        // mutable planner call. Repeated readers share one materialization;
-        // generation without report consumers allocates no per-motion JSON.
-        self.materialized_report.get_or_init(|| {
-            let mut report = self.report.clone();
-            progress.apply(&mut report.layers[report.active_layer].clearing);
-            report
-        })
+        &self.report
     }
     /// Planning progress (#198): depth levels done of those planned, and for
     /// engagement-front clearing the active level's reachable material area.
@@ -1875,7 +1726,6 @@ impl RoughingPlan {
             proof.maximum_upper_z_mm = Some(maximum);
             proof.generation = Some(stock.generation());
             self.generation = Some(stock.generation());
-            self.materialized_report.take();
         }
         loop {
             check(cancel)?;
@@ -1958,8 +1808,6 @@ impl RoughingPlan {
                 self.next_id = m.id + 1;
                 self.generation = Some(stock.generation() + 1);
                 self.report.motions += 1;
-                self.front_progress = plan.front_progress();
-                self.materialized_report.take();
                 return Ok(Some(m));
             }
             if self.refusal.is_none()
@@ -1972,8 +1820,6 @@ impl RoughingPlan {
             }
             plan.finish(cancel)?;
             self.report.layers[self.report.active_layer].clearing = plan.report();
-            self.front_progress = None;
-            self.materialized_report.take();
             self.report.completed_layers += 1;
             self.report.active_layer += 1;
             let memory = match self.plans.pop_front() {
@@ -1991,7 +1837,6 @@ impl RoughingPlan {
     pub fn finish_report(&mut self, cancel: &impl CancelSignal) -> Result<(), String> {
         check(cancel)?;
         if self.plans.is_empty() {
-            self.materialized_report.take();
             self.report.geometric_residual_status = if !self.report.layers.is_empty()
                 && self
                     .report

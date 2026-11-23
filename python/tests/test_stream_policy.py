@@ -250,7 +250,7 @@ class StreamPolicyTest(unittest.TestCase):
         tool = ToolAssembly.from_dict(m['tools'][0])
         definition = dict(m['operations'][0])
         definition.pop('kind')
-        definition.update(tool=tool, path_strategy='stock_front')
+        definition.update(tool=tool)
         stock = StockSpec(**{k: v for k, v in m['stock'].items() if k not in ('version', 'units')})
         setup = Setup(
             'top',

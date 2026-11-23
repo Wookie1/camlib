@@ -560,7 +560,7 @@ fn pocket_ramp_on_uneven_stock_descends_straight_only_through_air() {
 #[test]
 fn pocket_ramp_below_a_lower_authored_top_starts_at_that_top() {
     // A wider pocket has taken the top 2 mm; the slot starts at Z8 inside
-    // it. The first ramp starts at Z8, in air above the earlier floor.
+    // it. The first ramp starts at Z8 (the stock model's floor), in air above it.
     let (stock, heights) = precut([[2., 8.], [30., 16.]], 8.);
     let mut m = pocket_manifest(SLOT, Some(PocketEntry::Ramp(zigzag(4., 2.))));
     let Operation::Pocket(p) = &mut m.operations[0] else {
@@ -577,7 +577,9 @@ fn pocket_ramp_below_a_lower_authored_top_starts_at_that_top() {
         .filter(|m| m.curve.end()[2] < m.curve.start()[2] && horizontal(&m.curve) > 0.)
         .map(|m| m.curve.start()[2])
         .fold(f64::NEG_INFINITY, f64::max);
-    assert_eq!(sloped_top, 8.);
+    // At the earlier floor as the stock model holds it: up to its sweep
+    // tolerance above Z8, where the depths are planned from (#344).
+    assert!((8. ..=8. + 1e-4).contains(&sloped_top), "{sloped_top}");
     check_slot(&seen, &stock, true, 4., None);
 }
 
@@ -953,28 +955,10 @@ fn contour_ramp_refusals_and_default_serialisation() {
 }
 
 #[test]
-fn roughing_and_adaptive_refuse_a_ramp_entry_by_name() {
+fn roughing_refuses_a_ramp_entry_by_name() {
+    // AdaptivePocket ramps into enclosed material since its orbit planner
+    // was removed (#190); tests/ramp_entry_front.rs covers it.
     let cancel = AtomicBool::new(false);
-    let mut m: StreamManifest =
-        serde_json::from_str(include_str!("../fixtures/operations/helical-adaptive.json")).unwrap();
-    let Operation::AdaptivePocket(a) = &mut m.operations[0] else {
-        panic!("fixture");
-    };
-    a.pocket.entry = Some(PocketEntry::Ramp(ramp(3.)));
-    let error = OperationPlan::prepare(
-        m.operations[0].clone(),
-        &m.tools[0],
-        m.stock.height().unwrap(),
-        m.initial_position_mm,
-        1,
-        &cancel,
-    )
-    .map(|_| ())
-    .unwrap_err();
-    assert!(
-        error.contains("RampEntry is not supported") && error.contains("HelicalEntry"),
-        "{error}"
-    );
     let mut m: StreamManifest =
         serde_json::from_str(include_str!("../fixtures/operations/roughing.json")).unwrap();
     let Operation::Roughing(r) = &mut m.operations[0] else {

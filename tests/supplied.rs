@@ -155,7 +155,11 @@ fn cut_length_at(run: &Run, operation: &str, z: f64) -> f64 {
         .iter()
         .filter(|m| m.operation == operation && m.kind == MoveKind::Cut)
         .filter_map(|m| match m.curve {
-            Curve::Line { start, end } if start[2] == z && end[2] == z => {
+            // Within the sweep tolerance: a level planned from the faced
+            // stock model sits up to 1e-5 above the nominal Z (#344).
+            Curve::Line { start, end }
+                if (start[2] - z).abs() <= 1e-4 && (end[2] - z).abs() <= 1e-4 =>
+            {
                 Some((end[0] - start[0]).hypot(end[1] - start[1]))
             }
             _ => None,
@@ -261,8 +265,9 @@ fn the_stock_a_supplied_toolpath_leaves_is_what_the_next_operation_sees() {
     assert!(near(upper_at(cut, 9., y), 4.), "{}", upper_at(cut, 9., y));
     assert!(upper_at(cut, 6., y) < 4. && upper_at(cut, 6., y) >= 3.5);
     assert!(near(upper_at(cut, 20., 2.), 5.));
-    // The rest pocket (floor Z 3, in 1 mm steps: levels 4 and 3) plans from
-    // that stock: at Z 4 it no longer cuts along the supplied slot.
+    // The rest pocket (floor Z 3, in 1 mm steps from the faced stock model:
+    // levels near 4 and 3) plans from that stock: at Z 4 it no longer cuts
+    // along the supplied slot.
     let (after_slot, from_faced) = (
         cut_length_at(&with, "rest", 4.),
         cut_length_at(&without, "rest", 4.),

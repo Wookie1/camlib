@@ -47,7 +47,7 @@ See [Operations](operations.md) for parameters. Summary:
 | Supplied toolpath | `SuppliedToolpath`: the caller's own line/arc/helix moves with their feeds, run unchanged between planned operations through the same stream (stock handed on, per-move checks, material check, export gate, posting and decoding); camlib adds only the rapid travel to the first point; malformed moves refused by index; stock contact checking required; three-axis milling only |
 | Feeds and speeds | `cutting_data`: rpm and feed from surface speed and feed per tooth, chip thinning, ball effective diameter |
 | Probing, tool setting | Surface, outside and inside corner, bore, boss, pocket and web cycles that correct a work offset, and tool length and diameter on a declared tool setter, with a `ProbeTool` (stylus ball, stem, body); protected positioning, measuring moves checked clear until `search_mm` before the expected contact; stock never changed; what is stored recorded as a premise |
-| Plasma and laser cutting | Sheet parts with holes: kerf compensation (computed or G41/G42 wear), arc/line leads from the scrap, overcut or negative overburn, pierce clearance (center pierce in small holes), inner features and nested parts first, small-hole feed and THC off, micro-joints, common-line cutting of parts one kerf path apart (pairs and rows, opt-in), fixed or programmed pierce/cut heights; every lead, kerf path and pierce proven clear of the parts; sheet simulated cut through |
+| Plasma and laser cutting | Sheet parts with holes: kerf compensation (computed, G41/G42 wear, or applied by the controller from the written part side: `compensation="control"`, its offset replayed from the posted words with both corner joins proven clear), arc/line leads from the scrap, overcut or negative overburn, pierce clearance (center pierce in small holes), inner features and nested parts first, small-hole feed and THC off, micro-joints, common-line cutting of parts one kerf path apart (pairs and rows, opt-in), fixed or programmed pierce/cut heights; every lead, kerf path and pierce proven clear of the parts; sheet simulated cut through |
 | Sheet nesting ([nesting](nesting.md)) | Copies of parts with holes and arcs placed on a sheet or remnant by bottom-left fill, with declared kerf, leads, part spacing, edge margin, rotations, mirror and quantities; parts in holes of other parts; optional seeded search of the order; deterministic; the distances between parts and to the sheet edge proven by an independent closed-form check; parts that do not fit refused or listed. A heuristic: no claim of the densest nest |
 | Turning (lathe) | Facing, outside roughing (axial passes, every diameter left at its allowance), finishing, external, internal and face grooving, parting off, external and internal single-point threading, drilling on the axis (pecks), inside roughing and finishing (boring bars) of a turned profile and bore with insert/holder/bar geometry, the holder's body also from a supplied model (`TurningToolModel`: a mesh with its error, a declared placement and a cross-check against the declared insert); every move checked against the part, its bore, the stock and the chuck; axisymmetric stock with outer and inner bounds; constant surface speed (G96 with its G50/D limit) and feed per revolution (G95/G99); G18 output, finishing arcs (fillets, ball ends, the nose rolling round corners) as native G2/G3, radius or diameter X, T0101 words; a lathe setup is an ordinary `Setup` streamed like every run (per-move stock, playback with partial moves, cancellation, posted replay on the stock) with a material check (leftover material against the part) after each operation |
 
@@ -78,6 +78,12 @@ combinations and impossible dimensions are rejected before any motion.
   tool's table pose, or the spindle staying where it was);
   its first move is checked like any rapid, and posting refuses a setup that
   disagrees with the machine.
+- `Setup(end_position=EndPosition(gauge_z_mm=..., xy_mm=...))` ends a milling
+  program at a stated position: a Z rapid to the gauge height, then an XY
+  rapid, checked, posted and decoded like any move; none is assumed.
+- `ToolChangeInPlace(retract_gauge_z_mm=...)` plans a Z retract to a stated
+  spindle gauge height before every tool change in place, as an ordinary
+  checked, posted and decoded rapid; no retract is assumed without it.
 - Avoid areas and containment regions apply to every operation and to every
   rapid and link.
 
@@ -118,15 +124,25 @@ solid, and reports in the mesh's `source`:
   a curve with such a knot, is divided there by the kernel into C1 faces that
   share the new edge (`faces_divided_at_c0`). The crease is then an edge of
   the mesh.
+- A seam edge whose pcurves lean slightly from vertical or horizontal in UV is
+  straightened on the adapter's private copy before meshing when the proven 3D
+  move stays within the edge's tolerance (`seams_straightened`,
+  `seam_straighten_error_mm`), charged to trim and surface error. Exact seams
+  stay untouched; unstraightenable leaning seams are reported on mesher refusal.
 - The solid's own tolerances (`cad_topology_error_mm`, twice the largest) are
   part of the error. A solid whose tolerances alone exceed `max_error_mm` is
   refused; a loosely toleranced import needs a larger `max_error_mm`, or
   healing in the CAD system.
-- If the kernel's triangulation does not match a face's trims, the whole
-  solid is triangulated again, finer, then with the tolerances of the
-  adapter's private copy tightened (`tolerances_tightened_for_meshing`; the
-  error still charges the original ones). A face is never meshed on its own:
-  its edges would not be shared with its neighbours.
+- If the kernel's triangulation does not match a face's trims, camlib first
+  checks for self-intersecting UV trim polygons (for example at a zero-angle
+  tangent cusp, #360): offending curved chords are bisected at their mid
+  parameter on the real CAD edge across all incident faces
+  (`cusp_trim_bisections`) so the kernel can triangulate with the extra shared
+  nodes. If a mismatch remains, the whole solid is triangulated again, finer,
+  then with the tolerances of the adapter's private copy tightened
+  (`tolerances_tightened_for_meshing`; the error still charges the original
+  ones). A face is never meshed on its own: its edges would not be shared with
+  its neighbours.
 - Refusals name the face (`face 12 (BSPLINE, 48.300 mm2): ...`): a surface
   with no bound (a surface of revolution of a spline, an offset surface), a
   face no triangulation matches, or `max_facets` exceeded.

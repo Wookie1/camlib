@@ -55,7 +55,6 @@ def rest_job():
         1,
         1.5,
         12,
-        path_strategy="stock_front",
         feed_mm_min=600,
         plunge_mm_min=150,
         spindle_rpm=12000,

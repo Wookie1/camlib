@@ -1,13 +1,17 @@
 //! Flat-area finishing (the usual Flat/Horizontal strategy): finds the
 //! horizontal faces of a part and finishes each at its exact height with a
-//! flat end mill, in raster rows, entering each run with a vertical plunge.
+//! flat end mill, in contour-parallel passes that offset each flat's tool
+//! centre region inward, outside in, linked at depth where the link is
+//! proven, and entered from the side in air where a pass runs along an open
+//! edge — the plunge always coming down beside the level's face, never onto
+//! it.
 //!
 //! Proof: every cut is a horizontal line at the cut height. It is kept only
 //! where the highest point of the part (and the machining base) under the
 //! tool's swept disk (a capsule in XY) is not above the cut height plus the
 //! tolerance. That maximum is computed exactly per triangle (a linear
 //! function over the convex triangle-capsule intersection peaks at one of its
-//! extreme points); runs that fail are halved until they pass or vanish.
+//! extreme points); chords that fail are halved until they pass or vanish.
 use crate::{
     facing::TraverseAxis,
     motion::{Coolant, Curve, Event, Motion, MoveKind, SpindleDirection, Vec3},
@@ -18,11 +22,63 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+/// How far behind the pass start (in cutter radii) an arc ramp may begin
+/// (`FlatPlan::arc_ramp`), as far as a waterline side entry is searched.
+const ARC_RAMP_REACH_RADII: f64 = 4.;
+
 fn x_axis() -> TraverseAxis {
     TraverseAxis::X
 }
 fn level_tolerance() -> f64 {
     0.001
+}
+
+/// Emitted arc moves are split so each move's chord stays within this of the
+/// arc: the arc itself is exact, but moves are checked (and posted programs
+/// read) through their endpoints, so a move must not sweep so far that its
+/// chord cuts the corner its endpoints describe.
+const ARC_MOVE_SAGITTA: f64 = 0.005;
+
+/// The arc stroke split into equal sub-arcs whose chords stay within
+/// `sagitta` of the arc (a straight stroke passes through unchanged).
+fn split_arc(seg: &crate::pocket::Stroke, sagitta: f64) -> Vec<crate::pocket::Stroke> {
+    let Some((c, sweep)) = seg.arc else {
+        return vec![*seg];
+    };
+    let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+    let half = (1. - sagitta / rho).clamp(-1., 1.).acos().max(1e-9);
+    let n = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).max(1);
+    let start = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t0 = i as f64 / n as f64;
+        let t1 = (i + 1) as f64 / n as f64;
+        let p = if i == 0 {
+            seg.a
+        } else {
+            let angle = start + sweep * t0;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        };
+        let b = if i + 1 == n {
+            seg.b
+        } else {
+            let angle = start + sweep * t1;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        };
+        out.push(crate::pocket::Stroke {
+            a: p,
+            b,
+            arc: Some((c, sweep * (t1 - t0))),
+        });
+    }
+    out
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlatFloor {
+    pub z_mm: f64,
+    pub region: crate::planar::PlanarRegion,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,6 +87,12 @@ pub struct FlatOperation<G = SurfaceMesh> {
     pub id: String,
     pub tool: String,
     pub surface: G,
+    /// Optional CAD trims of the selected horizontal faces in work coordinates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub floors: Vec<FlatFloor>,
+    /// Cut the outermost wall-following contours after the floor, keeping the radial allowance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finish_walls: bool,
     /// Machining base: flats at or below it are not machined.
     pub floor_z_mm: f64,
     pub stepover_mm: f64,
@@ -40,6 +102,11 @@ pub struct FlatOperation<G = SurfaceMesh> {
     /// Axial stock left on the flats.
     #[serde(default)]
     pub stock_to_leave_mm: f64,
+    /// Radial stock left on the walls: the passes keep this much farther
+    /// from every surface standing above the flat than the cutter's radius,
+    /// so they cut only the horizontal faces.
+    #[serde(default)]
+    pub radial_stock_to_leave_mm: f64,
     /// Faces within this height of each other form one flat level.
     #[serde(default = "level_tolerance")]
     pub level_tolerance_mm: f64,
@@ -76,11 +143,14 @@ impl<G> FlatOperation<G> {
             id: self.id,
             tool: self.tool,
             surface: f(self.surface)?,
+            floors: self.floors,
+            finish_walls: self.finish_walls,
             floor_z_mm: self.floor_z_mm,
             stepover_mm: self.stepover_mm,
             clearance_z_mm: self.clearance_z_mm,
             axis: self.axis,
             stock_to_leave_mm: self.stock_to_leave_mm,
+            radial_stock_to_leave_mm: self.radial_stock_to_leave_mm,
             level_tolerance_mm: self.level_tolerance_mm,
             feed_mm_min: self.feed_mm_min,
             plunge_mm_min: self.plunge_mm_min,
@@ -101,8 +171,17 @@ pub struct FlatReport {
     pub strategy: &'static str,
     pub geometric_residual_status: ResidualStatus,
     pub levels_z_mm: Vec<f64>,
+    /// Loops cut (closed offset loops and the open stretches a loop was split
+    /// into by dropped chords).
     pub rows: usize,
     pub runs: usize,
+    /// Closed offset loops planned, before any chord was dropped.
+    pub loops: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub wall_passes: usize,
+    /// Links cut at depth between the passes of one chain.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub links_at_depth: usize,
     pub cut_length_mm: f64,
     /// Row length near flats that could not be proven clear and was dropped.
     pub dropped_length_mm: f64,
@@ -111,6 +190,22 @@ pub struct FlatReport {
     /// live stock stood above the run's height at its start.
     #[serde(skip_serializing_if = "is_zero")]
     pub ramped_entries: usize,
+    /// Runs entered by a vertical plunge in air and a tangent arc lead-in
+    /// whose radius is the tool's radius (see `FlatPlan::arc_lead_in`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub arc_lead_ins: usize,
+    /// Runs left by a tangent arc lead-out of the tool's radius before the
+    /// retract (see `FlatPlan::arc_lead_out`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub arc_lead_outs: usize,
+    /// Vertical plunges that turn to horizontal through a quarter circle of
+    /// the tool's radius in the vertical plane (see `FlatPlan::plunge_turn`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rounded_plunges: usize,
+    /// Entries through stock on one smooth descent along the pass's line
+    /// (see `FlatPlan::arc_ramp`): counted in `ramped_entries` too.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub arc_ramps: usize,
     pub clearance_proof: &'static str,
 }
 
@@ -1506,11 +1601,96 @@ impl Index {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Run {
-    a: [f64; 2],
-    b: [f64; 2],
+/// One cut pass at a fixed height: the segments of a closed loop in travel
+/// order (an open piece when only stretches of the loop were proven and
+/// allowed). A segment is a straight chord or an arc of the offset loop
+/// (cavalier contours' bulge), proven as a whole or as its chords.
+struct Piece {
+    /// The pass's height; every segment runs at this Z.
     z: f64,
+    segs: Vec<crate::pocket::Stroke>,
+}
+impl Piece {
+    fn start(&self) -> Vec3 {
+        let a = self.segs[0].a;
+        [a[0], a[1], self.z]
+    }
+    fn end(&self) -> Vec3 {
+        let b = self.segs[self.segs.len() - 1].b;
+        [b[0], b[1], self.z]
+    }
+    fn length(&self) -> f64 {
+        self.segs.iter().map(crate::profiles::stroke_length).sum()
+    }
+    /// The first `length` of the piece (all of it when shorter).
+    fn prefix(&self, length: f64) -> Piece {
+        let mut segs = vec![];
+        let mut left = length;
+        for seg in &self.segs {
+            if left <= 0. {
+                break;
+            }
+            let l = crate::profiles::stroke_length(seg);
+            if l <= left {
+                segs.push(*seg);
+            } else {
+                segs.push(sub_stroke(seg, 0., left / l));
+            }
+            left -= l;
+        }
+        Piece { z: self.z, segs }
+    }
+    fn strokes(&self) -> Vec<crate::pocket::Stroke> {
+        // The ramp walks the pass stroke by stroke; its arcs are split like
+        // the cut moves so no ramp leg sweeps a chord that cuts its corner.
+        self.segs
+            .iter()
+            .flat_map(|s| split_arc(s, ARC_MOVE_SAGITTA))
+            .collect()
+    }
+}
+
+/// One entry and the passes cut before the tool retracts: consecutive passes
+/// are joined by links at depth.
+struct Chain {
+    pieces: Vec<Piece>,
+    /// Side-entry candidates of the first pass: vertices (at most one per
+    /// 1 mm of the pass) with the outward normal, away from the region (left
+    /// of travel).
+    side: Vec<([f64; 2], [f64; 2])>,
+    /// The level's face (the flat the pass finishes): an entry may only plunge
+    /// down beside it, never onto it.
+    face: std::sync::Arc<crate::planar::PreparedRegion>,
+}
+
+/// How the chain is entered, decided against the live stock when reached.
+enum Entry {
+    /// Vertical plunge in air at `p`, then a lead at cutting feed to the
+    /// pass's start.
+    Side { p: [f64; 2] },
+    /// Vertical plunge at the pass's start.
+    Plunge,
+    /// Ramp down from `top` (reached through air) to the pass's start: the
+    /// zigzag's curves down the first pass (lines and arcs on the pass,
+    /// helices where a leg descends along an arc), or an arc ramp's descent
+    /// along the pass's line (`FlatPlan::arc_ramp`), whose first `air`
+    /// moves run through air above the stock (at the cutting feed, like a
+    /// lead) and the rest at the ramp's feed; or an arc ramp onto the start of
+    /// a flat arc lead-in, `then`.
+    Ramp {
+        top: f64,
+        curves: Vec<Curve>,
+        air: usize,
+        /// A flat arc lead-in from the descent's end to the pass's start
+        /// (`FlatPlan::ramped_arc_lead_in`).
+        then: Option<Curve>,
+    },
+    /// Vertical plunge in air at `lead`'s start, then the tangent arc lead-in
+    /// `lead` to the pass's start: flat at the pass's height (a lead at
+    /// cutting feed) or, when the plunge point is over the level's finished
+    /// face, a helix descending to it at the declared ramp's angle (at the
+    /// ramp's feed).
+    Arc { lead: Curve, helical: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1518,10 +1698,14 @@ enum Phase {
     Lift,
     Approach,
     Descend,
-    Plunge,
+    Enter,
+    Turn,
+    Lead,
+    ArcIn,
     Ramp,
     Cut,
-    Retract,
+    PieceEnd,
+    Leave,
     Rise,
     Done,
 }
@@ -1530,11 +1714,23 @@ pub struct FlatPlan {
     op: FlatOperation,
     spec: StockSpec,
     heights: crate::heights::Heights,
-    runs: Vec<Run>,
-    run: usize,
+    index: Index,
+    seen: Vec<u32>,
+    stamp: u32,
+    chains: Vec<Chain>,
+    chain: usize,
+    piece: usize,
+    seg: usize,
     phase: Phase,
     radius: f64,
-    ramp: std::collections::VecDeque<Vec3>,
+    limits: Option<crate::limits::PreparedLimits>,
+    entry: Option<Entry>,
+    ramp: std::collections::VecDeque<Curve>,
+    /// How many of `ramp`'s first moves run through air (`Entry::Ramp`).
+    ramp_air: usize,
+    lead: Option<(Curve, bool)>,
+    turn: std::collections::VecDeque<Curve>,
+    after_turn: Phase,
     initial: Vec3,
     position: Vec3,
     next_id: u64,
@@ -1562,6 +1758,7 @@ impl FlatPlan {
             op.stepover_mm,
             op.clearance_z_mm,
             op.stock_to_leave_mm,
+            op.radial_stock_to_leave_mm,
             op.level_tolerance_mm,
             op.feed_mm_min,
             op.plunge_mm_min,
@@ -1607,6 +1804,13 @@ impl FlatPlan {
                     format!(
                         "stock_to_leave_mm {} must not be negative",
                         op.stock_to_leave_mm
+                    ),
+                ),
+                (
+                    op.radial_stock_to_leave_mm >= 0.,
+                    format!(
+                        "radial_stock_to_leave_mm {} must not be negative",
+                        op.radial_stock_to_leave_mm
                     ),
                 ),
                 (
@@ -1689,157 +1893,324 @@ impl FlatPlan {
                 _ => levels.push((z, lo, hi)),
             }
         }
-        if let Some(l) = levels.iter().find(|l| {
-            l.0 > spec.max_mm[2] || spec.max_mm[2] - l.0 > cutter.cutting_length_mm - guard
+        let mut selected = Vec::new();
+        if op.floors.is_empty() {
+            selected.extend(levels.iter().map(|l| (l.0, None)));
+        } else {
+            for floor in &op.floors {
+                if cancel.is_cancelled() {
+                    return Err("flat-area planning cancelled".into());
+                }
+                if !floor.z_mm.is_finite()
+                    || floor.z_mm <= op.floor_z_mm + op.level_tolerance_mm
+                    || !levels
+                        .iter()
+                        .any(|l| (l.0 - floor.z_mm).abs() <= op.level_tolerance_mm)
+                {
+                    return Err(format!(
+                        "flat-area CAD floor Z{} has no matching horizontal mesh level",
+                        floor.z_mm
+                    ));
+                }
+                selected.push((floor.z_mm, Some(&floor.region)));
+            }
+            selected.sort_by(|a, b| b.0.total_cmp(&a.0));
+        }
+        if let Some((z, _)) = selected.iter().find(|(z, _)| {
+            *z > spec.max_mm[2] || spec.max_mm[2] - *z > cutter.cutting_length_mm - guard
         }) {
             return Err(format!(
                 "invalid flat-area finishing parameters: flat level Z {} is above the stock top or deeper below it than the cutting length {}",
-                l.0, cutter.cutting_length_mm
+                z, cutter.cutting_length_mm
             ));
         }
-        let axis = if op.axis == TraverseAxis::X { 0 } else { 1 };
-        let cross = 1 - axis;
         let region_limits = op
             .limits
             .as_ref()
             .filter(|l| !l.is_empty())
             .map(|l| crate::limits::PreparedLimits::new(l, r, op.tolerance_mm))
             .transpose()?;
-        let mut seen = vec![0u32; index.tris.len()];
+        // The part as a height field over XY, for the per-chord proofs and the
+        // side entries' leads.
+        let target = crate::roughing::PreparedRoughingTarget::prepare(
+            op.surface.clone(),
+            op.tolerance_mm,
+            cancel,
+        )?;
+        let mut seen = vec![0u32; index.len()];
         let mut stamp = 0u32;
-        let mut runs = vec![];
-        let (mut rows, mut dropped) = (0usize, 0f64);
-        for &(level, lo, hi) in &levels {
+        let h = op.stepover_mm.min(r) / 4.;
+        let mut chains: Vec<Chain> = vec![];
+        let (mut rows, mut loops, mut links, mut dropped) = (0usize, 0usize, 0usize, 0f64);
+        let mut wall_passes = 0;
+        let mut tool_xy = [initial[0], initial[1]];
+        for &(level, cad) in &selected {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
             let z = level + op.stock_to_leave_mm;
-            let (c0, c1) = (lo[cross] - r, hi[cross] + r);
-            let (a0, a1) = (lo[axis] - r, hi[axis] + r);
-            let intervals = ((c1 - c0) / op.stepover_mm).ceil().max(1.) as usize;
-            let pitch = (c1 - c0) / intervals as f64;
-            let h = op.stepover_mm.min(r) / 4.;
-            let samples = ((a1 - a0) / h).ceil().max(1.) as usize;
-            crate::resources::check_memory(
-                (intervals as u128 + 1) * (samples as u128 + 1) * 8,
-                "flat-area rows",
-            )?;
-            for row in 0..=intervals {
-                if cancel.is_cancelled() {
-                    return Err("flat-area planning cancelled".into());
-                }
-                let c = c0 + row as f64 * pitch;
-                let point = |s: usize| {
-                    let mut p = [0.; 2];
-                    p[axis] = a0 + (a1 - a0) * s as f64 / samples as f64;
-                    p[cross] = c;
-                    p
-                };
-                // Samples where the tool rests on this flat.
-                let on = |p: [f64; 2], seen: &mut [u32], stamp: &mut u32| {
-                    let height = index.max_height(p, p, r, seen, stamp);
-                    (height - level).abs() <= op.level_tolerance_mm
-                };
-                let mut row_runs = vec![];
-                let mut start = None;
-                for s in 0..=samples {
-                    let inside = on(point(s), &mut seen, &mut stamp);
-                    match (inside, start) {
-                        (true, None) => start = Some(s),
-                        (false, Some(s0)) => {
-                            if s - 1 > s0 {
-                                row_runs.push((point(s0), point(s - 1)));
-                            }
-                            start = None;
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(s0) = start
-                    && samples > s0
-                {
-                    row_runs.push((point(s0), point(samples)));
-                }
-                if row_runs.is_empty() {
-                    continue;
-                }
-                rows += 1;
-                if rows % 2 == 0 {
-                    row_runs.reverse();
-                    for run in &mut row_runs {
-                        *run = (run.1, run.0);
-                    }
-                }
-                // Prove each run; halve failures down to h / 16.
-                let mut stack: Vec<([f64; 2], [f64; 2], u32)> =
-                    row_runs.into_iter().rev().map(|(a, b)| (a, b, 0)).collect();
-                while let Some((a, b, depth)) = stack.pop() {
-                    let length = (b[0] - a[0]).hypot(b[1] - a[1]);
-                    if index.max_height(a, b, r, &mut seen, &mut stamp) <= z + op.tolerance_mm {
-                        let Some(limits) = &region_limits else {
-                            runs.push(Run { a, b, z });
-                            continue;
-                        };
-                        // Only the stretches proven inside the limits.
-                        let line = crate::motion::Curve::Line {
-                            start: [a[0], a[1], z],
-                            end: [b[0], b[1], z],
-                        };
-                        let mut kept = 0.;
-                        for [t0, t1] in limits.allowed_spans(&line, true)? {
-                            let at = |t: f64| [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
-                            let (p, q) = (at(t0), at(t1));
-                            if (q[0] - p[0]).hypot(q[1] - p[1]) > op.tolerance_mm {
-                                runs.push(Run { a: p, b: q, z });
-                                kept += (t1 - t0) * length;
-                            }
-                        }
-                        dropped += length - kept;
-                        continue;
-                    }
-                    if length <= h / 16. || depth >= 32 {
-                        dropped += length;
-                        continue;
-                    }
-                    let m = [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.];
-                    stack.push((m, b, depth + 1));
-                    stack.push((a, m, depth + 1));
-                }
-            }
-        }
-        // Rejoin halves that were both proven (same line, touching).
-        let mut merged: Vec<Run> = Vec::with_capacity(runs.len());
-        for run in runs {
-            if let Some(last) = merged.last_mut()
-                && last.b == run.a
-                && last.z == run.z
-            {
-                last.b = run.b;
+            // The tool centres resting on this level, as a planar region, and
+            // the level's face (for keeping entries off it).
+            let level_region = if let Some(cad) = cad {
+                Some(cad_level_region(&target, &op, level, r, cad, cancel)?)
+            } else {
+                level_region(
+                    &target,
+                    level,
+                    op.level_tolerance_mm,
+                    r,
+                    op.radial_stock_to_leave_mm,
+                    op.stepover_mm,
+                    op.tolerance_mm,
+                    cancel,
+                )?
+            };
+            let Some(LevelRegion {
+                centres: region,
+                face,
+                shadow_wall_reserve_mm,
+            }) = level_region
+            else {
                 continue;
+            };
+            // Offset loops per connected component, outside in.
+            // A loop cut only in stretches is cut through a gap between two
+            // of them when that takes no longer than a new entry's descent
+            // from the feed height at the plunge feed (and through any gap of
+            // up to two stepovers, as a link at depth would).
+            let bridge = (2. * op.stepover_mm)
+                .max((heights.feed - z).max(0.) * op.feed_mm_min / op.plunge_mm_min);
+            let groups = level_loops(&region, r, op.stepover_mm, op.tolerance_mm, bridge, cancel)?;
+            let level_chains = chains.len();
+            let mut walls = Vec::new();
+            // Mesh-derived contours include the reserve added around the
+            // raised shadow. Include it only when identifying which contours
+            // follow a wall. The path proof below still uses the cutter.
+            let wall_probe = r
+                + op.radial_stock_to_leave_mm
+                + shadow_wall_reserve_mm
+                + region.definition().boundary_error_mm
+                + op.surface.surface_error_mm
+                + guard;
+            // Nearest component first.
+            let mut order: Vec<usize> = (0..groups.len()).collect();
+            order.sort_by(|&a, &b| {
+                groups[a]
+                    .distance(tool_xy)
+                    .total_cmp(&groups[b].distance(tool_xy))
+                    .then(a.cmp(&b))
+            });
+            for gi in order {
+                loops += groups[gi].outers.len() + groups[gi].holes.len();
+                for (depth, ring, runs) in groups[gi].ordered(tool_xy, 2. * r, 2. * op.stepover_mm)
+                {
+                    if cancel.is_cancelled() {
+                        return Err("flat-area planning cancelled".into());
+                    }
+                    // An inner loop is cut only where its disk reaches floor
+                    // the loops before it left; a short stretch between two
+                    // such places is cut through rather than left for a link.
+                    let ring = match runs {
+                        // Each closed loop starts at its vertex nearest the tool.
+                        None => rotate_to_nearest(ring, tool_xy),
+                        // Open stretches in loop order from the one starting
+                        // nearest the tool; prove_ring splits them into
+                        // pieces where they do not meet.
+                        Some(runs) => open_runs_from_nearest(runs, tool_xy),
+                    };
+                    if ring.is_empty() {
+                        continue;
+                    }
+                    if op.finish_walls
+                        && depth == 0.
+                        && ring.iter().any(|s| {
+                            let mid = stroke_point(s, 0.5);
+                            index.max_height(mid, mid, wall_probe, &mut seen, &mut stamp)
+                                > z + op.tolerance_mm
+                        })
+                    {
+                        walls.push(ring);
+                        continue;
+                    }
+                    // Prove each chord; halve failures down to h / 16, keep
+                    // only the stretches inside the limits.
+                    let pieces = prove_ring(
+                        &ring,
+                        z,
+                        r,
+                        &index,
+                        &mut seen,
+                        &mut stamp,
+                        h,
+                        op.tolerance_mm,
+                        region_limits.as_ref(),
+                        &mut dropped,
+                        cancel,
+                    )?;
+                    for piece in pieces {
+                        rows += 1;
+                        // Consecutive passes join into one chain by a link at
+                        // depth when the link is short, proven and allowed;
+                        // otherwise the chain ends and a new one begins.
+                        let linked = chains.len() > level_chains && {
+                            let prev = chains[chains.len() - 1].pieces.last().unwrap().end();
+                            let next = piece.start();
+                            let length = (next[0] - prev[0]).hypot(next[1] - prev[1]);
+                            length <= 2. * op.stepover_mm
+                                && index.max_height(
+                                    [prev[0], prev[1]],
+                                    [next[0], next[1]],
+                                    r,
+                                    &mut seen,
+                                    &mut stamp,
+                                ) <= z + op.tolerance_mm
+                                && allows_segment(
+                                    region_limits.as_ref(),
+                                    [prev[0], prev[1]],
+                                    [next[0], next[1]],
+                                    z,
+                                    op.tolerance_mm,
+                                )?
+                        };
+                        if linked {
+                            let last = chains.len() - 1;
+                            chains[last].pieces.push(piece);
+                            links += 1;
+                        } else {
+                            let side = side_candidates(&piece);
+                            chains.push(Chain {
+                                pieces: vec![piece],
+                                side,
+                                face: std::sync::Arc::clone(&face),
+                            });
+                        }
+                        let end = chains[chains.len() - 1].pieces.last().unwrap().end();
+                        tool_xy = [end[0], end[1]];
+                    }
+                }
             }
-            merged.push(run);
+            if let Some(cad) = cad {
+                // The nominal outline is reachable at an open edge even at
+                // a sharp corner. Use an enlarged disk for this proof so
+                // an overhanging pass cannot take the declared wall stock.
+                let reserve = op.radial_stock_to_leave_mm + cad.boundary_error_mm + op.tolerance_mm;
+                for component in &cad.components {
+                    let outline = boundary_strokes(&component.outer, false, op.tolerance_mm)?;
+                    let mut omitted = 0.;
+                    let pieces = prove_ring(
+                        &outline,
+                        z,
+                        r + reserve,
+                        &index,
+                        &mut seen,
+                        &mut stamp,
+                        h,
+                        op.tolerance_mm,
+                        region_limits.as_ref(),
+                        &mut omitted,
+                        cancel,
+                    )?;
+                    for piece in pieces {
+                        let side = side_candidates(&piece);
+                        tool_xy = [piece.end()[0], piece.end()[1]];
+                        chains.push(Chain {
+                            pieces: vec![piece],
+                            side,
+                            face: face.clone(),
+                        });
+                        rows += 1;
+                    }
+                }
+            }
+            for ring in walls {
+                let ring = rotate_to_nearest(ring, tool_xy);
+                let mut omitted = 0.;
+                let pieces = prove_ring(
+                    &ring,
+                    z,
+                    r,
+                    &index,
+                    &mut seen,
+                    &mut stamp,
+                    h,
+                    op.tolerance_mm,
+                    region_limits.as_ref(),
+                    &mut omitted,
+                    cancel,
+                )?;
+                if omitted > 0. || pieces.is_empty() {
+                    return Err(format!(
+                        "flat-area wall pass at Z{level} could not be proven within the part and limits"
+                    ));
+                }
+                wall_passes += 1;
+                for piece in pieces {
+                    tool_xy = [piece.end()[0], piece.end()[1]];
+                    let side = side_candidates(&piece);
+                    chains.push(Chain {
+                        pieces: vec![piece],
+                        side,
+                        face: face.clone(),
+                    });
+                    rows += 1;
+                }
+            }
+            if cad.is_some() && chains.len() == level_chains {
+                return Err(format!(
+                    "flat-area CAD floor Z{level} has no proven pass for this cutter"
+                ));
+            }
         }
+        if op.finish_walls && wall_passes == 0 {
+            return Err(
+                "flat-area wall finishing needs a reachable wall beside a selected flat".into(),
+            );
+        }
+        let mut reported_levels: Vec<_> = selected.iter().map(|(z, _)| *z).collect();
+        reported_levels.dedup();
         let report = FlatReport {
             strategy: "flat",
             geometric_residual_status: ResidualStatus::Pending,
-            levels_z_mm: levels.iter().map(|l| l.0).collect(),
+            levels_z_mm: reported_levels,
             rows,
-            runs: merged.len(),
-            cut_length_mm: merged
+            runs: chains.len(),
+            loops,
+            wall_passes,
+            links_at_depth: links,
+            cut_length_mm: chains
                 .iter()
-                .map(|r| (r.b[0] - r.a[0]).hypot(r.b[1] - r.a[1]))
+                .flat_map(|c| c.pieces.iter())
+                .map(Piece::length)
                 .sum(),
             dropped_length_mm: dropped,
             runs_completed: 0,
             ramped_entries: 0,
-            clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; vertical entries above proven runs",
+            arc_lead_ins: 0,
+            arc_lead_outs: 0,
+            rounded_plunges: 0,
+            arc_ramps: 0,
+            clearance_proof: "exact maximum part height under each horizontal cut's swept disk (triangle-capsule extreme points) at most the cut height plus tolerance; contour-parallel offset passes outside in, side entry in air on open edges and every vertical plunge beside the level's face (a radius outside it, the face region a superset of the flat within the shadows' stated errors), links at depth and when chains break",
         };
         Ok(Self {
             op,
             spec: spec.clone(),
             heights,
-            runs: merged,
-            run: 0,
+            index,
+            seen,
+            stamp: 0,
+            chains,
+            chain: 0,
+            piece: 0,
+            seg: 0,
             phase: Phase::Lift,
             radius: r,
+            limits: region_limits,
+            entry: None,
             ramp: Default::default(),
+            ramp_air: 0,
+            lead: None,
+            turn: Default::default(),
+            after_turn: Phase::Cut,
             initial,
             position: initial,
             next_id: first_id,
@@ -1851,35 +2222,43 @@ impl FlatPlan {
     pub fn report(&self) -> &FlatReport {
         &self.report
     }
-    /// What enters the run at `run.a` after the rapid descent: a straight
-    /// plunge where no live stock stands above the run's height there (the
-    /// cells' upper bounds, within a tolerance), otherwise a ramp from the
-    /// stock's top over the whole run, down the run by the declared
-    /// `RampEntry`. Each ramp point lies vertically above the proven run, so
-    /// it clears the part as the run does. A run the ramp does not fit, or
-    /// stock above a run with no entry declared, is refused: a flat end mill
-    /// is never plunged into stock.
+    /// What enters the pass at its start after the rapid descent: a straight
+    /// plunge where no live stock stands above the pass's height there (the
+    /// cells' upper bounds, within a tolerance) and the disk comes down beside
+    /// the level's face, otherwise a ramp from the stock's top over the whole
+    /// pass, down the pass by the declared `RampEntry`. When the pass starts
+    /// over the level's face with no stock above (so the plain plunge is
+    /// refused) and the stock over the pass is that face's already-cut floor,
+    /// the ramp leaves from the cut height plus the depth the declared ramp
+    /// drops over its `min_length_mm` instead: the descent stops in air above
+    /// the face and the ramp comes down along the pass, never straight onto
+    /// the finished flat. Each ramp point lies vertically above the proven
+    /// pass, so it clears the part as the pass does. A pass the ramp does not
+    /// fit, or stock above a pass with no entry declared, is refused: a flat
+    /// end mill is never plunged into stock.
     fn plunge_or_ramp(
         &self,
-        run: Run,
+        piece: &Piece,
         stock: &Stock,
         cancel: &impl CancelSignal,
-    ) -> Result<Option<(f64, Vec<Vec3>)>, String> {
-        let at_start = stock.top_under_disk(run.a, self.radius);
-        if at_start <= run.z + self.op.tolerance_mm {
+    ) -> Result<Option<(f64, Vec<Curve>)>, String> {
+        let a = piece.start();
+        let at_start = stock.top_under_disk([a[0], a[1]], self.radius);
+        if at_start <= a[2] + self.op.tolerance_mm && self.beside_face([a[0], a[1]])? {
             return Ok(None);
         }
-        let length = (run.b[0] - run.a[0]).hypot(run.b[1] - run.a[1]);
-        let top = run_stock_top(stock, run, self.radius, cancel)?;
+        let length = piece.length();
+        let top = piece_stock_top(piece, stock, self.radius, cancel)?;
+        let b = piece.end();
         let which = format!(
             "flat-area run from ({:.3}, {:.3}) to ({:.3}, {:.3}) at Z{:.3}, {length:.3} mm long, has stock up to Z{top:.3} ({:.3} mm above it, {:.3} mm above it at its start)",
-            run.a[0],
-            run.a[1],
-            run.b[0],
-            run.b[1],
-            run.z,
-            top - run.z,
-            at_start - run.z
+            a[0],
+            a[1],
+            b[0],
+            b[1],
+            a[2],
+            top - a[2],
+            at_start - a[2]
         );
         let Some(entry) = self.op.entry.as_ref().and_then(|e| e.ramp()) else {
             return Err(format!(
@@ -1891,25 +2270,767 @@ impl FlatPlan {
                 "{which}: the run is shorter than 16 tolerances, too short to ramp on. Rough or rest-rough this area first"
             ));
         }
-        if top > self.heights.feed {
+        // Moves are read through their endpoints (posted programs, checks):
+        // a helix leg along an arc of the pass drops its depth over the arc,
+        // so over its chord it is steeper by the arc's length over the
+        // chord's. The ramp descends at the angle whose slope over every
+        // move's chord stays within the declared one.
+        let chain = piece.strokes();
+        let stretch = chain
+            .iter()
+            .filter(|s| s.arc.is_some())
+            .map(|s| {
+                let chord = (s.b[0] - s.a[0]).hypot(s.b[1] - s.a[1]);
+                if chord > 0. {
+                    crate::profiles::stroke_length(s) / chord
+                } else {
+                    1.
+                }
+            })
+            .fold(1., f64::max);
+        let entry = &crate::entry::RampEntry {
+            angle_rad: (entry.angle_rad.tan() / stretch).atan(),
+            ..entry.clone()
+        };
+        // Reaching here with no stock above the start means the start is over
+        // the level's face (the plain plunge above refused it for that). When
+        // the stock over the whole pass is that face's already-cut floor (the
+        // cells' upper bounds sit a tolerance above the cut height after a
+        // cut), a ramp from the stock top has no depth: the descent to it
+        // would end straight down on the finished face. The ramp then leaves
+        // from the cut height plus the depth the declared ramp drops over its
+        // `min_length_mm` — `min_length_mm * tan(angle)`, the drop of one leg
+        // at the declared angle over the shortest span the tool may ramp on
+        // (the whole pass when none is declared: a one-leg ramp reverses on
+        // no span) — and descends along the pass as for stock. The stock top
+        // wins when it is higher (real stock along the pass): the descent to
+        // it stops at or above every stock cell under the pass, in air.
+        //
+        // The ramp travels only the start of the pass when one leg descends
+        // the whole depth (the leg's length is the depth over the angle's
+        // tangent): it starts above the stock over that stretch, not over the
+        // whole pass, whose far side may run past part standing far above
+        // (cells along a taller wall). Starting from the floor above, the
+        // start height rises to the stock top over the stretch the ramp from
+        // it would travel until that stretch has no stock above it; when the
+        // stretch reaches the whole pass (the ramp reverses on it) the stock
+        // top over the whole pass is the floor.
+        let tan = entry.angle_rad.tan();
+        let mut target = if at_start <= a[2] + self.op.tolerance_mm {
+            let span = entry.min_length_mm.unwrap_or(length);
+            a[2] + span * tan
+        } else {
+            at_start
+        };
+        loop {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let span = (target - a[2]) / tan;
+            if span >= length {
+                target = target.max(top);
+                break;
+            }
+            let over = piece_stock_top(&piece.prefix(span), stock, self.radius, cancel)?;
+            if over <= target {
+                break;
+            }
+            target = over;
+        }
+        if target > self.heights.feed {
             return Err(format!(
-                "{which}, above the feed height Z{:.3}: raise feed_z_mm/retract_z_mm or rough this area first",
+                "{which}, ramp start Z{target:.3} above the feed height Z{:.3}: raise feed_z_mm/retract_z_mm or rough this area first",
                 self.heights.feed
             ));
         }
-        let chain = [crate::pocket::Stroke::line(run.a, run.b)];
         let curves = entry
-            .zigzag(&chain, top, run.z)
+            .zigzag(&chain, target, a[2])
             .map_err(|why| format!("{which}: {why}. Use a steeper declared angle, a longer run, or rough this area first"))?;
-        let mut points = vec![];
-        let first = curves.first().map_or(run.a, |c| {
-            let q = c.start();
-            [q[0], q[1]]
-        });
-        // Over the run at the stock's top, then down the legs.
-        points.push([first[0], first[1], top]);
-        points.extend(curves.iter().map(|c| c.end()));
-        Ok(Some((top, points)))
+        // The curves run from the ramp's start (at the ramp's start height)
+        // to the pass's start; the vertical descent to the ramp's start
+        // happens in `next_motion_with_stock`.
+        Ok(Some((target, curves)))
+    }
+    /// Whether the disk of radius `self.radius` swept along the arc about
+    /// `c` of radius `rho` from angle `start` through `sweep` stays clear of
+    /// the part at height `z`: the arc's chords at the tolerance's sagitta,
+    /// each proven with the capsule of radius r + sagitta, which contains the
+    /// arc's swept disk (as for the arcs of a pass in `prove_ring`).
+    fn arc_clear(&mut self, c: [f64; 2], rho: f64, start: f64, sweep: f64, z: f64) -> bool {
+        let tol = self.op.tolerance_mm;
+        let half = (1. - tol / rho).clamp(-1., 1.).acos().max(1e-9);
+        let count = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(4096);
+        let sagitta = rho * (1. - (sweep.abs() / (2. * count as f64)).cos());
+        let at = |t: f64| {
+            let angle = start + sweep * t;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        };
+        (0..count).all(|i| {
+            let (p, q) = (
+                at(i as f64 / count as f64),
+                at((i + 1) as f64 / count as f64),
+            );
+            self.index
+                .max_height(p, q, self.radius + sagitta, &mut self.seen, &mut self.stamp)
+                <= z + tol
+        })
+    }
+
+    /// The arc lead-in to the pass starting at `v` (height `z`) along the unit
+    /// tangent `t`, as in established CAM practice: a quarter circle of the
+    /// tool's radius, tangent to the pass at `v`, whose centre lies on the
+    /// normal at `v`, entered by a vertical plunge at its start. Of the two
+    /// sides of the pass, a side qualifies when the plunge point's disk
+    /// touches no stock above the pass's height (on an inner pass that is
+    /// the floor the passes before it finished, which lies more than a
+    /// stepover from the pass once the radius exceeds the stepover), the arc
+    /// is proven clear of the part, and the limits allow it. A plunge point a
+    /// radius beside the level's face comes down in air beside the flat and
+    /// the lead is flat at the pass's height; over the face the plunge stops
+    /// above the floor and the lead descends to the pass as a helix at the
+    /// declared ramp's angle over its chord (no ramp declared: no such side).
+    /// Beside the face wins; `None` when no side qualifies.
+    fn arc_lead_in(
+        &mut self,
+        stock: &Stock,
+        v: [f64; 2],
+        t: [f64; 2],
+        z: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Entry>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        let mut found: Option<Entry> = None;
+        for s in [1., -1.] {
+            let n = [-t[1] * s, t[0] * s];
+            let c = [v[0] + rho * n[0], v[1] + rho * n[1]];
+            let p = [c[0] - rho * t[0], c[1] - rho * t[1]];
+            if stock.top_under_disk(p, rho) > z + tol {
+                continue;
+            }
+            // Over the face, a plunge whose last radius turns to horizontal
+            // (`plunge_turn`, along the arc's tangent at `p`, which is -n)
+            // reaches the floor moving sideways and never dwells on it: the
+            // lead is flat there too.
+            let beside = self.beside_face(p)? || {
+                let d = [-n[0], -n[1]];
+                self.plunge_turn(stock, p, d, z, cancel)?.is_some()
+            };
+            let rise = if beside {
+                0.
+            } else {
+                match self.op.entry.as_ref().and_then(|e| e.ramp()) {
+                    Some(ramp) => rho * std::f64::consts::SQRT_2 * ramp.angle_rad.tan(),
+                    None => continue,
+                }
+            };
+            if z + rise > self.heights.feed {
+                continue;
+            }
+            let start = (p[1] - c[1]).atan2(p[0] - c[0]);
+            let sweep = s * std::f64::consts::FRAC_PI_2;
+            if !self.arc_clear(c, rho, start, sweep, z) {
+                continue;
+            }
+            let lead = if beside {
+                Curve::Arc {
+                    start: [p[0], p[1], z],
+                    end: [v[0], v[1], z],
+                    center: [c[0], c[1], z],
+                    plane: crate::motion::Plane::Xy,
+                    sweep_rad: sweep,
+                }
+            } else {
+                Curve::Helix {
+                    start: [p[0], p[1], z + rise],
+                    end: [v[0], v[1], z],
+                    center: [c[0], c[1], z + rise],
+                    plane: crate::motion::Plane::Xy,
+                    sweep_rad: sweep,
+                }
+            };
+            if let Some(l) = &self.limits
+                && !l.allows_curve(&lead, true)?
+            {
+                continue;
+            }
+            let better = matches!(found, None | Some(Entry::Arc { helical: true, .. })) && beside;
+            if found.is_none() || better {
+                found = Some(Entry::Arc {
+                    lead,
+                    helical: !beside,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// The arc lead-in to the pass starting at `v` (height `z`, unit tangent
+    /// `t`) entered through shallow stock: the flat quarter circle of
+    /// `arc_lead_in`, on a side where stock stands above the pass at its
+    /// start, reached by an arc ramp (`arc_ramp`) that descends along the
+    /// arc's tangent there (or, where the part is in the way, along the
+    /// pass's direction) and ends level at its start. The descent stays a
+    /// radius and more away from the pass, so it reads the stock beside the
+    /// pass rather than at the pass (next to a wall the stock grid carries
+    /// the wall's height in the cells beside it); the arc itself runs level
+    /// at the pass's height, as the passes do. `None` when neither side
+    /// qualifies.
+    fn ramped_arc_lead_in(
+        &mut self,
+        stock: &Stock,
+        v: [f64; 2],
+        t: [f64; 2],
+        z: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Entry>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        let n = t[0].hypot(t[1]);
+        if n <= 0. {
+            return Ok(None);
+        }
+        let t = [t[0] / n, t[1] / n];
+        for s in [1., -1.] {
+            let n = [-t[1] * s, t[0] * s];
+            let c = [v[0] + rho * n[0], v[1] + rho * n[1]];
+            let p = [c[0] - rho * t[0], c[1] - rho * t[1]];
+            if stock.top_under_disk(p, rho) <= z + tol {
+                continue;
+            }
+            let start = (p[1] - c[1]).atan2(p[0] - c[0]);
+            let sweep = s * std::f64::consts::FRAC_PI_2;
+            if !self.arc_clear(c, rho, start, sweep, z) {
+                continue;
+            }
+            let lead = Curve::Arc {
+                start: [p[0], p[1], z],
+                end: [v[0], v[1], z],
+                center: [c[0], c[1], z],
+                plane: crate::motion::Plane::Xy,
+                sweep_rad: sweep,
+            };
+            if let Some(l) = &self.limits
+                && !l.allows_curve(&lead, true)?
+            {
+                continue;
+            }
+            // Along the arc's tangent at its start first (one smooth path);
+            // where the part is in the way, along the pass's direction either
+            // way (the descent then meets the arc at a corner, at depth, as
+            // passes meet at their corners).
+            for d in [[-n[0], -n[1]], t, [-t[0], -t[1]]] {
+                if let Some((top, curves, air)) = self.arc_ramp(stock, p, d, z, cancel)? {
+                    return Ok(Some(Entry::Ramp {
+                        top,
+                        curves,
+                        air,
+                        then: Some(lead),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The arc lead-out from the pass ending at `v` (height `z`) along the
+    /// unit tangent `t`: a quarter circle of the tool's radius, tangent to the
+    /// pass at `v`, flat at the pass's height, on a side where the disk at its
+    /// end (where the retract lifts) touches no stock above the pass, proven
+    /// clear of the part and allowed by the limits; `None` when neither side
+    /// qualifies (the retract then lifts at `v`).
+    fn arc_lead_out(
+        &mut self,
+        stock: &Stock,
+        v: [f64; 2],
+        t: [f64; 2],
+        z: f64,
+    ) -> Result<Option<Curve>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        for s in [1., -1.] {
+            let n = [-t[1] * s, t[0] * s];
+            let c = [v[0] + rho * n[0], v[1] + rho * n[1]];
+            let e = [c[0] + rho * t[0], c[1] + rho * t[1]];
+            if stock.top_under_disk(e, rho) > z + tol {
+                continue;
+            }
+            let start = (v[1] - c[1]).atan2(v[0] - c[0]);
+            let sweep = s * std::f64::consts::FRAC_PI_2;
+            if !self.arc_clear(c, rho, start, sweep, z) {
+                continue;
+            }
+            let lead = Curve::Arc {
+                start: [v[0], v[1], z],
+                end: [e[0], e[1], z],
+                center: [c[0], c[1], z],
+                plane: crate::motion::Plane::Xy,
+                sweep_rad: sweep,
+            };
+            if let Some(l) = &self.limits
+                && !l.allows_curve(&lead, true)?
+            {
+                continue;
+            }
+            return Ok(Some(lead));
+        }
+        Ok(None)
+    }
+
+    /// The turn at the bottom of a vertical plunge onto `p` at height `z0`,
+    /// where the move that follows leaves along the unit direction `d`: the
+    /// plunge stops a tool radius higher, a radius back along `d`, and a
+    /// quarter circle of the tool's radius in the vertical plane through `d`
+    /// turns it to horizontal at `p`, tangent to the plunge above and to the
+    /// move after (one arc in the XZ or YZ plane when `d` runs along X or Y,
+    /// otherwise its chords at `ARC_MOVE_SAGITTA`, inside the circle).
+    /// Taken where the disk over the whole turn's span at `z0` is clear of
+    /// live stock above `z0` and of the part, the span lies inside the
+    /// limits, and the plunge's new bottom is below the feed height; `None`
+    /// otherwise (the plunge then comes straight down onto `p`).
+    fn plunge_turn(
+        &mut self,
+        stock: &Stock,
+        p: [f64; 2],
+        d: [f64; 2],
+        z0: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<Vec<Curve>>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        if z0 + rho > self.heights.feed {
+            return Ok(None);
+        }
+        let along_x = d[1].abs() <= 1e-12;
+        let along_y = d[0].abs() <= 1e-12;
+        let s = if along_x {
+            [p[0] - rho * d[0].signum(), p[1]]
+        } else if along_y {
+            [p[0], p[1] - rho * d[1].signum()]
+        } else {
+            [p[0] - rho * d[0], p[1] - rho * d[1]]
+        };
+        if segment_stock_top(stock, s, p, rho, cancel)? > z0 + tol
+            || self
+                .index
+                .max_height(s, p, rho, &mut self.seen, &mut self.stamp)
+                > z0 + tol
+            || !allows_segment(self.limits.as_ref(), s, p, z0, tol)?
+        {
+            return Ok(None);
+        }
+        let start = [s[0], s[1], z0 + rho];
+        let end = [p[0], p[1], z0];
+        let center = [p[0], p[1], z0 + rho];
+        if along_x || along_y {
+            let plane = if along_x {
+                crate::motion::Plane::Xz
+            } else {
+                crate::motion::Plane::Yz
+            };
+            let [u, v, _] = plane.axes();
+            let angle = |q: [f64; 3]| (q[v] - center[v]).atan2(q[u] - center[u]);
+            let mut sweep = angle(end) - angle(start);
+            if sweep > std::f64::consts::PI {
+                sweep -= 2. * std::f64::consts::PI;
+            } else if sweep < -std::f64::consts::PI {
+                sweep += 2. * std::f64::consts::PI;
+            }
+            return Ok(Some(vec![Curve::Arc {
+                start,
+                end,
+                center,
+                plane,
+                sweep_rad: sweep,
+            }]));
+        }
+        let half = (1. - ARC_MOVE_SAGITTA / rho)
+            .clamp(-1., 1.)
+            .acos()
+            .max(1e-9);
+        let count = ((std::f64::consts::FRAC_PI_2 / (2. * half)).ceil().max(1.) as usize).min(4096);
+        let at = |k: usize| {
+            if k == 0 {
+                return start;
+            }
+            if k == count {
+                return end;
+            }
+            let theta = std::f64::consts::FRAC_PI_2 * k as f64 / count as f64;
+            [
+                p[0] - rho * theta.cos() * d[0],
+                p[1] - rho * theta.cos() * d[1],
+                z0 + rho - rho * theta.sin(),
+            ]
+        };
+        Ok(Some(
+            (0..count)
+                .map(|k| Curve::Line {
+                    start: at(k),
+                    end: at(k + 1),
+                })
+                .collect(),
+        ))
+    }
+
+    /// A ramp into stock as one smooth descent onto the pass start `p`
+    /// (height `z`) along the pass's direction `d`, in the vertical plane
+    /// through `d`, as in established CAM practice for a plunge with an arc
+    /// lead-in: a vertical plunge through air, a quarter-circle-like arc of
+    /// the tool's radius turning it to the declared ramp angle above the
+    /// stock, a straight leg at that angle through the stock, and an arc of
+    /// the tool's radius turning it to horizontal, tangent to the pass at `p`.
+    /// The stock is met only on the leg and the last arc, never steeper than
+    /// the declared angle. Taken where a ramp is declared, live stock stands
+    /// above `z` under the span (at most the stock top over the whole span;
+    /// the upper arc ends above it), the disk over the span is clear of the
+    /// part at `z` (every point of the path is at or above `z`), the span lies
+    /// inside the limits and the plunge's bottom is below the feed height;
+    /// `None` otherwise (the zigzag ramp along the pass, `plunge_or_ramp`).
+    /// At most `ARC_RAMP_REACH_RADII` radii long (about half a millimetre of
+    /// stock at 3 degrees); deeper stock is ramped along the pass. Returns
+    /// the plunge's bottom, the descent's moves, and how many of them (the
+    /// upper arc) run through air.
+    fn arc_ramp(
+        &mut self,
+        stock: &Stock,
+        p: [f64; 2],
+        d: [f64; 2],
+        z: f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<Option<(f64, Vec<Curve>, usize)>, String> {
+        let tol = self.op.tolerance_mm;
+        let rho = self.radius;
+        let Some(ramp) = self.op.entry.as_ref().and_then(|e| e.ramp()) else {
+            return Ok(None);
+        };
+        let n = d[0].hypot(d[1]);
+        if n <= 0. {
+            return Ok(None);
+        }
+        let d = [d[0] / n, d[1] / n];
+        let along_x = d[1].abs() <= 1e-12;
+        let along_y = d[0].abs() <= 1e-12;
+        let d = if along_x {
+            [d[0].signum(), 0.]
+        } else if along_y {
+            [0., d[1].signum()]
+        } else {
+            d
+        };
+        let (sin, cos, tan) = (
+            ramp.angle_rad.sin(),
+            ramp.angle_rad.cos(),
+            ramp.angle_rad.tan(),
+        );
+        // Heights above z, distances along d (0 at p, negative behind it).
+        let bottom = rho * (1. - cos);
+        let mut stock_top = stock.top_under_disk(p, rho) - z;
+        if stock_top <= tol {
+            return Ok(None);
+        }
+        let mut shape = None;
+        for _ in 0..4 {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            // The upper arc ends a tolerance above the stock.
+            let h_a = (stock_top + tol).max(bottom);
+            let u_b = -rho * sin;
+            let u_a = u_b - (h_a - bottom) / tan;
+            let u_t = u_a - rho * (1. - sin);
+            let h_t = h_a + rho * cos;
+            let t = [p[0] + u_t * d[0], p[1] + u_t * d[1]];
+            let top = segment_stock_top(stock, t, p, rho, cancel)? - z;
+            if top <= stock_top + 1e-9 {
+                shape = Some((h_a, u_b, u_a, u_t, h_t, t));
+                break;
+            }
+            stock_top = top;
+        }
+        let Some((h_a, u_b, u_a, u_t, h_t, t)) = shape else {
+            return Ok(None);
+        };
+        // No farther out than four radii, as far as a waterline side entry
+        // is searched: deeper stock is ramped along the pass instead.
+        if -u_t > ARC_RAMP_REACH_RADII * rho
+            || z + h_t > self.heights.feed
+            || self
+                .index
+                .max_height(t, p, rho, &mut self.seen, &mut self.stamp)
+                > z + tol
+            || !allows_segment(self.limits.as_ref(), t, p, z, tol)?
+        {
+            return Ok(None);
+        }
+        let at = |u: f64, h: f64| [p[0] + u * d[0], p[1] + u * d[1], z + h];
+        let arc = |start: [f64; 3], end: [f64; 3], center: [f64; 3]| -> Vec<Curve> {
+            if along_x || along_y {
+                let plane = if along_x {
+                    crate::motion::Plane::Xz
+                } else {
+                    crate::motion::Plane::Yz
+                };
+                let [u, v, _] = plane.axes();
+                let angle = |q: [f64; 3]| (q[v] - center[v]).atan2(q[u] - center[u]);
+                let mut sweep = angle(end) - angle(start);
+                if sweep > std::f64::consts::PI {
+                    sweep -= 2. * std::f64::consts::PI;
+                } else if sweep < -std::f64::consts::PI {
+                    sweep += 2. * std::f64::consts::PI;
+                }
+                return vec![Curve::Arc {
+                    start,
+                    end,
+                    center,
+                    plane,
+                    sweep_rad: sweep,
+                }];
+            }
+            // Chords at ARC_MOVE_SAGITTA, inside the circle, in (u, h).
+            let to_uh = |q: [f64; 3]| ((q[0] - p[0]) * d[0] + (q[1] - p[1]) * d[1], q[2] - z);
+            let (cu, ch) = to_uh(center);
+            let (su, sh) = to_uh(start);
+            let (eu, eh) = to_uh(end);
+            let a0 = (sh - ch).atan2(su - cu);
+            let mut sweep = (eh - ch).atan2(eu - cu) - a0;
+            if sweep > std::f64::consts::PI {
+                sweep -= 2. * std::f64::consts::PI;
+            } else if sweep < -std::f64::consts::PI {
+                sweep += 2. * std::f64::consts::PI;
+            }
+            let half = (1. - ARC_MOVE_SAGITTA / rho)
+                .clamp(-1., 1.)
+                .acos()
+                .max(1e-9);
+            let count = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(4096);
+            let point = |k: usize| {
+                if k == 0 {
+                    return start;
+                }
+                if k == count {
+                    return end;
+                }
+                let a = a0 + sweep * k as f64 / count as f64;
+                at(cu + rho * a.cos(), ch + rho * a.sin())
+            };
+            (0..count)
+                .map(|k| Curve::Line {
+                    start: point(k),
+                    end: point(k + 1),
+                })
+                .collect()
+        };
+        let mut curves = arc(at(u_t, h_t), at(u_a, h_a), at(u_t + rho, h_t));
+        let air = curves.len();
+        if u_a < u_b - 1e-9 {
+            curves.push(Curve::Line {
+                start: at(u_a, h_a),
+                end: at(u_b, bottom),
+            });
+        }
+        curves.extend(arc(at(u_b, bottom), at(0., 0.), at(0., rho)));
+        Ok(Some((z + h_t, curves, air)))
+    }
+
+    /// Whether the disk at `p` comes down beside this chain's level's face: a
+    /// radius (less the tolerance) outside the face region, so a vertical
+    /// plunge at `p` never rests the disk on the flat the pass finishes. An
+    /// empty face region (no flat at the level) leaves the point free.
+    fn beside_face(&self, p: [f64; 2]) -> Result<bool, String> {
+        let q = self.chains[self.chain].face.query(p)?;
+        Ok(q.signed_clearance_mm
+            .is_none_or(|s| s <= self.op.tolerance_mm - self.radius))
+    }
+
+    /// How the current chain is entered, decided against the live stock: from
+    /// the side in air where the first pass runs along an open edge (the
+    /// plunge point's disk touches no stock above the cut, stays beside the
+    /// level's face, and the lead is proven and allowed), otherwise the
+    /// declared rule (`plunge_or_ramp`).
+    fn decide_entry(&mut self, stock: &Stock, cancel: &impl CancelSignal) -> Result<Entry, String> {
+        let piece = &self.chains[self.chain].pieces[self.piece];
+        let z = piece.start()[2];
+        let tol = self.op.tolerance_mm;
+        let first = piece.segs[0].a;
+        let closed = piece.segs.last().is_some_and(|s| s.b == first);
+        let mut best: Option<([f64; 2], [f64; 2])> = None;
+        for (v, n) in &self.chains[self.chain].side {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            if !closed && *v != first {
+                continue;
+            }
+            // Rotating the closed first piece to `v` moves its end, and with
+            // it the chain's link at depth to the next piece: `prepare`
+            // proved that link from the piece's original end, the link from
+            // `v` never was. Accept the candidate only when the new link
+            // passes the same three tests as a link in `prepare`; otherwise
+            // try the next vertex.
+            if self.piece + 1 < self.chains[self.chain].pieces.len() && *v != first {
+                let next = self.chains[self.chain].pieces[self.piece + 1].start();
+                let length = (next[0] - v[0]).hypot(next[1] - v[1]);
+                if length > 2. * self.op.stepover_mm
+                    || self.index.max_height(
+                        *v,
+                        [next[0], next[1]],
+                        self.radius,
+                        &mut self.seen,
+                        &mut self.stamp,
+                    ) > z + tol
+                    || !allows_segment(self.limits.as_ref(), *v, [next[0], next[1]], z, tol)?
+                {
+                    continue;
+                }
+            }
+            // Outward, trying the shortest offset first.
+            for l in [
+                0.25 * self.radius,
+                0.5 * self.radius,
+                self.radius,
+                1.5 * self.radius,
+                2. * self.radius,
+            ] {
+                let p = [v[0] + l * n[0], v[1] + l * n[1]];
+                if stock.top_under_disk(p, self.radius) > z + tol {
+                    continue;
+                }
+                if !self.beside_face(p)? {
+                    continue;
+                }
+                if self
+                    .index
+                    .max_height(p, *v, self.radius, &mut self.seen, &mut self.stamp)
+                    > z + tol
+                {
+                    continue;
+                }
+                if !allows_segment(self.limits.as_ref(), p, *v, z, tol)? {
+                    continue;
+                }
+                let nearer = best.is_none_or(|(bv, _)| {
+                    (v[0] - self.position[0]).hypot(v[1] - self.position[1])
+                        < (bv[0] - self.position[0]).hypot(bv[1] - self.position[1])
+                });
+                if nearer {
+                    best = Some((*v, p));
+                }
+                break;
+            }
+        }
+        if let Some((v, p)) = best {
+            // The loop is cut from the entry vertex.
+            if closed && (first[0] != v[0] || first[1] != v[1]) {
+                let piece = &mut self.chains[self.chain].pieces[self.piece];
+                rotate_piece(piece, v);
+            }
+            let t = self.chains[self.chain].pieces[self.piece].segs[0].tangent(false);
+            if let Some(entry) = self.arc_lead_in(stock, v, t, z, cancel)? {
+                self.report.arc_lead_ins += 1;
+                return Ok(entry);
+            }
+            return Ok(Entry::Side { p });
+        }
+        let t = self.chains[self.chain].pieces[self.piece].segs[0].tangent(false);
+        if let Some(entry) = self.arc_lead_in(stock, first, t, z, cancel)? {
+            self.report.arc_lead_ins += 1;
+            return Ok(entry);
+        }
+        // A pass start over the face with no stock above it is plunged when
+        // the plunge turns to horizontal there (`plunge_turn`): the disk never
+        // dwells on the floor it finishes.
+        let a = self.chains[self.chain].pieces[self.piece].start();
+        if stock.top_under_disk([a[0], a[1]], self.radius) <= z + tol
+            && self
+                .plunge_turn(stock, [a[0], a[1]], t, z, cancel)?
+                .is_some()
+        {
+            return Ok(Entry::Plunge);
+        }
+        if let Some((top, curves, air)) = self.arc_ramp(stock, [a[0], a[1]], t, z, cancel)? {
+            self.report.ramped_entries += 1;
+            self.report.arc_ramps += 1;
+            return Ok(Entry::Ramp {
+                top,
+                curves,
+                air,
+                then: None,
+            });
+        }
+        if let Some(entry) = self.ramped_arc_lead_in(stock, first, t, z, cancel)? {
+            self.report.ramped_entries += 1;
+            self.report.arc_ramps += 1;
+            self.report.arc_lead_ins += 1;
+            return Ok(entry);
+        }
+        // A closed first pass may also be entered at the middle of one of its
+        // straight strokes, where the arc lead-in fits there and not at its
+        // corner: each half of the split stroke is part of the proven
+        // stroke. Alone in its chain the pass starts and ends there; with a
+        // pass linked after it (proven from its original end), it runs from
+        // there to its original start and then once round in full, so it
+        // still ends where the link was proven (the stretch before its
+        // original start is cut twice). The strokes nearest the tool first,
+        // then the shortest such lead-up.
+        if closed {
+            let segs = self.chains[self.chain].pieces[self.piece].segs.clone();
+            let linked = self.piece + 1 < self.chains[self.chain].pieces.len();
+            let mut order: Vec<usize> = (0..segs.len())
+                .filter(|&i| {
+                    segs[i].arc.is_none()
+                        && crate::profiles::stroke_length(&segs[i]) >= 4. * self.radius
+                })
+                .collect();
+            let middle = |i: usize| stroke_point(&segs[i], 0.5);
+            let here = [self.position[0], self.position[1]];
+            if linked {
+                order.reverse();
+            } else {
+                order.sort_by(|&a, &b| {
+                    let (ma, mb) = (middle(a), middle(b));
+                    (ma[0] - here[0])
+                        .hypot(ma[1] - here[1])
+                        .total_cmp(&(mb[0] - here[0]).hypot(mb[1] - here[1]))
+                        .then(a.cmp(&b))
+                });
+            }
+            for i in order {
+                if cancel.is_cancelled() {
+                    return Err("flat-area planning cancelled".into());
+                }
+                let m = middle(i);
+                let t = segs[i].tangent(false);
+                if let Some(entry) = self.ramped_arc_lead_in(stock, m, t, z, cancel)? {
+                    let mut split = vec![sub_stroke(&segs[i], 0.5, 1.)];
+                    split.extend_from_slice(&segs[i + 1..]);
+                    if linked {
+                        split.extend_from_slice(&segs);
+                    } else {
+                        split.extend_from_slice(&segs[..i]);
+                        split.push(sub_stroke(&segs[i], 0., 0.5));
+                    }
+                    self.chains[self.chain].pieces[self.piece].segs = split;
+                    self.report.ramped_entries += 1;
+                    self.report.arc_ramps += 1;
+                    self.report.arc_lead_ins += 1;
+                    return Ok(entry);
+                }
+            }
+        }
+        let piece = &self.chains[self.chain].pieces[self.piece];
+        match self.plunge_or_ramp(piece, stock, cancel)? {
+            None => Ok(Entry::Plunge),
+            Some((top, curves)) => {
+                self.report.ramped_entries += 1;
+                Ok(Entry::Ramp {
+                    top,
+                    curves,
+                    air: 0,
+                    then: None,
+                })
+            }
+        }
     }
     pub fn prefix_events(&self) -> Vec<Event> {
         vec![
@@ -1969,7 +3090,9 @@ impl FlatPlan {
             }
             let p = self.position;
             let mut ramp_feed = None;
-            let (end, kind, next) = match self.phase {
+            // The move's curve: a straight line from the current position
+            // unless the phase carries one (a ramp leg or an arc of the pass).
+            let (end, kind, next, carried) = match self.phase {
                 Phase::Done => {
                     self.drained = true;
                     return Ok(None);
@@ -1977,39 +3100,189 @@ impl FlatPlan {
                 Phase::Lift => (
                     [p[0], p[1], self.heights.clearance],
                     MoveKind::Rapid,
-                    if self.runs.is_empty() {
+                    if self.chains.is_empty() {
                         Phase::Done
                     } else {
                         Phase::Approach
                     },
+                    None,
                 ),
                 Phase::Approach => {
-                    let a = self.runs[self.run].a;
-                    ([a[0], a[1], p[2]], MoveKind::Rapid, Phase::Descend)
+                    // The entry is decided here, against the live stock: the
+                    // rapid goes over the plunge point (a side entry), the
+                    // ramp's start, or the pass's start.
+                    let entry = self.decide_entry(stock, cancel)?;
+                    // Where the plunge lands, the direction the move after it
+                    // leaves in, and the phase after the plunge.
+                    let landing = {
+                        let piece = &self.chains[self.chain].pieces[self.piece];
+                        let a = piece.start();
+                        match &entry {
+                            Entry::Side { p: q } => {
+                                let (dx, dy) = (a[0] - q[0], a[1] - q[1]);
+                                let n = dx.hypot(dy);
+                                (n > 0.).then(|| (*q, [dx / n, dy / n], a[2], Phase::Lead))
+                            }
+                            Entry::Arc { lead, .. } => {
+                                let (Curve::Arc {
+                                    start,
+                                    center,
+                                    sweep_rad,
+                                    ..
+                                }
+                                | Curve::Helix {
+                                    start,
+                                    center,
+                                    sweep_rad,
+                                    ..
+                                }) = lead
+                                else {
+                                    unreachable!("an arc lead is an arc or a helix")
+                                };
+                                let sign = sweep_rad.signum();
+                                let (rx, ry) = (start[0] - center[0], start[1] - center[1]);
+                                let n = rx.hypot(ry);
+                                Some((
+                                    [start[0], start[1]],
+                                    [-ry * sign / n, rx * sign / n],
+                                    start[2],
+                                    Phase::ArcIn,
+                                ))
+                            }
+                            Entry::Plunge => {
+                                Some(([a[0], a[1]], piece.segs[0].tangent(false), a[2], Phase::Cut))
+                            }
+                            Entry::Ramp { .. } => None,
+                        }
+                    };
+                    self.turn.clear();
+                    if let Some((q, d, z0, after)) = landing
+                        && let Some(turn) = self.plunge_turn(stock, q, d, z0, cancel)?
+                    {
+                        self.report.rounded_plunges += 1;
+                        self.turn = turn.into();
+                        self.after_turn = after;
+                    }
+                    let over = match &entry {
+                        Entry::Side { p: over } => *over,
+                        Entry::Ramp { curves, .. } => {
+                            let f = curves[0].start();
+                            [f[0], f[1]]
+                        }
+                        Entry::Plunge => {
+                            let a = self.chains[self.chain].pieces[self.piece].start();
+                            [a[0], a[1]]
+                        }
+                        Entry::Arc { lead, .. } => {
+                            let f = lead.start();
+                            [f[0], f[1]]
+                        }
+                    };
+                    let over = match self.turn.front() {
+                        Some(first) => {
+                            let f = first.start();
+                            [f[0], f[1]]
+                        }
+                        None => over,
+                    };
+                    self.entry = Some(entry);
+                    (
+                        [over[0], over[1], p[2]],
+                        MoveKind::Rapid,
+                        Phase::Descend,
+                        None,
+                    )
                 }
                 Phase::Descend => (
                     [p[0], p[1], self.heights.feed],
                     MoveKind::Rapid,
-                    Phase::Plunge,
+                    Phase::Enter,
+                    None,
                 ),
-                Phase::Plunge => {
-                    let run = self.runs[self.run];
-                    match self.plunge_or_ramp(run, stock, cancel)? {
-                        Some((top, points)) => {
-                            self.ramp = points.into();
-                            self.report.ramped_entries += 1;
-                            // Down through air to the stock's top over the run.
+                Phase::Enter => {
+                    let a = self.chains[self.chain].pieces[self.piece].start();
+                    let planned = match self.entry.take().expect("entry plan") {
+                        Entry::Side { .. } => {
+                            ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Lead, None)
+                        }
+                        Entry::Plunge => ([p[0], p[1], a[2]], MoveKind::Plunge, Phase::Cut, None),
+                        Entry::Arc { lead, helical } => {
+                            // Straight down in air to the lead's start.
+                            let f = lead.start();
+                            self.lead = Some((lead, helical));
+                            ([p[0], p[1], f[2]], MoveKind::Plunge, Phase::ArcIn, None)
+                        }
+                        Entry::Ramp {
+                            top,
+                            curves,
+                            air,
+                            then,
+                        } => {
+                            self.ramp = curves.into();
+                            self.ramp_air = air;
+                            self.lead = then.map(|lead| (lead, false));
+                            // Down through air to the stock's top over the
+                            // pass, where the ramp's first curve begins.
                             (
-                                [p[0], p[1], top.min(p[2]).max(run.z)],
+                                [p[0], p[1], top.min(p[2]).max(a[2])],
                                 MoveKind::Plunge,
-                                Phase::Ramp,
+                                if self.ramp.is_empty() {
+                                    Phase::Cut
+                                } else {
+                                    Phase::Ramp
+                                },
+                                None,
                             )
                         }
-                        None => ([p[0], p[1], run.z], MoveKind::Plunge, Phase::Cut),
+                    };
+                    // A rounded plunge stops at the turn's top; the turn
+                    // lands where the plain plunge would have.
+                    match self.turn.front() {
+                        Some(first) => {
+                            let f = first.start();
+                            ([p[0], p[1], f[2]], MoveKind::Plunge, Phase::Turn, None)
+                        }
+                        None => planned,
                     }
                 }
+                Phase::Turn => {
+                    let curve = self.turn.pop_front().expect("turn move");
+                    let next = if self.turn.is_empty() {
+                        self.after_turn
+                    } else {
+                        Phase::Turn
+                    };
+                    (curve.end(), MoveKind::Lead, next, Some(curve))
+                }
+                Phase::Lead => {
+                    let a = self.chains[self.chain].pieces[self.piece].start();
+                    ([a[0], a[1], a[2]], MoveKind::Lead, Phase::Cut, None)
+                }
+                Phase::ArcIn => {
+                    let (lead, helical) = self.lead.take().expect("arc lead-in");
+                    let kind = if helical {
+                        // A helical lead descends as a ramp: at the ramp's feed.
+                        ramp_feed = Some(
+                            self.op
+                                .entry
+                                .as_ref()
+                                .and_then(|e| e.feed_mm_min())
+                                .unwrap_or(self.op.plunge_mm_min),
+                        );
+                        MoveKind::Plunge
+                    } else {
+                        MoveKind::Lead
+                    };
+                    (lead.end(), kind, Phase::Cut, Some(lead))
+                }
+                Phase::Ramp if self.ramp_air > 0 => {
+                    // Through air above the stock: like a lead.
+                    self.ramp_air -= 1;
+                    let curve = self.ramp.pop_front().expect("ramp move");
+                    (curve.end(), MoveKind::Lead, Phase::Ramp, Some(curve))
+                }
                 Phase::Ramp => {
-                    let end = self.ramp.pop_front().expect("ramp move");
+                    let curve = self.ramp.pop_front().expect("ramp move");
                     ramp_feed = Some(
                         self.op
                             .entry
@@ -2017,29 +3290,74 @@ impl FlatPlan {
                             .and_then(|e| e.feed_mm_min())
                             .unwrap_or(self.op.plunge_mm_min),
                     );
+                    let end = curve.end();
                     (
                         end,
                         MoveKind::Plunge,
-                        if self.ramp.is_empty() {
-                            Phase::Cut
-                        } else {
+                        if !self.ramp.is_empty() {
                             Phase::Ramp
+                        } else if self.lead.is_some() {
+                            Phase::ArcIn
+                        } else {
+                            Phase::Cut
                         },
+                        Some(curve),
                     )
                 }
                 Phase::Cut => {
-                    let run = self.runs[self.run];
-                    ([run.b[0], run.b[1], run.z], MoveKind::Cut, Phase::Retract)
+                    let piece = &self.chains[self.chain].pieces[self.piece];
+                    let seg = piece.segs[self.seg];
+                    let end = [seg.b[0], seg.b[1], piece.z];
+                    let curve = Some(seg.curve(piece.z));
+                    self.seg += 1;
+                    (
+                        end,
+                        MoveKind::Cut,
+                        if self.seg < piece.segs.len() {
+                            Phase::Cut
+                        } else {
+                            Phase::PieceEnd
+                        },
+                        curve,
+                    )
                 }
-                Phase::Retract => (
+                Phase::PieceEnd => {
+                    if self.piece + 1 < self.chains[self.chain].pieces.len() {
+                        // A proven link at depth to the next pass.
+                        let next = self.chains[self.chain].pieces[self.piece + 1].start();
+                        self.piece += 1;
+                        self.seg = 0;
+                        (next, MoveKind::Link, Phase::Cut, None)
+                    } else {
+                        let piece = &self.chains[self.chain].pieces[self.piece];
+                        let (v, z) = ([p[0], p[1]], piece.z);
+                        let t = piece.segs[piece.segs.len() - 1].tangent(true);
+                        match self.arc_lead_out(stock, v, t, z)? {
+                            Some(lead) => {
+                                self.report.arc_lead_outs += 1;
+                                (lead.end(), MoveKind::Lead, Phase::Leave, Some(lead))
+                            }
+                            None => (
+                                [p[0], p[1], self.heights.feed.max(p[2])],
+                                MoveKind::Retract,
+                                Phase::Rise,
+                                None,
+                            ),
+                        }
+                    }
+                }
+                Phase::Leave => (
                     [p[0], p[1], self.heights.feed.max(p[2])],
                     MoveKind::Retract,
                     Phase::Rise,
+                    None,
                 ),
                 Phase::Rise => {
-                    self.run += 1;
+                    self.chain += 1;
+                    self.piece = 0;
+                    self.seg = 0;
                     self.report.runs_completed += 1;
-                    let last = self.run == self.runs.len();
+                    let last = self.chain == self.chains.len();
                     let z = if last {
                         self.heights.clearance
                     } else {
@@ -2049,6 +3367,7 @@ impl FlatPlan {
                         [p[0], p[1], z.max(p[2])],
                         MoveKind::Rapid,
                         if last { Phase::Done } else { Phase::Approach },
+                        None,
                     )
                 }
             };
@@ -2056,7 +3375,7 @@ impl FlatPlan {
             if end == p {
                 continue;
             }
-            let curve = Curve::Line { start: p, end };
+            let curve = carried.unwrap_or(Curve::Line { start: p, end });
             curve.prepare(self.op.tolerance_mm)?;
             let motion = Motion {
                 id: self.next_id,
@@ -2079,19 +3398,51 @@ impl FlatPlan {
 }
 
 /// Highest live stock upper bound over the cells the cutter's disk touches
-/// anywhere along a run: sampled at no more than half a cell apart, each
-/// sample's disk widened to cover the capsule between samples.
-fn run_stock_top(
+/// anywhere along a pass: sampled at no more than half a cell apart along
+/// each chord, each sample's disk widened to cover the capsule between
+/// samples.
+fn piece_stock_top(
+    piece: &Piece,
     stock: &Stock,
-    run: Run,
     r: f64,
     cancel: &impl CancelSignal,
 ) -> Result<f64, String> {
-    segment_stock_top(stock, run.a, run.b, r, cancel)
+    let [wx, wy] = stock.cell_widths_mm();
+    let step = 0.5 * wx.min(wy);
+    let mut top = f64::MIN;
+    for seg in &piece.segs {
+        if cancel.is_cancelled() {
+            return Err("planning cancelled while reading the stock".into());
+        }
+        match seg.arc {
+            None => {
+                top = top.max(segment_stock_top(stock, seg.a, seg.b, r, cancel)?);
+            }
+            Some((c, sweep)) => {
+                // The disk the tool sweeps along a sub-arc is contained in the
+                // capsule of radius r + sagitta around its chord, so the stock
+                // is read over each chord with that wider radius.
+                let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+                let length = rho * sweep.abs();
+                let n = (length / step).ceil().max(1.) as usize;
+                let start = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]);
+                let mut a = seg.a;
+                for i in 1..=n {
+                    let angle = start + sweep * (i as f64 / n as f64);
+                    let b = [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()];
+                    let half = sweep.abs() / (2. * n as f64);
+                    let sagitta = rho * (1. - half.cos());
+                    top = top.max(segment_stock_top(stock, a, b, r + sagitta, cancel)?);
+                    a = b;
+                }
+            }
+        }
+    }
+    Ok(top)
 }
 
 /// Highest live stock upper bound over the cells a disk of radius `r`
-/// touches anywhere along the segment from `a` to `b` (see `run_stock_top`).
+/// touches anywhere along the segment from `a` to `b` (see `piece_stock_top`).
 pub(crate) fn segment_stock_top(
     stock: &Stock,
     a: [f64; 2],
@@ -2119,9 +3470,1588 @@ pub(crate) fn segment_stock_top(
     Ok(top)
 }
 
+struct LevelRegion {
+    centres: crate::planar::PreparedRegion,
+    face: std::sync::Arc<crate::planar::PreparedRegion>,
+    shadow_wall_reserve_mm: f64,
+}
+
+/// The region of tool centres the passes on the flat level `z` run in: the
+/// shadow of the part standing above `z - level_tolerance`, grown by the
+/// overhang `r - stepover` (none at a stepover of a radius or more), minus
+/// the shadow of the part standing above the level, grown by the radius plus
+/// `radial` (the radial stock left on the walls) plus the shadows' stated
+/// errors (the pattern of `waterline::flat_level_loops`): every position
+/// whose disk would come within `radial` of the part above the level. The
+/// "above" shadow's tip is picked so its `protected_from_z_mm` is strictly
+/// above `z + level_tolerance`; nothing standing above the level leaves the
+/// region alone. Every point of the region rests the disk on the level.
+///
+/// The overhang sets where the outermost pass runs past an open edge of the
+/// face (one where the part drops away): its centre `r - stepover` outside
+/// the edge, so its disk reaches `stepover` onto the face — the same width
+/// every later pass takes — instead of rolling along the edge a radius
+/// outside it and cutting nothing (the face is still covered: it lies inside
+/// the region, and the passes cover the region). This is the usual facing
+/// practice of running the tool part-way past the edge. Next to part standing
+/// above the level the region still ends a radius plus `radial` (plus
+/// errors) from it, so the outermost pass there runs along the wall, the
+/// wall's radial stock left standing.
+#[allow(clippy::too_many_arguments)]
+fn level_region(
+    target: &crate::roughing::PreparedRoughingTarget,
+    z: f64,
+    level_tolerance: f64,
+    r: f64,
+    radial: f64,
+    stepover: f64,
+    tolerance: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Option<LevelRegion>, String> {
+    use crate::planar::{Boolean, ConstructionOptions};
+    let options = ConstructionOptions {
+        tolerance_mm: tolerance,
+    };
+    let source_error = target.mesh().surface_error_mm;
+    let mut work = 0usize;
+    let below = target
+        .shadow_for_cutter(z - level_tolerance, 0., r, &mut work, cancel)
+        .map_err(|e| format!("flat-area shadow at Z{z}: {e}"))?;
+    if below.region.components.is_empty() {
+        return Ok(None);
+    }
+    // The shadow's numerical reserve, from its own report.
+    let numerical = (z - level_tolerance) - below.report.protected_from_z_mm - source_error;
+    let resting = below
+        .region
+        .prepare(options)
+        .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+        .offset_prepared(-(r - stepover).max(0.))
+        .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+        .into_parts()
+        .1;
+    let above_tip = z + level_tolerance + source_error + numerical + 16. * tolerance;
+    let above = target
+        .shadow_for_cutter(above_tip, 0., r, &mut work, cancel)
+        .map_err(|e| format!("flat-area shadow at Z{z}: {e}"))?;
+    let (region, face, shadow_wall_reserve_mm) = if above.region.components.is_empty() {
+        let face = below
+            .region
+            .prepare(options)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?;
+        (resting, face, 0.)
+    } else {
+        // A radius plus the radial stock left on the walls off everything
+        // standing above the level.
+        let shadow_wall_reserve_mm = above.report.boundary_error_mm;
+        let reach = r + radial + (shadow_wall_reserve_mm - source_error).max(0.);
+        let above_region = above
+            .region
+            .prepare(options)
+            .map_err(|e| format!("flat-area region at Z{z}: {e}"))?;
+        let envelope = above_region.protective_outer_envelope();
+        let blocked = envelope
+            .as_ref()
+            .unwrap_or(&above_region)
+            .offset_prepared(-reach)
+            .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+            .into_parts()
+            .1;
+        let region = resting
+            .boolean_prepared(&blocked, Boolean::Difference)
+            .map_err(|e| format!("flat-area region at Z{z}: {e}"))?
+            .into_parts()
+            .1;
+        // The level's face: the flat the pass finishes. The shadow standing
+        // above is eroded by its stated boundary error plus the tolerance
+        // before it is subtracted, so what is removed stays inside the part
+        // that really stands above and the face kept is a superset of the
+        // true flat: a point a radius outside this region is a radius
+        // outside the true face too.
+        let core = above_region
+            .offset_prepared(above.report.boundary_error_mm + tolerance)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?
+            .into_parts()
+            .1;
+        let face = below
+            .region
+            .prepare(options)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?
+            .boolean_prepared(&core, Boolean::Difference)
+            .map_err(|e| format!("flat-area face at Z{z}: {e}"))?
+            .into_parts()
+            .1;
+        (region, face, shadow_wall_reserve_mm)
+    };
+    if region.definition().components.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(LevelRegion {
+        centres: region,
+        face: std::sync::Arc::new(face),
+        shadow_wall_reserve_mm,
+    }))
+}
+
+fn cad_level_region(
+    target: &crate::roughing::PreparedRoughingTarget,
+    op: &FlatOperation,
+    z: f64,
+    r: f64,
+    cad: &crate::planar::PlanarRegion,
+    cancel: &impl CancelSignal,
+) -> Result<LevelRegion, String> {
+    let options = crate::planar::ConstructionOptions {
+        tolerance_mm: op.tolerance_mm,
+    };
+    let cad = cad
+        .prepare(options)
+        .map_err(|e| format!("flat-area CAD floor at Z{z}: {e}"))?;
+    let bounds = cad
+        .bounds()
+        .ok_or_else(|| format!("flat-area CAD floor at Z{z} is empty"))?;
+    // Entries continue to use a conservative shadow of the actual mesh.
+    // The caller's trim must never authorize a plunge onto the part.
+    let shadow = target.shadow_for_cutter(z - op.level_tolerance_mm, 0., r, &mut 0, cancel)?;
+    let face = shadow.region.prepare(options)?;
+    let mesh = face
+        .bounds()
+        .ok_or_else(|| format!("flat-area CAD floor at Z{z} has no mesh shadow"))?;
+    let error = cad.definition().boundary_error_mm + face.definition().boundary_error_mm;
+    if bounds[0] < mesh[0] - error
+        || bounds[1] < mesh[1] - error
+        || bounds[2] > mesh[2] + error
+        || bounds[3] > mesh[3] + error
+    {
+        return Err(format!(
+            "flat-area CAD floor at Z{z} extends beyond the mesh shadow"
+        ));
+    }
+    let reach =
+        r + op.radial_stock_to_leave_mm + cad.definition().boundary_error_mm + op.tolerance_mm;
+    let region = cad
+        .offset_prepared(reach)
+        .map_err(|e| format!("flat-area CAD floor offset at Z{z}: {e}"))?
+        .into_parts()
+        .1;
+    Ok(LevelRegion {
+        centres: region,
+        face: std::sync::Arc::new(face),
+        shadow_wall_reserve_mm: 0.,
+    })
+}
+
+/// The offset loops of one connected component of a level's region: the
+/// outer-boundary loops and the hole loops, each with its inward offset.
+/// One offset loop: its offset depth, its closed strokes, and the stretches
+/// of it that are cut when only part of it finishes floor no other loop
+/// covers (`None`: the whole loop; see `trim_ring`).
+type Ring = (
+    f64,
+    Vec<crate::pocket::Stroke>,
+    Option<Vec<Vec<crate::pocket::Stroke>>>,
+);
+
+struct LoopGroup {
+    outers: Vec<Ring>,
+    holes: Vec<Ring>,
+}
+impl LoopGroup {
+    fn distance(&self, p: [f64; 2]) -> f64 {
+        let nearest = |rings: &[Ring]| {
+            rings
+                .iter()
+                .flat_map(|(_, ring, _)| ring.iter())
+                .map(|s| (s.a[0] - p[0]).hypot(s.a[1] - p[1]))
+                .fold(f64::INFINITY, f64::min)
+        };
+        nearest(&self.outers).min(nearest(&self.holes))
+    }
+    /// The rings in cut order: outer loops before hole loops, offset
+    /// ascending (outside in), nearest the tool first at the same offset;
+    /// then, within the outer and within the hole loops, area by area
+    /// (`by_area`) where that takes fewer entries, so each area is finished,
+    /// outside in, before the tool crosses to the next.
+    fn ordered(&self, tool: [f64; 2], gap: f64, link: f64) -> Vec<Ring> {
+        let near = |ring: &[crate::pocket::Stroke]| {
+            ring.iter()
+                .map(|s| (s.a[0] - tool[0]).hypot(s.a[1] - tool[1]))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let sort = |rings: &[Ring]| -> Vec<Ring> {
+            let mut order: Vec<usize> = (0..rings.len()).collect();
+            order.sort_by(|&a, &b| {
+                rings[a]
+                    .0
+                    .total_cmp(&rings[b].0)
+                    .then(near(&rings[a].1).total_cmp(&near(&rings[b].1)))
+                    .then(a.cmp(&b))
+            });
+            order.into_iter().map(|i| rings[i].clone()).collect()
+        };
+        let mut all = by_area(sort(&self.outers), tool, gap, link);
+        let at = all
+            .last()
+            .and_then(|(_, ring, runs)| match runs {
+                Some(runs) => runs.last().and_then(|r| r.last()).map(|s| s.b),
+                None => ring.first().map(|s| s.a),
+            })
+            .unwrap_or(tool);
+        all.extend(by_area(sort(&self.holes), at, gap, link));
+        all
+    }
+}
+
+/// `rings` (in cut order: offset ascending) reordered area by area when
+/// that takes fewer entries. Each full ring and each kept stretch of a
+/// trimmed ring is one item; an item waits for every shallower item within
+/// `gap` of it (the cutter's diameter: every shallower item whose swept
+/// disk overlaps its own), so every area is still cut outside in and no
+/// item runs over floor a deeper one finished first; of the items whose
+/// turn has come, the one nearest the tool is cut next. Where the offsets
+/// split a level into separate areas (the strips either side of a boss),
+/// the tool then finishes one area before crossing to the next instead of
+/// visiting every area once per offset. The new order is taken only when
+/// it needs fewer entries (moves to the next item longer than `link`, the
+/// longest link at depth), or as many over less travel; otherwise the
+/// rings keep their order. Cut order does not change what is cut: each item
+/// was kept for the floor it alone reaches, and its proof and entry are
+/// decided against the part and the live stock as before.
+fn by_area(rings: Vec<Ring>, tool: [f64; 2], gap: f64, link: f64) -> Vec<Ring> {
+    let mut items: Vec<Ring> = vec![];
+    for (d, ring, runs) in &rings {
+        match runs {
+            None => items.push((*d, ring.clone(), None)),
+            Some(runs) => {
+                for run in runs.iter().filter(|r| !r.is_empty()) {
+                    items.push((*d, ring.clone(), Some(vec![run.clone()])));
+                }
+            }
+        }
+    }
+    let lines: Vec<Vec<crate::pocket::Stroke>> = items
+        .iter()
+        .map(|item| match &item.2 {
+            None => item.1.clone(),
+            Some(runs) => runs.concat(),
+        })
+        .collect();
+    let points: Vec<Vec<[f64; 2]>> = lines
+        .iter()
+        .map(|run| {
+            run.iter()
+                .flat_map(|s| (0..4).map(move |k| stroke_point(s, k as f64 / 4.)))
+                .chain(run.last().map(|s| s.b))
+                .collect()
+        })
+        .collect();
+    let distance = |p: [f64; 2], s: &crate::pocket::Stroke| {
+        if s.arc.is_none() {
+            dist2_to_segment(p, s.a, s.b).sqrt()
+        } else {
+            (0..=16)
+                .map(|k| {
+                    let x = stroke_point(s, k as f64 / 16.);
+                    (x[0] - p[0]).hypot(x[1] - p[1])
+                })
+                .fold(f64::INFINITY, f64::min)
+        }
+    };
+    let near = |i: usize, j: usize| {
+        points[i]
+            .iter()
+            .any(|p| lines[j].iter().any(|s| distance(*p, s) <= gap))
+            || points[j]
+                .iter()
+                .any(|p| lines[i].iter().any(|s| distance(*p, s) <= gap))
+    };
+    let n = items.len();
+    let mut waits: Vec<Vec<usize>> = vec![vec![]; n];
+    for j in 0..n {
+        for i in 0..n {
+            if items[i].0 < items[j].0 && near(i, j) {
+                waits[j].push(i);
+            }
+        }
+    }
+    let hypot = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).hypot(p[1] - q[1]);
+    // Where an item is entered and left from `at`: a closed ring at its
+    // vertex nearest the tool (`rotate_to_nearest`), a stretch from its first
+    // stroke to its last.
+    let ends = |strokes: &[crate::pocket::Stroke], closed: bool, at: [f64; 2]| {
+        if closed {
+            let v = strokes
+                .iter()
+                .map(|s| s.a)
+                .min_by(|p, q| hypot(*p, at).total_cmp(&hypot(*q, at)))
+                .unwrap_or(at);
+            (v, v)
+        } else {
+            (
+                strokes.first().map_or(at, |s| s.a),
+                strokes.last().map_or(at, |s| s.b),
+            )
+        }
+    };
+    // (entries, travel) of a walk over (strokes, closed) pieces.
+    let cost = |walk: &[(Vec<crate::pocket::Stroke>, bool)]| {
+        let (mut entries, mut travel, mut at) = (0usize, 0f64, tool);
+        for (strokes, closed) in walk {
+            let (start, end) = ends(strokes, *closed, at);
+            let jump = hypot(at, start);
+            if jump > link {
+                entries += 1;
+            }
+            travel += jump;
+            at = end;
+        }
+        (entries, travel)
+    };
+    let mut done = vec![false; n];
+    let mut order: Vec<usize> = vec![];
+    let mut at = tool;
+    while order.len() < n {
+        let next = (0..n)
+            .filter(|&j| !done[j] && waits[j].iter().all(|&i| done[i]))
+            .min_by(|&a, &b| {
+                let d = |k: usize| {
+                    points[k]
+                        .iter()
+                        .map(|p| hypot(*p, at))
+                        .fold(f64::INFINITY, f64::min)
+                };
+                d(a).total_cmp(&d(b)).then(a.cmp(&b))
+            })
+            .expect("the shallowest item left waits for nothing");
+        done[next] = true;
+        order.push(next);
+        at = ends(&lines[next], items[next].2.is_none(), at).1;
+    }
+    let by_area: Vec<(Vec<crate::pocket::Stroke>, bool)> = order
+        .iter()
+        .map(|&i| (lines[i].clone(), items[i].2.is_none()))
+        .collect();
+    // The rings as they are: a trimmed ring's stretches in loop order from
+    // the one starting nearest the tool (`open_runs_from_nearest`).
+    let mut as_is: Vec<(Vec<crate::pocket::Stroke>, bool)> = vec![];
+    let mut at = tool;
+    for (_, ring, runs) in &rings {
+        match runs {
+            None => {
+                at = ends(ring, true, at).1;
+                as_is.push((ring.clone(), true));
+            }
+            Some(runs) => {
+                let runs: Vec<&Vec<crate::pocket::Stroke>> =
+                    runs.iter().filter(|r| !r.is_empty()).collect();
+                let first = (0..runs.len())
+                    .min_by(|&a, &b| hypot(runs[a][0].a, at).total_cmp(&hypot(runs[b][0].a, at)))
+                    .unwrap_or(0);
+                for k in 0..runs.len() {
+                    let run = runs[(first + k) % runs.len()];
+                    at = run.last().map_or(at, |s| s.b);
+                    as_is.push((run.clone(), false));
+                }
+            }
+        }
+    }
+    let (new, old) = (cost(&by_area), cost(&as_is));
+    if new.0 < old.0 || (new.0 == old.0 && new.1 < old.1) {
+        order.into_iter().map(|i| items[i].clone()).collect()
+    } else {
+        rings
+    }
+}
+
+/// The offset loops of `region`, grouped per connected component: offsets
+/// inward by 0, stepover, 2 stepover, ... while non-empty, then the core:
+/// after the last non-empty offset `d`, while the region offset by
+/// `d + r - 16 tolerances` is still non-empty, the loops at `d + stepover/2`
+/// are added and the check repeats, so the disk covers every reachable point.
+/// With a stepover above the radius, an interval whose next offset pinched
+/// off (a corner between two boundaries of the region) also gets a ring at
+/// half the stepover, so the disk covers every reachable point there too
+/// (stepover up to the cutter diameter). Each loop keeps its arcs (cavalier
+/// contours' bulges); outer boundaries end up clockwise and holes
+/// counter-clockwise: the passes run outside in, so the stock still to cut
+/// lies inward of each ring, on the right of travel — climb milling with a
+/// clockwise spindle.
+fn level_loops(
+    region: &crate::planar::PreparedRegion,
+    r: f64,
+    stepover: f64,
+    tolerance: f64,
+    bridge: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Vec<LoopGroup>, String> {
+    use crate::planar::Boolean;
+    let options = crate::planar::ConstructionOptions {
+        tolerance_mm: tolerance,
+    };
+    let guard = 16. * tolerance;
+    let mut groups = vec![];
+    for component in &region.definition().components {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let single = crate::planar::PlanarRegion {
+            version: 1,
+            units: "mm".into(),
+            name: "flat-level-region".into(),
+            boundary_error_mm: region.definition().boundary_error_mm,
+            components: vec![component.clone()],
+            source: serde_json::Value::Null,
+        };
+        let prepared = single
+            .prepare(options)
+            .map_err(|e| format!("flat-area loop region: {e}"))?;
+        // A disk inside this component cannot be wider than its bounding
+        // box. Reserve the stated boundary error and the construction guard
+        // for a near pinch, then refuse inconsistent nonempty erosions.
+        let [xmin, ymin, xmax, ymax] = prepared.bounds().ok_or("flat-area loop bounds missing")?;
+        let max_depth =
+            0.5 * (xmax - xmin).min(ymax - ymin) + prepared.definition().boundary_error_mm + guard;
+        // Loops as (depth, strokes, the depth the loops before them reach,
+        // when they are only cut where they reach past it).
+        type Pending = (f64, Vec<crate::pocket::Stroke>, Option<f64>);
+        let mut outers: Vec<Pending> = vec![];
+        let mut holes: Vec<Pending> = vec![];
+        let mut vertices = 0usize;
+        let mut collect = |eroded: &crate::planar::PreparedRegion,
+                           d: f64,
+                           need: Option<f64>|
+         -> Result<(), String> {
+            // A loop the kernel vouches no geometry for is not cut: shorter
+            // than the guard (16 tolerances), or — the offset kernel
+            // quantizes vertices to its construction grid (32 tolerances per
+            // coordinate), so an offset that pinches to a point comes back as
+            // a square of side 4 * guard, 16 times the guard — every extent
+            // of the loop fits inside the kernel's own stated boundary error
+            // for this offset (8.027e-4 mm against the square's 6.4e-4 on the
+            // stepped test part's boss top at d = 6). Such a loop is the
+            // kernel's representation of a point or line, not a feature. Its
+            // points lie at depth d, within the stepover (at most the radius)
+            // of the ring at d - stepover along their ray to the boundary, so
+            // the disk covers them from that ring.
+            let error = eroded.definition().boundary_error_mm;
+            for c in &eroded.definition().components {
+                let outer = boundary_strokes(&c.outer, false, tolerance)?;
+                if !outer.is_empty() && !degenerate_loop(&outer, guard, error) {
+                    outers.push((d, outer, need));
+                }
+                for hole in &c.holes {
+                    let strokes = boundary_strokes(hole, true, tolerance)?;
+                    if !strokes.is_empty() && !degenerate_loop(&strokes, guard, error) {
+                        holes.push((d, strokes, need));
+                    }
+                }
+                vertices += c.outer.vertices.len()
+                    + c.holes.iter().map(|h| h.vertices.len()).sum::<usize>();
+            }
+            crate::resources::check_memory(vertices as u128 * 24, "flat-area offset loops")?;
+            Ok(())
+        };
+        let mut d = 0.;
+        let mut eroded = prepared
+            .offset_prepared(d)
+            .map_err(|e| format!("flat-area loop offset: {e}"))?
+            .into_parts()
+            .1;
+        while !eroded.definition().components.is_empty() {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            if d > max_depth {
+                return Err(
+                    "flat-area offset remains nonempty past the component's erosion limit".into(),
+                );
+            }
+            // The rings so far (at 0, s, ..., d - s) already cover every point
+            // of the region within d - s + r of its boundary: a point at depth
+            // t >= d' lies t - d' from the boundary of the offset at d' (the
+            // erosion's complement is the boundary's complement grown by d').
+            // A ring at d is cut only while points deeper than that remain;
+            // otherwise it would only run over floor the earlier rings have
+            // finished (a narrow rim offset from both sides, a small top).
+            // What is left must be more than the kernel's picture of a line
+            // (`uncovered`).
+            // Where such points remain, the ring is cut only where its disk
+            // reaches them.
+            let need = if d > 0. {
+                if uncovered(&prepared, d - stepover + r, tolerance, guard)?.is_none() {
+                    break;
+                }
+                Some(d - stepover + r)
+            } else {
+                None
+            };
+            collect(&eroded, d, need)?;
+            let next_depth = d + stepover;
+            if next_depth <= d {
+                return Err("flat-area offset depth cannot advance by the stepover".into());
+            }
+            let next = prepared
+                .offset_prepared(next_depth)
+                .map_err(|e| format!("flat-area loop offset: {e}"))?
+                .into_parts()
+                .1;
+            if stepover > r && !next.definition().components.is_empty() {
+                // With the stepover above the radius, points deeper than
+                // d + r but shallower than the next ring at d + stepover are
+                // covered by that ring from below only where its offset
+                // survives; where the offset pinched off (a corner between
+                // two boundaries of the region) the surviving ring stretches
+                // on either side can be more than 2r apart and such points
+                // are out of reach of every ring. They are exactly the band
+                // deeper than d + r - guard, outside the next offset, and
+                // farther than r from the next offset's area (the disk
+                // cannot reach them from there either): halve the gap with a
+                // ring at d + stepover/2, which lies at or below their depth
+                // (stepover <= 2r) and within stepover/2 <= r of them along
+                // their ray to the boundary. At a stepover at or below the
+                // radius no interval is deeper than d + r before the next
+                // ring, so this never fires.
+                let shallow = prepared
+                    .offset_prepared(d + r - guard)
+                    .map_err(|e| format!("flat-area loop offset: {e}"))?
+                    .into_parts()
+                    .1;
+                let band = shallow
+                    .boolean_prepared(&next, Boolean::Difference)
+                    .map_err(|e| format!("flat-area loop offset: {e}"))?
+                    .into_parts()
+                    .1;
+                if !band.definition().components.is_empty() {
+                    let reach = next
+                        .offset_prepared(-r)
+                        .map_err(|e| format!("flat-area loop offset: {e}"))?
+                        .into_parts()
+                        .1;
+                    let gap = band
+                        .boolean_prepared(&reach, Boolean::Difference)
+                        .map_err(|e| format!("flat-area loop offset: {e}"))?
+                        .into_parts()
+                        .1;
+                    if !gap.definition().components.is_empty() {
+                        let half = d + stepover / 2.;
+                        let mid = prepared
+                            .offset_prepared(half)
+                            .map_err(|e| format!("flat-area loop offset: {e}"))?
+                            .into_parts()
+                            .1;
+                        if !mid.definition().components.is_empty() {
+                            collect(&mid, half, None)?;
+                        }
+                    }
+                }
+            }
+            d = next_depth;
+            eroded = next;
+        }
+        let mut core = d - stepover;
+        loop {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            if uncovered(&prepared, core + r, tolerance, guard)?.is_none() {
+                break;
+            }
+            let step = core + stepover / 2.;
+            if step <= core || step > max_depth {
+                return Err(
+                    "flat-area remaining floor cannot be resolved within the erosion limit".into(),
+                );
+            }
+            let eroded = prepared
+                .offset_prepared(step)
+                .map_err(|e| format!("flat-area loop offset: {e}"))?
+                .into_parts()
+                .1;
+            collect(&eroded, step, Some(core + r))?;
+            core = step;
+        }
+        // Loops cut only where they finish floor nothing else covers: per
+        // depth reached, the points deeper than it, less what each loop's
+        // kept stretches sweep (outer loops first, as they are cut).
+        let (mut done_outers, mut done_holes): (Vec<Ring>, Vec<Ring>) = (vec![], vec![]);
+        let mut depths: Vec<f64> = outers.iter().chain(&holes).filter_map(|p| p.2).collect();
+        depths.sort_by(f64::total_cmp);
+        depths.dedup();
+        let mut needs: Vec<(f64, Option<crate::planar::PreparedRegion>)> = vec![];
+        for depth in depths {
+            needs.push((depth, uncovered(&prepared, depth, tolerance, guard)?));
+        }
+        let outer_count = outers.len();
+        for (index, (d, strokes, reach)) in outers.into_iter().chain(holes).enumerate() {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let runs = match reach {
+                None => None,
+                Some(reach) => {
+                    let slot = needs
+                        .iter()
+                        .position(|(depth, _)| *depth == reach)
+                        .expect("every reach has its region");
+                    match &needs[slot].1 {
+                        None => Some(vec![]),
+                        Some(need) => trim_ring(&strokes, need, r, bridge, guard, cancel)?,
+                    }
+                }
+            };
+            if runs.as_ref().is_some_and(|runs| runs.is_empty()) {
+                continue;
+            }
+            // What this loop's kept stretches sweep is finished for every later loop,
+            // whatever depth that loop reaches past.
+            let swept = match &runs {
+                None => vec![strokes.clone()],
+                Some(runs) => runs.clone(),
+            };
+            for (_, need) in needs.iter_mut() {
+                if let Some(region) = need.take() {
+                    *need = subtract_swept(region, &swept, r, guard, cancel)?;
+                }
+            }
+            if index < outer_count {
+                done_outers.push((d, strokes, runs));
+            } else {
+                done_holes.push((d, strokes, runs));
+            }
+        }
+        groups.push(LoopGroup {
+            outers: done_outers,
+            holes: done_holes,
+        });
+    }
+    Ok(groups)
+}
+
+/// The points of `prepared` deeper than `depth` (the reach of the rings cut
+/// so far), or `None` when there are none: the offset by `depth` plus the
+/// tolerance, without what is only the kernel's picture of a line
+/// (`without_slivers`). Such a sliver is left where two rings' reach meets
+/// exactly (a rim offset from both sides whose width is a whole number of
+/// passes): the offset returns the meeting line as a strip of no width the
+/// kernel can vouch for, which no ring needs to cover.
+fn uncovered(
+    prepared: &crate::planar::PreparedRegion,
+    depth: f64,
+    tolerance: f64,
+    guard: f64,
+) -> Result<Option<crate::planar::PreparedRegion>, String> {
+    let deeper = prepared
+        .offset_prepared(depth + tolerance)
+        .map_err(|e| format!("flat-area loop offset: {e}"))?
+        .into_parts()
+        .1;
+    without_slivers(deeper, guard)
+}
+
+/// `region` without its slivers — strips thinner than twice its own stated
+/// boundary error plus `guard` (16 tolerances, as for degenerate loops),
+/// which the kernel cannot tell from a line: the morphological opening
+/// (eroded by that width `e`, grown back by it), or `None` when nothing is
+/// left. The opening keeps every point that lies in a disk of radius `e`
+/// inside the region; a point it drops at a corner tip lies within
+/// `e / sin(angle / 2)` of what is kept (twice `e` down to 60 degrees), and
+/// `trim_ring` keeps loops within that margin.
+fn without_slivers(
+    region: crate::planar::PreparedRegion,
+    guard: f64,
+) -> Result<Option<crate::planar::PreparedRegion>, String> {
+    if region.definition().components.is_empty() {
+        return Ok(None);
+    }
+    let e = region.definition().boundary_error_mm + guard;
+    let core = region
+        .offset_prepared(e)
+        .map_err(|e| format!("flat-area loop offset: {e}"))?
+        .into_parts()
+        .1;
+    if core.definition().components.is_empty() {
+        return Ok(None);
+    }
+    let opened = core
+        .offset_prepared(-e)
+        .map_err(|e| format!("flat-area loop offset: {e}"))?
+        .into_parts()
+        .1;
+    Ok((!opened.definition().components.is_empty()).then_some(opened))
+}
+
+/// `need` without what the disk of radius `r` sweeps along the strokes of
+/// `runs` (straight strokes as capsules; arcs by their chords, each capsule's
+/// radius reduced by the chord's sagitta so it stays inside the arc's swept
+/// disk); `None` when nothing is left.
+fn subtract_swept(
+    need: crate::planar::PreparedRegion,
+    runs: &[Vec<crate::pocket::Stroke>],
+    r: f64,
+    guard: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Option<crate::planar::PreparedRegion>, String> {
+    use crate::planar::{Boundary, Component};
+    let mut capsules: Vec<Component> = vec![];
+    let mut capsule = |a: [f64; 2], b: [f64; 2], radius: f64| {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let length = d[0].hypot(d[1]);
+        if length <= guard || radius <= guard {
+            return;
+        }
+        let n = [-d[1] / length * radius, d[0] / length * radius];
+        capsules.push(Component {
+            outer: Boundary {
+                vertices: vec![
+                    [a[0] - n[0], a[1] - n[1], 0.],
+                    [b[0] - n[0], b[1] - n[1], 1.],
+                    [b[0] + n[0], b[1] + n[1], 0.],
+                    [a[0] + n[0], a[1] + n[1], 1.],
+                ],
+            },
+            holes: vec![],
+        });
+    };
+    for seg in runs.iter().flatten() {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        match seg.arc {
+            None => capsule(seg.a, seg.b, r),
+            Some((c, sweep)) => {
+                let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+                let sagitta = 0.01_f64.min(rho);
+                let half = (1. - sagitta / rho).clamp(-1., 1.).acos().max(1e-6);
+                let n = ((sweep.abs() / (2. * half)).ceil() as usize).clamp(1, 4096);
+                let sag = rho * (1. - (sweep.abs() / (2. * n as f64)).cos());
+                for k in 0..n {
+                    let t0 = k as f64 / n as f64;
+                    let t1 = (k + 1) as f64 / n as f64;
+                    capsule(stroke_point(seg, t0), stroke_point(seg, t1), r - sag);
+                }
+            }
+        }
+    }
+    if capsules.is_empty() {
+        return Ok(Some(need));
+    }
+    let need = need
+        .subtract_sweeps(capsules, cancel)
+        .map_err(|e| format!("flat-area swept region: {e}"))?
+        .into_parts()
+        .1;
+    // The remaining floor may be narrow where two sweeps nearly meet.
+    // Keep it for trim_ring: eroding and regrowing it here would discard
+    // material that neither cutter sweep covered.
+    Ok((!need.definition().components.is_empty()).then_some(need))
+}
+
+/// Whether a loop carries no geometry the kernel vouches for: its total
+/// length is below `guard` (16 tolerances), or every extent of the loop fits
+/// inside `error`, the kernel's own stated boundary error for the
+/// construction (see `collect` in `level_loops`). Extents cover the stroke
+/// endpoints and, for arcs, the cardinal directions the sweep crosses — an
+/// arc bulges past its endpoints' bounding box.
+fn degenerate_loop(strokes: &[crate::pocket::Stroke], guard: f64, error: f64) -> bool {
+    let mut total = 0.;
+    let mut min = [f64::INFINITY; 2];
+    let mut max = [f64::NEG_INFINITY; 2];
+    for s in strokes {
+        total += crate::profiles::stroke_length(s);
+        for p in [s.a, s.b] {
+            for k in 0..2 {
+                min[k] = min[k].min(p[k]);
+                max[k] = max[k].max(p[k]);
+            }
+        }
+        if let Some((c, sweep)) = s.arc {
+            let rho = (s.a[0] - c[0]).hypot(s.a[1] - c[1]);
+            let start = (s.a[1] - c[1]).atan2(s.a[0] - c[0]);
+            let tau = 2. * std::f64::consts::PI;
+            for k in 0..4 {
+                let angle = k as f64 * std::f64::consts::FRAC_PI_2;
+                let forward = if sweep >= 0. {
+                    (angle - start).rem_euclid(tau)
+                } else {
+                    (start - angle).rem_euclid(tau)
+                };
+                if forward <= sweep.abs() {
+                    let p = [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()];
+                    for k in 0..2 {
+                        min[k] = min[k].min(p[k]);
+                        max[k] = max[k].max(p[k]);
+                    }
+                }
+            }
+        }
+    }
+    total < guard || (max[0] - min[0]).max(max[1] - min[1]) <= error
+}
+
+/// The closed segment loop of a boundary: straight chords and arcs (cavalier
+/// contours' bulges, as `Stroke::from_boundary`), oriented counter-clockwise
+/// when `ccw` and clockwise otherwise. Degenerate segments (zero length or zero
+/// sweep) carry no geometry and are dropped or straightened. Arcs a boolean
+/// or offset kernel flattened to a chord polygon are refitted from their
+/// chords (`refit_arcs`) so a ring along them is one proven move instead of
+/// one move per chord.
+fn boundary_strokes(
+    boundary: &crate::planar::Boundary,
+    ccw: bool,
+    tolerance: f64,
+) -> Result<Vec<crate::pocket::Stroke>, String> {
+    let n = boundary.vertices.len();
+    if n < 2 {
+        return Err("flat-area loop boundary needs at least two vertices".into());
+    }
+    let segs: Vec<crate::pocket::Stroke> = crate::pocket::Stroke::from_boundary(boundary)
+        .into_iter()
+        .filter(|s| (s.b[0] - s.a[0]).hypot(s.b[1] - s.a[1]) > 1e-12)
+        .map(|mut s| {
+            if s.arc.is_some_and(|(_, sweep)| sweep.abs() < 1e-9) {
+                s.arc = None;
+            }
+            s
+        })
+        .collect();
+    if segs.len() < 2 {
+        return Ok(vec![]);
+    }
+    // Orientation from the closed chord polygon (an inscribed polygon has the
+    // arcs' orientation).
+    let mut pts: Vec<[f64; 2]> = segs.iter().map(|s| s.a).collect();
+    pts.push(segs[0].a);
+    let flipped = (ccw && signed_area(&pts) < 0.) || (!ccw && signed_area(&pts) > 0.);
+    let segs = if flipped {
+        segs.into_iter()
+            .rev()
+            .map(crate::pocket::Stroke::reversed)
+            .collect()
+    } else {
+        segs
+    };
+    Ok(absorb_stubs(refit_arcs(segs, tolerance / 4.)))
+}
+
+/// Absorb the straight stubs of a closed ring — a stroke shorter than
+/// `ARC_MOVE_SAGITTA`, where a kernel snapped two vertices of one corner a
+/// few microns apart — into a neighbouring straight stroke, which then runs
+/// to (or from) the stub's far end: the ring moves by less than the stub's
+/// length, within what the arcs' moves already stray, and is proven as it
+/// is afterwards. A stub between two arcs stays.
+fn absorb_stubs(mut segs: Vec<crate::pocket::Stroke>) -> Vec<crate::pocket::Stroke> {
+    let mut k = 0;
+    while segs.len() > 3 && k < segs.len() {
+        let s = segs[k];
+        let n = segs.len();
+        if s.arc.is_some() || (s.b[0] - s.a[0]).hypot(s.b[1] - s.a[1]) >= ARC_MOVE_SAGITTA {
+            k += 1;
+            continue;
+        }
+        let (next, prev) = ((k + 1) % n, (k + n - 1) % n);
+        if segs[next].arc.is_none() {
+            segs[next].a = s.a;
+        } else if segs[prev].arc.is_none() {
+            segs[prev].b = s.b;
+        } else {
+            k += 1;
+            continue;
+        }
+        segs.remove(k);
+    }
+    segs
+}
+
+/// Refit the arcs a boolean or offset kernel flattened to a chord polygon: a
+/// maximal run of strokes whose vertices share one circle (within `fit`)
+/// becomes one arc stroke again, so a ring along it is one proven move — or
+/// the circumscribed polygon of the arc — instead of one move per flattened
+/// chord. A run may mix straight chords with short arcs (the kernels also
+/// return a flattened circle as alternating micro-arcs and micro-chords): an
+/// arc joins a run through its end and mid points, which must sit on the
+/// fitted circle like every vertex. Only runs fully on the circle, with
+/// chords short against the radius, a steady one-sided turn and a sweep under
+/// a full circle are accepted; anything else stays as it was, and every
+/// emitted piece is still proven against the part before it is cut.
+fn refit_arcs(segs: Vec<crate::pocket::Stroke>, fit: f64) -> Vec<crate::pocket::Stroke> {
+    const MIN_RUN: usize = 4;
+    if segs.len() < MIN_RUN {
+        return segs;
+    }
+    // A stroke's points before its end: the start, and an arc's mid point.
+    let inner = |s: &crate::pocket::Stroke| -> Vec<[f64; 2]> {
+        match s.arc {
+            None => vec![s.a],
+            Some((c, sweep)) => {
+                let rho = (s.a[0] - c[0]).hypot(s.a[1] - c[1]);
+                let mid = (s.a[1] - c[1]).atan2(s.a[0] - c[0]) + sweep / 2.;
+                vec![s.a, [c[0] + rho * mid.cos(), c[1] + rho * mid.sin()]]
+            }
+        }
+    };
+    let mut out: Vec<crate::pocket::Stroke> = Vec::with_capacity(segs.len());
+    let mut i = 0;
+    while i < segs.len() {
+        // The longest run of strokes from `i` whose points share one circle:
+        // extend while the whole run still fits, and keep the last fit (it was
+        // checked against every point of the accepted run).
+        let mut pts = inner(&segs[i]);
+        let mut j = i;
+        let mut fitted: Option<([f64; 2], f64)> = None;
+        while j + 1 < segs.len() {
+            let mut trial = pts.clone();
+            trial.extend(inner(&segs[j + 1]));
+            trial.push(segs[j + 1].b);
+            let Some(f) = fit_circle_run(&trial, fit) else {
+                break;
+            };
+            trial.pop();
+            pts = trial;
+            fitted = Some(f);
+            j += 1;
+        }
+        if j - i + 1 >= MIN_RUN
+            && let Some((centre, sweep)) = fitted
+        {
+            out.push(crate::pocket::Stroke {
+                a: segs[i].a,
+                b: segs[j].b,
+                arc: Some((centre, sweep)),
+            });
+            i = j + 1;
+            continue;
+        }
+        out.push(segs[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The circle through the first, middle and last of `pts`, when every point
+/// sits on it within `fit`, the chords are short against the radius, the turn
+/// is steady and one-sided and the sweep stays under a full circle: the
+/// centre and the signed sweep from the first to the last point.
+fn fit_circle_run(pts: &[[f64; 2]], fit: f64) -> Option<([f64; 2], f64)> {
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+    let (p, q, r) = (pts[0], pts[n / 2], pts[n - 1]);
+    let cross = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    let long = (q[0] - p[0]).hypot(q[1] - p[1]) * (r[0] - p[0]).hypot(r[1] - p[1]);
+    // Collinear to the same 1e-9 rad a merged straight stretch may keep.
+    if long <= 0. || cross.abs() <= 1e-9 * long {
+        return None;
+    }
+    let (p2, q2, r2) = (
+        p[0] * p[0] + p[1] * p[1],
+        q[0] * q[0] + q[1] * q[1],
+        r[0] * r[0] + r[1] * r[1],
+    );
+    let centre = [
+        (p2 * (q[1] - r[1]) + q2 * (r[1] - p[1]) + r2 * (p[1] - q[1])) / (2. * cross),
+        (p2 * (r[0] - q[0]) + q2 * (p[0] - r[0]) + r2 * (q[0] - p[0])) / (2. * cross),
+    ];
+    let radius = (p[0] - centre[0]).hypot(p[1] - centre[1]);
+    if !radius.is_finite() || !(1e-9..=1e6).contains(&radius) {
+        return None;
+    }
+    // Every vertex on the circle, every chord short against the radius.
+    for s in pts {
+        if ((s[0] - centre[0]).hypot(s[1] - centre[1]) - radius).abs() > fit {
+            return None;
+        }
+    }
+    for w in pts.windows(2) {
+        if (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]) > 0.1 * radius {
+            return None;
+        }
+    }
+    // A steady one-sided turn: no chord turns against the run's direction.
+    let mut side = 0i32;
+    for w in pts.windows(3) {
+        let t =
+            (w[1][0] - w[0][0]) * (w[2][1] - w[1][1]) - (w[1][1] - w[0][1]) * (w[2][0] - w[1][0]);
+        let sign = t.signum() as i32;
+        if sign != 0 {
+            if side == 0 {
+                side = sign;
+            } else if side != sign {
+                return None;
+            }
+        }
+    }
+    // The signed sweep from the first to the last point around the centre.
+    let mut sweep = 0.;
+    let mut prev = [pts[0][0] - centre[0], pts[0][1] - centre[1]];
+    for &s in &pts[1..] {
+        let cur = [s[0] - centre[0], s[1] - centre[1]];
+        sweep += (prev[0] * cur[1] - prev[1] * cur[0]).atan2(prev[0] * cur[0] + prev[1] * cur[1]);
+        prev = cur;
+    }
+    if !sweep.is_finite() || sweep.abs() >= 2. * std::f64::consts::PI {
+        return None;
+    }
+    Some((centre, sweep))
+}
+
+/// Signed area of a closed polyline (the first point repeated at the end).
+fn signed_area(pts: &[[f64; 2]]) -> f64 {
+    let mut area = 0.;
+    for w in pts.windows(2) {
+        area += w[0][0] * w[1][1] - w[1][0] * w[0][1];
+    }
+    area / 2.
+}
+
+/// Rotate a closed piece (the last point repeating the first) so it starts at
+/// the vertex `v` (one of its own points) and ends there too.
+fn rotate_piece(piece: &mut Piece, v: [f64; 2]) {
+    let Some(i) = piece.segs.iter().position(|s| s.a == v) else {
+        return;
+    };
+    let mut rotated: Vec<crate::pocket::Stroke> = piece.segs[i..].to_vec();
+    rotated.extend_from_slice(&piece.segs[..i]);
+    piece.segs = rotated;
+}
+
+/// Sampling step along a loop when trimming it to the floor it must finish.
+const TRIM_STEP_MM: f64 = 0.25;
+
+/// The stretches of the closed `ring` whose disk of radius `r` can reach
+/// `need` (the points the loops before it leave uncovered), in loop order and
+/// each in the loop's direction, or `None` when the whole loop is needed.
+/// The loop is read in pieces of at most `TRIM_STEP_MM`; a piece is kept
+/// when its middle lies within `r` plus half the piece's length of `need`
+/// (the region's signed clearance, a distance, so no point of a dropped
+/// piece comes within `r` of `need`). A dropped stretch no longer than
+/// `bridge` between kept ones is kept as well: the pass is proven along it,
+/// and cutting through is shorter than leaving and coming back. Keeping is
+/// the conservative side: every point of `need` the whole loop would cover,
+/// the kept stretches cover.
+fn trim_ring(
+    ring: &[crate::pocket::Stroke],
+    need: &crate::planar::PreparedRegion,
+    r: f64,
+    bridge: f64,
+    guard: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Option<Vec<Vec<crate::pocket::Stroke>>>, String> {
+    if need.definition().components.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    // The reach kept around `need`: the radius, plus twice the sliver width
+    // `without_slivers` may have opened off a corner tip.
+    let reach = r + 2. * (need.definition().boundary_error_mm + guard);
+    // Pieces as (stroke index, t0, t1, length, kept).
+    let mut pieces: Vec<(usize, f64, f64, f64, bool)> = vec![];
+    for (i, seg) in ring.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let length = crate::profiles::stroke_length(seg);
+        let n = ((length / TRIM_STEP_MM).ceil() as usize).max(1);
+        for k in 0..n {
+            let (t0, t1) = (k as f64 / n as f64, (k + 1) as f64 / n as f64);
+            let mid = stroke_point(seg, (t0 + t1) / 2.);
+            let q = need.query(mid)?;
+            let distance = (-q.signed_clearance_mm.unwrap_or(f64::NEG_INFINITY)).max(0.);
+            pieces.push((
+                i,
+                t0,
+                t1,
+                length / n as f64,
+                distance <= reach + length / n as f64 / 2.,
+            ));
+        }
+    }
+    let count = pieces.len();
+    let Some(first_kept) = pieces.iter().position(|p| p.4) else {
+        return Ok(Some(vec![]));
+    };
+    if pieces.iter().all(|p| p.4) {
+        return Ok(None);
+    }
+    // Bridge short dropped stretches between kept ones, around the loop.
+    let mut k = 0;
+    while k < count {
+        let at = (first_kept + k) % count;
+        if pieces[at].4 {
+            k += 1;
+            continue;
+        }
+        let mut end = k;
+        let mut gap = 0.;
+        while end < count && !pieces[(first_kept + end) % count].4 {
+            gap += pieces[(first_kept + end) % count].3;
+            end += 1;
+        }
+        if gap <= bridge {
+            for j in k..end {
+                pieces[(first_kept + j) % count].4 = true;
+            }
+        }
+        k = end;
+    }
+    if pieces.iter().all(|p| p.4) {
+        return Ok(None);
+    }
+    // Start right after a dropped piece, so no stretch wraps the seam.
+    let start = (0..count)
+        .map(|k| (first_kept + k) % count)
+        .find(|&at| pieces[at].4 && !pieces[(at + count - 1) % count].4)
+        .unwrap_or(first_kept);
+    let mut runs: Vec<Vec<crate::pocket::Stroke>> = vec![];
+    let mut current: Vec<crate::pocket::Stroke> = vec![];
+    let mut open: Option<(usize, f64, f64)> = None;
+    let flush = |open: &mut Option<(usize, f64, f64)>, current: &mut Vec<crate::pocket::Stroke>| {
+        if let Some((i, t0, t1)) = open.take() {
+            current.push(sub_stroke(&ring[i], t0, t1));
+        }
+    };
+    for k in 0..count {
+        let (i, t0, t1, _, kept) = pieces[(start + k) % count];
+        if !kept {
+            flush(&mut open, &mut current);
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        match open {
+            Some((j, a, _)) if j == i => open = Some((j, a, t1)),
+            _ => {
+                flush(&mut open, &mut current);
+                open = Some((i, t0, t1));
+            }
+        }
+    }
+    flush(&mut open, &mut current);
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    Ok(Some(runs))
+}
+
+/// The point of a stroke at parameter `t` (0 at its start, 1 at its end).
+fn stroke_point(seg: &crate::pocket::Stroke, t: f64) -> [f64; 2] {
+    if t <= 0. {
+        return seg.a;
+    }
+    if t >= 1. {
+        return seg.b;
+    }
+    match seg.arc {
+        None => [
+            seg.a[0] + t * (seg.b[0] - seg.a[0]),
+            seg.a[1] + t * (seg.b[1] - seg.a[1]),
+        ],
+        Some((c, sweep)) => {
+            let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+            let angle = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]) + sweep * t;
+            [c[0] + rho * angle.cos(), c[1] + rho * angle.sin()]
+        }
+    }
+}
+
+/// The part of a stroke between parameters `t0` and `t1`, ending exactly on
+/// the stroke's own endpoints where it reaches them.
+fn sub_stroke(seg: &crate::pocket::Stroke, t0: f64, t1: f64) -> crate::pocket::Stroke {
+    crate::pocket::Stroke {
+        a: stroke_point(seg, t0),
+        b: stroke_point(seg, t1),
+        arc: seg.arc.map(|(c, sweep)| (c, sweep * (t1 - t0))),
+    }
+}
+
+/// Open stretches of one loop, in loop order, starting from the stretch whose
+/// start is nearest `tool`, as one stroke list (stretches that do not meet
+/// are split into separate pieces when proven).
+fn open_runs_from_nearest(
+    runs: Vec<Vec<crate::pocket::Stroke>>,
+    tool: [f64; 2],
+) -> Vec<crate::pocket::Stroke> {
+    let first = runs
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let d = |s: &[crate::pocket::Stroke]| (s[0].a[0] - tool[0]).hypot(s[0].a[1] - tool[1]);
+            d(a).total_cmp(&d(b))
+        })
+        .map_or(0, |(i, _)| i);
+    let n = runs.len();
+    (0..n)
+        .flat_map(|k| runs[(first + k) % n].iter().copied())
+        .collect()
+}
+
+/// Rotate a closed ring of segments (the last ending on the first's start) so
+/// it starts at the vertex nearest `tool` and ends there too.
+fn rotate_to_nearest(
+    ring: Vec<crate::pocket::Stroke>,
+    tool: [f64; 2],
+) -> Vec<crate::pocket::Stroke> {
+    if ring.len() < 2 {
+        return ring;
+    }
+    let (mut best, mut index) = (f64::INFINITY, 0usize);
+    for (i, s) in ring.iter().enumerate() {
+        let d = (s.a[0] - tool[0]).hypot(s.a[1] - tool[1]);
+        if d < best {
+            (best, index) = (d, i);
+        }
+    }
+    if index == 0 {
+        return ring;
+    }
+    let mut rotated: Vec<crate::pocket::Stroke> = ring[index..].to_vec();
+    rotated.extend_from_slice(&ring[..index]);
+    rotated
+}
+
+/// Prove every chord of `ring` at height `z` (the highest part point under
+/// the swept disk of radius `r` at most `z + tolerance`), halving failures
+/// down to `h / 16`, and keep only the stretches inside the limits. Adjacent
+/// proven chords merge into pieces; what cannot be proven or allowed is
+/// dropped, splitting the loop into open pieces.
+#[allow(clippy::too_many_arguments)]
+fn prove_ring(
+    ring: &[crate::pocket::Stroke],
+    z: f64,
+    r: f64,
+    index: &Index,
+    seen: &mut [u32],
+    stamp: &mut u32,
+    h: f64,
+    tolerance: f64,
+    limits: Option<&crate::limits::PreparedLimits>,
+    dropped: &mut f64,
+    cancel: &impl CancelSignal,
+) -> Result<Vec<Piece>, String> {
+    let mut pieces: Vec<Piece> = vec![];
+
+    // Append a segment, merging consecutive collinear chords of the same loop
+    // (direction change below 1e-9 rad, both proven, one straight move): a
+    // proven straight edge is not split into many chords.
+    fn push(pieces: &mut Vec<Piece>, seg: crate::pocket::Stroke, z: f64) {
+        if let Some(last) = pieces.last_mut()
+            && last.z == z
+            && last.segs.last().is_some_and(|s| s.b == seg.a)
+        {
+            let l = last.segs.last_mut().unwrap();
+            if l.arc.is_none() && seg.arc.is_none() {
+                let d0 = [l.b[0] - l.a[0], l.b[1] - l.a[1]];
+                let d1 = [seg.b[0] - seg.a[0], seg.b[1] - seg.a[1]];
+                let (l0, l1) = (d0[0].hypot(d0[1]), d1[0].hypot(d1[1]));
+                if l0 > 0.
+                    && l1 > 0.
+                    && (d0[0] * d1[1] - d0[1] * d1[0]).abs() <= 1e-9 * l0 * l1
+                    && d0[0] * d1[0] + d0[1] * d1[1] > 0.
+                {
+                    l.b = seg.b;
+                    return;
+                }
+            }
+            last.segs.push(seg);
+            return;
+        }
+        pieces.push(Piece { z, segs: vec![seg] });
+    }
+    // Prove the straight stretch from `a` to `b` with the capsule radius `rc`:
+    // kept where the highest part point under the capsule is not above the cut
+    // height plus the tolerance (split by the limits into kept spans), halved
+    // down to h / 16 otherwise, what cannot be proven dropped.
+    fn prove_line(
+        pieces: &mut Vec<Piece>,
+        index: &Index,
+        seen: &mut [u32],
+        stamp: &mut u32,
+        a: [f64; 2],
+        b: [f64; 2],
+        rc: f64,
+        z: f64,
+        h: f64,
+        tolerance: f64,
+        limits: Option<&crate::limits::PreparedLimits>,
+        dropped: &mut f64,
+        cancel: &impl CancelSignal,
+    ) -> Result<(), String> {
+        let mut stack = vec![(a, b, 0u32)];
+        while let Some((a, b, depth)) = stack.pop() {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            if index.max_height(a, b, rc, seen, stamp) <= z + tolerance {
+                match limits {
+                    None => push(pieces, crate::pocket::Stroke::line(a, b), z),
+                    Some(limits) => {
+                        // Only the stretches proven inside the limits.
+                        let line = crate::motion::Curve::Line {
+                            start: [a[0], a[1], z],
+                            end: [b[0], b[1], z],
+                        };
+                        let mut kept = 0.;
+                        for [t0, t1] in limits.allowed_spans(&line, true)? {
+                            let p = [a[0] + t0 * (b[0] - a[0]), a[1] + t0 * (b[1] - a[1])];
+                            let q = [a[0] + t1 * (b[0] - a[0]), a[1] + t1 * (b[1] - a[1])];
+                            if (q[0] - p[0]).hypot(q[1] - p[1]) > tolerance {
+                                push(pieces, crate::pocket::Stroke::line(p, q), z);
+                                kept += (t1 - t0) * length;
+                            }
+                        }
+                        *dropped += length - kept;
+                    }
+                }
+                continue;
+            }
+            if length <= h / 16. || depth >= 32 {
+                *dropped += length;
+                continue;
+            }
+            let m = [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.];
+            stack.push((m, b, depth + 1));
+            stack.push((a, m, depth + 1));
+        }
+        Ok(())
+    }
+    for seg in ring {
+        if cancel.is_cancelled() {
+            return Err("flat-area planning cancelled".into());
+        }
+        let Some((c, sweep)) = seg.arc else {
+            prove_line(
+                &mut pieces,
+                index,
+                seen,
+                stamp,
+                seg.a,
+                seg.b,
+                r,
+                z,
+                h,
+                tolerance,
+                limits,
+                dropped,
+                cancel,
+            )?;
+            continue;
+        };
+        // An arc of the offset loop: covered by its chords (sagitta at most
+        // the tolerance, refined while chords fail), each proven with the
+        // capsule of radius r + sagitta, which contains the arc's swept disk.
+        // Every chord proven, the arc is one move; otherwise the proven
+        // chords stand in for it.
+        let rho = (seg.a[0] - c[0]).hypot(seg.a[1] - c[1]);
+        let start = (seg.a[1] - c[1]).atan2(seg.a[0] - c[0]);
+        // Chords no shorter than the halving floor, so the refinement (and the
+        // fallback's chords) stay above what a straight chord could prove.
+        let count_cap = ((sweep.abs() * rho / (h / 16.)).ceil() as usize)
+            .max(1)
+            .next_power_of_two();
+        let mut count = {
+            let half = (1. - tolerance / rho).clamp(-1., 1.).acos().max(1e-9);
+            ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(count_cap)
+        };
+        let chord = |i: usize, count: usize| {
+            let t0 = i as f64 / count as f64;
+            let t1 = (i + 1) as f64 / count as f64;
+            let p = [
+                c[0] + rho * (start + sweep * t0).cos(),
+                c[1] + rho * (start + sweep * t0).sin(),
+            ];
+            let q = [
+                c[0] + rho * (start + sweep * t1).cos(),
+                c[1] + rho * (start + sweep * t1).sin(),
+            ];
+            let sagitta = rho * (1. - (sweep.abs() / (2. * count as f64)).cos());
+            (p, q, sagitta)
+        };
+        let mut proven = false;
+        while count <= count_cap {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            let all_clear = (0..count).all(|i| {
+                let (p, q, sagitta) = chord(i, count);
+                index.max_height(p, q, r + sagitta, seen, stamp) <= z + tolerance
+            });
+            if all_clear {
+                proven = true;
+                break;
+            }
+            count *= 2;
+        }
+        // The whole arc must also sit inside the limits; otherwise its chords
+        // are checked against them one by one below.
+        let allowed = limits.map_or(Ok(true), |l| l.allows_curve(&seg.curve(z), true))?;
+        if proven && allowed {
+            // One proven arc piece, split so every move's chord stays within
+            // `ARC_MOVE_SAGITTA` of the arc; the proof above covers the whole
+            // arc, every piece of it included.
+            for sub in split_arc(seg, ARC_MOVE_SAGITTA) {
+                push(&mut pieces, sub, z);
+            }
+            continue;
+        }
+        // Before the chord fallback: the arc's circumscribed polygon. Its
+        // `sides + 1` edges are the tangents at start + k*sweep/sides
+        // (k = 0..sides), so the path runs a -> the intersections of
+        // consecutive tangents (at the mid angles, radius
+        // rho / cos(sweep/(2*sides))) -> b, touching the circle at the
+        // tangent points and ending on the arc's own endpoints. For an arc
+        // whose centre is on the obstacle side (a convex corner of the
+        // blocked region, as round the grown shadow of a boss standing
+        // above) every edge stays on or outside the circle, away from the
+        // centre, so the disk along an edge keeps at least the clearance the
+        // planned arc's own disk has, and the edge proves as a straight cut
+        // at radius r with no sagitta: the move IS the segment. The polygon
+        // strays from the planned ring at most
+        // rho * (1/cos(sweep/(2*sides)) - 1) at its vertices, held to
+        // `ARC_MOVE_SAGITTA` through `sides`. An edge that fails the proof
+        // (the centre on the region side, the polygon bulging toward the
+        // obstacle) sends the arc to the chords below.
+        let sides = {
+            let step = (rho / (rho + ARC_MOVE_SAGITTA)).acos().max(1e-9);
+            ((sweep.abs() / (2. * step)).ceil().max(1.) as usize).max(1)
+        };
+        let reach = rho / (sweep.abs() / (2. * sides as f64)).cos();
+        let mut points = Vec::with_capacity(sides + 2);
+        points.push(seg.a);
+        for k in 0..sides {
+            let mid = start + sweep * (k as f64 + 0.5) / sides as f64;
+            points.push([c[0] + reach * mid.cos(), c[1] + reach * mid.sin()]);
+        }
+        points.push(seg.b);
+        let mut circumscribed = true;
+        for pair in points.windows(2) {
+            if cancel.is_cancelled() {
+                return Err("flat-area planning cancelled".into());
+            }
+            if index.max_height(pair[0], pair[1], r, seen, stamp) > z + tolerance
+                || !allows_segment(limits, pair[0], pair[1], z, tolerance)?
+            {
+                circumscribed = false;
+                break;
+            }
+        }
+        if circumscribed {
+            for pair in points.windows(2) {
+                push(
+                    &mut pieces,
+                    crate::pocket::Stroke::line(pair[0], pair[1]),
+                    z,
+                );
+            }
+            continue;
+        }
+        // The arc's chords at the tolerance's sagitta, each proven with the
+        // arc's capsule radius; failures are halved like straight chords.
+        let half = (1. - tolerance / rho).clamp(-1., 1.).acos().max(1e-9);
+        let count = ((sweep.abs() / (2. * half)).ceil().max(1.) as usize).min(count_cap);
+        let sagitta = rho * (1. - (sweep.abs() / (2. * count as f64)).cos());
+        for i in 0..count {
+            let (p, q, _) = chord(i, count);
+            prove_line(
+                &mut pieces,
+                index,
+                seen,
+                stamp,
+                p,
+                q,
+                r + sagitta,
+                z,
+                h,
+                tolerance,
+                limits,
+                dropped,
+                cancel,
+            )?;
+        }
+    }
+    Ok(pieces)
+}
+
+/// Side-entry candidates of a piece: its segment starts, at most one per 1 mm
+/// of the piece, each with the outward normal (left of travel: away from the
+/// region on a clockwise outer loop, into the hole on a counter-clockwise
+/// hole loop). On an arc the tangent at its start stands in for the chord.
+fn side_candidates(piece: &Piece) -> Vec<([f64; 2], [f64; 2])> {
+    let mut side = vec![];
+    let mut taken: Option<[f64; 2]> = None;
+    for seg in &piece.segs {
+        let v = seg.a;
+        if taken.is_some_and(|p| (v[0] - p[0]).hypot(v[1] - p[1]) < 1.) {
+            continue;
+        }
+        let d = seg.tangent(false);
+        if !(d[0]).is_finite() || d[0].hypot(d[1]) <= 0. {
+            continue;
+        }
+        side.push((v, [-d[1], d[0]]));
+        taken = Some(v);
+    }
+    side
+}
+
+/// Whether a straight move at `z` lies entirely inside the limits (always
+/// true without limits, and for a degenerate move between proven endpoints).
+fn allows_segment(
+    limits: Option<&crate::limits::PreparedLimits>,
+    a: [f64; 2],
+    b: [f64; 2],
+    z: f64,
+    tolerance: f64,
+) -> Result<bool, String> {
+    let Some(limits) = limits else {
+        return Ok(true);
+    };
+    if (b[0] - a[0]).hypot(b[1] - a[1]) <= tolerance {
+        return Ok(true);
+    }
+    let line = crate::motion::Curve::Line {
+        start: [a[0], a[1], z],
+        end: [b[0], b[1], z],
+    };
+    Ok(limits.allowed_spans(&line, true)?.as_slice() == [[0., 1.]])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cad_floor_retains_the_radial_reserve_and_rejects_an_outside_trim() {
+        let op: FlatOperation = serde_json::from_value(serde_json::json!({
+            "id":"flat", "tool":"mill", "floor_z_mm":0., "stepover_mm":1., "clearance_z_mm":8.,
+            "feed_mm_min":300., "plunge_mm_min":100., "tolerance_mm":0.00001, "spindle_rpm":6000.,
+            "tool_number":1, "length_register":1, "work_offset":1, "coolant":"flood",
+            "radial_stock_to_leave_mm":0.2, "surface":{
+                "version":1, "units":"mm", "surface_error_mm":0., "source":null,
+                "triangles":[[[0.,0.,4.],[10.,0.,4.],[10.,10.,4.]],[[0.,0.,4.],[10.,10.,4.],[0.,10.,4.]]]
+            }
+        })).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let target = crate::roughing::PreparedRoughingTarget::prepare(
+            op.surface.clone(),
+            op.tolerance_mm,
+            &cancel,
+        )
+        .unwrap();
+        let circle = crate::planar::PlanarRegion::circle("floor", [5., 5.], 2.).unwrap();
+        let centres = cad_level_region(&target, &op, 4., 1., &circle, &cancel)
+            .unwrap()
+            .centres;
+        let reach = 2. - 1. - op.radial_stock_to_leave_mm - op.tolerance_mm;
+        assert!((centres.summary().area_mm2 - std::f64::consts::PI * reach.powi(2)).abs() < 1e-8);
+        let outside = crate::planar::PlanarRegion::circle("outside", [25., 5.], 2.).unwrap();
+        assert!(
+            cad_level_region(&target, &op, 4., 1., &outside, &cancel)
+                .err()
+                .unwrap()
+                .contains("beyond the mesh shadow")
+        );
+    }
 
     fn tri(p: [Vec3; 3]) -> Tri {
         Tri {

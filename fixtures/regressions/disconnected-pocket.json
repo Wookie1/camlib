@@ -69,9 +69,7 @@
       {
         "kind": "adaptive_pocket",
         "bottom_allowance_mm": 0.0,
-        "boundary_tolerance_mm": 0.01,
         "clearance_z_mm": 12.0,
-        "clockwise": true,
         "coolant": "flood",
         "entry": {
           "angle_rad": 0.05235987755982989,
@@ -82,7 +80,7 @@
         "id": "adaptive",
         "length_register": 1,
         "max_engagement_deg": 90.0,
-        "path_strategy": "stock_front",
+        "path_strategy": "engagement_front",
         "plunge_mm_min": 150.0,
         "radial_allowance_mm": 0.0,
         "region": {

@@ -20,8 +20,7 @@ def example():
 
 @lru_cache(None)
 def config():
-    # These tests are of the orbit planner; the default is engagement_front (#190).
-    return example().adaptive_job(path_strategy="disk_front")
+    return example().adaptive_job()
 
 
 class AdaptiveTest(unittest.TestCase):
@@ -50,11 +49,9 @@ class AdaptiveTest(unittest.TestCase):
                         self.assertIsNone(sim._process.poll())
             self.assertTrue(first and sim.state.finished)
             self.assertEqual(levels, {9.0, 8.0})
-            self.assertEqual(report["navigation_components"], 1)
-            self.assertEqual(report["seed_orbits"], 2)
-            self.assertLessEqual(report["max_bounded_engagement_deg"], 90.0)
-            self.assertGreater(report["turn_arcs"], 0)
-            self.assertGreater(report["geometric_residual_area_mm2"], 0)
+            self.assertEqual(report["completed_layers"], 2)
+            for layer in report["layers"]:
+                self.assertLessEqual(layer["clearing"]["proven_max_engagement_deg"], report["max_engagement_deg"])
             self.assertGreater(sim.state.volume()["removed_lower_mm3"], 400.0)
             self.assertLessEqual(sim.state.volume()["removed_lower_mm3"], 6760.0 - shape.Volume())
             count = sim.state.completed
@@ -105,7 +102,6 @@ class AdaptiveTest(unittest.TestCase):
             self.assertEqual(player.state.heights.tobytes(), saved)
             self.assertLessEqual(run.status()["largest_frame_bytes"], 8 * 1024 * 1024)
         for bad in [
-            replace(op, orbit_radius_mm=0),
             replace(op, max_engagement_deg=0),
             replace(op, rest_tolerance_mm=0.01),
         ]:
@@ -116,7 +112,7 @@ class AdaptiveTest(unittest.TestCase):
                 self.assertEqual(sim.state.completed, 0)
 
 
-class StockFrontDevelopmentTest(unittest.TestCase):
+class FrontStreamTest(unittest.TestCase):
     def test_connected_front_links_cache_checked_post_and_fractional_replay(self):
         import json
         import os
@@ -134,7 +130,7 @@ class StockFrontDevelopmentTest(unittest.TestCase):
         tool = ToolAssembly.from_dict(manifest["tools"][0])
         definition = dict(manifest["operations"][0])
         definition.pop("kind")
-        definition.update(tool=tool, path_strategy="stock_front")
+        definition.update(tool=tool)
         operation = AdaptivePocket(
             **{
                 'feed_mm_min': 600,
@@ -170,8 +166,7 @@ class StockFrontDevelopmentTest(unittest.TestCase):
                             report = update.report
                     self.assertTrue(run.finished)
                     state = run.states["top"]
-                    self.assertTrue(report["front"]["coverage_complete"])
-                    self.assertGreater(report["front"]["cleared_reentry_links"], 0)
+                    self.assertEqual(report["completed_layers"], len(report["layers"]))
                     self.assertLess(state.completed, 3734)
                     self.assertEqual(report["regeneration"]["cache_hit"], revision == "warm")
                     if saved is None:
@@ -222,8 +217,8 @@ class StockFrontDevelopmentTest(unittest.TestCase):
         from tempfile import TemporaryDirectory
         from camlib.jobs import RegenerationCache
 
-        path = Path(__file__).resolve().parents[2] / "python/tests/support/stock_front_rest.py"
-        spec = importlib.util.spec_from_file_location("cached_stock_front_rest_example", path)
+        path = Path(__file__).resolve().parents[2] / "python/tests/support/adaptive_rest.py"
+        spec = importlib.util.spec_from_file_location("cached_adaptive_rest_example", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         cold = None
@@ -249,8 +244,11 @@ class StockFrontDevelopmentTest(unittest.TestCase):
                     }
                     print(json.dumps(dict(revision=revision, operations=summary)), flush=True)
                     self.assertEqual(set(ends), {"rough", "rest"})
-                    self.assertTrue(ends["rest"]["front"]["coverage_complete"])
-                    self.assertLessEqual(ends["rest"]["front"]["max_bounded_engagement_deg"], 90.0)
+                    self.assertEqual(ends["rest"]["completed_layers"], len(ends["rest"]["layers"]))
+                    for layer in ends["rest"]["layers"]:
+                        self.assertLessEqual(
+                            layer["clearing"]["proven_max_engagement_deg"], ends["rest"]["max_engagement_deg"]
+                        )
                     self.assertGreater(volumes["rest"], volumes["rough"] + 0.1)
                     if index == 1:
                         for name, report in ends.items():
@@ -271,8 +269,8 @@ class StockFrontDevelopmentTest(unittest.TestCase):
                     self.assertLess(ends["rest"]["motions"], 1000)
 
     def test_cad_larger_then_smaller_tool_reuses_native_columns_through_python_stream(self):
-        path = Path(__file__).resolve().parents[2] / "python/tests/support/stock_front_rest.py"
-        spec = importlib.util.spec_from_file_location("stock_front_rest_example", path)
+        path = Path(__file__).resolve().parents[2] / "python/tests/support/adaptive_rest.py"
+        spec = importlib.util.spec_from_file_location("adaptive_rest_example", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         shape = module.target().val()
@@ -290,8 +288,9 @@ class StockFrontDevelopmentTest(unittest.TestCase):
             self.assertTrue(sim.state.finished)
             self.assertEqual(set(ends), {"rough", "rest"})
             self.assertEqual(tools, {"rough8", "rest4"})
-            self.assertTrue(ends["rest"]["front"]["coverage_complete"])
-            self.assertLessEqual(ends["rest"]["front"]["max_bounded_engagement_deg"], 90.0)
+            self.assertEqual(ends["rest"]["completed_layers"], len(ends["rest"]["layers"]))
+            for layer in ends["rest"]["layers"]:
+                self.assertLessEqual(layer["clearing"]["proven_max_engagement_deg"], ends["rest"]["max_engagement_deg"])
             # The saved fresh D4 case needs2679moves. Bound this end-to-end
             # mostly-cleared case independently of exact trajectory ordering.
             self.assertLess(ends["rest"]["motions"], 1000)
@@ -304,9 +303,8 @@ class StockFrontDevelopmentTest(unittest.TestCase):
             with self.subTest(entry=entry):
                 c = dict(config())
                 op = c["operations"][0]
-                self.assertEqual(op.to_dict()["path_strategy"], "disk_front")
-                op = replace(op, floor_z_mm=9, path_strategy="stock_front", entry=entry)
-                self.assertEqual(op.to_dict()["path_strategy"], "stock_front")
+                self.assertEqual(op.to_dict()["path_strategy"], "engagement_front")
+                op = replace(op, floor_z_mm=9, entry=entry)
                 c["operations"] = (op,)
                 cuts, startup_removed, helix = 0, 0.0, False
                 with Simulation(**c) as sim:
@@ -326,7 +324,8 @@ class StockFrontDevelopmentTest(unittest.TestCase):
                                 sim.cancel()
                                 break
                     self.assertGreaterEqual(cuts, limit)
-                    self.assertEqual(helix, entry is not None)
+                    # With no entry the pocket enters by HelicalEntry's default helix too.
+                    self.assertTrue(helix)
                     self.assertTrue(sim.cancelled)
 
     def test_complete_front_stream_cache_revision_and_retained_stock_playback(self):
@@ -336,9 +335,7 @@ class StockFrontDevelopmentTest(unittest.TestCase):
         from camlib.simulation import StockState, ProtocolError
 
         c = dict(config())
-        c["operations"] = (
-            replace(c["operations"][0], floor_z_mm=9, path_strategy="stock_front", entry=HelicalEntry(angle_deg=3)),
-        )
+        c["operations"] = (replace(c["operations"][0], floor_z_mm=9, entry=HelicalEntry(angle_deg=3)),)
         with TemporaryDirectory() as directory:
             c["regeneration"] = RegenerationCache(directory).options({})
             c["revision"] = "front-complete-a"
@@ -395,8 +392,7 @@ class StockFrontDevelopmentTest(unittest.TestCase):
                     self.assertEqual(sim.state.completed, count)
                     self.assertEqual(sim.state.heights.tobytes(), complete)
                     self.assertEqual(sim.state.manifest["run"]["revision"], c["revision"])
-                    self.assertTrue(report["front"]["coverage_complete"])
-                    self.assertGreater(report["front"]["reentries"], 0)
+                    self.assertEqual(report["completed_layers"], 1)
                     self.assertEqual(report["regeneration"]["planned_motions"], 0)
                     self.assertEqual(report["regeneration"]["computed_sweeps"], 0)
                     fresh = StockState(sim.manifest_frame)
@@ -406,9 +402,8 @@ class StockFrontDevelopmentTest(unittest.TestCase):
             self.assertFalse(list(Path(directory).rglob("*.tmp")))
 
     def test_the_default_follows_the_stock_and_proves_its_engagement(self):
-        """#190: AdaptivePocket's default plans from the stock (engagement_front): far less motion than the orbit
-        planner on the same pocket, one helix per depth level, every cutting stroke proven within
-        acos(1 - stepover / r)."""
+        """#190: AdaptivePocket plans from the stock (engagement_front): one helix per depth level, every cutting
+        stroke proven within acos(1 - stepover / r)."""
         import math
         from camlib.simulation import OperationUpdate, Simulation
 
@@ -427,11 +422,8 @@ class StockFrontDevelopmentTest(unittest.TestCase):
         default = example().adaptive_job()
         self.assertEqual(default["operations"][0].to_dict()["path_strategy"], "engagement_front")
         moves, report, removed = run(default)
-        orbit_moves, _, orbit_removed = run(example().adaptive_job(path_strategy="disk_front"))
-        self.assertLess(moves * 3, orbit_moves)
-        # The same pocket: both remove its volume (224 x 2 mm3 less what a 4 mm cutter leaves in the corners).
+        # The pocket's volume: 224 x 2 mm3 less what a 4 mm cutter leaves in the corners.
         self.assertGreater(removed, 0.93 * 448)
-        self.assertAlmostEqual(removed, orbit_removed, delta=0.05 * 448)
         self.assertEqual(
             (report["strategy"], report["clearing"], report["completed_layers"]),
             ("adaptive_pocket", "engagement_front", 2),
@@ -442,18 +434,12 @@ class StockFrontDevelopmentTest(unittest.TestCase):
             front = layer["clearing"]
             self.assertEqual(front["helical_entries"], 1)
             self.assertLessEqual(front["proven_max_engagement_deg"], limit)
-        # Orbit options belong to the orbit planner.
-        from dataclasses import replace
-
-        bad = dict(default, operations=(replace(default["operations"][0], orbit_radius_mm=1),))
-        with self.assertRaisesRegex(Exception, "does not use orbits"):
-            run(bad)
 
     def test_link_and_entry_options_speed_up_links_that_are_clear_of_stock(self):
         """#211: AdaptivePocket takes the link and entry options of Roughing's adaptive clearing. A link at the
         link feed changes no stock cell and has no stock under the cutter (the stream's own heights and its
         stock-contact check, not the planner's report); the path is unchanged; the options are absent from the
-        job unless set; the orbit planner refuses them. (Chip thinning on the pocket: tests/adaptive.rs.)"""
+        job unless set. (Chip thinning on the pocket: tests/adaptive.rs.)"""
         import math
         from dataclasses import replace
 
@@ -561,31 +547,21 @@ class StockFrontDevelopmentTest(unittest.TestCase):
             run(link_chip_thinning=True)
         with self.assertRaisesRegex(Exception, "link_feed_mm_min 0 must be positive"):
             run(link_feed_mm_min=0)
-        for key, value in (
-            ("link_feed_mm_min", 3000),
-            ("link_chip_thinning", True),
-            ("rapid_descent_clearance_mm", 0.5),
-            ("ramp_clearance_mm", 0.5),
-        ):
-            with self.assertRaisesRegex(Exception, f"{key} applies to engagement_front clearing only"):
-                run(path_strategy="disk_front", **{key: value})
 
     def test_roughing_exposes_same_strategy_and_unknown_strategy_is_rejected(self):
         from camlib.operations import AdaptiveClearing
 
         self.assertEqual(AdaptiveClearing(0.25).to_dict()["path_strategy"], "engagement_front")
-        self.assertEqual(AdaptiveClearing(0.25, path_strategy="stock_front").to_dict()["path_strategy"], "stock_front")
         self.assertEqual(
-            AdaptiveClearing(0.25, path_strategy="stock_front", cutting_sense="conventional").to_dict()[
-                "cutting_sense"
-            ],
-            "conventional",
+            AdaptiveClearing(0.25, cutting_sense="conventional").to_dict()["cutting_sense"], "conventional"
         )
-        c = dict(config())
-        c["operations"] = (replace(c["operations"][0], path_strategy="not-a-strategy"),)
-        with self.assertRaisesRegex(SimulationError, "unknown variant"):
-            with Simulation(**c) as sim:
-                list(sim.run_operations())
+        # The orbit planners were removed (#190): their names are refused like any unknown one.
+        for strategy in ("not-a-strategy", "disk_front", "stock_front"):
+            c = dict(config())
+            c["operations"] = (replace(c["operations"][0], path_strategy=strategy),)
+            with self.assertRaisesRegex(SimulationError, "unknown variant"):
+                with Simulation(**c) as sim:
+                    list(sim.run_operations())
 
     def test_front_sweep_failure_is_not_cached_as_a_complete_operation(self):
         from tempfile import TemporaryDirectory
@@ -594,9 +570,7 @@ class StockFrontDevelopmentTest(unittest.TestCase):
         from camlib.simulation import SweepOptions
 
         c = dict(config())
-        c["operations"] = (
-            replace(c["operations"][0], floor_z_mm=9, path_strategy="stock_front", entry=HelicalEntry(angle_deg=3)),
-        )
+        c["operations"] = (replace(c["operations"][0], floor_z_mm=9, entry=HelicalEntry(angle_deg=3)),)
         # Deliberately exhaust native sweep work: a real producer error must
         # propagate and drop its cache writer even though this path can finish
         # when given its normal resource budget.

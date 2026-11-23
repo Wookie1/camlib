@@ -51,10 +51,18 @@ class Waterline:
     feed_z_mm: float | None = None
     # Ramp: descend continuously along each level's contour from the level
     # above, instead of cutting each level flat (finished by one flat lap).
+    # Ball end mills already reach every level of an island by a ramp along
+    # its contour from the level above (#46), so this changes nothing there.
     ramp: bool = False
+    # Ball end mills (#46): RampEntry(angle_deg=..., feed_mm_min=...) sets the
+    # steepest the ramp a level is reached by may be (as many laps, or passes
+    # along a run, as the angle needs) and its feed (default the plunge feed).
+    # None: 3 degrees at the cutting feed. Only RampEntry is accepted.
+    entry: object | None = None
 
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
+        _entry_dict(result)
         result.update(
             kind="waterline",
             tool=getattr(self.tool, "id", self.tool),
@@ -744,17 +752,47 @@ class ThreadMilling:
 
 
 @dataclass(frozen=True)
+class FlatFloor:
+    """A selected horizontal CAD trim, including holes, in work coordinates."""
+
+    z_mm: float
+    region: object
+
+    def to_dict(self):
+        return dict(z_mm=self.z_mm, region=self.region.to_dict())
+
+
+@dataclass(frozen=True)
 class Flat:
     """Flat-area finishing: finds the horizontal faces of ``surface`` above
     ``floor_z_mm`` and finishes each at its exact height (plus
-    ``stock_to_leave_mm``) with a flat, center-cutting end mill, in raster
-    rows ``stepover_mm`` apart along ``axis``. Each cut is kept only where
-    the part under the tool's swept disk is proven not above it. A run with no
-    stock above its height is entered with a vertical plunge. A run with
-    stock above it is refused unless ``entry=RampEntry(angle_deg, ...)`` is
-    declared: the tool then plunges to the stock's top over the whole run and
-    ramps down along the run (Z-flat tools are never plunged into stock). Faces
-    within ``level_tolerance_mm`` form one level."""
+    ``stock_to_leave_mm``) with a flat, center-cutting end mill, in
+    contour-parallel offset passes worked outside in: the outermost ring of
+    each level first (past an open edge its centre runs the radius less one
+    stepover outside the face, so it takes one stepover like every later
+    pass), the core last, with half-step rings where an offset pinches off
+    in a corner between two boundaries, so the disk covers every reachable
+    flat point at stepovers up to the cutter diameter. An inner ring is cut
+    only where it finishes floor the rings before it have not reached. Offset
+    loops are cut as arcs, each proven by chords at radius r + sagitta like
+    the straight cuts. Every cut is kept only where the part under the tool's
+    swept disk is proven not above it. A chain of passes is entered by a
+    vertical plunge through air and a quarter-circle lead-in of the tool's
+    radius, tangent to the pass, wherever a side of the pass has no stock
+    above it (beside an open edge, or floor earlier passes finished): flat
+    at cutting feed when the plunge point is a radius beside the face, else a
+    helix that stops above the finished floor and descends at the declared
+    ramp's angle. A chain ends with a tangent quarter-circle lead-out of the
+    same radius where its end point is clear. Otherwise a chain is entered
+    beside the face in air (a straight lead-in), else by a vertical plunge
+    where no stock stands above it. A chain with stock above it is refused unless
+    ``entry=RampEntry(angle_deg, ...)`` is declared: the tool then plunges to
+    the stock's top over the stretch of the chain's first loop the ramp
+    travels and ramps down along it
+    (Z-flat tools are never plunged into stock). Consecutive passes join by
+    straight links cut at depth when they are short, proven and inside the
+    machine limits. Faces within ``level_tolerance_mm`` form one level.
+    ``axis`` is accepted so old jobs load but no longer orders anything."""
 
     id: str
     tool: object
@@ -778,6 +816,11 @@ class Flat:
     # How a run under stock is entered: RampEntry(angle_deg, ...). None: no
     # stock stands above the runs, and one that does is refused.
     entry: object | None = None
+    # Radial stock left on the walls: the passes stay this much farther than
+    # the cutter's radius from everything standing above a flat.
+    radial_stock_to_leave_mm: float = 0
+    floors: tuple[FlatFloor, ...] = ()
+    finish_walls: bool = False
 
     def to_dict(self):
         result = {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -789,6 +832,11 @@ class Flat:
         entry = result.pop("entry")
         if entry is not None:
             result["entry"] = entry.to_dict() if hasattr(entry, "to_dict") else dict(entry)
+        floors = result.pop("floors")
+        if floors:
+            result["floors"] = [floor.to_dict() for floor in floors]
+        if not result["finish_walls"]:
+            result.pop("finish_walls")
         for key in ("retract_z_mm", "feed_z_mm"):
             if result[key] is None:
                 result.pop(key)
@@ -1475,8 +1523,7 @@ class RampEntry:
     proves, then one flat pass along it. The ramp and that pass are entry
     moves at the entry feed, a full-width slot like a helix's bore, and are
     not bounded by the engagement limit; every cutting pass after them is.
-    Roughing with offset or raster clearing, and the disk_front and
-    stock_front strategies, refuse a ramp entry.
+    Roughing with offset or raster clearing refuses a ramp entry.
     """
 
     angle_deg: float
@@ -1539,27 +1586,16 @@ class AdaptiveClearing:
     """Engagement-limited roughing: the cutter never takes more than
     max_radial_engagement_mm of radial width.
 
-    The default path_strategy='engagement_front' follows the boundary
-    between cut and uncut stock, entering from air or proven-cleared stock
-    and helixing only into enclosed material. Every cutting and stay-down
-    link stroke is proven exactly within the contact angle of that width,
-    acos(1 - w/r) (the layer report's proven_max_engagement_deg). Orbit
-    options do not apply to it.
-
-    path_strategy='stock_front' is a development strategy: it can stream a
-    productive prefix but raises if coverage/steering is unresolved. Its
-    cutting_sense is 'climb' (default) or 'conventional' with the CW spindle.
-
-    path_strategy='disk_front' (orbits over a whole region) is refused by
-    Roughing: it does not read the stock, so around a part it orbits through
-    the air beside the stock (#167). It remains AdaptivePocket's strategy.
+    path_strategy='engagement_front', the only planner (#190), follows the
+    boundary between cut and uncut stock, entering from air or
+    proven-cleared stock and helixing only into enclosed material. Every
+    cutting and stay-down link stroke is proven exactly within the contact
+    angle of that width, acos(1 - w/r) (the layer report's
+    proven_max_engagement_deg). cutting_sense is 'climb' (default) or
+    'conventional' with the CW spindle.
     """
 
     max_radial_engagement_mm: float
-    orbit_radius_mm: float | None = None
-    min_orbit_radius_mm: float | None = None
-    local_orbit_tolerance_mm: float | None = None
-    boundary_tolerance_mm: float = 0.01
 
     path_strategy: str = "engagement_front"
     cutting_sense: str | None = None
@@ -1766,8 +1802,9 @@ class RestPocket(Pocket):
 class AdaptivePocket(Pocket):
     """A pocket cleared with a bounded radial engagement.
 
-    The default path_strategy='engagement_front' follows the boundary between
-    cut and uncut stock inside the region, one depth level at a time (#190).
+    path_strategy='engagement_front', the only planner (#190), follows the
+    boundary between cut and uncut stock inside the region, one depth level
+    at a time.
     stepover_mm is the radial width of each pass (at most the cutter radius);
     max_engagement_deg below acos(1 - stepover/r) narrows it further. Each
     level enters by a helix into uncut material (entry's helix, or
@@ -1791,10 +1828,10 @@ class AdaptivePocket(Pocket):
     be proven within it refuses the operation. Helical and ramp entries still
     use their own entry rules.
 
-    Orbit options, max_stay_down_mm and rest_tolerance_mm do not apply; the
+    max_stay_down_mm and rest_tolerance_mm do not apply; the
     direction is cutting_sense ('climb' by default, or 'conventional').
 
-    engagement_front's entry and link options are the ones Roughing's
+    The entry and link options are the ones Roughing's
     adaptive clearing has. All are unset by default. The link options change
     feeds only; the entry options change descents, never a cutting pass:
 
@@ -1813,28 +1850,13 @@ class AdaptivePocket(Pocket):
       depth. None: rapid descent stops at feed_z_mm.
     - ramp_clearance_mm: each helical entry starts this far above the
       material its bore meets (never above feed_z_mm). None: at that material.
-
-    path_strategy='disk_front' is the earlier planner: it covers the region
-    with orbits of orbit_radius_mm (None: half the cutter radius) whatever the
-    stock holds, so its orbits overlap and it cuts far longer. With it,
-    clockwise sets the orbit direction; set min_orbit_radius_mm below
-    orbit_radius_mm and local_orbit_tolerance_mm (for example .05 mm) to size
-    orbits from whole-guide clearance. path_strategy='stock_front' is a
-    development strategy that raises on unresolved steering/coverage. Both
-    refuse the four options above, and an area of the region the cutter
-    fits in that no orbit does (cutter radius plus orbit radius).
     """
 
-    orbit_radius_mm: float | None = None
     max_engagement_deg: float = 90
-    boundary_tolerance_mm: float = 0.01
-    clockwise: bool = True
-    min_orbit_radius_mm: float | None = None
-    local_orbit_tolerance_mm: float | None = None
 
     path_strategy: str = "engagement_front"
     cutting_sense: str | None = None
-    # engagement_front only (see the class docstring); as on Roughing.
+    # See the class docstring; as on Roughing.
     rapid_descent_clearance_mm: float | None = None
     ramp_clearance_mm: float | None = None
     link_feed_mm_min: float | None = None
@@ -1859,19 +1881,11 @@ class AdaptivePocket(Pocket):
             pocket,
             kind="adaptive_pocket",
             max_engagement_deg=self.max_engagement_deg,
-            boundary_tolerance_mm=self.boundary_tolerance_mm,
-            clockwise=self.clockwise,
         )
         # The strategy is always written: a saved program states which planner made it.
         result["path_strategy"] = self.path_strategy
         if self.cutting_sense is not None:
             result["cutting_sense"] = self.cutting_sense
-        if self.orbit_radius_mm is not None:
-            result["orbit_radius_mm"] = self.orbit_radius_mm
-        if self.min_orbit_radius_mm is not None:
-            result["min_orbit_radius_mm"] = self.min_orbit_radius_mm
-        if self.local_orbit_tolerance_mm is not None:
-            result["local_orbit_tolerance_mm"] = self.local_orbit_tolerance_mm
         # Written only when set: a job without them is the job it was.
         for key in ("rapid_descent_clearance_mm", "ramp_clearance_mm", "link_feed_mm_min", "max_corner_engagement_deg"):
             if getattr(self, key) is not None:

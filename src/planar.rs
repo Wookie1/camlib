@@ -513,6 +513,11 @@ fn boundary_to_polyline(
         let mut intersect = None;
         p.visit_self_intersects_opt(
             &mut |i: PlineIntersect<f64>| {
+                if let PlineIntersect::Overlapping(hit) = &i
+                    && adjacent_lines_only_share_vertex(&p, hit.start_index1, hit.start_index2)
+                {
+                    return cavalier_contours::core::Control::Continue;
+                }
                 intersect = Some(i);
                 cavalier_contours::core::Control::Break(())
             },
@@ -537,6 +542,25 @@ fn boundary_to_polyline(
     Ok(p)
 }
 
+/// The arc backend can report overlapping adjacent short chords in a mixed
+/// loop. Strictly ordered projections on either axis prove that two straight
+/// segments share just the middle vertex, independently of the backend.
+fn adjacent_lines_only_share_vertex(p: &Polyline<f64>, i: usize, j: usize) -> bool {
+    let n = p.vertex_count();
+    let first = if (i + 1) % n == j {
+        i
+    } else if (j + 1) % n == i {
+        j
+    } else {
+        return false;
+    };
+    let a = p.at(first);
+    let b = p.at((first + 1) % n);
+    let c = p.at((first + 2) % n);
+    let ordered = |a, b, c| (a < b && b < c) || (c < b && b < a);
+    a.bulge == 0. && b.bulge == 0. && (ordered(a.x, b.x, c.x) || ordered(a.y, b.y, c.y))
+}
+
 fn boundary_neighbors(p: &Polyline<f64>, index: usize) -> [[f64; 3]; 4] {
     std::array::from_fn(|i| {
         let v = p.at((index + p.vertex_count() - 1 + i) % p.vertex_count());
@@ -558,6 +582,17 @@ fn group_loops(
     mut negatives: Vec<Polyline<f64>>,
     origin: Point,
 ) -> Result<Vec<Component>, String> {
+    // Cavalier can return a closed segment traversed in both directions.
+    // This has zero winding everywhere off the segment and encloses no
+    // area. Keep curved two-vertex loops and validate all retained geometry.
+    let has_boundary = |p: &Polyline<f64>| {
+        !p.is_closed
+            || p.vertex_count() != 2
+            || p.iter_vertexes()
+                .any(|v| v.bulge != 0. || !v.x.is_finite() || !v.y.is_finite())
+    };
+    positives.retain(has_boundary);
+    negatives.retain(has_boundary);
     for p in &mut positives {
         if p.area() < 0. {
             p.invert_direction_mut();
@@ -937,6 +972,47 @@ impl PreparedRegion {
             return Ok(output);
         }
         self.integer_boolean_prepared(other, operation, error)
+    }
+    /// Subtract the union of overlapping cutter sweeps in one operation.
+    /// Intermediate capsule seams may touch or overlap, even though the
+    /// boundary of their combined sweep is unambiguous. Chording and grid
+    /// rounding use the same error budget as the two-region integer boolean.
+    pub(crate) fn subtract_sweeps(
+        &self,
+        sweeps: Vec<Component>,
+        cancel: &impl crate::stock::CancelSignal,
+    ) -> Result<PreparedConstruction, String> {
+        let tolerance = self.options.tolerance_mm;
+        let chord = tolerance / 8.;
+        let grid = (tolerance / 128.).max(1e-8);
+        let mut clipper = Clipper64::new();
+        clipper.add_subject(&integer_paths(self, self.origin, grid, chord)?);
+        for component in sweeps {
+            if cancel.is_cancelled() {
+                return Err("sweep subtraction cancelled".into());
+            }
+            let sweep = PlanarRegion {
+                version: 1,
+                units: "mm".into(),
+                name: "swept-capsule".into(),
+                boundary_error_mm: 0.,
+                components: vec![component],
+                source: serde_json::Value::Null,
+            }
+            .prepare(self.options)?;
+            clipper.add_clip(&integer_paths(&sweep, self.origin, grid, chord)?);
+        }
+        let mut closed = Vec::new();
+        if !clipper.execute(ClipType::Difference, FillRule::NonZero, &mut closed, None) {
+            return Err("integer sweep difference failed".into());
+        }
+        self.integer_result(
+            closed,
+            "clipper2_rust_1.2.0_chorded",
+            self.definition.boundary_error_mm + tolerance,
+            chord,
+            grid,
+        )
     }
     fn integer_boolean_prepared(
         &self,

@@ -133,16 +133,14 @@ fn stock_digest(producer: &StreamProducer) -> Result<String, String> {
     Ok(format!("{:x}", h.finalize()))
 }
 fn clearance_dependency(stock: &crate::stock::Stock, operation: &Operation) -> Option<[u8; 32]> {
-    use crate::{adaptive::AdaptivePathStrategy::StockFront, roughing::RoughingClearing};
+    use crate::roughing::RoughingClearing;
+    // The engagement front reads the committed sweeps themselves
+    // (`Stock::committed_clearance_since`), not only the cell bounds the
+    // stock digest covers, so two stocks with equal cells but different
+    // committed sweeps must not share a cached plan.
     let sensitive = match operation {
-        Operation::AdaptivePocket(op) => op.path_strategy == StockFront,
-        Operation::Roughing(op) => matches!(
-            op.clearing,
-            RoughingClearing::Adaptive {
-                path_strategy: StockFront,
-                ..
-            }
-        ),
+        Operation::AdaptivePocket(_) => true,
+        Operation::Roughing(op) => matches!(op.clearing, RoughingClearing::Adaptive { .. }),
         _ => false,
     };
     sensitive.then(|| stock.committed_clearance_fingerprint())
@@ -764,7 +762,7 @@ fn uncached<C: CancelSignal>(
         )
         .map_err(|e| {
             if changed {
-                producer.explain_tool_change(e)
+                producer.explain_tool_change(operation.id(), e)
             } else {
                 e
             }
@@ -830,6 +828,7 @@ fn uncached<C: CancelSignal>(
             meter.report(plan.progress())?;
         }
         plan.finish_report(cancel)?;
+        after_operation(producer, index, cancel, &mut |bytes: &[u8]| send(bytes))?;
         meter.end()?;
         send(&encode_operation_control(
             &manifest,
@@ -853,6 +852,74 @@ fn uncached<C: CancelSignal>(
         send(&producer.finish_material_verification(cancel)?)?;
     }
     send(&producer.finish(DEFAULT_FRAME_LIMIT)?)?;
+    Ok(())
+}
+/// The run's own moves after operation `index`'s last, before its end: the
+/// stated retract before a tool change in place (#374) and, after the last
+/// operation, the moves to the stated end position (#378). Each is an ordinary
+/// motion of that operation and takes the path of every planned move: the
+/// operation's avoid areas, the configured checks, the stock sweep and its
+/// frames. They are never part of the operation's cache entry, since they
+/// depend on what follows it. Without a stated value nothing is sent.
+fn after_operation<C: CancelSignal>(
+    producer: &mut StreamProducer,
+    index: usize,
+    cancel: &C,
+    send: &mut impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let manifest = producer.manifest();
+    let op = manifest
+        .operations
+        .get(index)
+        .ok_or("operation index missing")?;
+    let mut moves = vec![];
+    if let Some(next) = manifest.operations.get(index + 1)
+        && let Some(motion) = producer.tool_change_retract(op.id(), op.tool(), next.tool())?
+    {
+        moves.push((
+            format!(
+                "the retract before the tool change from {} to {}",
+                op.tool(),
+                next.tool()
+            ),
+            motion,
+        ));
+    }
+    if index + 1 == manifest.operations.len() {
+        for motion in producer.end_position_moves(op.id(), op.tool())? {
+            let (start, end) = (motion.curve.start(), motion.curve.end());
+            let axis = if start[2] == end[2] { "XY" } else { "Z" };
+            moves.push((format!("the end position's {axis} move"), motion));
+        }
+    }
+    if moves.is_empty() {
+        return Ok(());
+    }
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.id == op.tool())
+        .ok_or("operation tool missing")?;
+    let guard = crate::limits::LinkGuard::new(op.limits(), tool, manifest.sweep.tolerance_mm)?;
+    for (what, motion) in moves {
+        let named = |e: String| {
+            format!(
+                "{what} (a rapid from {:?} to {:?}): {e}",
+                motion.curve.start(),
+                motion.curve.end()
+            )
+        };
+        if let Some(g) = &guard {
+            g.check(&motion).map_err(named)?;
+        }
+        let (chunk, check) = producer
+            .push_checked_motion(motion.clone(), DEFAULT_FRAME_LIMIT, cancel)
+            .map_err(named)?;
+        send(&chunk)?;
+        if let Some(check) = check {
+            send(&check)?;
+        }
+    }
     Ok(())
 }
 /// Generate or reuse complete operations, always publishing current-identity
@@ -979,6 +1046,7 @@ fn cached<C: CancelSignal>(
             {
                 return Err("cached operation final stock/position mismatch".into());
             }
+            after_operation(producer, index, cancel, &mut send)?;
             meter.end()?;
             let mut report = entry.footer.report.clone();
             report_sources(&mut report, &op, entry.header.base_generation, base)?;
@@ -1012,7 +1080,7 @@ fn cached<C: CancelSignal>(
                 )
                 .map_err(|e| {
                     if changed {
-                        producer.explain_tool_change(e)
+                        producer.explain_tool_change(op.id(), e)
                     } else {
                         e
                     }
@@ -1108,8 +1176,9 @@ fn cached<C: CancelSignal>(
                 meter.report(plan.progress())?;
             }
             plan.finish_report(cancel)?;
-            meter.end()?;
             let report = serde_json::to_value(plan.report()).map_err(|e| e.to_string())?;
+            // The cache entry is the operation alone: its end is taken
+            // before the run's own moves that follow it.
             let footer = Footer {
                 motions: count,
                 events: plan.suffix_events(),
@@ -1117,6 +1186,8 @@ fn cached<C: CancelSignal>(
                 end_stock: stock_digest(producer)?,
                 end_position: producer.position(),
             };
+            after_operation(producer, index, cancel, &mut send)?;
+            meter.end()?;
             let (saved, final_key) = recording.finish(&footer)?;
             stats["key"] = final_key.into();
             stats["planned_motions"] = json!(count);
@@ -1286,7 +1357,6 @@ fn control_turn(
 mod clearance_key_tests {
     use super::*;
     use crate::{
-        adaptive::AdaptivePathStrategy,
         motion::{Curve, MoveKind},
         stock::{Stock, SweepOptions},
         stream::StreamManifest,
@@ -1325,11 +1395,8 @@ mod clearance_key_tests {
             b.snapshot(),
             "the height image alone cannot distinguish these sweeps"
         );
-        let mut operation = manifest.operations[0].clone();
-        let Operation::AdaptivePocket(adaptive) = &mut operation else {
-            panic!("fixture");
-        };
-        adaptive.path_strategy = AdaptivePathStrategy::StockFront;
+        let operation = manifest.operations[0].clone();
+        assert!(matches!(operation, Operation::AdaptivePocket(_)), "fixture");
         assert_ne!(
             clearance_dependency(&a, &operation),
             clearance_dependency(&b, &operation)
@@ -1348,18 +1415,18 @@ mod clearance_key_tests {
             clearance_dependency(&a, &operation),
             clearance_dependency(&restored, &operation)
         );
-        let Operation::AdaptivePocket(adaptive) = &mut operation else {
+        let Operation::AdaptivePocket(adaptive) = &operation else {
             unreachable!();
         };
-        adaptive.path_strategy = AdaptivePathStrategy::DiskFront;
         let raster = Operation::Pocket(adaptive.pocket.clone());
-        assert_eq!(clearance_dependency(&a, &operation), None);
         assert_eq!(clearance_dependency(&a, &raster), None);
-        let rough: StreamManifest =
-            serde_json::from_str(include_str!("../fixtures/regressions/stock-front.json")).unwrap();
+        let rough: StreamManifest = serde_json::from_str(include_str!(
+            "../fixtures/operations/roughing-open-block.json"
+        ))
+        .unwrap();
         assert!(
             clearance_dependency(&a, &rough.operations[0]).is_some(),
-            "nested stock-front roughing also consumes the premise"
+            "adaptive roughing also consumes the premise"
         );
     }
 }

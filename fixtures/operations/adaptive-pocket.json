@@ -68,8 +68,6 @@
     {
       "kind": "adaptive_pocket",
       "max_engagement_deg": 90,
-      "boundary_tolerance_mm": 0.01,
-      "clockwise": true,
       "id": "adaptive",
       "tool": "t1",
       "region": {

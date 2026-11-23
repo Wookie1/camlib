@@ -20,7 +20,6 @@ macro_rules! modules {
 
 modules! {
     adaptive,
-    adaptive_connected,
     adaptive_front_complete,
     assembly_reach,
     chamfer,
@@ -77,6 +76,7 @@ modules! {
     tapping,
     thermal,
     thermal_common_line,
+    thermal_control,
     thermal_mark,
     thread_mill,
     trace,

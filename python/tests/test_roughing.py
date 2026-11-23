@@ -73,33 +73,6 @@ def stream(adaptive=False):
 
 
 class RoughingTest(unittest.TestCase):
-    def test_stock_front_four_layer_cad_rough_streams_bulk_removal_and_completes(self):
-        c = example().roughing_job(stock_front=True, omit_empty_cuts=True)
-        self.assertEqual(c['operations'][0].clearing.path_strategy, 'stock_front')
-        first_removal = False
-        report = None
-        with Simulation(**c) as sim:
-            for update in sim.run_operations():
-                if isinstance(update, OperationUpdate):
-                    if update.stage == 'end':
-                        report = update.report
-                elif not first_removal and sim.state.volume()['removed_lower_mm3'] > 1:
-                    self.assertFalse(sim.state.finished)
-                    first_removal = True
-            self.assertTrue(first_removal and sim.state.finished)
-            self.assertIsNotNone(report)
-            self.assertEqual(report['completed_layers'], 4)
-            self.assertEqual(report['motions'], sim.state.completed)
-            self.assertLessEqual(sim.state.completed, 10000)
-            self.assertGreater(sim.state.volume()['removed_lower_mm3'], 5500)
-            self.assertLess(sim.state.volume()['removed_upper_mm3'], 32 * 28 * 10 - 1888)
-            for layer in report['layers']:
-                front = layer['clearing']['front']
-                self.assertTrue(front['coverage_complete'])
-                self.assertEqual(front['completed_components'], 2)
-                self.assertGreater(front['bulk_contours'], 0)
-                self.assertLessEqual(front['max_bounded_engagement_deg'], report['max_engagement_deg'])
-
     def test_step_up_layers_follow_each_stepdown_and_remove_the_wall_stair(self):
         base = example().roughing_job(offset=True)
         operation = base['operations'][0]
@@ -129,7 +102,7 @@ class RoughingTest(unittest.TestCase):
             run(dict(base, operations=(replace(operation, stepup_mm=2.0),)))
 
     def test_engagement_front_clears_every_layer_and_reports_its_estimate(self):
-        c = example().roughing_job(engagement_front=True)
+        c = example().roughing_job(adaptive=True)
         clearing = c['operations'][0].clearing
         self.assertEqual(clearing.to_dict()['path_strategy'], 'engagement_front')
         report = None
@@ -223,7 +196,8 @@ class RoughingTest(unittest.TestCase):
             self.assertNotIn('confined_strokes', front)
             paths.append(kinds)
         self.assertEqual(paths[0], paths[1])
-        with self.assertRaisesRegex(SimulationError, 'does not clear with path_strategy disk_front'):
+        # The orbit planner was removed (#190): its name is refused.
+        with self.assertRaisesRegex(SimulationError, 'unknown variant'):
             run(StockEdgeEntry(), AdaptiveClearing(3, path_strategy='disk_front'))
 
     def test_empty_cut_policy_is_an_explicit_strict_python_boolean(self):

@@ -25,7 +25,7 @@ machine, so they have no defaults: pass them as keyword arguments.
 | `work_offset` | 1 | 1..9 → G54..G59.x |
 | `retract_z_mm` | `clearance_z_mm` | Rapid travel height between passes (Pocket, RestPocket, AdaptivePocket, Roughing, Contour, Chamfer, Facing, TrochoidalSlot, Bore, Parallel, Spiral, Radial, Project, Waterline, Trace) |
 | `feed_z_mm` | `retract_z_mm` | Rapid descent stops here and plunge feed begins; leaving a pass, feed changes to rapid here |
-| `boundary_tolerance_mm` | 0.01 | Allowed construction error of offset boundaries (Contour, Chamfer, Bore, TrochoidalSlot, adaptive clearing) |
+| `boundary_tolerance_mm` | 0.01 | Allowed construction error of offset boundaries (Contour, Chamfer, Bore, TrochoidalSlot) |
 | `reverse` | off | Run the passes the other way: Facing and Parallel start each pass from the opposite end, Waterline cuts its contours the other way, Contour/Chamfer (`None` = from `cutting_sense`) reverse the loop direction |
 | `one_way` | off | Parallel: cut every row in the same direction instead of alternating (see [Parallel finishing](#parallel-finishing-parallel)); Facing has `mode="one_way"` |
 
@@ -138,7 +138,12 @@ these tools. Contour supports exterior air entry without tabs.
   Required order: stock top < `feed_z_mm` ≤ `retract_z_mm` ≤ `clearance_z_mm`.
 - `RestPocket` cuts only material left by earlier operations (it reads the
   simulated stock), typically with a smaller tool. `rest_tolerance_mm` (0.01)
-  is how much leftover is ignored.
+  is how much leftover is ignored. A cell that straddles a wall can still
+  report material after its lower portion was cut. When a cell check cannot
+  omit a stroke, the planner also checks the complete cutter sweep against
+  committed cleared columns at the same height allowance. The report counts
+  these extra omissions in `rest_history_skipped_strokes`. Unproven strokes
+  stay in the plan, including when the clearance query budget runs out.
 - An entry comes straight down, or starts its helix or ramp, from the lowest
   height at which the cuts already committed (by this or an earlier
   operation) prove the whole tool clear of stock, so a level cut where an
@@ -169,17 +174,16 @@ without a word:
   `AdaptivePocket` no place in that connected area of tool centres is clear
   of material to enter from and no helix the entry allows fits (a helix the
   policy forbids, `StockEdgeEntry(helix=None)`, is no way in), or the area is
-  tighter than the planner resolves (below); for `disk_front` and
-  `stock_front` no orbit fits. The message names the operation, a tool-centre
-  position in the area, the area's extent, what was tried (the helix or orbit
+  tighter than the planner resolves (below). The message names the operation, a tool-centre
+  position in the area, the area's extent, what was tried (the helix
   radii and what the area leaves) and the options: another entry
   (`RampEntry`, a plunge, a smaller helix), a smaller cutter, an earlier
   operation that opens a start there, or a region without that area.
 - **A region the cutter fits nowhere in refuses the operation**, since it
   can do nothing it was asked to. (This used to be an empty plan with a
   `CamWarning`.)
-- `Pocket`, `RestPocket`, `disk_front` and `stock_front` refuse before any
-  motion. `AdaptivePocket`'s default strategy plans from the stock, so it
+- `Pocket` and `RestPocket` refuse before any
+  motion. `AdaptivePocket` plans from the stock, so it
   refuses when a level starts, before that level's first motion: for the
   first level that is before any motion of the operation.
 - **Not refused:** a pocket with nothing left to cut, and the parts of a
@@ -193,8 +197,24 @@ without a word:
 **A top below the remaining stock** (`Pocket` and `AdaptivePocket`, issue
 #129). `top_z_mm` may be below the stock's original top when earlier
 operations removed the material: the depth (and the cutting-length check) is
-then measured from `top_z_mm`. Every stock cell meeting the `region` must be at
-or below it. Stock may stand higher outside the region, for example a low
+then measured from `top_z_mm`, and an `AdaptivePocket` plans its first level
+from it (#344), so no level is deeper than `stepdown_mm`. Every stock cell
+meeting the `region` must be at or below it, within the stock model's band
+of 16 x `tolerance_mm`; the run checks this against the committed stock, so a
+lower top needs the stock (an `AdaptivePocket` planned without it is refused).
+Where stock inside that band stands above `top_z_mm` within the cutter's reach,
+the depths are measured from the highest of it instead
+(`stock_top.reachable_upper_z_mm` in the report, #344): `stepdown_mm` is a
+strict maximum below the stock model. The model cannot tell a faced top's
+sweep error from material, so a top faced to exactly `top_z_mm` can gain a last,
+nearly empty depth when the depth is a whole number of stepdowns. The floor is
+checked against the authored top first. If the stock changes before the first motion and
+stands higher than the top the depths were planned from, where the cutter
+reaches, the run refuses. After the first motion, the next move requires the
+complete preceding sweep to have been committed with the matching tool and
+stock. A replacement stock may have refilled earlier levels even if its top
+and generation still match; plan the operation again against that stock.
+Stock may stand higher outside the region, for example a low
 pocket beside a tall wall, when the tool assembly clears it:
 
 - Before any motion, the neck, shank and every holder section are checked
@@ -374,8 +394,6 @@ Decisions (#219), with the reason:
   place, and it would ramp through the air beside the stock and through the
   air the layers above have cut (a layer's pocket starts at the stock top
   while the flutes span it). Use `AdaptiveClearing` for a ramp.
-- **`path_strategy="disk_front"` and `"stock_front"` refuse it**: they start
-  every pass from a fitted seed circle, which a helix opens.
 - **A `Contour` ramp with holding tabs stays refused.** A tab is a lift whose
   far side comes back down into the uncut loop at the tab's own slope (45
   degrees for a triangle, straight down for a rectangle). A tool that needs a
@@ -397,8 +415,8 @@ Refused, before any motion:
 - `RampEntry` on a `Contour` with holding tabs, or with limits that block part
   of a loop: the tool comes back down from a tab or a lift steeper than the
   ramp angle. A `Contour` accepts no other entry type.
-- `RampEntry` on `Roughing` with offset or raster clearing, and with the
-  `disk_front` and `stock_front` strategies (see the decisions above).
+- `RampEntry` on `Roughing` with offset or raster clearing (see the
+  decisions above).
 
 Refused while running (the run stops and no program is written):
 
@@ -418,7 +436,15 @@ Same region and depths as `Pocket`, cleared with a bounded radial engagement:
 no full-width slotting, for hard materials and high-speed toolpaths.
 `retract_z_mm`/`feed_z_mm` work as for `Pocket`.
 
-- **It follows the stock** (`path_strategy="engagement_front"`, the default):
+- **It follows the stock** (`path_strategy="engagement_front"`, the only
+  planner; the orbit planners `disk_front` and `stock_front` were removed in
+  #190 and their names are refused. A program saved earlier that chose
+  `engagement_front` still reads: the orbit fields the earlier serializers
+  wrote with it (`orbit_radius_mm` and its siblings as null,
+  `boundary_tolerance_mm`, and an adaptive pocket's `clockwise`) are dropped,
+  since the engagement front never used them. One saved without a
+  `path_strategy` was planned by the old default, `disk_front`, and is refused
+  with that reason):
   one depth level at a time, each pass runs along the boundary between cut
   and uncut stock inside the region, so nothing is cut twice. The region's
   boundary is a wall.
@@ -470,16 +496,19 @@ no full-width slotting, for hard materials and high-speed toolpaths.
   that tight which opens into a wider part of the region is not such an
   area: the level's wall pass follows the walls' exact offset into it and
   cuts it.
-- **Small regions on large stock** keep the same steering resolution. If the
-  whole-stock steering grid exceeds 64 million cells, its domain is bounded
-  to the operation region's exact bounds (including arc extrema), plus the
-  existing exterior margin. Integer cell offsets retain the stock-aligned
-  lattice, and the report records the reduced dimensions. A grid already
-  below the cap stays unchanged. The 64M cap and planning-memory budget still
-  apply after bounding: a genuinely large active region must be split or use
-  a larger tool. This is a focused allocation improvement under #193/#325;
-  it does not tile a large active front or change the exact stroke, entry,
-  engagement, stock or machine checks.
+- **Large adaptive layers** use the same stock-aligned steering resolution as
+  small ones. Above 64 million cells, the planner first bounds the grid to
+  the operation, including arc extrema and the exterior margin. If the
+  bounded grid still exceeds that threshold, each front-search tile reads
+  enough neighbouring cells to see the entire cutter disk and steering band.
+  Uniform cleared heights share storage, and each entry-search tile tracks
+  its best candidate. Ties follow the same row and column order as on a
+  small layer. The report gives the tiled dimensions and cell size.
+  Whole-layer region masks, distance fields and entry connectivity still
+  require memory proportional to the bounded footprint. If the estimated
+  working set exceeds the available or declared budget, planning refuses
+  with `engagement_front steering grid needs about … GiB but only … GiB is
+  available`. Split the operation region or provide the required memory.
 - **The residual area of a level** (`layers[].clearing`) counts all the
   stock left in the region at that level, from the region and the stock
   (on the steering grid, with the stock's whole-cell bounds), not from
@@ -525,27 +554,10 @@ no full-width slotting, for hard materials and high-speed toolpaths.
   - `ramp_clearance_mm`: each helix starts this far above the material it
     meets, never above `feed_z_mm`.
   The wall pass is reached like any other pass (a stay-down link, or a
-  descent with these options) and enters on its lead-in arc at `feed_mm_min`. `path_strategy="disk_front"` and `"stock_front"`
-  refuse all four by name.
-- Orbit options, `max_stay_down_mm` and `rest_tolerance_mm` do not apply and
-  are refused. Corners the cutter cannot reach are left and reported as the
-  level's residual area.
-- `path_strategy="disk_front"` is the earlier planner: it covers the region
-  with orbits of `orbit_radius_mm` (default half the tool radius) whatever
-  the stock holds. Its orbits overlap, so it cuts many times longer (33.7 m
-  against 1.1 m on a 50 x 30 x 8 mm pocket with a 10 mm cutter). With it,
-  `clockwise` sets the orbit direction, `max_engagement_deg` (default 90)
-  bounds the total contact, and `min_orbit_radius_mm` with
-  `local_orbit_tolerance_mm` sizes each orbit from the clearance around it.
-  An orbit sweeps a disk of the cutter radius plus the orbit radius. An
-  area of the region the cutter fits in (a component of its tool-centre
-  region) that is nowhere that wide is an area no entry reaches: the pocket
-  is refused before any motion with the sweep's size and the options (#250;
-  it used to be left). The narrower parts of an area an orbit does fit in
-  are left and reported in the plan's residual region, as before. The same
-  holds for `stock_front`.
-- `path_strategy="stock_front"` is a development strategy; it stops with an
-  error where its coverage is unresolved.
+  descent with these options) and enters on its lead-in arc at `feed_mm_min`.
+- `max_stay_down_mm` and `rest_tolerance_mm` do not apply and are refused.
+  Corners the cutter cannot reach are left and reported as the level's
+  residual area.
 
 ## Surface mesh inputs
 
@@ -608,7 +620,7 @@ refused with its location: export the mesh with shared edge vertices
   passes, with that much overlap reserved for the coverage proof,
 - `AdaptiveClearing(max_radial_engagement_mm)`: engagement-limited clearing
   that follows the boundary between cut and uncut stock
-  (`path_strategy="engagement_front"`, the default). Passes start from air
+  (`path_strategy="engagement_front"`, the only planner, #190). Passes start from air
   beside the stock or from stock already cleared (proven clear by the
   committed cuts) and helix only into enclosed material; each pass starts at
   the upstream end of the material it cuts; short moves between passes stay
@@ -670,7 +682,7 @@ refused with its location: export the mesh with shared edge vertices
     `wall_passes_skipped`.
   - Every cutting and link move is also checked exactly against the layer
     region before it is emitted, and the run fails rather than emit one that
-    does not fit. Orbit options and `omit_empty_cuts` do not apply, the entry
+    does not fit. `omit_empty_cuts` does not apply, the entry
     must be `StockEdgeEntry` or `RampEntry`, and the direction is
     `cutting_sense` (`"climb"` by default, `"conventional"`); `clockwise` does
     not apply.
@@ -686,8 +698,8 @@ refused with its location: export the mesh with shared edge vertices
     material and no way in (as defined for
     [`AdaptivePocket`](#adaptive-pocket-adaptivepocket)) is put in the
     layer's report, `layers[].clearing.unentered_areas`: `reason`
-    (`no_helix_fits`, `no_helix_allowed`, `tighter_than_planner_resolves`,
-    or `no_orbit_fits` with `stock_front`), `at_mm`, the extent of its tool
+    (`no_helix_fits`, `no_helix_allowed` or
+    `tighter_than_planner_resolves`), `at_mm`, the extent of its tool
     centres (`min_mm`, `max_mm`), `level_z_mm`, `cutter_radius_mm`,
     `radii_tried_mm`, `needed_mm` and `available_mm`. Its stock is in the
     layer's residual area, which counts all the stock left in the layer's
@@ -710,13 +722,6 @@ refused with its location: export the mesh with shared edge vertices
     an area has none (for example with `StockEdgeEntry(helix=None)` and an
     enclosed area), naming the area, what was tried and the options. They
     leave no area without an entry, so they list none.
-  - `path_strategy="disk_front"` is refused in `Roughing`. It covers a region
-    it takes to be solid with small orbits and never reads the stock;
-    `Roughing`'s region is the stock grown by a margin, so it orbited through
-    the air beside the stock (#167: 75 m of a 137 m path on a 130 x 90 mm
-    stock). It remains `AdaptivePocket`'s strategy, where the region's
-    boundary is a wall. `path_strategy="stock_front"` is a development
-    strategy with the same options as `AdaptivePocket`.
   With `rapid_descent_clearance_mm`
   (opt-in, on `Roughing`), a descent into a column that the committed cuts
   prove clear for the whole tool assembly is rapid down to that far above
@@ -1629,30 +1634,145 @@ the passes; the surface mesh decides the heights and the clearance proof.
 
 ## Flat-area finishing: `Flat`
 
+Optional `floors` selects horizontal CAD trims in work coordinates as
+`FlatFloor(z_mm, region)` values. The region carries its outer loops,
+holes and boundary error. `camlib.cadquery.flat_floors(shape)` exports
+upward horizontal faces using the analytic CAD floor exporter. Each
+selected height must match a horizontal level on the supplied mesh.
+The trims shape the insets and the engine proves overhang at open outlines.
+The mesh remains the clearance authority and supplies a conservative
+entry shadow. Omitting `floors` uses the mesh-derived levels.
+
+`finish_walls=True` schedules the outermost contours beside raised walls
+after the floor passes at each level. They keep `radial_stock_to_leave_mm`
+and the floor's axial allowance. Every contour uses the ordinary tool,
+part, limit and live-stock checks. An explicit request with no reachable
+wall or with an unproven wall contour refuses. See Autodesk's
+[2D Offset Roughing reference](https://help.autodesk.com/view/fusion360/ENU/?contextId=MFG-REF-2D-POCKET-CMD)
+for floor selection, wall passes and radial stock to leave.
+
 Required: `surface`, `floor_z_mm`, `stepover_mm`, `clearance_z_mm`. Finds the
 horizontal faces above `floor_z_mm` (faces within `level_tolerance_mm`, 0.001,
 form one level) and finishes each level at its exact height plus
 `stock_to_leave_mm`, top level first, with a flat center-cutting end mill in
-raster rows along `axis`. A cut is kept only where the highest point of the
-part under the tool's swept disk is not above the cut (computed exactly per
-facet). A run is entered by a vertical plunge where no live stock stands
-above its height at its start (within `tolerance_mm`). Where stock does (roughing
-left it, or the stock was not cut there yet), the run is entered by a ramp, and
-only if the operation declares `entry=RampEntry(angle_deg, ...)`: the tool
-plunges through air to the top of the live stock over the whole run (the highest
-cell bound anywhere along it, not just at its start), then zigzags down along
-the run at no more than the declared angle and at the entry's `feed_mm_min`
-(default the plunge feed). A zigzag that has to reverse on the run needs the
-entry's `min_length_mm`. Every ramp point lies above the proven run, so it
-clears the part like the run does; the report counts the ramped runs as
-`ramped_entries`. Nothing is plunged into stock on any path: a run with stock
-above it and no declared entry, a ramp that does not fit (too short a run, an
-angle too shallow for the run, or stock above the feed height) is refused,
-naming the run, its length and the stock above it. The `flat` benchmark runs on
-a blank roughed to 0.1 mm over the flats and declares a 3 degree entry. Near
-walls the tool stays a
-radius away; the report gives the levels, runs, cut length and any row length
-that could not be proven clear (`dropped_length_mm`).
+contour-parallel offset passes, outside in. Every pass is climb milled with a
+clockwise spindle: cut outside in, the stock still to cut lies inward of each
+ring, so outer loops run clockwise and hole loops counter-clockwise, keeping it
+on the right of travel. The region of tool centres resting on a level is the
+level's shadow grown by the radius less one stepover (none at a stepover of a
+radius or more), so past an open edge the outermost pass runs that far outside
+the face and its disk takes one stepover of it like every later pass, minus the
+shadow of everything standing above it grown by the radius plus
+`radial_stock_to_leave_mm` (default 0) plus its stated errors, so near walls
+the tool stays a radius plus the radial stock away and cuts only the horizontal
+faces: the walls keep their radial stock for a wall finish. Flat covers small
+notches between straight facets of the protective shadow with a
+validated outer envelope before expansion. This can only add protection, with
+the displacement included in the boundary error, and the cuts are still
+checked against the original part. An erosion that fails to advance or leaves
+area beyond the component's geometric depth limit refuses the operation.
+The inward offsets at
+0, `stepover_mm`, 2 `stepover_mm`, ... are the passes; after the last one, a
+core deeper than a radius is covered by half-step passes while it lasts, and
+where an offset pinches off in a corner between two boundaries of the region
+(the surviving ring stretches more than a diameter apart) a half-step pass is
+added too, so the disk covers every reachable flat point at stepovers up to the
+cutter diameter. An inner pass is planned only while floor remains deeper than
+the passes before it reach (more than a sliver thinner than the offset kernel's
+stated error, which it cannot tell from a line), and it is cut only along the
+stretches whose disk reaches that floor, less what the passes already kept at
+its depth sweep. Floor remaining between those cutter sweeps stays eligible for
+subsequent passes, even where the remaining strip is narrow. A gap between two kept stretches is cut through when that
+takes no longer than a new entry's descent from the feed height at the plunge
+feed, or is at most two stepovers. Offset loops are cut as arcs (the offsets'
+cavalier bulges), an arc proven by its chords, each chord held to the same
+proof with radius r + sagitta, and emitted as arc blocks when every chord
+proves; when a chord fails, the arc's circumscribed polygon (tangent edges
+whose vertices stray at most 0.005 mm outside the arc) is tried next, each edge
+proven as a straight cut, before falling back to the chords; a chord that
+cannot be proven is halved down to a sixteenth of the loop, and what still
+fails is dropped into `dropped_length_mm`, the loop continuing as open pieces.
+A cut is kept only where the highest point of the part under the tool's swept
+disk is not above the cut (computed exactly per facet). Per connected
+component, nearest first, the passes are cut at growing offset depth (the
+outermost ring first); at the same depth outer boundary loops before hole
+loops, then nearest first, and each loop starts at its vertex nearest the tool.
+Where the offsets split a level into separate areas (the strips either side of
+a boss), each area is finished, outside in, before the tool crosses to the
+next: a loop or a kept stretch of one waits only for the shallower ones whose
+swept disk overlaps its own, and of those whose turn has come the nearest is
+cut next. This order is used when it needs fewer entries than the plain depth
+order, or as many with less travel. Kernel artefacts are not cut as moves of
+their own: a run of strokes on one circle (straight chords, or chords mixed
+with micro-arcs) is refitted as one arc, and a straight stub under 0.005 mm is
+absorbed into its straight neighbour. Consecutive pieces join into one chain by
+a straight link at the cut height and cutting feed when the link is at most two
+stepovers long, passes the same proof and lies inside the machine limits;
+otherwise the chain ends (retract, new entry). Where a side of the chain's
+first pass has no live stock above the cut (beside an open edge, or floor
+earlier passes have finished), the chain is entered by a vertical plunge
+through air and a quarter-circle lead-in of the tool's radius, tangent to the
+pass at its start: flat at the cut height and cutting feed when the plunge
+point lies a radius beside the face, otherwise a helix that stops above the
+finished floor (radius × √2 × the tangent of the declared ramp angle) and
+descends to the pass at no more than the ramp's angle over its chord, at the
+ramp's feed (with no ramp declared that side does not qualify). The arc is
+proven clear of the part by its chords at radius r + sagitta and must lie
+inside the machine limits. A chain ends with a flat tangent quarter-circle
+lead-out of the tool's radius where the disk at its end touches no stock above
+the cut; otherwise it retracts at the pass's end. The report counts them as
+`arc_lead_ins` and `arc_lead_outs`. Every vertical plunge that lands in air
+(side entries, arc lead-ins, plunges at a chain's start) stops a tool radius
+higher and a radius back along the move that follows, and turns to horizontal
+on a quarter circle of the tool's radius in the vertical plane of that move
+(one XZ or YZ arc when the move runs along X or Y, otherwise its chords within
+5 microns), at cutting feed; the span is proven clear of the part and of live
+stock at the landing height and inside the limits, otherwise the plunge comes
+straight down. The report counts these as `rounded_plunges`. Because a rounded
+plunge reaches the floor moving sideways, a plunge may also land over the
+level's face where no stock stands above the pass: there the arc lead-in is
+flat, and a pass start with no stock above it is plunged and turned instead of
+ramped. A helical lead-in, or a ramp, is used only where the turn does not fit.
+Otherwise a chain is entered beside the level's face where the flat is open
+(side entry in air): the tool rapids over a point a quarter to two radii
+outside the chain's first loop, away from the region, where no stock stands
+within the disk above the cut, plunges vertically through air to the cut height
+and leads in at cutting feed. Where no such point exists it plunges vertically
+at the chain's start when no live stock stands above its height there (within
+`tolerance_mm`). A pass start under no more stock than an arc ramp can take is
+entered by one smooth descent along the pass's line, as with a plunge and an
+arc lead-in: the tool plunges through air, an arc of its radius turns it to the
+declared ramp angle above the stock, a straight leg at that angle goes through
+the stock, and an arc of its radius turns it level onto the pass. The stock is
+never met steeper than the declared angle, and the whole descent starts at most
+four tool radii behind the pass start (about half a millimetre of stock at 3
+degrees). Where the stock beside a wall is too tall to ramp along the pass, the
+arc ramp comes down beside the pass start on its open side instead and the tool
+turns into the pass on a level arc lead-in. A closed lap with no such room at
+its start is entered the same way at the middle of one of its straight sides,
+and the lap starts and ends there. Deeper stock is ramped along the pass as
+follows. Where stock does (roughing left it, or the stock was not cut there
+yet), the chain is entered by a ramp, and only if the operation declares
+`entry=RampEntry(angle_deg, ...)`: the tool plunges through air to the top of
+the live stock over the stretch of the chain's first loop the ramp travels (the
+highest cell bound anywhere along that stretch; the whole loop when the ramp
+has to reverse on it), then zigzags down along that loop at no more than the
+declared angle (over each move's chord, so a leg along an arc descends a little
+shallower) and at the entry's `feed_mm_min` (default the plunge feed); a zigzag
+that has to reverse needs the entry's `min_length_mm`. Every ramp point lies
+above the proven loop, so it clears the part like the loop does; the report
+counts ramped chains as `ramped_entries`. Nothing is plunged into stock on any
+path: a chain with stock above it and no declared entry, a ramp that does not
+fit (too short a loop, an angle too shallow for the loop, or stock above the
+feed height) is refused, naming the chain, its length and the stock above it.
+The `flat` benchmark runs on a blank roughed to 0.1 mm over the flats and
+declares a 3 degree entry. The report gives the levels, `loops` (closed offset
+loops planned), `rows` (loops cut, counting the open pieces a split loop
+leaves), `runs` (chains), `links_at_depth`, cut length, `runs_completed`,
+`ramped_entries`, `arc_ramps` (arc-ramp entries, also counted in
+`ramped_entries`), `arc_lead_ins`, `arc_lead_outs`, `rounded_plunges`, and any
+length that could not be proven clear (`dropped_length_mm`). `axis` is still
+accepted so old jobs load, but no longer orders anything.
 
 ## Spiral, radial and project finishing: `Spiral`, `Radial`, `Project`
 
@@ -1898,26 +2018,109 @@ report's `shadow_error_mm` is the largest such error over the levels cut.
 `contour_error_mm`; `reverse` cuts the contours the other way;
 `safety_margin_mm` and `stock_to_leave_mm` work as for `Parallel`.
 
-A ball's contour is entered from beside the wall: the ball drops at a point
-moved away from the wall and then leads in sideways, so its tip never lands on
-the wall (it used to drop on the surface, up to 1.9 mm axially into stock). The
-point is chosen from the live stock. It is the nearest point, starting
-`max(r/2, 1)` mm from the loop and stepping out by that much up to 4 cutter
-radii, on either side of the loop start, where the lead to the contour is
-clear of the surface, the machining limits allow the plunge and the lead, and
-the stock under the ball (the upper bound of every cell its disk can touch) is
-at or below the height it plunges to. A loop with no such point keeps the
-tangent lead on the wall, as before, and is counted in the report's
-`wall_entries`, and the run warns (`CamWarning`): there the ball may come down
-into stock, so rough or rest-rough that area first. (It is not refused, because stock that has not been roughed to
-the level would then stop every waterline before the reach checks that name
-the real limit.) The `waterline`, `waterline-dense` and `steep-and-shallow`
-benchmarks run on blanks roughed to 0.1 to 0.3 mm over the part.
+Ball end mills cut one island at a time, top to bottom (#46). Every level is
+contoured first; its contours (and the runs the in-between levels, slope or
+region limits keep) are grouped into stacks: going down, a contour joins the
+stack whose contour at that stack's latest level it overlaps (islands grow
+downward, holes shrink), a contour overlapping none starts a stack, and one
+overlapping several merges them into a new stack cut after them. The tool
+finishes a stack before moving to the nearest next one. Where cutting a stack
+top to bottom would make a move fail the neck, shank or holder reach check
+against the live stock - typically a neighbour's uncut stock the shank would
+meet - that stack is deferred and finished last, level by level; the report's
+`stacks` and `stacks_level_ordered` count them. No check is relaxed to keep
+an order.
+
+Within a stack, a closed loop below a closed loop is reached without a
+retract: a short link at the upper level to the nearest point of the lower
+loop, a ramp down along that loop to its level, then the whole loop cut flat
+from where the ramp ends, so the flat lap passes over the entire ramp again.
+The ramp is never steeper than the ramp angle: the level gap over the
+tangent of the angle along the loop, and where one lap is too short for
+that, as many whole laps as the angle needs, each descending an equal share
+(refused by name past 1000 laps). The split onto a loop vertex only ever
+lengthens a ramp. Without an `entry` the angle is 3 degrees. Descending moves
+use the declared plunge feed unless `RampEntry` supplies its own feed. On an
+open run, a declared `min_length_mm` is the minimum travel before reversal.
+The link, ramp and loop must all clear the part. Each link's maximum stock
+depth over the whole swept cutter is bounded by the larger of the level gap
+and the stock the finishing lap is guaranteed to meet at its arrival point,
+within the operation tolerance. The planner enters the loop separately when
+the live stock bounds cannot establish that limit. The report's `ramp_links` counts the linked levels.
+
+Open runs (the parts of a contour slope or region limits keep) are linked the
+same way: from the end of the run just cut to the start of the next one, at
+the upper level, then down along the run at the ramp angle to half the level
+gap and back to its start (more such passes where the run is too short for
+the angle; no ramp at the same level), then the run cut. Where
+the straight link would cross the part (the runs of one wall all run the same
+way, so the next starts at the far end), the link goes back along the run just
+cut, at its level, to its point nearest the next start, then straight to it.
+The same proofs and stock bound apply. In a stack the next piece is the
+nearest one that is ready - a piece may go before pieces it is more than two
+cutter radii from (bounding boxes), unless one of them is a closed loop - so the
+separate walls of one contour are cut one after the other, each top to bottom,
+instead of switching walls at every level. On an in-between level under
+limits, the fragments the scallop rule keeps within one run the limits allow
+are cut as one piece when the gaps between them are under four cutter radii
+(the gaps are inside the limits).
+
+A loop the tool is not already at - the first of a stack, a run, or a
+loop a link could not reach - is entered after a retract, never by coming in
+from the side into a full cut and never by plunging into material: a side
+entry (a plunge beside the loop, at the nearest point `max(r/2, 1)` mm out and
+on up to 4 cutter radii on either side of its tangent, then a horizontal lead
+onto it) only where the stock under the ball there is at or below the level
+and the whole lead meets no stock above the level - pure air; a closed loop
+with no such point beside its start is sampled along its whole length and its
+start moves to the first one (`moved_entries`). Otherwise the ball plunges at
+the loop start to the lowest height the stock under it there is clear at (at
+most the feed height, so in air) and ramps down along the loop to the level at
+the ramp angle as above; an open run goes along itself to half the depth and
+back to its start, at the same angle - then cuts it (`helical_entries`). If no entry exists the
+operation is refused, naming the level and the XY: rough or rest-rough there
+first. Where an entry reaches its level in stock more than three
+`stepdown_mm` deep, or a link more than three `stepdown_mm` beyond the level
+gap it descends, the report counts it (`deep_stock_entries`) and the
+simulation warns: rough or rest-rough first. A rough in steps up to three
+times the finishing stepdown, plus its allowance, leaves no more than that
+on a slope and does not warn; a raw blank, or a gap the rough tool could not
+reach, does. The `waterline`, `waterline-dense` and
+`steep-and-shallow` benchmarks run on blanks roughed to 0.1 to 0.3 mm over
+the part.
 
 `ramp=True` (ramp finishing) cuts each level as one continuous descent along
 its contour from the level above, instead of a flat lap and a step down; the
 lowest level is then cut once more flat. Each ramp follows a contour proven
-clear at its own level and stays above that level, so it cannot gouge.
+clear at its own level and stays above that level, so it cannot gouge. For
+ball end mills this is what the linking above already does for every island,
+so `ramp=True` changes nothing there; flat and bull-nose end mills keep it.
+
+In-between levels: between two main levels a ball end mill's plan adds
+sub-levels where the main levels are too far apart along the surface (on a
+slope at contact angle t the passes of levels `stepdown_mm` apart are
+`stepdown_mm / sin(t)` apart along it) and halving would lower the scallop by
+more than the path tolerance `contour_error_mm` — a level is added only where
+it lowers the scallop by more than the tolerance the caller already declares.
+The bound is the scallop of a vertical wall at this stepdown plus the
+tolerance: `scallop_mm = R - sqrt(R^2 - stepdown_mm^2/4) + contour_error_mm`
+(R the ball radius; capped at R when `stepdown_mm^2/4 >= R^2`). The widest
+spacing along the surface that keeps that bound is
+`D = 2 sqrt(R^2 - (R - scallop_mm)^2)`; sub-levels halve their gap (depth 1,
+2, ... while the spacing still exceeds the bound) and keep only the parts of
+the parent contour whose greatest contact angle satisfies
+`sin(t) < P / D - 1e-9`, with `P` the parent level spacing of that gap (so a
+short last gap needs fewer levels), which keeps passes at most `D` apart
+along the surface. An exactly vertical wall never gets a sub-level (the 1e-9
+tie). The report's `scallop_levels` counts the sub-levels that cut, and
+`scallop_from_deg` is the contact angle below which the bound is NOT claimed
+(`asin(min(1, stepdown_mm / (2^K D)))`, K the deepest sub-level); ball end
+mills only — flat and bull-nose reports have neither field. The cost: at
+coarse stepdowns every wall that is not exactly vertical gets extra levels (a
+70-degree flank gets depth-1 levels at the gap midpoints), so cycle and
+planning time grow on drafted or curved parts; once the stepdown is fine
+enough that the wall scallop's gain is under the tolerance, no sub-levels are
+added and the cycle is unchanged.
 
 Depth: when the remaining stock stands no higher above `bottom_z_mm` than the
 cutting length, every level is within the flutes. Where it stands higher (a
@@ -2066,8 +2269,53 @@ cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=
 
 - **Kerf compensation**: the beam center runs half a kerf (plus half of
   `boundary_tolerance_mm`) outside each part. `compensation="wear"` posts the
-  same path with G41/G42, turned on over the straight lead-in and off over the
-  straight lead-out, so the operator can trim the kerf at the controller.
+  same path with G41/G42 (G41 for the usual direction: the controller offsets
+  toward the scrap, on the left of travel; G42 with `reverse=True`), turned on
+  over the straight lead-in and off over the straight lead-out, so the
+  operator can trim the kerf at the controller.
+- **Controller kerf** (`compensation="control"`, #384): for controllers that
+  apply the whole kerf themselves (plasma tables whose nesting software is
+  set to "in control"). The program carries the part side of the kerf path,
+  the part outline beyond the boundary margin, and turns the controller's
+  offset on with half the declared kerf before the straight lead-in and off
+  before the straight lead-out (WinCNC: `G41 O<kerf/2>` and `G40`, each on a
+  block of its own; WinCNC Users Guide, Controller 3.1, revision 3.1.04,
+  pp. 138-139; ShopSabre's own plasma post for these tables writes it so).
+  The side is the scrap side: G41 for outlines clockwise and holes
+  counter-clockwise, G42 with `reverse=True`. A post whose controller has no
+  amount word (`GCodeDialect.compensation_amount_word`) refuses it.
+  - What is planned is where the beam then runs. Along the edges it is the
+    same kerf path; at an outside corner, whose part side is a corner the
+    controller turns itself, the beam path is the controller's intersection
+    join (WinCNC: arcs and lines are offset and "a new intersection point"
+    calculated, Versions Information List 3.1.01a): the two edges' kerf paths
+    run on to where they meet, r / sin(θ/2) from the written corner. The arc
+    join a controller could use instead (an arc of half a kerf about the
+    written corner) lies inside it, and both are proven clear of every part,
+    the extended corner against the neighbouring parts too. Inside corners
+    are where the controller's offsets overlap and are trimmed: one place.
+    A loop whose first vertex is an outside corner starts in the middle of
+    the edge after it (the leads meet a straight edge).
+  - The pierce is on the written path, half a kerf to the part side of the
+    planned lead, and keeps `pierce_clearance_mm`; the entry move (offset
+    off to on) runs straight from it to the start of the lead arc and the
+    cancel move from the end of the lead-out arc to the written end, both
+    checked as leads. Both leads need a straight part and an arc
+    (`radius_mm > 0`), so the written lead runs tangent into the cut: where
+    a controller ends its start-up at a corner differs between controllers.
+  - The posted program is decoded and the controller's offset replayed from
+    the written words (`camlib.controller_offset`, independent of the
+    planner and the post), move by move against the plan.
+  - Refused: with `common_line` (a part on both sides), `micro_joints` (the
+    beam stops inside the loop), `corner_loops` (a path that crosses
+    itself), `edge_starts`; leads without a straight part or an arc; a loop
+    the controller cannot form from its part side: a slot or gap narrower
+    than the kerf (its kerf path bridges it), an element whose part side
+    its corners trim away, a kerf path that turns sharply toward the part
+    or crosses itself, or a written part outline that doubles back or crosses
+    itself (including a second intersection between consecutive edges); an
+    outside corner whose extended join is not clear
+    of the parts (an acute point near a neighbour).
 - **Order**: holes before their part's outline; a part lying in another part's
   hole before that hole. Among parts at the same depth `part_order` chooses the
   next one: `"nearest"` (default: the part whose outline starts nearest to
@@ -2127,8 +2375,8 @@ cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=
   the lead-in and off before the lead-out of each loop.
 - **Micro-joints**: `MicroJoints(width_mm, count=... or spacing_mm=...,
   holes=False)` leave uncut bridges on outlines; the beam turns off over each
-  and fires again after it (no pierce clearance there). Not with wear
-  compensation.
+  and fires again after it (no pierce clearance there). Not with wear or
+  control compensation.
 - `power_percent` is the laser power (posted as S).
 - **Lead placement**: `lead_placement=camlib.LeadPlacement(keep_off, keep_off_distance_mm=...,
   prefer=...)` says where loops may start, and so where their leads go (a

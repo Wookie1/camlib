@@ -153,6 +153,28 @@ class LinuxCNCInterpreterTest(unittest.TestCase):
         job = taps.job(taps.tapping)
         self.assertGreater(self.run_job(job, taps.machine(job)), 8)
 
+    def test_a_stated_retract_before_a_tool_change_in_place(self):
+        # #374. The interpreter's tool table holds zero offsets, so the two
+        # tools here have one gauge length: the tip is where the program
+        # says before and after M6, and the retract, the change and the
+        # descent are compared block by block.
+        import test_tool_change_pose as change
+        from camlib import ToolChangeInPlace
+
+        order = ("short", "long")
+        job = change.in_place_job(order, 12, ToolChangeInPlace(retract_gauge_z_mm=150), long=75)
+        self.assertGreaterEqual(self.run_job(job, change.in_place_machine(order, long=75)), 16)
+
+    def test_a_stated_end_position(self):
+        # #378: the Z rapid and the XY rapid after the last operation.
+        import test_drill_cycles as drills
+        import test_end_position as ends
+
+        for end in (ends.UP, ends.END):
+            with self.subTest(end=end):
+                job = ends.job(end)
+                self.assertGreaterEqual(self.run_job(job, drills.linuxcnc(job)), 8)
+
     def run_lathe(self, plan, dialect, change=None, **settings):
         """Post a planned lathe job for a LinuxCNC lathe with `dialect` and
         compare the interpreter's run with the plan's events. `change`

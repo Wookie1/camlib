@@ -57,10 +57,10 @@
 //! assert!(stock.volume().removed_upper_mm3 > 0.);
 //! ```
 pub mod adaptive;
-mod adaptive_front;
 pub mod buffers;
 pub mod chamfer;
 pub mod contour;
+pub mod controller_offset;
 pub mod deburr;
 pub mod dexel;
 pub mod dynamics;

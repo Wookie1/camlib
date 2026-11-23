@@ -16,7 +16,7 @@ def part():
     return base.union(boss)
 
 
-def roughed(cell=0.25):
+def roughed(cell=0.25, margin=0.0):
     """The part with 0.1 mm left on the flats and the walls to size: the
     blank a flat finishing pass meets after roughing."""
     import cadquery as cq
@@ -24,7 +24,8 @@ def roughed(cell=0.25):
 
     blank = (
         cq.Workplane("XY")
-        .box(24, 16, 4.1, centered=False)
+        .box(24 + 2 * margin, 16 + 2 * margin, 4.1, centered=False)
+        .translate((-margin, -margin, 0))
         .union(cq.Workplane("XY").box(8, 8, 3, centered=False).translate((8, 4, 4.1)))
     )
     return camlib.StockSpec.from_mesh(export_stock_mesh(blank), cell)
@@ -137,7 +138,7 @@ class FlatTest(unittest.TestCase):
         report, snapshot = None, None
         plunges, ramp_feeds, slopes = 0, set(), []
         radius = 2.0
-        with self.simulation(tool, op, roughed()) as sim:
+        with self.simulation(tool, op, roughed(margin=10)) as sim:
             s = sim.state
             snapshot = list(s.heights)
             for update in sim.run_operations():
@@ -179,16 +180,17 @@ class FlatTest(unittest.TestCase):
                     pass
 
     def test_a_ramp_that_does_not_fit_is_refused_not_plunged(self):
+        wide = camlib.StockSpec((-10, -10, 0), (34, 26, 8), 0.25)
         # 4 mm of stock at 3 degrees needs about 76 mm of travel: the ramp
         # must reverse on a 24 mm run, which needs a declared min_length_mm.
         tool, op = self.flat(camlib.RampEntry(angle_deg=3))
         with self.assertRaisesRegex(Exception, "min_length_mm is not set"):
-            with self.simulation(tool, op) as sim:
+            with self.simulation(tool, op, wide) as sim:
                 for _ in sim.run_operations():
                     pass
         tool, op = self.flat(camlib.RampEntry(angle_deg=3, min_length_mm=100))
         with self.assertRaisesRegex(Exception, "shorter than min_length_mm"):
-            with self.simulation(tool, op) as sim:
+            with self.simulation(tool, op, wide) as sim:
                 for _ in sim.run_operations():
                     pass
 
