@@ -202,12 +202,15 @@ from it (#344), so no level is deeper than `stepdown_mm`. Every stock cell
 meeting the `region` must be at or below it, within the stock model's band
 of 16 x `tolerance_mm`; the run checks this against the committed stock, so a
 lower top needs the stock (an `AdaptivePocket` planned without it is refused).
-Where stock inside that band stands above `top_z_mm` within the cutter's reach,
-the depths are measured from the highest of it instead
-(`stock_top.reachable_upper_z_mm` in the report, #344): `stepdown_mm` is a
-strict maximum below the stock model. The model cannot tell a faced top's
-sweep error from material, so a top faced to exactly `top_z_mm` can gain a last,
-nearly empty depth when the depth is a whole number of stepdowns. The floor is
+Where stock inside that band stands more than `tolerance_mm` above `top_z_mm`
+within the cutter's reach, the depths are measured from the highest of it
+instead (`stock_top.reachable_upper_z_mm` in the report, #344), so no depth is
+deeper than `stepdown_mm` below the stock model. Stock within `tolerance_mm`
+of the top is at the top (#381): a flat cut at a height leaves the model's
+upper bound its sweep guard (the run's sweep `tolerance_mm`) above it, and
+each depth is placed a stepdown below the tip of the depth above, not below
+that guard. So a pocket from a floor faced to exactly `top_z_mm` cuts whole
+stepdowns, with no extra, nearly empty last depth. The floor is
 checked against the authored top first. If the stock changes before the first motion and
 stands higher than the top the depths were planned from, where the cutter
 reaches, the run refuses. After the first motion, the next move requires the
@@ -1572,6 +1575,16 @@ no-gouge height; `stock_to_leave_mm` leaves material. In a direct comparison
 with OpenCamLib's drop-cutter on the same mesh, camlib's tip stayed between
 +0.0046 and +0.0099 mm above the exact no-gouge height.
 
+Set `fit_arcs=True` on eligible ball-end curved finishing operations such
+as `Spiral` to fit constant-depth XY cutting runs. The planner bounds the
+distance from the entire line run to each arc in both directions and
+rechecks continuous clearance and path excess with that bound. Runs with
+slope, rest or machining limits, and cuts requiring live-stock flute-depth
+admission continue to use lines. The report counts fitted arcs. To retain
+G2/G3 where the machine and post precision allow it, use
+`LoweringOptions(native_arcs=True)`. Existing stock, machine and
+decoded-program verification still apply to the posted output.
+
 Pass direction: rows run along `axis`, stepping from the low to the high end
 of the other axis. By default they alternate (zigzag: the first row from the
 low end of `axis`, or from the high end with `reverse=True`, the next one
@@ -1598,6 +1611,15 @@ climb milling and on the left conventional: `axis="x"` cuts conventional and
 `axis="y"` climb, and `reverse=True` swaps each. (On a slope the ball also
 cuts uphill or downhill; that depends on the surface, not on this option.)
 The report has `one_way: true` when it is set.
+
+Set `slope_aware_stepover=True` to use the ball-end raster's `stepover_mm`
+as the flat-surface maximum. Each interval is reduced by the cosine of
+the greatest cross-track facet slope over its proposed strip and cutter
+reach. This follows the [steep-area stepover approach in Autodesk Parallel
+finishing](https://help.autodesk.com/view/fusion360/ENU/?contextId=MFG-REF-3D-PARALLEL-CMD).
+The report records this option and the maximum generated row pitch.
+Whole-target ridge height still requires the independent material check,
+including at joins, fillets, and unreachable areas.
 
 Depth: when the remaining stock stands no higher above `floor_z_mm` than the
 cutting length, every pass is within the flutes. Where it stands higher (a
@@ -1714,7 +1736,13 @@ cutter diameter. An inner pass is planned only while floor remains deeper than
 the passes before it reach (more than a sliver thinner than the offset kernel's
 stated error, which it cannot tell from a line), and it is cut only along the
 stretches whose disk reaches that floor, less what the passes already kept at
-its depth sweep. Floor remaining between those cutter sweeps stays eligible for
+its depth sweep. Each kept stretch's sweep is taken as one region, the disk
+swept along the whole connected stretch (short arcs by chords within the
+planar kernel's chord error, longer arcs on their own by chords of at most
+0.01 mm sagitta, the radius reduced by the chords' sagitta), never more than
+the disk covers; along a finely faceted wall a stretch has thousands of
+strokes.
+Floor remaining between those cutter sweeps stays eligible for
 subsequent passes, even where the remaining strip is narrow. A gap between two kept stretches is cut through when that
 takes no longer than a new entry's descent from the feed height at the plunge
 feed, or is at most two stepovers. Offset loops are cut as arcs (the offsets'
@@ -1908,6 +1936,11 @@ How it is computed:
   along the boundary pass or back along the ring just cut; only otherwise a
   retract.
 
+At a near-perpendicular crossing of a facet edge, the pass endpoint retains
+its distance along that edge during coverage verification. This prevents
+spurious gaps on split faces. In each face subdivision, a lower bound rules
+out distance functions that cannot be nearest before clipping their regions.
+
 Cancellation is checked while constructing a level, including subdivision
 inside one facet, path chaining and simplification. A cancelled contour returns
 an error; its partial paths cannot become a successful plan.
@@ -2098,6 +2131,13 @@ limits, the fragments the scallop rule keeps within one run the limits allow
 are cut as one piece when the gaps between them are under four cutter radii
 (the gaps are inside the limits).
 
+A ramp along an open run always reverses, so a run shorter than the declared
+`min_length_mm` (the shortest span the tool may reverse a ramp on), or too
+short for the angle within 1000 passes, has no ramp along itself (#392). Slope
+limits near their threshold leave such runs, fractions of a millimetre long.
+A link down onto one is not taken (`links_refused_short_run`); the run is
+entered after a retract like any run a link cannot reach, as below.
+
 A loop the tool is not already at - the first of a stack, a run, or a
 loop a link could not reach - is entered after a retract, never by coming in
 from the side into a full cut and never by plunging into material: a side
@@ -2110,7 +2150,23 @@ start moves to the first one (`moved_entries`). Otherwise the ball plunges at
 the loop start to the lowest height the stock under it there is clear at (at
 most the feed height, so in air) and ramps down along the loop to the level at
 the ramp angle as above; an open run goes along itself to half the depth and
-back to its start, at the same angle - then cuts it (`helical_entries`). If no entry exists the
+back to its start, at the same angle - then cuts it (`helical_entries`). An
+open run too short for that ramp (see above) ramps the same way along the
+level's whole contour instead: from the run's start in the cut direction,
+through the run and on along the contour, then back to the start, with every
+reversal on at least `min_length_mm` (`contour_ramp_entries`, also counted in
+`helical_entries`). This is the ramp along "the path that comes after the
+plunge" of FreeCAD's ramp entry dressup, whose back-and-forth method turns
+round wherever its path ends; the run is one stretch of that contour, and the
+slope or region limits that cut it out choose what is finished, not where the
+tool may travel above the level. The ramp stays over the contour at or above
+its level and carries the same part-clearance and machining-limit proofs as
+every entry, so a region limit the contour leaves refuses it by name. Where
+the stock under the ball at the run's start is at or below the level, the
+plunge comes straight down in air and no ramp is needed. There is no plunge
+into material: a contour too short for the ramp as well is refused, naming
+the run, the level and the XY; rough or rest-rough there down to the level, or
+declare the steeper angle or smaller `min_length_mm` the tool allows. If no entry exists the
 operation is refused, naming the level and the XY: rough or rest-rough there
 first. Where an entry reaches its level in stock more than three
 `stepdown_mm` deep, or a link more than three `stepdown_mm` beyond the level
@@ -2145,7 +2201,12 @@ the parent contour whose greatest contact angle satisfies
 `sin(t) < P / D - 1e-9`, with `P` the parent level spacing of that gap (so a
 short last gap needs fewer levels), which keeps passes at most `D` apart
 along the surface. An exactly vertical wall never gets a sub-level (the 1e-9
-tie). The report's `scallop_levels` counts the sub-levels that cut, and
+tie). Under `slope_from_deg` a part is kept only where its greatest contact
+angle is at least that angle, so a sub-level whose bound `P / D - 1e-9` is at
+most `sin(slope_from_deg)` keeps nothing and is not planned at all (#398): on
+the steep half of `steep_and_shallow` only the shallow depths that can still
+cut are contoured (the toolpath is the same; the planning time is not spent
+on empty levels). The report's `scallop_levels` counts the sub-levels that cut, and
 `scallop_from_deg` is the contact angle below which the bound is NOT claimed
 (`asin(min(1, stepdown_mm / (2^K D)))`, K the deepest sub-level); ball end
 mills only — flat and bull-nose reports have neither field. The cost: at
@@ -2378,13 +2439,83 @@ cut = camlib.ThermalCut("plasma", torch, parts, feed_mm_min=2500, cut_height_mm=
 - **Direction**: outlines clockwise, holes counter-clockwise (the part on the
   right of travel, the good side of a plasma arc with clockwise swirl);
   `reverse=True` swaps both.
-- **Leads**: `Lead(length_mm, radius_mm)`: a straight part and a tangent arc,
-  both in the scrap. `overcut_mm` cuts past the start; a negative value starts
-  the lead-out that far before the loop closes (negative overburn, the
-  Hypertherm recommendation for holes with an arc lead-in). A loop starts at
-  its first vertex; where the leads there would leave the scrap (a corner of a
-  straight-edged hole), they move to the middle of the longest edge whose
-  leads are clear (reported).
+- **Leads**: a lead-in runs from the pierce point onto the loop, a lead-out
+  from the loop into the scrap; one `Lead` describes either, read from the cut
+  outward, and both lie in the scrap. The shapes are those cutting CAM offers
+  (#400):
+  - `Lead(length_mm, radius_mm)`: a straight part square to the edge, then a
+    quarter-turn arc tangent to the cut (either may be zero). Its programs
+    are what they were before the other shapes.
+  - `Lead.line(length_mm, angle_deg)`: straight, at `angle_deg` to the edge's
+    tangent, from 0 (in line with the edge, along its extension) to 90 (square
+    to it). An in-line lead-out is the in-line overrun along the cut. An
+    in-line lead-in belongs at a corner (below): on a straight edge its
+    pierce would lie on the kerf path, against the part, and is refused by
+    the pierce clearance.
+  - `Lead.arc(radius_mm, sweep_deg)`: a tangent arc of that sweep, more than 0
+    and at most 180 degrees (beyond a half turn the arc turns back towards the
+    cut).
+  - `Lead.line_arc(length_mm, radius_mm, sweep_deg=90)`: a straight part
+    tangent to an arc of that sweep: the lead-in runs the line, then the arc
+    onto the cut. `Lead.arc_line(radius_mm, length_mm, sweep_deg=90)` is the
+    same shape as a lead-out reads it, arc off the cut, then the line.
+    With the default quarter turn its leads are `Lead(length_mm, radius_mm)`'s.
+
+  Sources: Aerotech CADFusion 3.00.000 help, "Lead Moves" ("A lead move can be
+  a line or it can be a circular arc": a line with its angle and length, an
+  arc with the "full angle that the lead move sweeps through" and its radius);
+  Autodesk Fusion, "2D Contour reference", Linking tab (Lead-In Sweep Angle,
+  Horizontal Lead-In Radius, the Linear Lead-In Distance tangent to the arc
+  that the controller switches compensation on over, and the lead-out alike);
+  eCam, "Generic cutting module" (tangent arc, perpendicular, slant line and
+  "Extension", which puts the leads at a corner). How long: Hypertherm,
+  *Thick metal cutting techniques*, white paper 807850 r2, p. 8 ("as a general
+  rule lead-in length should be equal to the material thickness"); its p. 3
+  "dogleg" lead-out turns about 120 degrees into the skeleton, which these
+  shapes do not offer (an angle beyond 90 to the edge). None is assumed: the
+  lengths, radii, angles and sweeps are the caller's.
+
+  - **At a corner**: an in-line lead-in that meets the loop at a corner of the
+    kerf path (the arc the offset puts round a drawn outside corner, or its
+    end) starts the loop where that arc ends and comes in along the next
+    edge's extension, past the corner, through the scrap. With an in-line
+    lead-out too, the corner's arc is not cut: the lead-out runs on along the
+    previous edge's extension, and the two straight kerfs cross beyond the
+    corner. Each must run at least half a kerf past where the two edges' kerf
+    paths meet, so the corner is cut through, or the cut is refused naming the
+    lengths needed; `overcut_mm` must be 0 there (the lead-out is the overrun),
+    and wear or control compensation is refused with it (the path crosses
+    itself). A rectangle started at a corner with `Lead.line(6, 0)` both ways
+    cuts a square corner: lead-in along the bottom edge's extension, lead-out
+    down the side edge's.
+  - **Placement**: every shape is placed and proven like the plain lead: its
+    kerf clear of every part and its pierce keeping `pierce_clearance_mm`, at
+    the loop's start, at the start `lead_placement` chooses or at a declared
+    start (`starts=`), refused by name where it is not clear. A loop starts at
+    its first vertex; where the leads there would leave the scrap (a corner
+    of a straight-edged hole), they move to the middle of the longest edge
+    whose leads are clear, or, for an in-line lead-in, to the first of the
+    loop's corners where they are (reported). In a hole too small for its leads only
+    `Lead(length_mm, radius_mm)` moves its pierce to the hole's centre; a
+    shape of its own is refused there, by name. A common line is entered
+    straight along its line, `lead_in.length_mm` long, whatever the shape.
+  - **Compensation**: `compensation="wear"` turns G41/G42 on over the lead-in's
+    straight part and off over the lead-out's, so both need one (`Lead.arc`
+    has none and is refused). `compensation="control"` also needs the written
+    lead to run tangent into the cut: a straight part and an arc, so
+    `Lead.line` is refused there; its lead arcs are cut in pieces of at most a
+    quarter turn, like the loop's arcs.
+  - **Overcut and overrun**: `overcut_mm` cuts on round the loop past the
+    start (the loop's own path: on a straight edge, in line with it); a
+    negative value starts the lead-out that far before the loop closes
+    (negative overburn: Hypertherm, "Troubleshooting cut quality problems: hole
+    quality", a radiused lead-in "with a very small or negative lead-out"; a
+    short straight lead-in with "a small leadout (positive overburn)";
+    Hypertherm FAQ "How can I cut better holes?": "Don't program a lead-out;
+    instead, use an overburn technique ... staying on the hole radius").
+    `Lead.line(length_mm, 0)` as the lead-out is the straight overrun: at a
+    straight edge it continues along the cut, at a corner along the previous
+    edge's extension.
 - **Pierce**: each pierce point keeps `pierce_clearance_mm` (default one kerf)
   beyond half a kerf from every part. In a hole too small for the leads, the
   pierce moves to the hole center (reported).

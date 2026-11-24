@@ -1,7 +1,7 @@
 //! Adaptive, continuously checked parallel finishing of faceted upper surfaces.
 use crate::{
     facing::TraverseAxis,
-    motion::{Coolant, Curve, Event, Motion, MoveKind, SpindleDirection, Vec3},
+    motion::{Coolant, Curve, Event, Motion, MoveKind, Plane, SpindleDirection, Vec3},
     pocket::ResidualStatus,
     stock::{CancelSignal, Stock, StockSpec},
     surface::{PreparedSurface, SurfaceMesh, SurfaceWork},
@@ -16,6 +16,161 @@ mod scallop;
 pub use patterns::{FinishPattern, GeodesicSeed};
 /// One XY polyline of a scan pattern.
 type Pass = Vec<[f64; 2]>;
+
+fn raster_coordinate(
+    spec: &StockSpec,
+    radius: f64,
+    cross: usize,
+    rows: usize,
+    pitch: f64,
+    row: usize,
+) -> f64 {
+    if row + 1 == rows {
+        spec.max_mm[cross] + radius
+    } else {
+        spec.min_mm[cross] - radius + row as f64 * pitch
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slope_raster_coordinates(
+    mesh: &SurfaceMesh,
+    cross: usize,
+    start: f64,
+    end: f64,
+    step: f64,
+    reach: f64,
+    guard: f64,
+    cancel: &impl CancelSignal,
+) -> Result<Vec<f64>, String> {
+    use std::{cmp::Reverse, collections::BinaryHeap};
+    let span_bytes = mesh.triangles.len() as u128 * 40;
+    crate::resources::check_memory(span_bytes, "parallel slope spans")?;
+    let mut spans = Vec::with_capacity(mesh.triangles.len());
+    for &[a, b, c] in mesh.triangles.iter() {
+        if cancel.is_cancelled() {
+            return Err("parallel planning cancelled".into());
+        }
+        let u: Vec3 = std::array::from_fn(|k| b[k] - a[k]);
+        let v: Vec3 = std::array::from_fn(|k| c[k] - a[k]);
+        let nz = (u[0] * v[1] - u[1] * v[0]).abs();
+        if nz == 0. {
+            continue; // A vertical facet spans no area in plan.
+        }
+        let nc = if cross == 0 {
+            u[1] * v[2] - u[2] * v[1]
+        } else {
+            u[2] * v[0] - u[0] * v[2]
+        };
+        spans.push((
+            a[cross].min(b[cross]).min(c[cross]),
+            a[cross].max(b[cross]).max(c[cross]),
+            nz / metallic::hypot(nz, nc),
+        ));
+    }
+    spans.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    let mut positions = vec![start];
+    let mut position = start;
+    // The span budget includes one heap entry per facet. Reserve it here so
+    // geometric capacity growth cannot exceed that bound on a wide strip.
+    let mut active = BinaryHeap::new();
+    active
+        .try_reserve_exact(spans.len())
+        .map_err(|err| format!("parallel slope spans allocation failed: {err}"))?;
+    let mut next = 0;
+    while position < end {
+        if cancel.is_cancelled() {
+            return Err("parallel planning cancelled".into());
+        }
+        // A contact can lie to either side of the cutter's centre line.
+        // Test the entire proposed interval, including its cutter halo.
+        while next < spans.len() && spans[next].0 <= position + step + reach {
+            // Positive finite cosines have the same order as their bits.
+            active.push(Reverse((spans[next].2.to_bits(), next)));
+            next += 1;
+        }
+        while active
+            .peek()
+            .is_some_and(|&Reverse((_, i))| spans[i].1 < position - reach)
+        {
+            active.pop();
+        }
+        let pitch = step
+            * active
+                .peek()
+                .map_or(1., |&Reverse((bits, _))| f64::from_bits(bits));
+        if pitch <= guard || !pitch.is_finite() {
+            return Err("slope-aware parallel stepover falls below the planning tolerance; use a separate steep-area operation".into());
+        }
+        position = (position + pitch).min(end);
+        if positions.len() == positions.capacity() {
+            crate::resources::check_memory(
+                span_bytes + positions.len() as u128 * 16,
+                "parallel slope-aware rows",
+            )?;
+            positions
+                .try_reserve_exact(positions.len())
+                .map_err(|err| format!("parallel slope-aware rows allocation failed: {err}"))?;
+        }
+        positions.push(position);
+    }
+    Ok(positions)
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+
+    #[test]
+    fn steep_facet_row_coordinate_is_reproducible() {
+        let mesh = SurfaceMesh {
+            version: 1,
+            units: "mm".into(),
+            triangles: vec![[[0., 0., 0.], [1., 0., 0.], [0., 11., 261.]]].into(),
+            surface_error_mm: 0.,
+            source: serde_json::Value::Null,
+        };
+        let rows = slope_raster_coordinates(
+            &mesh,
+            1,
+            0.,
+            1.,
+            1.,
+            1.,
+            1e-5,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        // Cross-track projection 11/hypot(11,261); the host norm can
+        // differ in the last bit of the generated cutter coordinate.
+        assert_eq!(rows[1].to_bits(), 0x3fa5_8f35_2c29_98e4);
+    }
+
+    #[test]
+    fn projected_spacing_tracks_local_cross_slope() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mesh = SurfaceMesh {
+            version: 1,
+            units: "mm".into(),
+            triangles: vec![
+                [[0., 0., 0.], [2., 0., 0.], [0., 10., 0.]],
+                [[0., 10., 0.], [2., 10., 0.], [0., 20., 10.]],
+            ]
+            .into(),
+            surface_error_mm: 0.,
+            source: serde_json::Value::Null,
+        };
+        let rows = slope_raster_coordinates(&mesh, 1, 0., 20., 1., 1., 1e-5, &cancel).unwrap();
+        assert_eq!(&rows[..2], &[0., 1.]);
+        assert_eq!(rows.last(), Some(&20.));
+        let narrow = 1. / 2f64.sqrt();
+        for pair in rows.windows(2).filter(|pair| pair[0] >= 8.) {
+            assert!(pair[1] - pair[0] <= narrow + 1e-12, "{pair:?}");
+        }
+        let along = slope_raster_coordinates(&mesh, 0, 0., 2., 1., 1., 1e-5, &cancel).unwrap();
+        assert_eq!(along, vec![0., 1., 2.]);
+    }
+}
 
 /// Whole-stock upper-height premise for a finishing cutter after roughing.
 /// This reports actual conservative stock, not the nominal CAD surface height.
@@ -102,6 +257,9 @@ pub struct ParallelOperation<G = SurfaceMesh> {
     /// project, which require 0.
     #[serde(default)]
     pub stepover_mm: f64,
+    /// Fit constant-height XY arcs inside the existing path-error budget.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fit_arcs: bool,
     pub clearance_z_mm: f64,
     /// Raster row direction.
     #[serde(default = "default_axis")]
@@ -121,6 +279,10 @@ pub struct ParallelOperation<G = SurfaceMesh> {
     /// Issue #175.
     #[serde(default, skip_serializing_if = "is_false")]
     pub one_way: bool,
+    /// Treat the raster stepover as a flat-surface maximum and project it
+    /// onto each strip using the maximum cross-track facet slope.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub slope_aware_stepover: bool,
     #[serde(default, skip_serializing_if = "FinishPattern::is_raster")]
     pub pattern: FinishPattern,
     /// Contact (slope) angle limits, degrees from the tool axis: cut only
@@ -365,10 +527,12 @@ impl<G> ParallelOperation<G> {
             surface: f(self.surface)?,
             floor_z_mm: self.floor_z_mm,
             stepover_mm: self.stepover_mm,
+            fit_arcs: self.fit_arcs,
             clearance_z_mm: self.clearance_z_mm,
             axis: self.axis,
             reverse: self.reverse,
             one_way: self.one_way,
+            slope_aware_stepover: self.slope_aware_stepover,
             pattern: self.pattern,
             slope_from_deg: self.slope_from_deg,
             slope_to_deg: self.slope_to_deg,
@@ -403,10 +567,15 @@ pub struct ParallelReport {
     pub triangles: usize,
     pub rows: usize,
     pub row_pitch_mm: f64,
+    #[serde(skip_serializing_if = "is_false")]
+    pub slope_aware_stepover: bool,
     pub rows_completed: usize,
     pub cut_segments: usize,
     pub adaptive_splits: usize,
     pub compacted_vertices: usize,
+    /// Constant-height XY cuts accepted by the arc proof.
+    #[serde(skip_serializing_if = "no_entries")]
+    pub fitted_arcs: usize,
     pub reused_segments: usize,
     pub vertical_transitions: usize,
     pub transition_moves: usize,
@@ -559,6 +728,8 @@ pub struct ParallelPlan {
     /// Current pass, lifted onto the surface; `cursor` is the next chord.
     vertices: Vec<Vec3>,
     cursor: usize,
+    /// Cross-track coordinates of the optional variable-spacing raster.
+    raster_coordinates: Vec<f64>,
     /// XY polylines of a non-raster pattern (entered by a vertical plunge).
     passes: Vec<Pass>,
     transition: Vec<(Vec3, MoveKind)>,
@@ -910,7 +1081,33 @@ impl ParallelPlan {
         // Scan the rounded rectangle expanded by the actual ball radius so
         // sloped edge contacts can lie outside the model's XY footprint.
         let span = spec.max_mm[cross] - spec.min_mm[cross] + 2. * radius;
+        let inflated =
+            radius + op.stock_to_leave_mm + op.surface.surface_error_mm + op.safety_margin_mm;
+        let raster_coordinates = if op.slope_aware_stepover {
+            if !op.pattern.is_raster() || !matches!(cutter.shape, CutterShape::Ball) {
+                return Err("slope-aware stepover requires a ball-end parallel raster".into());
+            }
+            slope_raster_coordinates(
+                mesh,
+                cross,
+                spec.min_mm[cross] - radius,
+                spec.max_mm[cross] + radius,
+                op.stepover_mm,
+                inflated,
+                guard,
+                cancel,
+            )?
+        } else {
+            vec![]
+        };
         let (rows, pitch) = match &op.pattern {
+            FinishPattern::Raster if !raster_coordinates.is_empty() => (
+                raster_coordinates.len(),
+                raster_coordinates
+                    .windows(2)
+                    .map(|w| w[1] - w[0])
+                    .fold(0., f64::max),
+            ),
             FinishPattern::Raster => {
                 let intervals = (span / op.stepover_mm).ceil() as usize;
                 if intervals == 0 {
@@ -926,8 +1123,6 @@ impl ParallelPlan {
                 (passes.len(), op.stepover_mm)
             }
         };
-        let inflated =
-            radius + op.stock_to_leave_mm + op.surface.surface_error_mm + op.safety_margin_mm;
         let mut slope_work = SurfaceWork::default();
         let corner = match cutter.shape {
             CutterShape::Flat => Some(0.),
@@ -1073,7 +1268,13 @@ impl ParallelPlan {
         let rows = if limits.is_some() || rest.is_some() || region_limits.is_some() {
             if op.pattern.is_raster() {
                 passes = (0..rows)
-                    .map(|row| Self::raster_row(&op, spec, radius, axis, rows, pitch, row))
+                    .map(|row| {
+                        let coordinate =
+                            raster_coordinates.get(row).copied().unwrap_or_else(|| {
+                                raster_coordinate(spec, radius, cross, rows, pitch, row)
+                            });
+                        Self::raster_row(&op, spec, radius, axis, coordinate, row)
+                    })
                     .collect();
             }
             let spacing = if op.stepover_mm > 0. {
@@ -1170,10 +1371,12 @@ impl ParallelPlan {
             triangles: mesh.triangles.len(),
             rows,
             row_pitch_mm: pitch,
+            slope_aware_stepover: op.slope_aware_stepover,
             rows_completed: 0,
             cut_segments: 0,
             adaptive_splits: 0,
             compacted_vertices: 0,
+            fitted_arcs: 0,
             reused_segments: 0,
             vertical_transitions: 0,
             transition_moves: 0,
@@ -1226,6 +1429,7 @@ impl ParallelPlan {
             stack: vec![],
             vertices: vec![],
             cursor: 0,
+            raster_coordinates,
             passes,
             transition: vec![],
             ramp: Default::default(),
@@ -1308,7 +1512,16 @@ impl ParallelPlan {
     ) -> Result<(Vec<Pass>, f64), String> {
         let lo = [spec.min_mm[0] - radius, spec.min_mm[1] - radius];
         let hi = [spec.max_mm[0] + radius, spec.max_mm[1] + radius];
-        let sagitta = op.path_error_mm;
+        // Reserve part of the pattern error for the optional fitted arc.
+        let sagitta = if op.fit_arcs
+            && op.limits.is_none()
+            && op.rest_threshold_mm.is_none()
+            && (op.slope_from_deg, op.slope_to_deg) == (0., 90.)
+        {
+            op.path_error_mm / 4.
+        } else {
+            op.path_error_mm
+        };
         let guard = 16. * op.tolerance_mm;
         let finite = |v: &[f64]| v.iter().all(|x| x.is_finite() && x.abs() <= 1e6);
         let radii = |center: [f64; 2], inner: f64, outer: Option<f64>| {
@@ -1435,17 +1648,11 @@ impl ParallelPlan {
         spec: &StockSpec,
         radius: f64,
         axis: usize,
-        rows: usize,
-        pitch: f64,
+        c: f64,
         row: usize,
     ) -> Vec<[f64; 2]> {
         let cross = 1 - axis;
         let reverse = op.row_reversed(row);
-        let c = if row + 1 == rows {
-            spec.max_mm[cross] + radius
-        } else {
-            spec.min_mm[cross] - radius + row as f64 * pitch
-        };
         let outside = (spec.min_mm[cross] - c).max(c - spec.max_mm[cross]).max(0.);
         let extension = (radius * radius - outside * outside).max(0.).sqrt();
         let (lo, hi) = (spec.min_mm[axis] - extension, spec.max_mm[axis] + extension);
@@ -1469,11 +1676,20 @@ impl ParallelPlan {
         let mut b = [0.; 3];
         let cross = 1 - self.axis;
         let reverse = self.op.row_reversed(self.row);
-        a[cross] = if self.row + 1 == self.report.rows {
-            self.spec.max_mm[cross] + self.radius
-        } else {
-            self.spec.min_mm[cross] - self.radius + self.row as f64 * self.report.row_pitch_mm
-        };
+        a[cross] = self
+            .raster_coordinates
+            .get(self.row)
+            .copied()
+            .unwrap_or_else(|| {
+                raster_coordinate(
+                    &self.spec,
+                    self.radius,
+                    cross,
+                    self.report.rows,
+                    self.report.row_pitch_mm,
+                    self.row,
+                )
+            });
         b[cross] = a[cross];
         let outside = (self.spec.min_mm[cross] - a[cross])
             .max(a[cross] - self.spec.max_mm[cross])
@@ -1615,6 +1831,120 @@ impl ParallelPlan {
             [s.b[0], s.b[1], s.a[2]]
         }
     }
+    /// Try a bounded run of whole lifted segments. The tube enclosing the
+    /// arc is checked with an enlarged protected ball and a smaller contact
+    /// ball. These bound gouge and path excess at every point of the arc,
+    /// without sampling the arc or spending the same error allowance twice.
+    fn fitted_cut(&mut self, cancel: &impl CancelSignal) -> Result<Option<Motion>, String> {
+        if !self.op.fit_arcs
+            || self.flat.is_some()
+            || self.op.pattern.is_raster()
+            || self.op.limits.is_some()
+            || self.op.rest_threshold_mm.is_some()
+            || self.move_depth.is_some()
+            || (self.op.slope_from_deg, self.op.slope_to_deg) != (0., 90.)
+            || !self.transition.is_empty()
+            || !self.stack.is_empty()
+            || self.prepared_segment.is_some()
+        {
+            return Ok(None);
+        }
+        let budget = (self.op.path_error_mm / 2.).min((self.inflated - self.protected) / 2.);
+        let mut work = self.report.work;
+        let vertices = &self.vertices[self.cursor..];
+        let Some(&start) = vertices.first() else {
+            return Ok(None);
+        };
+        if start[0] != self.position[0]
+            || start[1] != self.position[1]
+            || start[2] - self.tip_offset != self.position[2]
+        {
+            return Ok(None);
+        }
+        let n = vertices
+            .iter()
+            .take(17)
+            .take_while(|p| p[2] == start[2])
+            .count();
+        // A shorter attempt keeps the same start and never consumes a
+        // segment until an arc has been proved.
+        for count in [n, n.div_ceil(2), n.div_ceil(4)] {
+            if count < 4 || budget <= 0. {
+                break;
+            }
+            let vertices = &vertices[..count];
+            let xy: Vec<_> = vertices.iter().map(|p| [p[0], p[1]]).collect();
+            let Some((center, sweep, band)) = arc_band(&xy, budget) else {
+                continue;
+            };
+            let mut maximum: f64 = 0.;
+            let mut certified = true;
+            for w in vertices.windows(2) {
+                if !self.surface.segment_clear(
+                    w[0],
+                    w[1],
+                    self.protected + band,
+                    &mut work,
+                    cancel,
+                )? {
+                    certified = false;
+                    break;
+                }
+                let excess = self.surface.horizontal_excess_bound(
+                    w[0],
+                    w[1],
+                    self.inflated - band,
+                    self.op.path_error_mm,
+                    &mut work,
+                    cancel,
+                )?;
+                let Some(excess) = excess.filter(|e| *e <= self.op.path_error_mm) else {
+                    certified = false;
+                    break;
+                };
+                maximum = maximum.max(excess);
+            }
+            if !certified {
+                continue;
+            }
+            let mut end = vertices[count - 1];
+            end[2] -= self.tip_offset;
+            let curve = Curve::Arc {
+                start: self.position,
+                end,
+                center: [center[0], center[1], end[2]],
+                plane: Plane::Xy,
+                sweep_rad: sweep,
+            };
+            let Ok(prepared) = curve.prepare(self.op.tolerance_mm) else {
+                continue;
+            };
+            let bounds = prepared.bounds();
+            if (0..2).any(|k| {
+                bounds.min[k] < self.spec.min_mm[k] - self.radius
+                    || bounds.max[k] > self.spec.max_mm[k] + self.radius
+            }) {
+                continue;
+            }
+            if cancel.is_cancelled() {
+                return Err("parallel planning cancelled".into());
+            }
+            let result = self.emit_curve(end, MoveKind::Cut, None, curve)?;
+            self.cursor += count - 1;
+            self.report.work = work;
+            self.report.max_certified_path_excess_mm = Some(
+                self.report
+                    .max_certified_path_excess_mm
+                    .unwrap_or(0.)
+                    .max(maximum),
+            );
+            self.report.fitted_arcs += 1;
+            return Ok(result);
+        }
+        self.report.work = work;
+        Ok(None)
+    }
+
     fn next_cut(&mut self, cancel: &impl CancelSignal) -> Result<Option<(Vec3, MoveKind)>, String> {
         if cancel.is_cancelled() {
             return Err("parallel planning cancelled".into());
@@ -2165,13 +2495,22 @@ impl ParallelPlan {
         if end == self.position || d < 1e-9 {
             return Ok(None);
         }
-        if self.next_id == u64::MAX {
-            return Err("parallel motion id space exhausted".into());
-        }
         let curve = Curve::Line {
             start: self.position,
             end,
         };
+        self.emit_curve(end, kind, plunge_feed, curve)
+    }
+    fn emit_curve(
+        &mut self,
+        end: Vec3,
+        kind: MoveKind,
+        plunge_feed: Option<f64>,
+        curve: Curve,
+    ) -> Result<Option<Motion>, String> {
+        if self.next_id == u64::MAX {
+            return Err("parallel motion id space exhausted".into());
+        }
         curve.prepare(self.op.tolerance_mm)?;
         let motion = Motion {
             id: self.next_id,
@@ -2293,24 +2632,31 @@ impl ParallelPlan {
                     self.phase = Phase::Cut;
                     result
                 }
-                Phase::Cut => match self.next_cut(cancel)? {
-                    Some((end, kind)) => {
-                        let r = self.emit(end, kind)?;
-                        if r.is_some() {
-                            if kind == MoveKind::Cut {
-                                self.report.cut_segments += 1;
-                            } else {
-                                self.report.transition_moves += 1;
+                Phase::Cut => {
+                    if let Some(arc) = self.fitted_cut(cancel)? {
+                        self.report.cut_segments += 1;
+                        Some(arc)
+                    } else {
+                        match self.next_cut(cancel)? {
+                            Some((end, kind)) => {
+                                let r = self.emit(end, kind)?;
+                                if r.is_some() {
+                                    if kind == MoveKind::Cut {
+                                        self.report.cut_segments += 1;
+                                    } else {
+                                        self.report.transition_moves += 1;
+                                    }
+                                }
+                                r
+                            }
+                            None => {
+                                self.report.rows_completed += 1;
+                                self.phase = Phase::Exit;
+                                None
                             }
                         }
-                        r
                     }
-                    None => {
-                        self.report.rows_completed += 1;
-                        self.phase = Phase::Exit;
-                        None
-                    }
-                },
+                }
                 Phase::Exit => {
                     let result = self.emit(
                         [
@@ -2367,6 +2713,69 @@ impl ParallelPlan {
             }
         }
     }
+}
+
+/// Two-way distance bound between the line run and arc. Each source chord
+/// differs from the chord of its radially projected ends by at most the
+/// larger endpoint shift. The intervening minor arc adds its sagitta.
+fn arc_band(xy: &[[f64; 2]], limit: f64) -> Option<([f64; 2], f64, f64)> {
+    let (center, sweep) = crate::flat::fit_circle_run(xy, limit, metallic::hypot, metallic::atan2)?;
+    if !(1e-8..=std::f64::consts::PI).contains(&sweep.abs()) {
+        return None;
+    }
+    let radius = metallic::hypot(xy[0][0] - center[0], xy[0][1] - center[1]);
+    let guard = 512. * f64::EPSILON * (1. + radius + center[0].abs() + center[1].abs());
+    let mut band: f64 = 0.;
+    for w in xy.windows(2) {
+        let [a, b] = std::array::from_fn(|i| [w[i][0] - center[0], w[i][1] - center[1]]);
+        let angle = metallic::atan2(a[0] * b[1] - a[1] * b[0], a[0] * b[0] + a[1] * b[1]);
+        if angle * sweep <= 0. || angle.abs() >= std::f64::consts::FRAC_PI_2 {
+            return None;
+        }
+        let shift = (metallic::hypot(a[0], a[1]) - radius)
+            .abs()
+            .max((metallic::hypot(b[0], b[1]) - radius).abs());
+        band = band.max(shift + 2. * radius * metallic::sin(angle / 4.).powi(2) + guard);
+    }
+    (band <= limit).then_some((center, sweep, band))
+}
+
+#[cfg(test)]
+#[test]
+fn arc_band_tests_the_interior_and_refuses_backtracking() {
+    let run = |step: f64| {
+        (0..=8)
+            .map(|i| {
+                let (sin, cos) = (i as f64 * step).sin_cos();
+                [8. * cos, 8. * sin]
+            })
+            .collect::<Vec<_>>()
+    };
+    let dense = run(0.01);
+    assert!(arc_band(&dense, 0.001).is_some());
+    // All vertices sit exactly on a circle. The interiors of the chords
+    // are too far from the arc and must still refuse.
+    assert!(arc_band(&run(0.06), 0.001).is_none());
+    let mut turns_back = dense;
+    turns_back.swap(4, 5);
+    assert!(arc_band(&turns_back, 0.001).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn arc_sweep_is_reproducible_on_the_unit_circle() {
+    // Rational unit-circle points, parameterized by t = i/28. The sweep
+    // changes by two ulps with host atan2 on Linux.
+    let points: Vec<_> = (0..4)
+        .map(|i| {
+            let i = f64::from(i);
+            let den = 784. + i * i;
+            [(784. - i * i) / den, 56. * i / den]
+        })
+        .collect();
+    let (center, sweep, _) = arc_band(&points, 0.001).unwrap();
+    assert_eq!(center, [0., 0.]);
+    assert_eq!(sweep.to_bits(), 0x3fcb_5307_6f58_37a8);
 }
 
 /// The XY distance of `q` from the chord `a`-`b`.
