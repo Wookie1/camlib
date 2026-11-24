@@ -1587,6 +1587,15 @@ climb milling and on the left conventional: `axis="x"` cuts conventional and
 cuts uphill or downhill; that depends on the surface, not on this option.)
 The report has `one_way: true` when it is set.
 
+Set `slope_aware_stepover=True` to use the ball-end raster's `stepover_mm`
+as the flat-surface maximum. Each interval is reduced by the cosine of
+the greatest cross-track facet slope over its proposed strip and cutter
+reach. This follows the [steep-area stepover approach in Autodesk Parallel
+finishing](https://help.autodesk.com/view/fusion360/ENU/?contextId=MFG-REF-3D-PARALLEL-CMD).
+The report records this option and the maximum generated row pitch.
+Whole-target ridge height still requires the independent material check,
+including at joins, fillets, and unreachable areas.
+
 Depth: when the remaining stock stands no higher above `floor_z_mm` than the
 cutting length, every pass is within the flutes. Where it stands higher (a
 part taller than the flutes, after roughing), each feed move is checked
