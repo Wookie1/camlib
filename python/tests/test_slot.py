@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 from camlib import Engine
-from camlib.operations import Pocket, TrochoidalSlot
+from camlib.operations import HelicalEntry, Pocket, TrochoidalSlot
 from camlib.planar import Boundary, Component, PlanarRegion
 from camlib.playback import Cursor, Player, RecordedRun
 from camlib.simulation import OperationUpdate, Simulation, SimulationError, StockSpec
@@ -30,6 +30,7 @@ def slot():
         tool_number=1,
         length_register=1,
         coolant="flood",
+        entry=HelicalEntry(3),
     )
 
 
@@ -151,6 +152,69 @@ class TrochoidalSlotTest(unittest.TestCase):
             self.assertEqual(sim.state.completed, 0)
 
 
+class SlotHelixEntryTest(unittest.TestCase):
+    """Each depth pass plunges only through air, then helixes down; no entry, no plunge into stock."""
+
+    def run_slot(self, op):
+        with Simulation(
+            StockSpec((0, 0, 0), (24, 24, 10), 0.25),
+            (tool(),),
+            operations=(op,),
+            revision="helix-slot",
+            initial_position_mm=(0, 0, 12),
+        ) as sim:
+            reports, motions = [], []
+            for update in sim.run_operations():
+                if isinstance(update, OperationUpdate):
+                    reports.append(update.report)
+                else:
+                    motions.append(update.motion)
+            self.assertTrue(sim.state.finished)
+            return reports[-1], motions
+
+    def test_entry_is_sent_as_a_helix(self):
+        self.assertEqual(slot().to_dict()["entry"], dict(kind="helix", angle_rad=math.radians(3)))
+        from dataclasses import replace
+
+        self.assertNotIn("entry", replace(slot(), entry=None).to_dict())
+
+    def test_each_pass_plunges_through_air_then_helixes_down(self):
+        report, motions = self.run_slot(slot())
+        self.assertEqual(report["helical_entries"], 2)
+        self.assertGreater(report["helix_turns"], 2)
+        self.assertIn("helix", report["seed_entry_policy"])
+        # The first pass plunges to the stock top, the second to the depth the first cut.
+        self.assertAlmostEqual(report["max_air_plunge_mm"], 1.0, places=9)
+
+    def test_without_an_entry_a_plunge_into_stock_is_refused(self):
+        from dataclasses import replace
+
+        with Simulation(
+            StockSpec((0, 0, 0), (24, 24, 10), 0.25),
+            (tool(),),
+            operations=(replace(slot(), entry=None),),
+            revision="no-entry-slot",
+            initial_position_mm=(0, 0, 12),
+        ) as sim:
+            with self.assertRaisesRegex(SimulationError, "depth pass 1 would plunge .*HelicalEntry"):
+                list(sim.run_operations())
+
+    def test_a_ramp_entry_is_refused(self):
+        from dataclasses import replace
+
+        from camlib.operations import RampEntry
+
+        with Simulation(
+            StockSpec((0, 0, 0), (24, 24, 10), 0.25),
+            (tool(),),
+            operations=(replace(slot(), entry=RampEntry(3)),),
+            revision="ramp-slot",
+            initial_position_mm=(0, 0, 12),
+        ) as sim:
+            with self.assertRaisesRegex(SimulationError, "HelicalEntry only"):
+                list(sim.run_operations())
+
+
 S_PATH = ((6, 12, 1), (20, 12, -1), (34, 12, 0))
 
 
@@ -163,6 +227,7 @@ def s_slot(**overrides):
         length_register=1,
         coolant="flood",
         path_mm=S_PATH,
+        entry=HelicalEntry(3),
     )
     values.update(overrides)
     return TrochoidalSlot("s", tool(), None, None, 6, 10, 9, 1, 12, **values)

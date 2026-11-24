@@ -40,6 +40,11 @@ use std::f64::consts::TAU;
 /// per-query allowance is unbounded in total; once the shared budget is
 /// spent the plan keeps its bounded orbits and queries no more.
 const STOCK_QUERY_WORK: usize = 1_000_000;
+/// History-clearance work one slot operation may spend proving its passes'
+/// straight plunges clear, shared by every pass (each pass's proof revisits
+/// the history of the passes before it); out of work a plunge is not proven
+/// and the pass takes its helix or is refused.
+const PLUNGE_PROOF_WORK: u64 = 1_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +93,14 @@ pub struct TrochoidalSlotOperation {
     /// whole orbits at feed_mm_min (today's output, unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub air_feed_mm_min: Option<f64>,
+    /// How each depth pass enters below the stock: a `HelicalEntry` on the
+    /// orbit circle (radius rho, the op's sense, its own angle and feed).
+    /// The cutter plunges at the entry feed only down to the highest
+    /// stock the entry's footprint (the disk of radius rho + r) can touch,
+    /// and helixes from there; no entry declared, a plunge into stock is
+    /// refused, naming the pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<crate::entry::PocketEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +121,14 @@ pub struct SlotReport {
     pub stock_clear_advances: usize,
     pub stock_query_work: usize,
     pub stock_query_work_exhausted: bool,
+    /// History-proof work spent on straight-plunge proofs, all passes
+    /// together (at most `PLUNGE_PROOF_WORK`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub plunge_proof_work: usize,
+    /// The shared plunge-proof budget ran out: later passes were not proven
+    /// clear for a straight plunge (they take their helix or are refused).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub plunge_proof_work_exhausted: bool,
     /// Lines and arcs of the centreline (1 for a straight slot).
     pub path_pieces: usize,
     /// Links across corners, inside the vertex orbit's disk.
@@ -131,6 +152,18 @@ pub struct SlotReport {
     pub return_chords: usize,
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub return_chord_saved_mm: f64,
+    /// Depth passes entered on a helix, and its turns in all.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub helical_entries: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub helix_turns: usize,
+    /// The deepest straight plunge below the stock top, each one proven
+    /// to run through air (no stock under the entry's footprint).
+    pub max_air_plunge_mm: f64,
+}
+
+fn helix(op: &TrochoidalSlotOperation) -> Option<&crate::entry::HelicalEntry> {
+    op.entry.as_ref().and_then(|e| e.helix())
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -383,6 +416,8 @@ pub struct SlotPlan {
     expected_generation: Option<u64>,
     /// What is left of `STOCK_QUERY_WORK` for the stock-clear fast path.
     query_work_left: usize,
+    /// What is left of `PLUNGE_PROOF_WORK`, shared by every pass's plunge proof.
+    plunge_work_left: u64,
     /// Centre of the most recent completed orbit at this depth (seed or
     /// controlled): the predecessor the next controlled orbit's proven-air
     /// proof needs. None at a new depth pass and after a stock-clear
@@ -395,7 +430,17 @@ pub struct SlotPlan {
     /// Motions of the orbit piece being emitted: one cut arc, or the
     /// rounded return of a proven-air piece (marked true).
     pending: VecDeque<(Curve, bool)>,
+    /// The helix of the current pass's entry (phase 10): turns left, and
+    /// the z each remaining turn ends at is spread evenly down to `z`.
+    helix: Option<HelixDescent>,
     report: SlotReport,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HelixDescent {
+    top: f64,
+    turns: usize,
+    done: usize,
 }
 
 impl SlotPlan {
@@ -546,6 +591,26 @@ impl SlotPlan {
                     ),
                 ),
                 (
+                    match &op.entry {
+                        None | Some(crate::entry::PocketEntry::Helix(_)) => true,
+                        Some(_) => false,
+                    },
+                    "a trochoidal slot enters on a HelicalEntry only (the helix runs on the orbit circle); \
+                     StockEdgeEntry and RampEntry are not supported here"
+                        .into(),
+                ),
+                (
+                    helix(&op).is_none_or(|h| {
+                        h.validate(f64::INFINITY, op.tolerance_mm, op.entry_feed_mm_min)
+                            .is_ok()
+                            && h.radius_mm.is_none()
+                            && h.clockwise.is_none_or(|c| c == op.clockwise)
+                    }),
+                    "the slot's HelicalEntry needs a valid angle and feed, no radius_mm (it runs on \
+                     the orbit circle, width/2 - tool radius) and no clockwise other than the slot's"
+                        .into(),
+                ),
+                (
                     (1..=9).contains(&op.work_offset),
                     format!("work_offset {} must be 1..9", op.work_offset),
                 ),
@@ -621,12 +686,18 @@ impl SlotPlan {
             boundary_underclearance_bound_mm: op.boundary_tolerance_mm,
             bounded_advance_mm: pitch,
             max_bounded_engagement_deg: 0.,
-            seed_entry_policy: "center_cutting_plunge_and_seed_orbit_at_entry_feed; seed engagement is NOT limited",
+            seed_entry_policy: if op.entry.is_some() {
+                "plunge_through_air_then_declared_helix_on_the_orbit_circle_and_seed_orbit_at_entry_feed; seed engagement is NOT limited"
+            } else {
+                "plunge_only_through_air_else_refused_and_seed_orbit_at_entry_feed; seed engagement is NOT limited"
+            },
             seed_orbits: 0,
             controlled_orbits: 0,
             stock_clear_advances: 0,
             stock_query_work: 0,
             stock_query_work_exhausted: false,
+            plunge_proof_work: 0,
+            plunge_proof_work_exhausted: false,
             path_pieces: pieces.len(),
             corner_links: 0,
             corner_arcs: 0,
@@ -634,6 +705,9 @@ impl SlotPlan {
             air_fed_mm: 0.,
             return_chords: 0,
             return_chord_saved_mm: 0.,
+            helical_entries: 0,
+            helix_turns: 0,
+            max_air_plunge_mm: 0.,
         };
         let heights = crate::heights::Heights::resolve(
             op.clearance_z_mm,
@@ -661,9 +735,11 @@ impl SlotPlan {
             next_id: first_motion_id,
             expected_generation: None,
             query_work_left: STOCK_QUERY_WORK,
+            plunge_work_left: PLUNGE_PROOF_WORK,
             prev_center: None,
             orbit_pieces: VecDeque::new(),
             pending: VecDeque::new(),
+            helix: None,
             report,
         })
     }
@@ -1002,15 +1078,151 @@ impl SlotPlan {
                     false,
                     2,
                 ),
-                2 => (
-                    Curve::Line {
+                // Plunge through air only: down to the highest stock the
+                // entry's footprint (the seed orbit's disk, radius rho + r)
+                // can touch, then the declared helix (phase 10); without
+                // one, stock above the pass is refused. Below the first
+                // pass the previous pass's seed orbit at this same centre
+                // swept exactly that disk down to its own depth, so the
+                // plunge reaches at least that level (the grid's whole
+                // cells at the disk's rim would hide it).
+                2 => {
+                    let c = self.center(0., z);
+                    let previous = self.op.top_z_mm - self.pass as f64 * self.op.stepdown_mm;
+                    let top = stock
+                        .top_under_disk([c[0], c[1]], self.radius + self.cutter_radius)
+                        .min(previous);
+                    let air = top.max(z);
+                    // A straight plunge to the pass depth only where it is
+                    // proven to cut nothing: no cell's upper bound under the
+                    // disk stands above the pass (a conservative bound), or
+                    // the committed cutter sweeps prove the cutter's disk at
+                    // the plunge's end clear from the pass depth up (the flat
+                    // air-move proof, footprint by footprint from the
+                    // recorded sweeps, where a floor cut to exactly this
+                    // depth may be touched). A cut to this depth leaves its
+                    // cells' upper bounds a sweep's rounding above it, and a
+                    // cut elsewhere in the same cell proves nothing here. Any
+                    // other stock above the pass, however thin, takes the
+                    // helix or is refused. The proofs of all passes share one
+                    // work budget: out of it, a pass is not proven.
+                    let end = self.orbit_start(0., z);
+                    let at_end = Motion {
+                        id: self.next_id,
+                        operation: self.op.id.clone(),
+                        tool: self.op.tool.clone(),
+                        kind: MoveKind::Air,
+                        curve: Curve::Line { start: end, end },
+                        feed_mm_min: Some(self.op.entry_feed_mm_min),
+                    };
+                    let proven = air <= z || {
+                        let before = self.plunge_work_left;
+                        let proven = if self.plunge_work_left > 0 {
+                            stock.flat_history_clearance(
+                                &at_end,
+                                self.cutter_radius,
+                                &mut self.plunge_work_left,
+                                cancel,
+                            )
+                        } else {
+                            Ok(false)
+                        };
+                        // Counted before a cancelled proof returns: the plan's
+                        // budget is spent either way.
+                        self.report.plunge_proof_work += (before - self.plunge_work_left) as usize;
+                        self.report.plunge_proof_work_exhausted |= self.plunge_work_left == 0;
+                        proven?
+                    };
+                    let helix_top = if proven {
+                        z
+                    } else if let Some(h) = helix(&self.op) {
+                        let turns = h.turns(self.radius, air - z).map_err(|e| {
+                            format!("slot {}: depth pass {}: {e}", self.op.id, self.pass + 1)
+                        })?;
+                        self.helix = Some(HelixDescent {
+                            top: air,
+                            turns,
+                            done: 0,
+                        });
+                        air
+                    } else if self.plunge_work_left == 0 {
+                        return Err(format!(
+                            "slot {}: depth pass {}: the stock up to Z{:.4} under the orbit's disk at \
+                             ({:.4}, {:.4}) is not proven clear of a plunge to Z{:.4}: the plunge proofs' \
+                             shared work budget ({PLUNGE_PROOF_WORK} visits) is spent; declare \
+                             entry=HelicalEntry(angle) to helix down on the orbit circle, or use fewer, \
+                             deeper passes",
+                            self.op.id,
+                            self.pass + 1,
+                            top,
+                            c[0],
+                            c[1],
+                            z
+                        ));
+                    } else {
+                        return Err(format!(
+                            "slot {}: depth pass {} would plunge up to {:.4} mm into stock at ({:.4}, {:.4}): \
+                             the stock cells under the orbit's disk reach Z{:.4} over the pass at Z{:.4}, \
+                             and no committed cut proves the plunge's footprint clear (a cut elsewhere in \
+                             a cell does not, nor one to the pass depth that the cells round above it); \
+                             declare entry=HelicalEntry(angle) to helix down on the orbit circle, or, if \
+                             this stock is already cut to the pass depth, use a finer stock cell_size_mm",
+                            self.op.id,
+                            self.pass + 1,
+                            air - z,
+                            c[0],
+                            c[1],
+                            top,
+                            z
+                        ));
+                    };
+                    self.report.max_air_plunge_mm = self
+                        .report
+                        .max_air_plunge_mm
+                        .max(self.op.top_z_mm - helix_top);
+                    (
+                        Curve::Line {
+                            start: self.position,
+                            end: self.orbit_start(0., helix_top),
+                        },
+                        MoveKind::Plunge,
+                        true,
+                        if self.helix.is_some() { 10 } else { 3 },
+                    )
+                }
+                // One helix turn per motion on the orbit circle, at the
+                // entry's feed, ending at the orbit start at the pass depth.
+                10 => {
+                    let mut d = self.helix.expect("helix planned in phase 2");
+                    d.done += 1;
+                    let next = if d.done == d.turns {
+                        z
+                    } else {
+                        d.top - (d.top - z) * d.done as f64 / d.turns as f64
+                    };
+                    let center = self.center(0., self.position[2]);
+                    let curve = Curve::Helix {
                         start: self.position,
-                        end: self.orbit_start(0., z),
-                    },
-                    MoveKind::Plunge,
-                    true,
-                    3,
-                ),
+                        end: [self.position[0], self.position[1], next],
+                        center,
+                        plane: Plane::Xy,
+                        sweep_rad: if self.op.clockwise { -TAU } else { TAU },
+                    };
+                    let mut motion = self.emit(curve, MoveKind::Plunge, true)?;
+                    if let Some(feed) = helix(&self.op).and_then(|h| h.feed_mm_min) {
+                        motion.feed_mm_min = Some(feed);
+                    }
+                    self.report.helix_turns += 1;
+                    if d.done == d.turns {
+                        self.helix = None;
+                        self.report.helical_entries += 1;
+                        self.phase = 3;
+                    } else {
+                        self.helix = Some(d);
+                    }
+                    self.expected_generation = Some(stock.generation() + 1);
+                    return Ok(Some(motion));
+                }
                 3 => {
                     let center = self.center(self.distance, z);
                     let curve = Curve::Arc {

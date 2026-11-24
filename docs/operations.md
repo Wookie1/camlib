@@ -1231,8 +1231,30 @@ the circle with rounded ends. `entry_feed_mm_min` (150) is the entry feed.
 ```python
 # An S-shaped slot: two half turns of radius 7, tangent where they meet.
 TrochoidalSlot("s", tool, None, None, 6, 10, 8, 1, 12,
-               path_mm=((6, 12, 1), (20, 12, -1), (34, 12, 0)), ...)
+               path_mm=((6, 12, 1), (20, 12, -1), (34, 12, 0)),
+               entry=HelicalEntry(3), ...)
 ```
+
+- Entry: each depth pass plunges at `entry_feed_mm_min` only through air,
+  down to the highest stock the first orbit's disk (orbit radius + tool
+  radius) can touch, or to the depth the previous pass already cut there.
+  Below that it descends on `entry=HelicalEntry(angle_deg)`: whole turns
+  around the first orbit's circle, in the slot's sense, no steeper than the
+  angle, at the helix's `feed_mm_min` (default `entry_feed_mm_min`), then the
+  first orbit at depth. Leave `radius_mm` and `clockwise` unset (the helix
+  runs on the orbit circle in the slot's sense). Other entries are refused.
+  With no entry declared, a plunge into stock is refused, naming the pass;
+  over stock a previous cut already cleared, every pass plunges through air
+  and needs none. A plunge to the pass depth counts as through air only where
+  no stock cell under the first orbit's disk stands above the pass, or where
+  the committed cuts prove the plunging cutter's footprint clear (a cut
+  elsewhere in a cell proves nothing; that proof shares one work budget,
+  `plunge_proof_work`, across all passes, and `plunge_proof_work_exhausted`
+  says when it ran out). A refusal says which applies and how to go on: a
+  `HelicalEntry`, a finer stock `cell_size_mm` over stock already cut to the
+  pass depth, or fewer, deeper passes. The report counts `helical_entries` and
+  `helix_turns`, and `max_air_plunge_mm` is the deepest plunge below the stock
+  top.
 
 - `path_mm` vertices are `(x, y, bulge_to_next)`, bulge = tan(sweep / 4) in
   [-1, 1] (at most a half turn per arc, as in `Boundary`); the last bulge is 0.

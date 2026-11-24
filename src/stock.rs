@@ -977,6 +977,20 @@ impl Stock {
         self.history_clearance_impl(motion, radius, height, work, cancel, false)
     }
 
+    /// `history_clearance` for a flat cutter on a horizontal line or XY arc
+    /// (the air-move proof): no new removal at its constant Z, where touching
+    /// a floor cut to exactly that height is allowed. Not flat, unproven or
+    /// out of `work`: `false`.
+    pub(crate) fn flat_history_clearance(
+        &self,
+        motion: &Motion,
+        radius: f64,
+        work: &mut u64,
+        cancel: &impl CancelSignal,
+    ) -> Result<bool, String> {
+        self.history_clearance_impl(motion, radius, 0., work, cancel, true)
+    }
+
     fn history_clearance_impl(
         &self,
         motion: &Motion,
