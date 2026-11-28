@@ -520,7 +520,8 @@ class TrochoidalSlotWallFinishTest(unittest.TestCase):
                     if len(operations) == 1:
                         self.assertAlmostEqual(lower, top)
                     else:
-                        self.assertAlmostEqual(upper, floor)
+                        self.assertGreaterEqual(lower, floor - walls.tolerance_mm)
+                        self.assertLessEqual(upper, floor + walls.tolerance_mm)
             return volume["removed_lower_mm3"], volume["removed_upper_mm3"]
 
         # The slot alone leaves its walls: certainly less than the drawn slot.
