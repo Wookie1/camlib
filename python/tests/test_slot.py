@@ -505,6 +505,22 @@ class TrochoidalSlotWallFinishTest(unittest.TestCase):
                     pass
                 self.assertTrue(sim.state.finished)
                 volume = sim.state.volume()
+
+                # Cells wholly inside or outside the drawn wall. Check the
+                # long sides and both end caps independently of total volume.
+                def bounds(x, y):
+                    i = 2 * (int(y / 0.05) * sim.state.nx + int(x / 0.05))
+                    return tuple(sim.state.heights[i : i + 2])
+
+                inside = [bounds(x, y) for x, y in ((14, 9.125), (14, 14.875), (5.125, 12), (22.875, 12))]
+                outside = [bounds(x, y) for x, y in ((14, 8.875), (14, 15.125), (4.875, 12), (23.125, 12))]
+                for lower, _ in outside:
+                    self.assertAlmostEqual(lower, top)
+                for lower, upper in inside:
+                    if len(operations) == 1:
+                        self.assertAlmostEqual(lower, top)
+                    else:
+                        self.assertAlmostEqual(upper, floor)
             return volume["removed_lower_mm3"], volume["removed_upper_mm3"]
 
         # The slot alone leaves its walls: certainly less than the drawn slot.
